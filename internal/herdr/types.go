@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 )
@@ -23,6 +24,48 @@ const (
 	// AgentStatusUnknown 表示 Herdr 无法可靠识别 Agent 状态。
 	AgentStatusUnknown AgentStatus = "unknown"
 )
+
+// SubscriptionSpec 描述一个 Herdr 公开事件订阅。
+type SubscriptionSpec struct {
+	// Type 是 Herdr 定义的事件订阅类型。
+	Type string `json:"type"`
+	// PaneID 是 pane.agent_status_changed 所需的面板标识。
+	PaneID string `json:"pane_id,omitempty"`
+}
+
+// Event 表示 Herdr 事件流中的一条原始事件。
+type Event struct {
+	// Kind 是 Herdr 推送的事件名称。
+	Kind string
+	// Data 是未经业务解释的事件对象。
+	Data json.RawMessage
+}
+
+// AgentStatusEvent 表示 pane.agent_status_changed 事件。
+type AgentStatusEvent struct {
+	// PaneID 是状态变化的面板标识。
+	PaneID string
+	// WorkspaceID 是该面板所在工作区标识。
+	WorkspaceID string
+	// AgentStatus 是 Agent 当前生命周期状态。
+	AgentStatus AgentStatus
+	// Agent 是可选的 Agent 标识。
+	Agent *string
+	// Title 是可选的展示标题。
+	Title *string
+	// DisplayAgent 是可选的面向用户展示的 Agent 名称。
+	DisplayAgent *string
+	// StateLabels 是状态的可选展示标签。
+	StateLabels map[string]string
+}
+
+// SubscriptionStream 表示一个保持打开的 Herdr 事件订阅连接。
+type SubscriptionStream interface {
+	// Recv 阻塞直到接收到下一条事件或 context 被取消。
+	Recv(ctx context.Context) (Event, error)
+	// Close 关闭订阅连接；可重复调用。
+	Close() error
+}
 
 // AgentSession 表示 Agent 提供的可恢复会话标识。
 type AgentSession struct {
