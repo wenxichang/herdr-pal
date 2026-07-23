@@ -1,0 +1,13 @@
+{
+  "wecom": {
+    "bot_id": "",
+    "allowed_user_id": ""
+  },
+  "herdr": {
+    "session": "",
+    "socket_path": ""
+  },
+  "log": {
+    "level": "info"
+  }
+}

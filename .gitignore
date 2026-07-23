@@ -7,3 +7,8 @@ config.json
 dist/
 coverage.out
 *.test
+*.lock
+*.log
+*.tmp
+.tmp/
+tmp/
