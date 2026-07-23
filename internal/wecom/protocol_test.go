@@ -206,7 +206,7 @@ func TestProtocolDecodeResponseAndErrors(t *testing.T) {
 		t.Fatalf("pending result = %+v, want ErrProtocol", result)
 	}
 	var protocolErr *ProtocolError
-	if !errors.As(result.Err, &protocolErr) || protocolErr.RequestID != "request-2" || protocolErr.ErrCode != 40001 || protocolErr.Message != "rejected" {
+	if !errors.As(result.Err, &protocolErr) || protocolErr.RequestID != "request-2" || protocolErr.ErrCode != 40001 || protocolErr.Message != safeProtocolMessage {
 		t.Fatalf("ProtocolError = %#v", protocolErr)
 	}
 	if pending.resolve(Response{Headers: Headers{RequestID: "unknown"}, ErrCode: 40001, ErrMsg: "rejected"}) {
@@ -300,17 +300,51 @@ func TestProtocolUnsupportedCallbackKeepsRawReservedForUnknownFrames(t *testing.
 }
 
 func TestProtocolErrorSanitizesLogFields(t *testing.T) {
-	requestID := "request\r\nforged\tentry"
+	requestID := "request\r\nforged\tentry\u2028line\u2029paragraph\u202Ereversed🙂"
 	serverMessage := strings.Repeat("界", 100) + "\r\nforged"
 	err := newProtocolError(requestID, 42, serverMessage)
-	if strings.ContainsAny(err.Error(), "\r\n\t") || !utf8.ValidString(err.Error()) || len(err.Error()) > 256 {
+	if strings.ContainsAny(err.Error(), "\r\n\t\u2028\u2029\u202e") || !utf8.ValidString(err.Error()) || len(err.Error()) > 256 {
 		t.Fatalf("Error() = %q, must be bounded valid single-line UTF-8", err.Error())
 	}
 	if strings.Contains(err.Error(), requestID) || strings.Contains(err.Error(), serverMessage) {
 		t.Fatalf("Error() leaked raw injected field: %q", err.Error())
 	}
-	if strings.ContainsAny(err.RequestID, "\r\n\t") || strings.ContainsAny(err.Message, "\r\n\t") || !utf8.ValidString(err.RequestID) || !utf8.ValidString(err.Message) {
+	if strings.ContainsAny(err.RequestID, "\r\n\t\u2028\u2029\u202e") || strings.ContainsAny(err.Message, "\r\n\t\u2028\u2029\u202e") || !utf8.ValidString(err.RequestID) || !utf8.ValidString(err.Message) {
 		t.Fatalf("ProtocolError fields are not safe: %#v", err)
+	}
+	if !strings.Contains(err.RequestID, "🙂") {
+		t.Fatalf("ProtocolError request id lost printable emoji: %q", err.RequestID)
+	}
+}
+
+func TestProtocolErrorNeverExposesServerErrMsg(t *testing.T) {
+	secret := "subscribe-secret"
+	markdown := "markdown private content"
+	response := Response{
+		Headers: Headers{RequestID: "request-1"},
+		ErrCode: 40001,
+		ErrMsg:  secret + " " + markdown,
+	}
+	var pending pendingRequests
+	wait, err := pending.register(response.Headers.RequestID)
+	if err != nil {
+		t.Fatalf("register() error = %v", err)
+	}
+	if !pending.resolve(response) {
+		t.Fatal("resolve() = false, want true")
+	}
+	result := <-wait
+	var protocolErr *ProtocolError
+	if !errors.As(result.Err, &protocolErr) {
+		t.Fatalf("result error = %v, want ProtocolError", result.Err)
+	}
+	for _, visible := range []string{result.Err.Error(), protocolErr.RequestID, protocolErr.Message} {
+		if strings.Contains(visible, secret) || strings.Contains(visible, markdown) {
+			t.Fatalf("ProtocolError leaked server err msg in %q", visible)
+		}
+	}
+	if protocolErr.Message != safeProtocolMessage {
+		t.Fatalf("ProtocolError.Message = %q, want fixed safe text", protocolErr.Message)
 	}
 }
 

@@ -17,8 +17,9 @@ const (
 	// DefaultEndpoint 是企业微信智能机器人长连接的默认服务地址。
 	DefaultEndpoint = "wss://openws.work.weixin.qq.com"
 	// MarkdownByteLimit 是企业微信 Markdown 正文允许的最大 UTF-8 字节数。
-	MarkdownByteLimit = 20480
-	logFieldByteLimit = 80
+	MarkdownByteLimit   = 20480
+	logFieldByteLimit   = 80
+	safeProtocolMessage = "企业微信请求失败"
 )
 
 var (
@@ -52,7 +53,7 @@ type Response struct {
 
 // ProtocolError 表示可关联到企业微信请求的协议或业务错误。
 //
-// Error 文本不会回显订阅密钥或 Markdown 正文；Message 仅保留经过清理的服务端错误说明。
+// Error 文本不会回显订阅密钥或 Markdown 正文；Message 只保留固定的安全摘要。
 type ProtocolError struct {
 	RequestID string
 	ErrCode   int
@@ -71,11 +72,7 @@ func (e *ProtocolError) Error() string {
 	if e.ErrCode == 0 {
 		return fmt.Sprintf("%s: 请求 %s", ErrProtocol, requestID)
 	}
-	message := sanitizeLogField(e.Message)
-	if message == "" {
-		return fmt.Sprintf("%s: 请求 %s 失败（错误码 %d）", ErrProtocol, requestID, e.ErrCode)
-	}
-	return fmt.Sprintf("%s: 请求 %s 失败（错误码 %d）：%s", ErrProtocol, requestID, e.ErrCode, message)
+	return fmt.Sprintf("%s: 请求 %s 失败（错误码 %d）", ErrProtocol, requestID, e.ErrCode)
 }
 
 // Unwrap 使 ProtocolError 可被 errors.Is 识别为 ErrProtocol。
@@ -295,7 +292,7 @@ func decodeResponse(values map[string]json.RawMessage, data []byte) (Frame, erro
 	if err != nil || !ok {
 		return Frame{}, newProtocolError(headers.RequestID, errCode, "响应说明无效")
 	}
-	response := Response{Headers: headers, ErrCode: errCode, ErrMsg: sanitizeLogField(errMsg)}
+	response := Response{Headers: headers, ErrCode: errCode, ErrMsg: errMsg}
 	frame := Frame{Kind: FrameResponse, Headers: headers, Response: &response, Raw: append(json.RawMessage(nil), data...)}
 	return frame, nil
 }
@@ -414,7 +411,7 @@ func isJSONNull(raw json.RawMessage) bool {
 func sanitizeLogField(value string) string {
 	var cleaned strings.Builder
 	for _, character := range value {
-		if unicode.IsControl(character) {
+		if !unicode.IsPrint(character) || character == '\u2028' || character == '\u2029' {
 			continue
 		}
 		cleaned.WriteRune(character)
@@ -441,8 +438,8 @@ func truncateUTF8(value string, limit int) string {
 	return truncated.String() + suffix
 }
 
-func newProtocolError(requestID string, errCode int, message string) *ProtocolError {
-	return &ProtocolError{RequestID: sanitizeLogField(requestID), ErrCode: errCode, Message: sanitizeLogField(message)}
+func newProtocolError(requestID string, errCode int, _ string) *ProtocolError {
+	return &ProtocolError{RequestID: sanitizeLogField(requestID), ErrCode: errCode, Message: safeProtocolMessage}
 }
 
 type requestResult struct {
