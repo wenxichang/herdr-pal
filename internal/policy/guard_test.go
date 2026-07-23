@@ -78,15 +78,16 @@ func TestKeyAuditContainsOnlyPermittedFields(t *testing.T) {
 	t.Parallel()
 
 	at := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
-	audit, err := NewKeyAudit("wang", "pane-1", "sha256:abc", "A", at, "sent")
+	occupantHash := strings.Repeat("a", 64)
+	audit, err := NewKeyAudit("wang", "pane-1", occupantHash, "A", at, AuditResultSent)
 	if err != nil {
 		t.Fatalf("NewKeyAudit() error = %v", err)
 	}
-	if audit.Key != "A" || audit.At != at || audit.Result != "sent" {
+	if audit.UserID() != "wang" || audit.PaneID() != "pane-1" || audit.OccupantHash() != occupantHash || audit.Key() != "A" || audit.At() != at || audit.Result() != AuditResultSent {
 		t.Fatalf("NewKeyAudit() = %#v", audit)
 	}
-	if _, err := NewKeyAudit("wang", "pane-1", "sha256:abc", "ctrl+c", at, "rejected"); !errors.Is(err, ErrInvalidKey) {
-		t.Fatalf("NewKeyAudit() invalid key error = %v, want ErrInvalidKey", err)
+	if _, err := NewKeyAudit("wang", "pane-1", occupantHash, "ctrl+c", at, AuditResultRejected); !errors.Is(err, ErrInvalidAudit) {
+		t.Fatalf("NewKeyAudit() invalid key error = %v, want ErrInvalidAudit", err)
 	}
 
 	typ := reflect.TypeOf(KeyAudit{})
@@ -94,8 +95,13 @@ func TestKeyAuditContainsOnlyPermittedFields(t *testing.T) {
 		t.Fatalf("KeyAudit has %d fields, want only 6 safe fields", typ.NumField())
 	}
 	for _, name := range []string{"UserID", "PaneID", "OccupantHash", "Key", "At", "Result"} {
-		if _, ok := typ.FieldByName(name); !ok {
-			t.Fatalf("KeyAudit missing permitted field %q", name)
+		if _, ok := typ.MethodByName(name); !ok {
+			t.Fatalf("KeyAudit missing read-only accessor %q", name)
+		}
+	}
+	for index := range typ.NumField() {
+		if typ.Field(index).IsExported() {
+			t.Fatalf("KeyAudit field %q must not be externally mutable", typ.Field(index).Name)
 		}
 	}
 
@@ -118,6 +124,57 @@ func TestKeyAuditContainsOnlyPermittedFields(t *testing.T) {
 	for _, sensitive := range []string{"secret", "token", "prompt", "terminal", "content"} {
 		if _, ok := fields[sensitive]; ok {
 			t.Fatalf("serialized audit exposed %q: %#v", sensitive, fields)
+		}
+	}
+}
+
+func TestKeyAuditRejectsUnsafeValuesAndCannotSerializeZeroValue(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+	validHash := strings.Repeat("b", 64)
+	for _, test := range []struct {
+		name         string
+		userID       string
+		paneID       string
+		occupantHash string
+		key          string
+		at           time.Time
+		result       AuditResult
+	}{
+		{name: "empty user", paneID: "pane", occupantHash: validHash, key: "up", at: at, result: AuditResultSent},
+		{name: "blank user", userID: " \t", paneID: "pane", occupantHash: validHash, key: "up", at: at, result: AuditResultSent},
+		{name: "empty pane", userID: "user", occupantHash: validHash, key: "up", at: at, result: AuditResultSent},
+		{name: "blank pane", userID: "user", paneID: " \n", occupantHash: validHash, key: "up", at: at, result: AuditResultSent},
+		{name: "raw terminal content as hash", userID: "user", paneID: "pane", occupantHash: "terminal output: secret-token", key: "up", at: at, result: AuditResultSent},
+		{name: "upper case hash", userID: "user", paneID: "pane", occupantHash: strings.Repeat("A", 64), key: "up", at: at, result: AuditResultSent},
+		{name: "zero time", userID: "user", paneID: "pane", occupantHash: validHash, key: "up", result: AuditResultSent},
+		{name: "raw error as result", userID: "user", paneID: "pane", occupantHash: validHash, key: "up", at: at, result: AuditResult("terminal output: secret-token")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewKeyAudit(test.userID, test.paneID, test.occupantHash, test.key, test.at, test.result)
+			if !errors.Is(err, ErrInvalidAudit) {
+				t.Fatalf("NewKeyAudit() error = %v, want ErrInvalidAudit", err)
+			}
+			if err != nil && strings.Contains(err.Error(), "secret-token") {
+				t.Fatalf("NewKeyAudit() leaked sensitive value: %v", err)
+			}
+		})
+	}
+
+	if _, err := json.Marshal(KeyAudit{}); err == nil || !errors.Is(err, ErrInvalidAudit) {
+		t.Fatalf("json.Marshal(zero KeyAudit) error = %v, want ErrInvalidAudit", err)
+	}
+	for _, unsafeAudit := range []KeyAudit{
+		{userID: "user", paneID: "pane", occupantHash: "terminal output: secret-token", key: "up", at: at, result: AuditResultSent},
+		{userID: "user", paneID: "pane", occupantHash: validHash, key: "up", at: at, result: AuditResult("raw failure: secret-token")},
+	} {
+		_, err := json.Marshal(unsafeAudit)
+		if !errors.Is(err, ErrInvalidAudit) {
+			t.Fatalf("json.Marshal(unsafe KeyAudit) error = %v, want ErrInvalidAudit", err)
+		}
+		if strings.Contains(err.Error(), "secret-token") {
+			t.Fatalf("json.Marshal(unsafe KeyAudit) leaked sensitive value: %v", err)
 		}
 	}
 }

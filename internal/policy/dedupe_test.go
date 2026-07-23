@@ -109,6 +109,67 @@ func TestDeduperHandlesClockRollbackConservatively(t *testing.T) {
 	}
 }
 
+func TestDeduperUsesMonotonicLogicalTimeDuringClockRollback(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+	clock := newTestClock(start)
+	deduper := mustDeduper(t, time.Minute, 4, clock.Now)
+	clock.Advance(30 * time.Second)
+	if !deduper.AddIfNew("before-rollback") {
+		t.Fatal("seed key should be new")
+	}
+	clock.Set(start.Add(-time.Hour))
+	if !deduper.AddIfNew("during-rollback") {
+		t.Fatal("new key during rollback should use the logical clock")
+	}
+	if deduper.AddIfNew("during-rollback") {
+		t.Fatal("rollback should retain key")
+	}
+	clock.Set(start.Add(31 * time.Second))
+	if deduper.AddIfNew("during-rollback") {
+		t.Fatal("wall clock recovery before logical ttl must retain key")
+	}
+	clock.Set(start.Add(90 * time.Second))
+	if !deduper.AddIfNew("during-rollback") {
+		t.Fatal("key should be accepted at logical ttl boundary")
+	}
+}
+
+func TestDeduperMetadataStaysBoundedUnderLongCapacityAndDuplicateLoads(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock(time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC))
+	const capacity = 7
+	deduper := mustDeduper(t, time.Hour, capacity, clock.Now)
+	for index := range 20000 {
+		key := string(rune('a'+index%26)) + "-" + string(rune(index%10+'0'))
+		deduper.AddIfNew(key)
+		deduper.AddIfNew(key)
+		if deduper.entryCount() > capacity || deduper.orderCount() > capacity {
+			t.Fatalf("metadata exceeded capacity: entries=%d order=%d", deduper.entryCount(), deduper.orderCount())
+		}
+	}
+	clock.Advance(time.Hour)
+	for index := range capacity {
+		if !deduper.AddIfNew("reinsert-" + string(rune(index+'0'))) {
+			t.Fatal("expired key should be reinserted")
+		}
+	}
+	if deduper.entryCount() != capacity || deduper.orderCount() != capacity {
+		t.Fatalf("metadata = entries=%d order=%d, want %d", deduper.entryCount(), deduper.orderCount(), capacity)
+	}
+}
+
+func TestNilDeduperRejectsEveryKey(t *testing.T) {
+	t.Parallel()
+
+	var deduper *Deduper
+	if deduper.AddIfNew("message") || deduper.AddIfNew("") {
+		t.Fatal("nil Deduper must reject every key")
+	}
+}
+
 func TestDeduperAllowsOnlyOneConcurrentFirstInsert(t *testing.T) {
 	t.Parallel()
 

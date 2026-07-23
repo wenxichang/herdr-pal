@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"container/list"
 	"errors"
 	"strings"
 	"sync"
@@ -22,18 +23,14 @@ type Deduper struct {
 	capacity int
 	clock    Clock
 	entries  map[string]dedupeEntry
-	order    []orderEntry
-	nextSeq  uint64
+	order    *list.List
+	lastNow  time.Time
+	hasNow   bool
 }
 
 type dedupeEntry struct {
 	expiresAt time.Time
-	sequence  uint64
-}
-
-type orderEntry struct {
-	key      string
-	sequence uint64
+	element   *list.Element
 }
 
 // NewDeduper 创建容量受限、线程安全的消息幂等器。
@@ -46,13 +43,14 @@ func NewDeduper(ttl time.Duration, capacity int, clock Clock) (*Deduper, error) 
 		capacity: capacity,
 		clock:    clock,
 		entries:  make(map[string]dedupeEntry, capacity),
-		order:    make([]orderEntry, 0, capacity),
+		order:    list.New(),
 	}, nil
 }
 
 // AddIfNew 将非空幂等键登记为已处理；首次登记返回 true，重复键返回 false。
 //
-// 到达精确过期边界的键视为已过期。时钟回拨时，尚未到期的记录会保守地继续视为重复。
+// nil 接收者、空白键和重复键均返回 false。到达精确过期边界的键视为已过期；时钟回拨时
+// 使用锁内单调逻辑时间，因此尚未到期的记录会保守地继续视为重复。
 func (d *Deduper) AddIfNew(key string) bool {
 	if d == nil || strings.TrimSpace(key) == "" {
 		return false
@@ -61,40 +59,46 @@ func (d *Deduper) AddIfNew(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	now := d.clock()
+	now := d.logicalNow()
 	d.removeExpired(now)
 	if _, exists := d.entries[key]; exists {
 		return false
 	}
 	if len(d.entries) == d.capacity {
-		oldest := d.order[0]
-		entry := d.entries[oldest.key]
-		if entry.sequence == oldest.sequence {
-			delete(d.entries, oldest.key)
-		}
-		d.order = d.order[1:]
+		d.removeOldest()
 	}
-	d.nextSeq++
-	d.entries[key] = dedupeEntry{expiresAt: now.Add(d.ttl), sequence: d.nextSeq}
-	d.order = append(d.order, orderEntry{key: key, sequence: d.nextSeq})
+	element := d.order.PushBack(key)
+	d.entries[key] = dedupeEntry{expiresAt: now.Add(d.ttl), element: element}
 	return true
 }
 
-// removeExpired 同时压缩顺序队列，确保重插入不会由陈旧记录误删，且元数据有界。
-func (d *Deduper) removeExpired(now time.Time) {
-	kept := d.order[:0]
-	for _, record := range d.order {
-		entry, exists := d.entries[record.key]
-		if !exists || entry.sequence != record.sequence {
-			continue
-		}
-		if !entry.expiresAt.After(now) {
-			delete(d.entries, record.key)
-			continue
-		}
-		kept = append(kept, record)
+func (d *Deduper) logicalNow() time.Time {
+	raw := d.clock()
+	if !d.hasNow || raw.After(d.lastNow) {
+		d.lastNow = raw
+		d.hasNow = true
 	}
-	d.order = kept
+	return d.lastNow
+}
+
+// removeExpired 仅从队首清理；逻辑时间和过期时间均单调不减，因此该操作摊销为 O(1)。
+func (d *Deduper) removeExpired(now time.Time) {
+	for element := d.order.Front(); element != nil; element = d.order.Front() {
+		key := element.Value.(string)
+		entry := d.entries[key]
+		if entry.expiresAt.After(now) {
+			return
+		}
+		delete(d.entries, key)
+		d.order.Remove(element)
+	}
+}
+
+func (d *Deduper) removeOldest() {
+	element := d.order.Front()
+	key := element.Value.(string)
+	delete(d.entries, key)
+	d.order.Remove(element)
 }
 
 func (d *Deduper) entryCount() int {
@@ -106,5 +110,5 @@ func (d *Deduper) entryCount() int {
 func (d *Deduper) orderCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return len(d.order)
+	return d.order.Len()
 }
