@@ -44,7 +44,10 @@ func (b *Buffer) Refresh(targetKey string, lines []string) {
 // 即使下一页已在缓存中，仍返回受 MaxLines 限制的正数，保持调用方“读取后调用 Expand”
 // 的流程不变；Expand 会优先消费缓存页。
 func (b *Buffer) NextReadSize() (int, error) {
-	if !b.hasCachedOlderPage() && (b.oldest || (b.page+2)*PageSize > MaxLines) {
+	if b.hasCachedOlderPage() {
+		return len(b.lines), nil
+	}
+	if b.oldest || (b.page+2)*PageSize > MaxLines {
 		return 0, ErrOldestPage
 	}
 	return min((b.page+2)*PageSize, MaxLines), nil

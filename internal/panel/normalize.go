@@ -66,9 +66,10 @@ func stripANSI(text string) string {
 }
 
 func skipControlString(text string, index int, bellTerminates bool) int {
+	firstNewline := -1
 	for index < len(text) {
-		if text[index] == '\n' {
-			return index
+		if text[index] == '\n' && firstNewline < 0 {
+			firstNewline = index
 		}
 		if bellTerminates && text[index] == 0x07 {
 			return index + 1
@@ -80,6 +81,9 @@ func skipControlString(text string, index int, bellTerminates bool) int {
 			return index + 2
 		}
 		index++
+	}
+	if firstNewline >= 0 {
+		return firstNewline
 	}
 	return index
 }

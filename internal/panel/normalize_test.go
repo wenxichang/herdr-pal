@@ -70,10 +70,20 @@ func TestNormalizeRemovesSaveRestoreAndStringControls(t *testing.T) {
 }
 
 func TestNormalizeDoesNotConsumeFollowingLineForUnterminatedStringControl(t *testing.T) {
-	input := "before\x1bPunfinished\nvisible"
+	input := "before\x1bPunfinished\nvisible\nstart\x1b]unterminated\nnext"
 
 	got := panel.Normalize(input)
-	want := []string{"before", "visible"}
+	want := []string{"before", "visible", "start", "next"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Normalize() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeConsumesTerminatedControlStringsAcrossLines(t *testing.T) {
+	input := "before\x1b]osc payload\nmore osc\x1b\\after\nnext\x1bPdcs payload\nmore dcs\u009cfinal"
+
+	got := panel.Normalize(input)
+	want := []string{"beforeafter", "nextfinal"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Normalize() = %#v, want %#v", got, want)
 	}
@@ -150,6 +160,60 @@ func TestBufferPageUpMakesAllMaxLinesCachePagesReachable(t *testing.T) {
 	}
 	if _, err := buffer.NextReadSize(); !errors.Is(err, panel.ErrOldestPage) {
 		t.Fatalf("NextReadSize() error = %v, want ErrOldestPage", err)
+	}
+}
+
+func TestBufferNextReadSizeRetainsCompleteCachedAnchor(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		latestStart int
+		historyFrom int
+		historyTo   int
+		wantSize    int
+		wantPage    []string
+	}{
+		{
+			name:        "full maximum cache",
+			latestStart: 1000,
+			historyFrom: 30,
+			historyTo:   1000,
+			wantSize:    panel.MaxLines,
+			wantPage:    externalLines(800, 900),
+		},
+		{
+			name:        "short cache still keeps anchor",
+			latestStart: 200,
+			historyFrom: 50,
+			historyTo:   200,
+			wantSize:    180,
+			wantPage:    externalLines(50, 100),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			latest := externalLines(test.latestStart, test.latestStart+30)
+			history := externalLines(test.historyFrom, test.historyTo)
+			snapshot := append(append([]string(nil), history...), latest...)
+			var buffer panel.Buffer
+			buffer.Refresh("target-a", latest)
+			if err := externalPageUp(&buffer, "target-a", snapshot); err != nil {
+				t.Fatalf("first pageup error = %v", err)
+			}
+
+			readSize, err := buffer.NextReadSize()
+			if err != nil {
+				t.Fatalf("NextReadSize() error = %v", err)
+			}
+			if readSize != test.wantSize {
+				t.Fatalf("NextReadSize() = %d, want %d", readSize, test.wantSize)
+			}
+			recent := snapshot[len(snapshot)-readSize:]
+			if err := buffer.Expand("target-a", recent); err != nil {
+				t.Fatalf("Expand(recent) error = %v", err)
+			}
+			if got := buffer.Render(); !reflect.DeepEqual(got, test.wantPage) {
+				t.Fatalf("cached next page = %#v, want %#v", got, test.wantPage)
+			}
+		})
 	}
 }
 
