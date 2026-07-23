@@ -197,8 +197,30 @@ func TestClientDisconnectAndFullEventQueueReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runClient(t, client, ctx)
 	completeSubscribe(t, client, first)
+	firstSession := client.getCurrent()
 	first.push(textCallbackJSON("callback-1"))
 	first.push(textCallbackJSON("callback-2"))
+	select {
+	case <-firstSession.done:
+	case <-time.After(time.Second):
+		t.Fatal("event overflow did not finish session")
+	}
+	select {
+	case event := <-client.Events():
+		if event.RequestID != "callback-1" {
+			t.Fatalf("first event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first queued event missing")
+	}
+	select {
+	case event := <-client.Events():
+		if event.RequestID != "callback-2" {
+			t.Fatalf("overflow event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overflow event missing")
+	}
 	if commandOf(t, second.nextWrite(t)).Cmd != "aibot_subscribe" {
 		t.Fatal("full event queue did not reconnect")
 	}
@@ -272,6 +294,42 @@ func TestClientUnavailableTimeoutAndNoSecretLeak(t *testing.T) {
 	}
 }
 
+func TestClientRejectsInvalidEndpointAndPermanentSubscribeError(t *testing.T) {
+	for _, endpoint := range []string{"", "https://example.test", "ws:///missing-host"} {
+		if _, err := NewClient(ClientConfig{Endpoint: endpoint, BotID: "bot", Secret: "secret", AllowedUserID: "user"}); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("NewClient(%q) error = %v, want ErrProtocol", endpoint, err)
+		}
+	}
+	socket := newFakeSocket()
+	attempts := 0
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { attempts++; return socket, nil })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := runClient(t, client, ctx)
+	subscribe := socket.nextWrite(t)
+	socket.push(responseJSON(requestIDOf(t, subscribe), 40001))
+	if err := <-done; !errors.Is(err, ErrProtocol) {
+		t.Fatalf("Run() = %v, want permanent ErrProtocol", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("dial attempts = %d, want 1", attempts)
+	}
+}
+
+func TestClientFormattingNeverLeaksSecret(t *testing.T) {
+	secret := "format-secret"
+	config := ClientConfig{Endpoint: "ws://example.test", BotID: "bot", Secret: secret, AllowedUserID: "user"}
+	client, err := NewClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{fmt.Sprint(config), fmt.Sprintf("%+v", config), fmt.Sprintf("%#v", config), fmt.Sprint(client), fmt.Sprintf("%+v", client), fmt.Sprintf("%#v", client)} {
+		if strings.Contains(value, secret) {
+			t.Fatalf("formatted value leaked secret: %s", value)
+		}
+	}
+}
+
 func TestClientWriteFailureDoesNotLeakSecret(t *testing.T) {
 	secret := "write-secret"
 	socket := newFakeSocket()
@@ -285,6 +343,38 @@ func TestClientWriteFailureDoesNotLeakSecret(t *testing.T) {
 	if !errors.Is(err, ErrUnavailable) || contains(err.Error(), secret) {
 		t.Fatalf("SendMarkdown() error = %v, want safe ErrUnavailable", err)
 	}
+}
+
+func TestSessionResponseOwnershipWinsOverCancellationAndFinish(t *testing.T) {
+	socket := newFakeSocket()
+	session := newSession(context.Background(), socket, make(chan IncomingText, 1))
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- session.request(ctx, "request-1", []byte(`{"cmd":"ping","headers":{"req_id":"request-1"}}`))
+	}()
+	_ = socket.nextWrite(t)
+	socket.push(responseJSON("request-1", 0))
+	waitPendingGone(t, &session.pending, "request-1")
+	cancel()
+	session.finish(ErrUnavailable)
+	if err := <-result; err != nil {
+		t.Fatalf("request result = %v, want resolved success", err)
+	}
+}
+
+func TestSessionWriteErrorAfterResponseOwnershipReturnsResponse(t *testing.T) {
+	socket := newFakeSocket()
+	socket.writeErr = errors.New("transport write failure")
+	session := newSession(context.Background(), socket, make(chan IncomingText, 1))
+	socket.writeHook = func(data []byte) {
+		socket.push(responseJSON(requestIDOfJSON(data), 0))
+		waitPendingGone(t, &session.pending, requestIDOfJSON(data))
+	}
+	if err := session.request(context.Background(), "request-1", []byte(`{"cmd":"ping","headers":{"req_id":"request-1"}}`)); err != nil {
+		t.Fatalf("request result = %v, want response success", err)
+	}
+	session.finish(ErrUnavailable)
 }
 
 func TestClientRequestContextCancelsWithoutEndingSession(t *testing.T) {
@@ -464,11 +554,12 @@ func TestClientProductionWebSocketReconnectsAndReplacesPendingSession(t *testing
 }
 
 type fakeSocket struct {
-	reads    chan fakeRead
-	writes   chan []byte
-	closed   chan struct{}
-	once     sync.Once
-	writeErr error
+	reads     chan fakeRead
+	writes    chan []byte
+	closed    chan struct{}
+	once      sync.Once
+	writeErr  error
+	writeHook func([]byte)
 }
 type fakeRead struct {
 	typ  websocket.MessageType
@@ -494,6 +585,9 @@ func (s *fakeSocket) Write(ctx context.Context, typ websocket.MessageType, data 
 		return fmt.Errorf("unexpected message type")
 	}
 	if s.writeErr != nil {
+		if s.writeHook != nil {
+			s.writeHook(data)
+		}
 		return s.writeErr
 	}
 	select {
@@ -503,6 +597,24 @@ func (s *fakeSocket) Write(ctx context.Context, typ websocket.MessageType, data 
 		return ErrUnavailable
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func waitPendingGone(t *testing.T, pending *pendingRequests, requestID string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		pending.mu.Lock()
+		_, exists := pending.waits[requestID]
+		pending.mu.Unlock()
+		if !exists {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("response did not take pending ownership")
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 func (s *fakeSocket) Close(websocket.StatusCode, string) error {
