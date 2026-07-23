@@ -236,9 +236,10 @@ func TestNotifierPartialSnapshotRetryRevalidatesOccupant(t *testing.T) {
 	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
 		t.Fatalf("occupant 替换后重试返回错误：%v", err)
 	}
-	messages := strings.Join(im.Messages(), "\n")
-	if strings.Contains(messages, "SENSITIVE-PARTIAL-MARKER") || !strings.Contains(messages, "已完成") {
-		t.Fatalf("分段重试泄露旧 occupant 快照：%q", messages)
+	messages := im.Messages()
+	joined := strings.Join(messages, "\n")
+	if strings.Contains(joined, "SENSITIVE-PARTIAL-MARKER") || strings.Count(joined, "已完成") != 1 || len(messages) != 1 {
+		t.Fatalf("分段重试泄露旧 occupant 快照或重复标题：%#v", messages)
 	}
 }
 
@@ -687,6 +688,38 @@ func TestNotificationDispatcherDeduplicatesPendingInvalidationByOccupant(t *test
 	}
 }
 
+func TestNotificationDispatcherCancellationDoesNotStartPendingTasks(t *testing.T) {
+	im := newCancelCountingNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 2,
+		Backoff:  &notificationRetry{delay: time.Second},
+		Wait:     waitSupervisorDelay,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+
+	first := notificationTarget()
+	first.OccupantKey = "occupant-1"
+	if err := dispatcher.EnqueueInvalidated(first); err != nil {
+		t.Fatalf("首次 EnqueueInvalidated() 返回错误：%v", err)
+	}
+	<-im.firstStarted
+	second := first
+	second.OccupantKey = "occupant-2"
+	if err := dispatcher.EnqueueInvalidated(second); err != nil {
+		t.Fatalf("待发 EnqueueInvalidated() 返回错误：%v", err)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+	if got := im.CallCount(); got != 1 {
+		t.Fatalf("context 取消后仍启动待发通知：calls=%d", got)
+	}
+}
+
 func TestNotificationDispatcherInvalidationRemovesPendingSamePaneStatus(t *testing.T) {
 	im := newGatedNotifierIM()
 	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
@@ -876,6 +909,39 @@ type failOnceNotifierIM struct {
 	failed   bool
 	calls    int
 	messages []string
+}
+
+type cancelCountingNotifierIM struct {
+	mu           sync.Mutex
+	calls        int
+	firstStarted chan struct{}
+}
+
+func newCancelCountingNotifierIM() *cancelCountingNotifierIM {
+	return &cancelCountingNotifierIM{firstStarted: make(chan struct{})}
+}
+
+func (i *cancelCountingNotifierIM) RespondMarkdown(context.Context, string, string) error {
+	return errors.New("Notifier 不应回复入站回调")
+}
+
+func (i *cancelCountingNotifierIM) SendMarkdown(ctx context.Context, _ string) error {
+	i.mu.Lock()
+	i.calls++
+	call := i.calls
+	i.mu.Unlock()
+	if call == 1 {
+		close(i.firstStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (i *cancelCountingNotifierIM) CallCount() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.calls
 }
 
 func (i *failOnceNotifierIM) RespondMarkdown(context.Context, string, string) error {

@@ -370,6 +370,60 @@ func TestSupervisorLifecycleEventsDebounceSnapshotAndRebuildStatusStream(t *test
 	}
 }
 
+func TestSupervisorSamePaneOccupantReplacementRebuildsStatusStream(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	oldStatus := newSupervisorStream()
+	newStatus := newSupervisorStream()
+	initial := supervisorSnapshot(supervisorPaneWithSession(
+		"pane-1", "terminal-1", "codex", herdr.AgentStatusIdle, "session-old",
+	))
+	replacement := supervisorSnapshot(supervisorPaneWithSession(
+		"pane-1", "terminal-1", "codex", herdr.AgentStatusDone, "session-new",
+	))
+	oldStatus.BufferOnClose(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusBlocked))
+	client := newSupervisorClient(initial, initial, replacement, replacement)
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{oldStatus, newStatus}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	observed := make(chan supervisorMessage, 16)
+	harness.supervisor.messageObserved = func(message supervisorMessage) { observed <- message }
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "occupant 替换基线", func() bool { return serviceAvailable(harness.service) })
+	before := harness.registry.CreateListSnapshot()
+	if len(before) != 1 {
+		t.Fatalf("初始目标 = %#v", before)
+	}
+
+	lifecycle.Emit(supervisorLifecycleEvent("pane.agent_detected"))
+	debounce := awaitSupervisorWait(t, harness.waiter)
+	debounce.Release()
+	if specs := awaitSupervisorSubscribe(t, client); !reflect.DeepEqual(specs, herdr.StatusSubscriptions([]string{"pane-1"})) {
+		t.Fatalf("occupant 替换后的 status specs = %#v", specs)
+	}
+	awaitSupervisorCondition(t, "关闭旧 occupant status stream", func() bool { return oldStatus.CloseCount() == 1 })
+	awaitSupervisorObservedMessage(t, observed, func(message supervisorMessage) bool {
+		return message.kind == supervisorStreamStatus && message.generation == 1 && message.err == nil
+	})
+	awaitSupervisorCondition(t, "权威 occupant 替换快照", func() bool {
+		targets := harness.registry.CreateListSnapshot()
+		return client.SnapshotCount() == 4 && len(targets) == 1 &&
+			targets[0].OccupantKey != before[0].OccupantKey && targets[0].Status == herdr.AgentStatusDone
+	})
+
+	newStatus.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "新 occupant status stream", func() bool {
+		targets := harness.registry.CreateListSnapshot()
+		return len(targets) == 1 && targets[0].Status == herdr.AgentStatusWorking
+	})
+	if got := harness.factory.ConnectCount(); got != 1 {
+		t.Fatalf("旧 occupant 缓冲事件触发重连：Connect 次数 = %d", got)
+	}
+}
+
 func TestSupervisorAllLifecycleKindsTriggerSnapshot(t *testing.T) {
 	for _, kind := range []string{"pane.created", "pane.closed", "pane.updated", "pane.exited", "pane.agent_detected"} {
 		t.Run(kind, func(t *testing.T) {
@@ -1141,6 +1195,12 @@ func supervisorPane(paneID, terminalID, agent string, status herdr.AgentStatus) 
 	return herdr.Pane{PaneID: paneID, TerminalID: terminalID, WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef(agent), DisplayAgent: stringRef(display), AgentStatus: status}
 }
 
+func supervisorPaneWithSession(paneID, terminalID, agent string, status herdr.AgentStatus, sessionValue string) herdr.Pane {
+	pane := supervisorPane(paneID, terminalID, agent, status)
+	pane.AgentSession = &herdr.AgentSession{Source: agent, Agent: agent, Kind: "id", Value: sessionValue}
+	return pane
+}
+
 func supervisorStatusEvent(paneID, workspaceID, agent string, status herdr.AgentStatus) herdr.Event {
 	data, _ := json.Marshal(map[string]any{
 		"pane_id": paneID, "workspace_id": workspaceID, "agent_status": status, "agent": agent,
@@ -1306,12 +1366,13 @@ type supervisorStreamItem struct {
 }
 
 type supervisorStream struct {
-	items     chan supervisorStreamItem
-	closed    chan struct{}
-	recvEnded chan error
-	closeOnce sync.Once
-	mu        sync.Mutex
-	closes    int
+	items      chan supervisorStreamItem
+	closed     chan struct{}
+	recvEnded  chan error
+	closeOnce  sync.Once
+	mu         sync.Mutex
+	closes     int
+	closeItems []supervisorStreamItem
 }
 
 func newSupervisorStream() *supervisorStream {
@@ -1331,6 +1392,9 @@ func (s *supervisorStream) Recv(ctx context.Context) (event herdr.Event, err err
 	case <-ctx.Done():
 		return herdr.Event{}, ctx.Err()
 	case <-s.closed:
+		if item, ok := s.popCloseItem(); ok {
+			return item.event, item.err
+		}
 		return herdr.Event{}, io.ErrClosedPipe
 	case item := <-s.items:
 		return item.event, item.err
@@ -1379,6 +1443,23 @@ func (s *supervisorStream) Emit(event herdr.Event) {
 
 func (s *supervisorStream) End(err error) {
 	s.items <- supervisorStreamItem{err: err}
+}
+
+func (s *supervisorStream) BufferOnClose(event herdr.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeItems = append(s.closeItems, supervisorStreamItem{event: event})
+}
+
+func (s *supervisorStream) popCloseItem() (supervisorStreamItem, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.closeItems) == 0 {
+		return supervisorStreamItem{}, false
+	}
+	item := s.closeItems[0]
+	s.closeItems = s.closeItems[1:]
+	return item, true
 }
 
 func (s *supervisorStream) CloseCount() int {

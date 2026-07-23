@@ -221,7 +221,7 @@ func supervisorRunError(parentContext, runContext context.Context, fallback erro
 }
 
 func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, dispatcher *notificationDispatcher) (bool, error) {
-	lifecycle, status, statusSpecs, baseline, err := s.prepareSubscriptions(ctx, client)
+	lifecycle, status, statusPlan, baseline, err := s.prepareSubscriptions(ctx, client)
 	if err != nil {
 		return false, err
 	}
@@ -316,8 +316,8 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 					return finish(err)
 				}
 				rebuilds := 0
-				status, statusSpecs, discovery, rebuilds, err = s.reconcileStatusSubscriptions(
-					ctx, client, status, statusSpecs, discovery,
+				status, statusPlan, discovery, rebuilds, err = s.reconcileStatusSubscriptions(
+					ctx, client, status, statusPlan, discovery,
 					func() { statusGeneration++ },
 				)
 				if err != nil {
@@ -342,14 +342,14 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 	}
 }
 
-func (s *Supervisor) prepareSubscriptions(ctx context.Context, client ManagedHerdr) (lifecycle herdr.SubscriptionStream, status herdr.SubscriptionStream, statusSpecs []herdr.SubscriptionSpec, baseline herdr.Snapshot, err error) {
+func (s *Supervisor) prepareSubscriptions(ctx context.Context, client ManagedHerdr) (lifecycle herdr.SubscriptionStream, status herdr.SubscriptionStream, statusPlan statusSubscriptionPlan, baseline herdr.Snapshot, err error) {
 	discovery, err := s.snapshot(ctx, client)
 	if err != nil {
-		return nil, nil, nil, herdr.Snapshot{}, err
+		return nil, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, err
 	}
 	lifecycle, err = client.Subscribe(ctx, herdr.LifecycleSubscriptions())
 	if err != nil {
-		return nil, nil, nil, herdr.Snapshot{}, err
+		return nil, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, err
 	}
 	cleanup := true
 	defer func() {
@@ -360,36 +360,38 @@ func (s *Supervisor) prepareSubscriptions(ctx context.Context, client ManagedHer
 			}
 		}
 	}()
-	statusSpecs = statusSubscriptionsFromSnapshot(discovery)
-	status, err = subscribeStatus(ctx, client, statusSpecs)
+	statusPlan = statusSubscriptionPlanFromSnapshot(discovery)
+	// 专用 status 订阅从创建时的 current_sequence 开始且不重放旧状态；订阅后的
+	// 权威 snapshot 用于覆盖 discovery 与订阅确认之间的状态变化。
+	status, err = subscribeStatus(ctx, client, statusPlan.specs)
 	if err != nil {
-		return lifecycle, nil, nil, herdr.Snapshot{}, err
+		return lifecycle, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, err
 	}
 	baseline, err = s.snapshot(ctx, client)
 	if err != nil {
-		return lifecycle, status, statusSpecs, herdr.Snapshot{}, err
+		return lifecycle, status, statusPlan, herdr.Snapshot{}, err
 	}
-	status, statusSpecs, baseline, _, err = s.reconcileStatusSubscriptions(ctx, client, status, statusSpecs, baseline, nil)
+	status, statusPlan, baseline, _, err = s.reconcileStatusSubscriptions(ctx, client, status, statusPlan, baseline, nil)
 	if err != nil {
-		return lifecycle, status, statusSpecs, herdr.Snapshot{}, err
+		return lifecycle, status, statusPlan, herdr.Snapshot{}, err
 	}
 	cleanup = false
-	return lifecycle, status, statusSpecs, baseline, nil
+	return lifecycle, status, statusPlan, baseline, nil
 }
 
 func (s *Supervisor) reconcileStatusSubscriptions(
 	ctx context.Context,
 	client ManagedHerdr,
 	status herdr.SubscriptionStream,
-	statusSpecs []herdr.SubscriptionSpec,
+	statusPlan statusSubscriptionPlan,
 	snapshot herdr.Snapshot,
 	beforeReplace func(),
-) (herdr.SubscriptionStream, []herdr.SubscriptionSpec, herdr.Snapshot, int, error) {
+) (herdr.SubscriptionStream, statusSubscriptionPlan, herdr.Snapshot, int, error) {
 	rebuilds := 0
 	for {
-		desired := statusSubscriptionsFromSnapshot(snapshot)
-		if sameSubscriptionSpecs(statusSpecs, desired) {
-			return status, statusSpecs, snapshot, rebuilds, nil
+		desired := statusSubscriptionPlanFromSnapshot(snapshot)
+		if sameStatusSubscriptionPlan(statusPlan, desired) {
+			return status, statusPlan, snapshot, rebuilds, nil
 		}
 		if beforeReplace != nil {
 			beforeReplace()
@@ -398,16 +400,16 @@ func (s *Supervisor) reconcileStatusSubscriptions(
 			_ = status.Close()
 			status = nil
 		}
-		statusSpecs = desired
+		statusPlan = desired
 		var err error
-		status, err = subscribeStatus(ctx, client, statusSpecs)
+		status, err = subscribeStatus(ctx, client, statusPlan.specs)
 		if err != nil {
-			return status, statusSpecs, herdr.Snapshot{}, rebuilds, err
+			return status, statusPlan, herdr.Snapshot{}, rebuilds, err
 		}
 		rebuilds++
 		snapshot, err = s.snapshot(ctx, client)
 		if err != nil {
-			return status, statusSpecs, herdr.Snapshot{}, rebuilds, err
+			return status, statusPlan, herdr.Snapshot{}, rebuilds, err
 		}
 	}
 }
@@ -423,19 +425,32 @@ func (s *Supervisor) snapshot(ctx context.Context, client ManagedHerdr) (herdr.S
 	return snapshot, nil
 }
 
-func statusSubscriptionsFromSnapshot(snapshot herdr.Snapshot) []herdr.SubscriptionSpec {
-	unique := make(map[string]struct{}, len(snapshot.Panes))
-	for _, pane := range snapshot.Panes {
-		if pane.Agent != nil && pane.PaneID != "" {
-			unique[pane.PaneID] = struct{}{}
+type statusSubscriptionIdentity struct {
+	paneID      string
+	occupantKey string
+}
+
+type statusSubscriptionPlan struct {
+	specs      []herdr.SubscriptionSpec
+	identities []statusSubscriptionIdentity
+}
+
+func statusSubscriptionPlanFromSnapshot(snapshot herdr.Snapshot) statusSubscriptionPlan {
+	registry := &session.Registry{}
+	registry.Replace(snapshot, false)
+	targets := registry.CreateListSnapshot()
+	identities := make([]statusSubscriptionIdentity, 0, len(targets))
+	for _, target := range targets {
+		if target.PaneID != "" {
+			identities = append(identities, statusSubscriptionIdentity{paneID: target.PaneID, occupantKey: target.OccupantKey})
 		}
 	}
-	paneIDs := make([]string, 0, len(unique))
-	for paneID := range unique {
-		paneIDs = append(paneIDs, paneID)
+	sort.Slice(identities, func(left, right int) bool { return identities[left].paneID < identities[right].paneID })
+	paneIDs := make([]string, len(identities))
+	for index, identity := range identities {
+		paneIDs[index] = identity.paneID
 	}
-	sort.Strings(paneIDs)
-	return herdr.StatusSubscriptions(paneIDs)
+	return statusSubscriptionPlan{specs: herdr.StatusSubscriptions(paneIDs), identities: identities}
 }
 
 func subscribeStatus(ctx context.Context, client ManagedHerdr, specs []herdr.SubscriptionSpec) (herdr.SubscriptionStream, error) {
@@ -445,12 +460,12 @@ func subscribeStatus(ctx context.Context, client ManagedHerdr, specs []herdr.Sub
 	return client.Subscribe(ctx, specs)
 }
 
-func sameSubscriptionSpecs(left, right []herdr.SubscriptionSpec) bool {
-	if len(left) != len(right) {
+func sameStatusSubscriptionPlan(left, right statusSubscriptionPlan) bool {
+	if len(left.identities) != len(right.identities) {
 		return false
 	}
-	for index := range left {
-		if left[index] != right[index] {
+	for index := range left.identities {
+		if left.identities[index] != right.identities[index] {
 			return false
 		}
 	}

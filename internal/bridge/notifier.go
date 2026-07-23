@@ -217,7 +217,14 @@ func (d *notificationDispatcher) Run(ctx context.Context) error {
 
 func (d *notificationDispatcher) next(ctx context.Context) (*notificationTask, context.Context, context.CancelFunc, bool) {
 	for {
+		if ctx.Err() != nil {
+			return nil, nil, nil, false
+		}
 		d.mu.Lock()
+		if ctx.Err() != nil {
+			d.mu.Unlock()
+			return nil, nil, nil, false
+		}
 		if len(d.queue) > 0 {
 			task := d.queue[0]
 			d.queue = d.queue[1:]
@@ -458,6 +465,14 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 				key: key, parts: append([]string(nil), parts...), epoch: deliveryEpoch,
 			}
 			n.pending[paneID] = progress
+		} else {
+			shared := commonNotificationPrefix(progress.parts, parts)
+			if progress.next > shared {
+				progress.next = shared
+			}
+			progress.key = key
+			progress.parts = append(progress.parts[:0], parts...)
+			progress.epoch = deliveryEpoch
 		}
 		deliveryParts := progress.parts
 		start := progress.next
@@ -496,12 +511,20 @@ func (n *Notifier) notificationProgressCurrentLocked(paneID string, progress *no
 }
 
 func sameNotificationIdentity(left, right notificationKey) bool {
-	// 快照可用性变化表示 occupant 校验或读取结果已变化，不能续传旧快照分段。
 	return left.paneID == right.paneID &&
 		left.occupantKey == right.occupantKey &&
 		left.kind == right.kind &&
-		left.status == right.status &&
-		left.snapshotAvailable == right.snapshotAvailable
+		left.status == right.status
+}
+
+func commonNotificationPrefix(left, right []string) int {
+	limit := min(len(left), len(right))
+	for index := 0; index < limit; index++ {
+		if left[index] != right[index] {
+			return index
+		}
+	}
+	return limit
 }
 
 func renderStatusTitle(title string, target session.Target) string {
