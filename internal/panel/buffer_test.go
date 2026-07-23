@@ -92,6 +92,8 @@ func TestBufferExpandStopsAtOldestKnownContentAndMaximum(t *testing.T) {
 
 	buffer.Refresh("target-a", numberedLines(100))
 	buffer.lines = numberedLines(MaxLines)
+	buffer.newestLen = PageSize
+	buffer.page = 9
 	if err := buffer.Expand("target-a", numberedLines(MaxLines)); !errors.Is(err, ErrOldestPage) {
 		t.Fatalf("maximum error = %v, want ErrOldestPage", err)
 	}

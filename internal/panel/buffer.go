@@ -40,11 +40,14 @@ func (b *Buffer) Refresh(targetKey string, lines []string) {
 }
 
 // NextReadSize 返回下一次 pageup 需要的 agent.read lines。
+//
+// 即使下一页已在缓存中，仍返回受 MaxLines 限制的正数，保持调用方“读取后调用 Expand”
+// 的流程不变；Expand 会优先消费缓存页。
 func (b *Buffer) NextReadSize() (int, error) {
-	if b.oldest || b.page >= MaxLines/PageSize-1 {
+	if !b.hasCachedOlderPage() && (b.oldest || (b.page+2)*PageSize > MaxLines) {
 		return 0, ErrOldestPage
 	}
-	return (b.page + 2) * PageSize, nil
+	return min((b.page+2)*PageSize, MaxLines), nil
 }
 
 // Expand 用旧缓存作为连续重叠锚点扩充更早内容。
@@ -55,10 +58,6 @@ func (b *Buffer) Expand(targetKey string, snapshot []string) error {
 	if targetKey != b.targetKey || len(b.lines) == 0 {
 		b.Reset()
 		return ErrPanelChanged
-	}
-	if len(b.lines) >= MaxLines {
-		b.oldest = true
-		return ErrOldestPage
 	}
 	if len(snapshot) > MaxLines {
 		snapshot = snapshot[len(snapshot)-MaxLines:]
@@ -74,6 +73,10 @@ func (b *Buffer) Expand(targetKey string, snapshot []string) error {
 		prefix = prefix[len(prefix)-room:]
 	}
 	if len(prefix) == 0 {
+		if b.hasCachedOlderPage() {
+			b.page++
+			return nil
+		}
 		b.oldest = true
 		return ErrOldestPage
 	}
@@ -97,10 +100,7 @@ func (b *Buffer) Render() []string {
 	if len(b.lines) == 0 {
 		return nil
 	}
-	newestLen := b.newestLen
-	if newestLen <= 0 || newestLen > len(b.lines) {
-		newestLen = min(PageSize, len(b.lines))
-	}
+	newestLen := b.latestPageLen()
 	end := len(b.lines)
 	if b.page > 0 {
 		end -= newestLen + (b.page-1)*PageSize
@@ -117,6 +117,17 @@ func (b *Buffer) Render() []string {
 		start = 0
 	}
 	return append([]string(nil), b.lines[start:end]...)
+}
+
+func (b *Buffer) hasCachedOlderPage() bool {
+	return len(b.lines)-b.latestPageLen() > b.page*PageSize
+}
+
+func (b *Buffer) latestPageLen() int {
+	if b.newestLen <= 0 || b.newestLen > len(b.lines) {
+		return min(PageSize, len(b.lines))
+	}
+	return b.newestLen
 }
 
 // Reset 清空全部分页状态。

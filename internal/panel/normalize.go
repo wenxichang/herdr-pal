@@ -52,26 +52,34 @@ func stripANSI(text string) string {
 				}
 			}
 		case ']':
+			index = skipControlString(text, index+2, true)
+		case 'P', '_', '^', 'X':
+			index = skipControlString(text, index+2, false)
+		case '7', '8':
 			index += 2
-			for index < len(text) {
-				if text[index] == 0x07 {
-					index++
-					break
-				}
-				if text[index] == 0x1b && index+1 < len(text) && text[index+1] == '\\' {
-					index += 2
-					break
-				}
-				if text[index] == 0xc2 && index+1 < len(text) && text[index+1] == 0x9c {
-					index += 2
-					break
-				}
-				index++
-			}
 		default:
 			result.WriteByte(text[index])
 			index++
 		}
 	}
 	return result.String()
+}
+
+func skipControlString(text string, index int, bellTerminates bool) int {
+	for index < len(text) {
+		if text[index] == '\n' {
+			return index
+		}
+		if bellTerminates && text[index] == 0x07 {
+			return index + 1
+		}
+		if text[index] == 0x1b && index+1 < len(text) && text[index+1] == '\\' {
+			return index + 2
+		}
+		if text[index] == 0xc2 && index+1 < len(text) && text[index+1] == 0x9c {
+			return index + 2
+		}
+		index++
+	}
+	return index
 }
