@@ -279,6 +279,9 @@ func TestServiceReadMismatchDoesNotInvalidateNewSelectionOrPanel(t *testing.T) {
 func TestServiceReplaceSnapshotWaitsForInputAndResetsInvalidSelection(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("replace", 100, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("replace-preload-content", "/con"))
+	assertPanelState(t, service, true, 0, "replace-100")
 	fake.blockPrompt = make(chan struct{})
 	fake.promptStarted = make(chan struct{}, 1)
 	promptDone := make(chan struct{})
@@ -308,19 +311,24 @@ func TestServiceReplaceSnapshotWaitsForInputAndResetsInvalidSelection(t *testing
 	if _, err := service.registry.ValidateSelected(); err == nil {
 		t.Fatal("replacement did not clear selection")
 	}
-	service.stateMu.Lock()
-	ready := service.panelReady
-	service.stateMu.Unlock()
-	if ready {
-		t.Fatal("replacement did not reset panel")
-	}
+	assertPanelState(t, service, false, 0, "")
 
 	service.registry.Replace(testSnapshot(), false)
 	service.HandleMessage(context.Background(), incoming("replace-reconnect-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("replace-reconnect-select", "/sel 1"))
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("reconnect", 100, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("replace-reconnect-content", "/con"))
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("reconnect", 0, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("replace-reconnect-pageup", "/pageup"))
+	assertPanelState(t, service, true, 1, "reconnect-000")
 	changes = service.ReplaceSnapshot(testSnapshot(), true)
 	if !changes.SelectionInvalidated {
 		t.Fatalf("reconnect changes = %#v", changes)
+	}
+	assertPanelState(t, service, false, 0, "")
+	service.HandleMessage(context.Background(), incoming("replace-reconnect-pagedown", "/pagedn"))
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "reconnect-") {
+		t.Fatalf("reconnect leaked cached panel through pagedown: %q", reply)
 	}
 }
 
@@ -1112,6 +1120,26 @@ func awaitChangeSet(t *testing.T, channel <-chan session.ChangeSet, name string)
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for %s", name)
 		return session.ChangeSet{}
+	}
+}
+
+func assertPanelState(t *testing.T, service *Service, wantReady bool, wantPage int, wantContent string) {
+	t.Helper()
+	service.stateMu.Lock()
+	ready, page := service.panelReady, service.page
+	content := strings.Join(service.panel.Render(), "\n")
+	service.stateMu.Unlock()
+	if ready != wantReady || page != wantPage {
+		t.Fatalf("panel state = ready %t page %d, want ready %t page %d", ready, page, wantReady, wantPage)
+	}
+	if wantContent == "" {
+		if content != "" {
+			t.Fatalf("panel content = %q, want empty", content)
+		}
+		return
+	}
+	if !strings.Contains(content, wantContent) {
+		t.Fatalf("panel content = %q, want %q", content, wantContent)
 	}
 }
 
