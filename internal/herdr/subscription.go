@@ -198,10 +198,10 @@ func (s *subscriptionStream) Recv(ctx context.Context) (Event, error) {
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := s.conn.SetDeadline(deadline); err != nil {
-			return Event{}, unavailableContextError(ctx, err)
+			return Event{}, s.terminateUnavailable(ctx, err)
 		}
 	} else if err := s.conn.SetDeadline(timeZero); err != nil {
-		return Event{}, unavailableContextError(ctx, err)
+		return Event{}, s.terminateUnavailable(ctx, err)
 	}
 	stopCancellation := context.AfterFunc(ctx, func() {
 		_ = s.Close()
@@ -210,22 +210,35 @@ func (s *subscriptionStream) Recv(ctx context.Context) (Event, error) {
 	stopCancellation()
 	clearErr := s.conn.SetDeadline(timeZero)
 	if contextErr := ctx.Err(); contextErr != nil {
-		_ = s.Close()
 		if readErr == nil {
 			readErr = contextErr
 		}
-		return Event{}, unavailableContextError(ctx, readErr)
-	}
-	if clearErr != nil {
-		return Event{}, unavailableContextError(ctx, clearErr)
+		return Event{}, s.terminateUnavailable(ctx, readErr)
 	}
 	if readErr != nil {
 		if errors.Is(readErr, ErrFrameTooLarge) || errors.Is(readErr, ErrProtocol) && !errors.Is(readErr, io.EOF) {
-			return Event{}, readErr
+			return Event{}, s.terminate(readErr)
 		}
-		return Event{}, unavailableContextError(ctx, readErr)
+		return Event{}, s.terminateUnavailable(ctx, readErr)
 	}
-	return parseEvent(line)
+	if clearErr != nil {
+		return Event{}, s.terminateUnavailable(ctx, clearErr)
+	}
+	event, err := parseEvent(line)
+	if err != nil {
+		return Event{}, s.terminate(err)
+	}
+	return event, nil
+}
+
+func (s *subscriptionStream) terminateUnavailable(ctx context.Context, err error) error {
+	_ = s.Close()
+	return unavailableContextError(ctx, err)
+}
+
+func (s *subscriptionStream) terminate(err error) error {
+	_ = s.Close()
+	return err
 }
 
 func (s *subscriptionStream) Close() error {
