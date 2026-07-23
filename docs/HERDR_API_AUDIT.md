@@ -1,0 +1,412 @@
+# Herdr 本地 API 审计
+
+## 1. 审计范围
+
+本文记录 Herdr Pal 创建前对 Herdr 本地 API 的源码审计结果。
+
+- Herdr 源码目录：`/Users/wxc/Code/herdr`
+- 基线提交：`2a20e90 fix: preserve physical escape on windows`
+- 审计日期：`2026-07-23`
+- 本文中的源码路径均相对于 Herdr 仓库根目录。
+
+结论只覆盖该基线源码。运行时应通过 `herdr api schema --json` 检查已安装二进制
+实际支持的协议。
+
+## 2. 协议和传输
+
+Herdr 提供本地 Socket API：
+
+- Unix 使用本地 Socket 文件；服务端将权限限制为 `0600`。
+- Windows 通过 `interprocess::local_socket` 使用对应的本地 IPC 实现。
+- 普通请求和响应使用换行分隔 JSON（NDJSON）。
+- 请求格式是 Herdr 自定义的 `{id, method, params}`，不是 JSON-RPC。
+- 普通连接通常发送一个请求并接收一个响应。
+- `events.subscribe` 保持连接并持续推送事件 JSON 行。
+
+请求示例：
+
+```json
+{"id":"req-1","method":"agent.list","params":{}}
+```
+
+成功响应使用相同的 `id`：
+
+```json
+{"id":"req-1","result":{"type":"agent_list","agents":[]}}
+```
+
+错误响应包含错误码和消息：
+
+```json
+{"id":"req-1","error":{"code":"agent_not_found","message":"..."}}
+```
+
+主要源码依据：
+
+- `src/api/schema.rs:34`：请求结构和方法枚举。
+- `src/api/server.rs:139`：读取首个 JSON 行并分派请求。
+- `src/api/server.rs:645`：长连接事件订阅。
+- `src/api/server.rs:28`：Unix Socket 权限模式。
+- `src/api/client.rs:31`：Herdr 内部可复用 NDJSON 客户端。
+
+## 3. 会话初始化
+
+外部客户端应首先调用：
+
+```json
+{"id":"bootstrap","method":"session.snapshot","params":{}}
+```
+
+返回内容包括：
+
+- Herdr 版本和协议版本。
+- 当前聚焦的 workspace、tab 和 pane。
+- workspace、tab、pane 列表。
+- tab 布局快照。
+- Agent 列表及其当前状态。
+
+`SessionSnapshot` 定义在 `src/api/schema/session.rs:8`。
+
+快照不是订阅。客户端读取快照后仍需建立事件订阅；断线或本地缓存可能过期时，
+必须重新读取快照。
+
+## 4. API 功能概览
+
+### 4.1 Server 和 Session
+
+- `ping`
+- `server.stop`
+- `server.live_handoff`
+- `server.reload_config`
+- `server.agent_manifests`
+- `server.reload_agent_manifests`
+- `session.snapshot`
+
+### 4.2 Workspace、Worktree 和 Tab
+
+- Workspace：create、list、get、focus、rename、move、metadata、close。
+- Worktree：list、create、open、remove。
+- Tab：create、list、get、focus、rename、move、close。
+
+这些接口可用于展示上下文和维护 pane 身份，但 Herdr Pal 第一版不必提供完整
+终端管理 UI。
+
+### 4.3 Pane
+
+主要能力包括：
+
+- list、current、get、process_info。
+- split、swap、move、zoom、layout、neighbor、edges、resize。
+- read、wait_for_output。
+- send_text、send_keys、send_input。
+- report_agent、report_agent_session、report_metadata。
+- created、updated、focused、moved、exited、closed 等生命周期。
+
+### 4.4 Agent
+
+- `agent.list`
+- `agent.get`
+- `agent.read`
+- `agent.explain`
+- `agent.send_keys`
+- `agent.prompt`
+- `agent.wait`
+- `agent.rename`
+- `agent.focus`
+- `agent.start`
+- `agent.view.set`
+- `agent.view.clear`
+
+### 4.5 Events
+
+- `events.subscribe`：长连接、多订阅事件流。
+- `events.wait`：一次性等待；当前服务端实际上只支持 Agent 状态匹配。
+
+完整方法枚举位于 `src/api/schema.rs:45`，用户文档位于
+`docs/next/website/src/content/docs/socket-api.mdx:93`。
+
+## 5. Agent 状态感知
+
+### 5.1 状态集合
+
+公共 `AgentStatus` 包含：
+
+- `working`：Agent 正在工作。
+- `blocked`：检测到审批、提问或需要用户介入的界面。
+- `idle`：Agent 可接受输入，并且对应标签页已经被用户查看。
+- `done`：底层同样为空闲，但后台完成后尚未被查看。
+- `unknown`：识别到 Agent，但无法可靠分类其生命周期。
+
+定义位于 `src/api/schema/common.rs:142`。
+
+### 5.2 状态订阅
+
+```json
+{
+  "id": "status-sub",
+  "method": "events.subscribe",
+  "params": {
+    "subscriptions": [
+      {
+        "type": "pane.agent_status_changed",
+        "pane_id": "w1:p1"
+      }
+    ]
+  }
+}
+```
+
+服务端先返回订阅确认，随后推送：
+
+```json
+{
+  "event": "pane.agent_status_changed",
+  "data": {
+    "pane_id": "w1:p1",
+    "workspace_id": "w1",
+    "agent_status": "blocked",
+    "agent": "claude",
+    "title": "需要确认",
+    "display_agent": "Claude",
+    "state_labels": {}
+  }
+}
+```
+
+事件结构位于 `src/api/schema/events.rs:393`，事件生成逻辑位于
+`src/app/api.rs:554`。
+
+### 5.3 状态订阅限制
+
+- `pane.agent_status_changed` 必须指定 `pane_id`，没有全局通配订阅。
+- 一个订阅连接的订阅列表在连接建立后不能动态追加。
+- pane 创建、关闭或 Agent 替换后，bridge 必须重建订阅或新建连接。
+- 状态相同但 title、display_agent、state_labels 变化时也可能收到该事件。
+- 如果只关心状态迁移，bridge 必须保存并比较上一次状态。
+
+建议同时订阅：
+
+- `pane.created`
+- `pane.closed`
+- `pane.exited`
+- `pane.agent_detected`
+- `pane.updated`
+
+### 5.4 事件恢复限制
+
+`EventHub` 只在内存中保留最近 512 个事件，内部 sequence 没有暴露给外部客户端。
+通用事件订阅内部从 sequence 0 开始读取当前保留队列，因此客户端不应假设连接后
+只会看到严格意义上的“新事件”。
+
+断线恢复必须：
+
+1. 重新调用 `session.snapshot`。
+2. 用快照替换本地运行时状态。
+3. 重建 pane 级状态订阅。
+4. 对可能重复的通知做幂等去重。
+
+相关实现位于 `src/api/event_hub.rs:1` 和 `src/api/subscriptions.rs:328`。
+
+## 6. 输入能力
+
+### 6.1 普通 IM 文本
+
+推荐映射到：
+
+```json
+{
+  "id": "prompt-1",
+  "method": "agent.prompt",
+  "params": {
+    "target": "w1:p1",
+    "text": "请继续处理并告诉我测试结果"
+  }
+}
+```
+
+`agent.prompt` 会：
+
+- 解析并验证目标 Agent。
+- 检查该 Agent 是否仍控制 pane 的前台进程。
+- 根据实时 bracketed-paste 模式编码文本。
+- 自动追加 Enter。
+- 可选地在同一请求中等待 `idle`、`done`、`blocked` 等状态。
+
+实现位于 `src/app/api/agents.rs:58` 和 `src/app/api_helpers.rs:25`。
+
+带等待的请求示例：
+
+```json
+{
+  "id": "prompt-2",
+  "method": "agent.prompt",
+  "params": {
+    "target": "w1:p1",
+    "text": "运行测试",
+    "wait": {
+      "until": ["idle", "done", "blocked"],
+      "timeout_ms": 300000
+    }
+  }
+}
+```
+
+### 6.2 交互式 UI 按键
+
+```json
+{
+  "id": "keys-1",
+  "method": "agent.send_keys",
+  "params": {
+    "target": "w1:p1",
+    "keys": ["down", "enter"]
+  }
+}
+```
+
+适用于：
+
+- 选择 Agent 提供的选项。
+- `esc`、方向键、Enter、`ctrl+c` 等 UI 操作。
+- 用户明确点击 IM 中的审批或控制按钮。
+
+安全要求：不能把 `blocked` 自动等同于“发送 Enter”。不同 Agent 和不同页面的
+默认选项可能具有完全不同的风险。
+
+### 6.3 原始 Pane 输入
+
+- `pane.send_text`：发送原始文本，不追加 Enter。
+- `pane.send_keys`：发送按键序列。
+- `pane.send_input`：一次发送文本和按键。
+
+这些接口不验证当前 pane occupant，应该作为高级或受控能力，不作为普通 IM 文本的
+默认通路。实现位于 `src/app/api/panes.rs:1463`。
+
+## 7. 输出能力
+
+### 7.1 快照读取
+
+`agent.read` 和 `pane.read` 返回解析后的终端屏幕或 scrollback 快照。
+
+```json
+{
+  "id": "read-1",
+  "method": "agent.read",
+  "params": {
+    "target": "w1:p1",
+    "source": "recent_unwrapped",
+    "lines": 120,
+    "format": "text"
+  }
+}
+```
+
+可用 source：
+
+| Source | 含义 |
+| --- | --- |
+| `visible` | 当前可见终端页面 |
+| `recent` | 最近的屏幕和 scrollback，保留软换行 |
+| `recent_unwrapped` | 最近的屏幕和 scrollback，去除软换行 |
+| `detection` | Agent 状态检测使用的底部缓冲快照 |
+
+格式支持 `text` 和 `ansi`。默认读取 80 行，单次最多请求 1000 行。实现位于
+`src/app/api_helpers.rs:104`。
+
+Herdr 默认每个 pane 保留 10,000,000 字节 scrollback，但实际可读历史仍受终端
+alternate screen 影响。配置定义位于 `src/config/model.rs:855`。
+
+### 7.2 输出不是 LLM 消息
+
+快照可能包含：
+
+- 用户 prompt。
+- Agent 回复。
+- 工具调用日志。
+- spinner 和状态栏。
+- 权限请求或问题界面。
+- TUI 边框、局部重绘和重复内容。
+
+因此输出只能称为“终端快照”，不能直接标注为结构化 assistant message。
+
+Claude Code、OpenCode 等全屏 Agent 可能使用 alternate screen。离开页面后，旧内容
+不一定进入 Herdr scrollback；增加 `lines` 无法恢复已经丢失的 alternate-screen 行。
+相关说明位于 `docs/next/website/src/content/docs/agent-automation.mdx:84`。
+
+### 7.3 当前没有通用实时输出流
+
+虽然 Schema 中定义了 `PaneOutputChanged`，但当前基线中：
+
+- `events.subscribe` 没有 `pane.output_changed` 订阅类型。
+- 没有发现生产代码发布该事件。
+- plugin hook 明确排除了高频 output-change 事件。
+- 原始 PTY 字节只进入终端解析器，没有通过公共 API 暴露。
+
+PTY 入口位于 `src/pane.rs:1913`；事件类型位于
+`src/api/schema/events.rs:171`。
+
+### 7.4 当前没有可用增量游标
+
+`PaneReadResult` 定义了：
+
+```text
+revision: u64
+truncated: bool
+```
+
+但 `agent.read` 和 `pane.read` 当前固定返回：
+
+```text
+revision: 0
+truncated: false
+```
+
+实现位置：
+
+- `src/app/api/agents.rs:127`
+- `src/app/api/panes.rs:1189`
+
+因此 bridge 必须保存上一次规范化后的文本，自行做后缀差分、hash 去重和 checkpoint。
+
+### 7.5 输出匹配
+
+`pane.output_matched` 和 `pane.wait_for_output` 可以搜索已知字符串或单行正则。
+
+适合：
+
+- 已知权限提示。
+- 构建完成标识。
+- 固定错误文本。
+- 特定 CLI 问题。
+
+它们不等于输出流。订阅实现会轮询终端快照，并在“未匹配到 → 匹配到”时发出事件。
+实现位于 `src/api/subscriptions.rs:340`。
+
+## 8. 对 Herdr Pal 的直接结论
+
+第一版可以完全通过现有 API 实现：
+
+```text
+状态变化事件
+    → 读取 recent_unwrapped 快照
+    → 清理并和上次输出做差分
+    → 发送新增内容到 IM
+
+IM 普通文本
+    → 校验用户和会话绑定
+    → agent.prompt
+
+IM 显式控制按钮
+    → 策略校验
+    → agent.send_keys
+```
+
+暂时无法只依靠 Herdr API 实现：
+
+- 逐 token 实时输出。
+- 精确的 assistant turn 边界。
+- 完整的原生 Agent transcript。
+- 基于服务端 revision 的输出断点续传。
+- exactly-once 事件交付。
+
+这些限制应由产品文案、输出提取策略和重连逻辑明确处理，而不是在第一版中隐式承诺。
