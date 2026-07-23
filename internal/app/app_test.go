@@ -337,6 +337,28 @@ func TestRunParentCancellationFirstRemainsNormal(t *testing.T) {
 	}
 }
 
+func TestParentTriggeredShutdownClassifiesSimultaneousResultDeterministically(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	tests := []struct {
+		name           string
+		selectedParent bool
+		result         *componentResult
+		want           bool
+	}{
+		{name: "直接选中 parent", selectedParent: true, want: true},
+		{name: "选中 parent 派生取消", result: &componentResult{err: context.Canceled, shutdownDerived: true}, want: true},
+		{name: "选中同时到达的真实错误", result: &componentResult{err: errors.New("fatal")}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := parentTriggeredShutdown(ctx, test.selectedParent, test.result); got != test.want {
+				t.Fatalf("parentTriggeredShutdown() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRunTreatsIndependentEventsClosureAsUnexpectedLoopStop(t *testing.T) {
 	supervisor := newFakeRunner()
 	im := newOrderedResultWeCom(nil)

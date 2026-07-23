@@ -319,13 +319,16 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 	}, results)
 
 	collected := make([]componentResult, 0, 3)
-	shutdownTriggeredByParent := false
+	selectedParent := false
+	var selectedResult *componentResult
 	select {
 	case <-parent.Done():
-		shutdownTriggeredByParent = true
+		selectedParent = true
 	case result := <-results:
 		collected = append(collected, result)
+		selectedResult = &result
 	}
+	shutdownTriggeredByParent := parentTriggeredShutdown(parent, selectedParent, selectedResult)
 	// 先停止业务消息消费，再取消两侧连接和未完成请求。
 	stopMessages()
 	cancelComponents()
@@ -345,6 +348,13 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 		}
 	}
 	return runtimeOutcome{err: runtimeRootError(shutdownTriggeredByParent, collected)}
+}
+
+func parentTriggeredShutdown(parent context.Context, selectedParent bool, selectedResult *componentResult) bool {
+	if selectedParent {
+		return true
+	}
+	return selectedResult != nil && selectedResult.shutdownDerived && parent.Err() != nil
 }
 
 func runComponent(ctx context.Context, name string, run func(context.Context) error, results chan<- componentResult) {
