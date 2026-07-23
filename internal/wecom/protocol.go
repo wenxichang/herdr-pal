@@ -158,7 +158,10 @@ func EncodePing(requestID string) ([]byte, error) {
 	if err := validateRequired(requestID, "请求标识"); err != nil {
 		return nil, err
 	}
-	return encodeRequest("ping", requestID, struct{}{})
+	return json.Marshal(struct {
+		Command string  `json:"cmd"`
+		Headers Headers `json:"headers"`
+	}{Command: "ping", Headers: Headers{RequestID: requestID}})
 }
 
 func encodeMarkdownRequest(command, requestID, chatID string, chatType int, content string) ([]byte, error) {
@@ -231,11 +234,43 @@ func DecodeFrame(data []byte) (Frame, error) {
 	switch command {
 	case "aibot_msg_callback":
 		return decodeCallback(headers, values)
-	case "disconnected_event":
-		return Frame{Kind: FrameDisconnected, Headers: headers}, nil
+	case "aibot_event_callback":
+		return decodeEventCallback(headers, values)
 	default:
 		return Frame{Kind: FrameUnknown, Headers: headers, Raw: append(json.RawMessage(nil), data...)}, nil
 	}
+}
+
+func decodeEventCallback(headers Headers, values map[string]json.RawMessage) (Frame, error) {
+	body, err := objectField(values, "body")
+	if err != nil {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件正文无效")
+	}
+	if _, err := requiredString(body, "msgid"); err != nil {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件消息标识无效")
+	}
+	if createTime, ok, err := optionalInt(body, "create_time"); err != nil || !ok || createTime < 0 {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件创建时间无效")
+	}
+	if _, err := requiredString(body, "aibotid"); err != nil {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件机器人标识无效")
+	}
+	messageType, err := requiredString(body, "msgtype")
+	if err != nil || messageType != "event" {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件消息类型无效")
+	}
+	event, err := objectField(body, "event")
+	if err != nil {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件内容无效")
+	}
+	eventType, err := requiredString(event, "eventtype")
+	if err != nil {
+		return Frame{}, newProtocolError(headers.RequestID, 0, "事件类型无效")
+	}
+	if eventType == "disconnected_event" {
+		return Frame{Kind: FrameDisconnected, Headers: headers}, nil
+	}
+	return Frame{Kind: FrameUnknown, Headers: headers}, nil
 }
 
 func decodeResponse(values map[string]json.RawMessage, data []byte) (Frame, error) {
@@ -341,6 +376,9 @@ func optionalString(values map[string]json.RawMessage, key string) (string, bool
 	if !ok {
 		return "", false, nil
 	}
+	if isJSONNull(raw) {
+		return "", true, errors.New("field is null")
+	}
 	var value string
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return "", true, err
@@ -353,11 +391,18 @@ func optionalInt(values map[string]json.RawMessage, key string) (int, bool, erro
 	if !ok {
 		return 0, false, nil
 	}
+	if isJSONNull(raw) {
+		return 0, true, errors.New("field is null")
+	}
 	var value int
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return 0, true, err
 	}
 	return value, true, nil
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 func sanitizeMessage(message string) string {

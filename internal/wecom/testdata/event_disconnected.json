@@ -1,0 +1,11 @@
+{
+  "cmd": "aibot_event_callback",
+  "headers": {"req_id": "event-callback-1"},
+  "body": {
+    "msgid": "event-message-1",
+    "create_time": 1720000000,
+    "aibotid": "bot-1",
+    "msgtype": "event",
+    "event": {"eventtype": "disconnected_event"}
+  }
+}

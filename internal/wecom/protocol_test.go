@@ -83,15 +83,30 @@ func TestProtocolEncodePing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodePing() error = %v", err)
 	}
-	var got struct {
-		Cmd     string  `json:"cmd"`
-		Headers Headers `json:"headers"`
-	}
+	var got map[string]json.RawMessage
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if got.Cmd != "ping" || got.Headers.RequestID != "ping-1" {
-		t.Fatalf("EncodePing() = %+v, want ping-1", got)
+	if len(got) != 2 || got["cmd"] == nil || got["headers"] == nil || got["body"] != nil {
+		t.Fatalf("EncodePing() top-level keys = %v, want only cmd and headers", mapsKeys(got))
+	}
+	var headerFields map[string]json.RawMessage
+	if err := json.Unmarshal(got["headers"], &headerFields); err != nil {
+		t.Fatalf("Unmarshal(header fields) error = %v", err)
+	}
+	if len(headerFields) != 1 || headerFields["req_id"] == nil {
+		t.Fatalf("EncodePing() header keys = %v, want only req_id", mapsKeys(headerFields))
+	}
+	var command string
+	var headers Headers
+	if err := json.Unmarshal(got["cmd"], &command); err != nil {
+		t.Fatalf("Unmarshal(cmd) error = %v", err)
+	}
+	if err := json.Unmarshal(got["headers"], &headers); err != nil {
+		t.Fatalf("Unmarshal(headers) error = %v", err)
+	}
+	if command != "ping" || headers.RequestID != "ping-1" {
+		t.Fatalf("EncodePing() = cmd=%q headers=%+v, want ping-1", command, headers)
 	}
 }
 
@@ -181,6 +196,10 @@ func TestProtocolDecodeResponseAndErrors(t *testing.T) {
 
 	for _, data := range [][]byte{
 		[]byte(`{"headers":{},"errcode":0,"errmsg":"ok"}`),
+		[]byte(`{"headers":null,"errcode":0,"errmsg":"ok"}`),
+		[]byte(`{"headers":{"req_id":null},"errcode":0,"errmsg":"ok"}`),
+		[]byte(`{"headers":{"req_id":"request-1"},"errcode":null,"errmsg":"ok"}`),
+		[]byte(`{"headers":{"req_id":"request-1"},"errcode":0,"errmsg":null}`),
 		[]byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":"callback-1"},"body":{"msgid":"m","aibotid":"b","chattype":"single","from":{"userid":"u"},"msgtype":"text","text":{}}}`),
 		[]byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":3},"body":{}}`),
 		[]byte(`{`),
@@ -193,12 +212,31 @@ func TestProtocolDecodeResponseAndErrors(t *testing.T) {
 }
 
 func TestProtocolDecodeDisconnectedAndUnknownFrames(t *testing.T) {
-	disconnected, err := DecodeFrame([]byte(`{"cmd":"disconnected_event","headers":{"req_id":"disconnect-1"},"body":{}}`))
+	assertDisconnectedFixtureShape(t, readFixture(t, "testdata/event_disconnected.json"))
+	disconnected, err := DecodeFrame(readFixture(t, "testdata/event_disconnected.json"))
 	if err != nil {
 		t.Fatalf("DecodeFrame(disconnected) error = %v", err)
 	}
-	if disconnected.Kind != FrameDisconnected || disconnected.Headers.RequestID != "disconnect-1" {
+	if disconnected.Kind != FrameDisconnected || disconnected.Headers.RequestID != "event-callback-1" {
 		t.Fatalf("disconnected frame = %+v", disconnected)
+	}
+
+	event, err := DecodeFrame([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-2"},"body":{"msgid":"event-message-2","create_time":1720000000,"aibotid":"bot-1","msgtype":"event","event":{"eventtype":"future_event"}}}`))
+	if err != nil {
+		t.Fatalf("DecodeFrame(future event) error = %v", err)
+	}
+	if event.Kind != FrameUnknown || event.IncomingText != nil {
+		t.Fatalf("future event frame = %+v, want non-text unknown frame", event)
+	}
+	if _, err := DecodeFrame([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-3"},"body":{"msgid":"event-message-3","aibotid":"bot-1","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("DecodeFrame(invalid event) error = %v, want ErrProtocol", err)
+	}
+	legacy, err := DecodeFrame([]byte(`{"cmd":"disconnected_event","headers":{"req_id":"legacy-1"},"body":{}}`))
+	if err != nil {
+		t.Fatalf("DecodeFrame(legacy disconnected command) error = %v", err)
+	}
+	if legacy.Kind == FrameDisconnected {
+		t.Fatalf("legacy disconnected command = %+v, must not be treated as official disconnected event", legacy)
 	}
 
 	unknown, err := DecodeFrame([]byte(`{"cmd":"future_command","headers":{"req_id":"future-1"},"body":{"later":true}}`))
@@ -347,4 +385,39 @@ func readFixture(t *testing.T, path string) []byte {
 
 func testRequestID(index int) string {
 	return "request-" + strings.Repeat("x", index+1)
+}
+
+func mapsKeys(values map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func assertDisconnectedFixtureShape(t *testing.T, data []byte) {
+	t.Helper()
+	var frame map[string]json.RawMessage
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatalf("Unmarshal(event fixture) error = %v", err)
+	}
+	if len(frame) != 3 || frame["cmd"] == nil || frame["headers"] == nil || frame["body"] == nil {
+		t.Fatalf("event fixture keys = %v, want cmd/headers/body", mapsKeys(frame))
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(frame["body"], &body); err != nil {
+		t.Fatalf("Unmarshal(event body) error = %v", err)
+	}
+	for _, key := range []string{"msgid", "create_time", "aibotid", "msgtype", "event"} {
+		if body[key] == nil {
+			t.Fatalf("event fixture body missing %q", key)
+		}
+	}
+	var event map[string]json.RawMessage
+	if err := json.Unmarshal(body["event"], &event); err != nil {
+		t.Fatalf("Unmarshal(event payload) error = %v", err)
+	}
+	if len(event) != 1 || event["eventtype"] == nil {
+		t.Fatalf("event fixture payload keys = %v, want only eventtype", mapsKeys(event))
+	}
 }
