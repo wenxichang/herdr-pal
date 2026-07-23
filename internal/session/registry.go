@@ -126,7 +126,10 @@ func (r *Registry) Replace(snapshot herdr.Snapshot, reconnect bool) ChangeSet {
 	r.targets = nextTargets
 	r.orders = nextOrders
 	if reconnect {
-		changes.SelectionInvalidated = r.invalidateSelection()
+		changes.SelectionInvalidated = r.selectedKey != ""
+		r.selectedKey = ""
+		r.selectedPane = ""
+		r.selectionInvalid = false
 		r.listSnapshot = nil
 	} else if r.selectedKey != "" {
 		selected, exists := r.targets[r.selectedPane]

@@ -230,11 +230,30 @@ func TestReconnectClearsSelectionAndListSnapshot(t *testing.T) {
 	if !changes.SelectionInvalidated {
 		t.Fatalf("reconnect changes = %#v, want selection invalidated", changes)
 	}
-	if _, err := registry.ValidateSelected(); err == nil {
-		t.Fatal("ValidateSelected() should reject selection after reconnect")
+	if _, err := registry.ValidateSelected(); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("ValidateSelected() after reconnect error = %v, want ErrNoSelection", err)
 	}
-	if _, err := registry.Select(1); err == nil {
-		t.Fatal("Select() should require a fresh list snapshot after reconnect")
+	if _, err := registry.Select(1); !errors.Is(err, ErrNoListSnapshot) {
+		t.Fatalf("Select() after reconnect error = %v, want ErrNoListSnapshot", err)
+	}
+}
+
+func TestReconnectClearsPendingSelectionInvalidation(t *testing.T) {
+	registry := &Registry{}
+	original := testAgentPane("pane-1", "terminal-1", "codex", nil)
+	registry.Replace(testSnapshot(original), false)
+	registry.CreateListSnapshot()
+	if _, err := registry.Select(1); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-2", "claude", nil)), false)
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-2", "claude", nil)), true)
+	if _, err := registry.ValidateSelected(); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("ValidateSelected() after reconnect error = %v, want ErrNoSelection", err)
+	}
+	if _, err := registry.Select(1); !errors.Is(err, ErrNoListSnapshot) {
+		t.Fatalf("Select() after reconnect error = %v, want ErrNoListSnapshot", err)
 	}
 }
 
