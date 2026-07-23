@@ -95,3 +95,23 @@ func TestRenderPageAndSplitMarkdownKeepTerminalPageSelfContained(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitMarkdownAllowsEmptyTerminalPageAtExactWrapperLimit(t *testing.T) {
+	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, nil)
+	header, body, ok := renderedPageParts(content)
+	if !ok || body != "" {
+		t.Fatalf("RenderPage() = %q, want empty rendered terminal page", content)
+	}
+	limit := len(header) + len("\n分段 1/1") + len(codeFenceOpen) + len(codeFenceClose)
+
+	parts := SplitMarkdown(content, limit)
+	if len(parts) != 1 || len(parts[0]) != limit {
+		t.Fatalf("SplitMarkdown() = %#v, want one %d-byte part", parts, limit)
+	}
+	if !strings.HasSuffix(parts[0], "\n```") {
+		t.Fatalf("part does not close its code block: %q", parts[0])
+	}
+	if got := SplitMarkdown(content, limit-1); got != nil {
+		t.Fatalf("SplitMarkdown(..., %d) = %#v, want nil", limit-1, got)
+	}
+}

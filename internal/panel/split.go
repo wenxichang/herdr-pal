@@ -57,14 +57,17 @@ func splitRenderedPage(header, body string, limit int) []string {
 	digits := len(strconv.Itoa(max(1, utf8.RuneCountInString(body))))
 	markerReserve := "\n分段 " + strings.Repeat("9", digits) + "/" + strings.Repeat("9", digits)
 	payloadLimit := limit - len(header) - len(markerReserve) - len(codeFenceOpen) - len(codeFenceClose)
+	if body == "" {
+		if payloadLimit < 0 {
+			return nil
+		}
+		return []string{fmt.Sprintf("%s\n分段 1/1%s%s", header, codeFenceOpen, codeFenceClose)}
+	}
 	if payloadLimit <= 0 {
 		return nil
 	}
 
 	parts := splitPlain(body, payloadLimit)
-	if body == "" {
-		parts = []string{""}
-	}
 	if len(parts) == 0 {
 		return nil
 	}
