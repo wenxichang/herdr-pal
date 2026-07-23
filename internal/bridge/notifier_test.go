@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
@@ -350,6 +351,186 @@ func TestNotifierResetDoesNotLetOldInflightDeliveryRestoreDedupe(t *testing.T) {
 	}
 }
 
+func TestNotificationDispatcherCoalescesLatestStatusPerPane(t *testing.T) {
+	im := newGatedNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  &notificationRetry{delay: time.Second},
+		Wait:     waitSupervisorDelay,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+	epoch := dispatcher.BeginEpoch()
+
+	if err := dispatcher.EnqueueInvalidated(notificationTarget()); err != nil {
+		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
+	}
+	<-im.firstStarted
+	for _, transition := range []session.Transition{
+		notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking),
+		notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked),
+		notificationTransition(herdr.AgentStatusBlocked, herdr.AgentStatusDone),
+	} {
+		if err := dispatcher.EnqueueStatus(epoch, transition); err != nil {
+			t.Fatalf("同 pane 状态合并时 EnqueueStatus() 返回错误：%v", err)
+		}
+	}
+	close(im.firstRelease)
+	awaitNotifierCondition(t, "合并后的最新状态通知", func() bool { return len(im.Messages()) == 2 })
+	messages := strings.Join(im.Messages(), "\n")
+	if !strings.Contains(messages, "目标已失效") || !strings.Contains(messages, "已完成") || strings.Contains(messages, "开始工作") || strings.Contains(messages, "已阻塞") {
+		t.Fatalf("同 pane 状态未合并为最新任务：%q", messages)
+	}
+
+	dispatcher.EndEpoch(epoch)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherDropsOldEpochStatusButKeepsInvalidation(t *testing.T) {
+	im := newGatedNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  &notificationRetry{delay: time.Second},
+		Wait:     waitSupervisorDelay,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+	oldEpoch := dispatcher.BeginEpoch()
+
+	if err := dispatcher.EnqueueInvalidated(notificationTarget()); err != nil {
+		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
+	}
+	<-im.firstStarted
+	if err := dispatcher.EnqueueStatus(oldEpoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
+		t.Fatalf("旧 epoch EnqueueStatus() 返回错误：%v", err)
+	}
+	dispatcher.EndEpoch(oldEpoch)
+	newEpoch := dispatcher.BeginEpoch()
+	if err := dispatcher.EnqueueStatus(newEpoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusUnknown)); err != nil {
+		t.Fatalf("新 epoch EnqueueStatus() 返回错误：%v", err)
+	}
+	close(im.firstRelease)
+	awaitNotifierCondition(t, "跨 epoch 通知", func() bool { return len(im.Messages()) == 2 })
+	messages := strings.Join(im.Messages(), "\n")
+	if !strings.Contains(messages, "目标已失效") || !strings.Contains(messages, "无法可靠识别") || strings.Contains(messages, "已完成") {
+		t.Fatalf("epoch 清理或 invalidation 保留不正确：%q", messages)
+	}
+
+	dispatcher.EndEpoch(newEpoch)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherRetriesInvalidationWithInjectedWait(t *testing.T) {
+	im := &notifierIM{failAt: 1}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	retry := &notificationRetry{delay: 7 * time.Second}
+	waiter := newNotificationRetryWaiter()
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 2,
+		Backoff:  retry,
+		Wait:     waiter.Wait,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+
+	if err := dispatcher.EnqueueInvalidated(notificationTarget()); err != nil {
+		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
+	}
+	wait := <-waiter.started
+	if wait.delay != 7*time.Second || retry.NextCount() != 1 {
+		t.Fatalf("通知重试等待 = %v，Next=%d", wait.delay, retry.NextCount())
+	}
+	im.SetFailAt(0)
+	close(wait.release)
+	awaitNotifierCondition(t, "invalidation 重试成功", func() bool { return len(im.Messages()) == 2 })
+	if retry.ResetCount() != 1 {
+		t.Fatalf("通知成功后 Reset 次数 = %d，期望 1", retry.ResetCount())
+	}
+
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherCancellationStopsRetryWait(t *testing.T) {
+	im := &notifierIM{failAt: 1}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	waiter := newNotificationRetryWaiter()
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  &notificationRetry{delay: time.Minute},
+		Wait:     waiter.Wait,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+
+	if err := dispatcher.EnqueueInvalidated(notificationTarget()); err != nil {
+		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
+	}
+	wait := <-waiter.started
+	cancel()
+	if err := <-wait.done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("重试等待取消结果 = %v，期望 context.Canceled", err)
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+	if got := len(im.Messages()); got != 1 {
+		t.Fatalf("取消后仍执行重试：messages=%d", got)
+	}
+}
+
+func TestNotificationDispatcherDeduplicatesPendingInvalidationByOccupant(t *testing.T) {
+	im := newGatedNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  &notificationRetry{delay: time.Second},
+		Wait:     waitSupervisorDelay,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+
+	first := notificationTarget()
+	first.OccupantKey = "occupant-1"
+	if err := dispatcher.EnqueueInvalidated(first); err != nil {
+		t.Fatalf("首次 EnqueueInvalidated() 返回错误：%v", err)
+	}
+	<-im.firstStarted
+	if err := dispatcher.EnqueueInvalidated(first); err != nil {
+		t.Fatalf("重复 occupant 不应占用新 slot：%v", err)
+	}
+	second := first
+	second.OccupantKey = "occupant-2"
+	if err := dispatcher.EnqueueInvalidated(second); err != nil {
+		t.Fatalf("第二个 occupant 应占用唯一待发 slot：%v", err)
+	}
+	third := first
+	third.OccupantKey = "occupant-3"
+	if err := dispatcher.EnqueueInvalidated(third); !errors.Is(err, ErrNotificationQueueFull) {
+		t.Fatalf("第三个 occupant error = %v，期望 ErrNotificationQueueFull", err)
+	}
+
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
 func mustNotifier(t *testing.T, im IMAdapter, read ReadRecentFunc) *Notifier {
 	t.Helper()
 	return mustNotifierWithGetter(t, im, matchingNotificationAgent, read)
@@ -500,6 +681,119 @@ type blockingNotifierIM struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type gatedNotifierIM struct {
+	mu           sync.Mutex
+	messages     []string
+	firstStarted chan struct{}
+	firstRelease chan struct{}
+	once         sync.Once
+}
+
+func newGatedNotifierIM() *gatedNotifierIM {
+	return &gatedNotifierIM{firstStarted: make(chan struct{}), firstRelease: make(chan struct{})}
+}
+
+func (i *gatedNotifierIM) RespondMarkdown(context.Context, string, string) error {
+	return errors.New("Notifier 不应回复入站回调")
+}
+
+func (i *gatedNotifierIM) SendMarkdown(ctx context.Context, content string) error {
+	blocked := false
+	i.once.Do(func() {
+		blocked = true
+		close(i.firstStarted)
+	})
+	if blocked {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-i.firstRelease:
+		}
+	}
+	i.mu.Lock()
+	i.messages = append(i.messages, content)
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *gatedNotifierIM) Messages() []string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]string(nil), i.messages...)
+}
+
+type notificationRetry struct {
+	mu     sync.Mutex
+	delay  time.Duration
+	next   int
+	resets int
+}
+
+func (r *notificationRetry) Next() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next++
+	return r.delay
+}
+
+func (r *notificationRetry) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resets++
+}
+
+func (r *notificationRetry) NextCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.next
+}
+
+func (r *notificationRetry) ResetCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.resets
+}
+
+type notificationRetryWait struct {
+	delay   time.Duration
+	release chan struct{}
+	done    chan error
+}
+
+type notificationRetryWaiter struct {
+	started chan *notificationRetryWait
+}
+
+func newNotificationRetryWaiter() *notificationRetryWaiter {
+	return &notificationRetryWaiter{started: make(chan *notificationRetryWait, 4)}
+}
+
+func (w *notificationRetryWaiter) Wait(ctx context.Context, delay time.Duration) error {
+	request := &notificationRetryWait{delay: delay, release: make(chan struct{}), done: make(chan error, 1)}
+	w.started <- request
+	var err error
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-request.release:
+	}
+	request.done <- err
+	return err
+}
+
+func awaitNotifierCondition(t *testing.T, name string, condition func() bool) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for !condition() {
+		select {
+		case <-deadline:
+			t.Fatalf("等待%s超时", name)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
 }
 
 func (i *blockingNotifierIM) RespondMarkdown(context.Context, string, string) error {

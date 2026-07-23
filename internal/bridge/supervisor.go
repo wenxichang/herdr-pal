@@ -68,6 +68,12 @@ type SupervisorOptions struct {
 	StableWindow time.Duration
 	// Now 返回当前时间，使稳定窗口可在测试中推进。
 	Now func() time.Time
+	// NotificationQueueCapacity 是待发送主动通知的有界队列容量。
+	NotificationQueueCapacity int
+	// NotificationBackoff 是主动通知发送失败后的独立退避策略。
+	NotificationBackoff RetryPolicy
+	// NotificationWait 是主动通知重试使用的可取消等待函数。
+	NotificationWait SupervisorWaitFunc
 }
 
 // Supervisor 维护 Herdr snapshot、生命周期订阅、状态订阅和重连状态机。
@@ -77,12 +83,15 @@ type Supervisor struct {
 	service  *Service
 	notifier *Notifier
 
-	backoff               RetryPolicy
-	wait                  SupervisorWaitFunc
-	debounceDelay         time.Duration
-	protocolProbeInterval time.Duration
-	stableWindow          time.Duration
-	now                   func() time.Time
+	backoff                   RetryPolicy
+	wait                      SupervisorWaitFunc
+	debounceDelay             time.Duration
+	protocolProbeInterval     time.Duration
+	stableWindow              time.Duration
+	now                       func() time.Time
+	notificationQueueCapacity int
+	notificationBackoff       RetryPolicy
+	notificationWait          SupervisorWaitFunc
 
 	// 仅供同包测试观察主循环已取出的消息；nil 时没有运行时行为。
 	messageObserved func(supervisorMessage)
@@ -111,11 +120,22 @@ func NewSupervisor(factory HerdrFactory, registry *session.Registry, service *Se
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	if options.NotificationQueueCapacity <= 0 {
+		options.NotificationQueueCapacity = defaultNotificationQueueCapacity
+	}
+	if options.NotificationBackoff == nil {
+		options.NotificationBackoff = newDefaultSupervisorRetry(defaultSupervisorBackoffMin, defaultSupervisorBackoffMax, nil)
+	}
+	if options.NotificationWait == nil {
+		options.NotificationWait = waitSupervisorDelay
+	}
 	return &Supervisor{
 		factory: factory, registry: registry, service: service, notifier: notifier,
 		backoff: options.Backoff, wait: options.Wait,
 		debounceDelay: options.DebounceDelay, protocolProbeInterval: options.ProtocolProbeInterval,
 		stableWindow: options.StableWindow, now: options.Now,
+		notificationQueueCapacity: options.NotificationQueueCapacity,
+		notificationBackoff:       options.NotificationBackoff, notificationWait: options.NotificationWait,
 	}, nil
 }
 
@@ -124,6 +144,18 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s == nil {
 		return ErrInvalidSupervisorDependency
 	}
+	dispatcher := newNotificationDispatcher(s.notifier, notificationDispatcherOptions{
+		Capacity: s.notificationQueueCapacity,
+		Backoff:  s.notificationBackoff,
+		Wait:     s.notificationWait,
+	})
+	dispatcherContext, cancelDispatcher := context.WithCancel(ctx)
+	dispatcherResult := make(chan error, 1)
+	go func() { dispatcherResult <- dispatcher.Run(dispatcherContext) }()
+	defer func() {
+		cancelDispatcher()
+		<-dispatcherResult
+	}()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -145,10 +177,13 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			continue
 		}
 
-		stable, err := s.runHealthyCycle(ctx, client)
+		stable, err := s.runHealthyCycle(ctx, client, dispatcher)
 		s.degrade()
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, ErrNotificationQueueFull) {
+			return err
 		}
 		if stable {
 			s.backoff.Reset()
@@ -159,15 +194,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 }
 
-func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) (bool, error) {
+func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, dispatcher *notificationDispatcher) (bool, error) {
 	lifecycle, status, statusSpecs, baseline, err := s.prepareSubscriptions(ctx, client)
 	if err != nil {
 		return false, err
 	}
 	healthyStarted := s.now()
 	s.service.ReplaceSnapshot(baseline, true)
+	epoch := dispatcher.BeginEpoch()
 	s.notifier.Reset()
 	s.service.SetHerdr(client)
+	defer dispatcher.EndEpoch(epoch)
 
 	cycleContext, cancelCycle := context.WithCancel(ctx)
 	messages := make(chan supervisorMessage, supervisorEventChannelCapacity)
@@ -237,7 +274,9 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) (
 					}
 					return finish(err)
 				}
-				_ = s.notifier.HandleTransition(ctx, transition)
+				if err := dispatcher.EnqueueStatus(epoch, transition); err != nil {
+					return finish(err)
+				}
 			case supervisorDebounceElapsed:
 				if message.generation != debounceGeneration {
 					continue
@@ -260,10 +299,14 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) (
 				}
 				changes := s.service.ReplaceSnapshot(discovery, false)
 				for _, target := range changes.RemovedTargets {
-					_ = s.notifier.TargetInvalidated(ctx, target)
+					if err := dispatcher.EnqueueInvalidated(target); err != nil {
+						return finish(err)
+					}
 				}
 				for _, target := range changes.ReplacedTargets {
-					_ = s.notifier.TargetInvalidated(ctx, target)
+					if err := dispatcher.EnqueueInvalidated(target); err != nil {
+						return finish(err)
+					}
 				}
 				if rebuilds > 0 && status != nil {
 					startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)

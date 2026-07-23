@@ -7,14 +7,21 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
-// ErrInvalidNotifierDependency 表示 Notifier 缺少必需依赖。
-var ErrInvalidNotifierDependency = errors.New("Notifier 依赖无效")
+var (
+	// ErrInvalidNotifierDependency 表示 Notifier 缺少必需依赖。
+	ErrInvalidNotifierDependency = errors.New("Notifier 依赖无效")
+	// ErrNotificationQueueFull 表示主动通知待发队列已达到有界容量。
+	ErrNotificationQueueFull = errors.New("主动通知队列已满")
+)
+
+const defaultNotificationQueueCapacity = 64
 
 // ReadRecentFunc 读取目标的 recent_unwrapped 终端快照。
 type ReadRecentFunc func(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
@@ -29,6 +36,259 @@ type notificationKey struct {
 	status            herdr.AgentStatus
 	snapshotHash      string
 	snapshotAvailable bool
+}
+
+type notificationTaskKind uint8
+
+const (
+	notificationTaskStatus notificationTaskKind = iota
+	notificationTaskInvalidated
+)
+
+type notificationTask struct {
+	id              uint64
+	kind            notificationTaskKind
+	epoch           uint64
+	paneID          string
+	invalidationKey string
+	transition      session.Transition
+	target          session.Target
+}
+
+type notificationDispatcherOptions struct {
+	Capacity int
+	Backoff  RetryPolicy
+	Wait     SupervisorWaitFunc
+}
+
+// notificationDispatcher 在 Supervisor 整个 Run 生命周期内串行发送主动通知。
+//
+// 状态任务按 pane 合并且受连接周期 epoch 约束；目标失效任务不绑定 epoch，因此会跨
+// Herdr 重连保留。队列锁只保护内存任务，不跨越终端读取、IM 发送或重试等待。
+type notificationDispatcher struct {
+	notifier *Notifier
+	capacity int
+	backoff  RetryPolicy
+	wait     SupervisorWaitFunc
+	wake     chan struct{}
+
+	mu                 sync.Mutex
+	nextTaskID         uint64
+	nextEpoch          uint64
+	currentEpoch       uint64
+	queue              []*notificationTask
+	pendingStatus      map[string]*notificationTask
+	pendingInvalidated map[string]*notificationTask
+	active             *notificationTask
+	activeCancel       context.CancelFunc
+}
+
+func newNotificationDispatcher(notifier *Notifier, options notificationDispatcherOptions) *notificationDispatcher {
+	if options.Capacity <= 0 {
+		options.Capacity = defaultNotificationQueueCapacity
+	}
+	if options.Backoff == nil {
+		options.Backoff = newDefaultSupervisorRetry(time.Second, 30*time.Second, nil)
+	}
+	if options.Wait == nil {
+		options.Wait = waitSupervisorDelay
+	}
+	return &notificationDispatcher{
+		notifier: notifier, capacity: options.Capacity, backoff: options.Backoff, wait: options.Wait,
+		wake: make(chan struct{}, 1), pendingStatus: make(map[string]*notificationTask),
+		pendingInvalidated: make(map[string]*notificationTask),
+	}
+}
+
+func (d *notificationDispatcher) BeginEpoch() uint64 {
+	d.mu.Lock()
+	d.nextEpoch++
+	d.currentEpoch = d.nextEpoch
+	d.dropStatusLocked(0)
+	epoch := d.currentEpoch
+	d.mu.Unlock()
+	d.signal()
+	return epoch
+}
+
+func (d *notificationDispatcher) EndEpoch(epoch uint64) {
+	d.mu.Lock()
+	if d.currentEpoch != epoch {
+		d.mu.Unlock()
+		return
+	}
+	d.currentEpoch = 0
+	d.dropStatusLocked(epoch)
+	d.mu.Unlock()
+	d.signal()
+}
+
+func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.Transition) error {
+	if _, _, notify := notificationPolicy(transition); !notify {
+		return nil
+	}
+	d.mu.Lock()
+	if epoch == 0 || d.currentEpoch != epoch {
+		d.mu.Unlock()
+		return nil
+	}
+	paneID := transition.Target.PaneID
+	if pending := d.pendingStatus[paneID]; pending != nil {
+		pending.epoch = epoch
+		pending.transition = transition
+		d.mu.Unlock()
+		return nil
+	}
+	if len(d.queue) >= d.capacity {
+		d.mu.Unlock()
+		return ErrNotificationQueueFull
+	}
+	d.nextTaskID++
+	task := &notificationTask{id: d.nextTaskID, kind: notificationTaskStatus, epoch: epoch, paneID: paneID, transition: transition}
+	d.queue = append(d.queue, task)
+	d.pendingStatus[paneID] = task
+	if d.active != nil && d.active.kind == notificationTaskStatus && d.active.paneID == paneID && d.activeCancel != nil {
+		d.activeCancel()
+	}
+	d.mu.Unlock()
+	d.signal()
+	return nil
+}
+
+func (d *notificationDispatcher) EnqueueInvalidated(target session.Target) error {
+	d.mu.Lock()
+	key := target.PaneID + "\x00" + target.OccupantKey
+	if d.pendingInvalidated[key] != nil {
+		d.mu.Unlock()
+		return nil
+	}
+	if len(d.queue) >= d.capacity {
+		d.mu.Unlock()
+		return ErrNotificationQueueFull
+	}
+	d.nextTaskID++
+	task := &notificationTask{
+		id: d.nextTaskID, kind: notificationTaskInvalidated, paneID: target.PaneID,
+		invalidationKey: key, target: target,
+	}
+	d.queue = append(d.queue, task)
+	d.pendingInvalidated[key] = task
+	d.mu.Unlock()
+	d.signal()
+	return nil
+}
+
+func (d *notificationDispatcher) Run(ctx context.Context) error {
+	if d == nil || d.notifier == nil {
+		return ErrInvalidNotifierDependency
+	}
+	for {
+		task, taskContext, cancel, ok := d.next(ctx)
+		if !ok {
+			return ctx.Err()
+		}
+		err := d.deliver(taskContext, task)
+		for err != nil && taskContext.Err() == nil && d.taskCurrent(task) {
+			if waitErr := d.wait(taskContext, d.backoff.Next()); waitErr != nil {
+				if taskContext.Err() != nil {
+					break
+				}
+				continue
+			}
+			if !d.taskCurrent(task) {
+				break
+			}
+			err = d.deliver(taskContext, task)
+		}
+		d.backoff.Reset()
+		d.finish(task.id, cancel)
+	}
+}
+
+func (d *notificationDispatcher) next(ctx context.Context) (*notificationTask, context.Context, context.CancelFunc, bool) {
+	for {
+		d.mu.Lock()
+		if len(d.queue) > 0 {
+			task := d.queue[0]
+			d.queue = d.queue[1:]
+			if task.kind == notificationTaskStatus && d.pendingStatus[task.paneID] == task {
+				delete(d.pendingStatus, task.paneID)
+			}
+			if task.kind == notificationTaskStatus && task.epoch != d.currentEpoch {
+				d.mu.Unlock()
+				continue
+			}
+			taskContext, cancel := context.WithCancel(ctx)
+			d.active = task
+			d.activeCancel = cancel
+			d.mu.Unlock()
+			return task, taskContext, cancel, true
+		}
+		d.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, false
+		case <-d.wake:
+		}
+	}
+}
+
+func (d *notificationDispatcher) deliver(ctx context.Context, task *notificationTask) error {
+	switch task.kind {
+	case notificationTaskStatus:
+		return d.notifier.HandleTransition(ctx, task.transition)
+	case notificationTaskInvalidated:
+		return d.notifier.TargetInvalidated(ctx, task.target)
+	default:
+		return nil
+	}
+}
+
+func (d *notificationDispatcher) taskCurrent(task *notificationTask) bool {
+	if task.kind == notificationTaskInvalidated {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.currentEpoch == task.epoch && d.pendingStatus[task.paneID] == nil
+}
+
+func (d *notificationDispatcher) finish(taskID uint64, cancel context.CancelFunc) {
+	cancel()
+	d.mu.Lock()
+	if d.active != nil && d.active.id == taskID {
+		if d.active.kind == notificationTaskInvalidated && d.pendingInvalidated[d.active.invalidationKey] == d.active {
+			delete(d.pendingInvalidated, d.active.invalidationKey)
+		}
+		d.active = nil
+		d.activeCancel = nil
+	}
+	d.mu.Unlock()
+}
+
+func (d *notificationDispatcher) dropStatusLocked(epoch uint64) {
+	kept := d.queue[:0]
+	clear(d.pendingStatus)
+	for _, task := range d.queue {
+		if task.kind == notificationTaskStatus && (epoch == 0 || task.epoch == epoch) {
+			continue
+		}
+		kept = append(kept, task)
+		if task.kind == notificationTaskStatus {
+			d.pendingStatus[task.paneID] = task
+		}
+	}
+	d.queue = kept
+	if d.active != nil && d.active.kind == notificationTaskStatus && (epoch == 0 || d.active.epoch == epoch) && d.activeCancel != nil {
+		d.activeCancel()
+	}
+}
+
+func (d *notificationDispatcher) signal() {
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Notifier 根据 Agent 状态迁移向企业微信发送主动通知。

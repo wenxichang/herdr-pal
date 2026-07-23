@@ -145,6 +145,127 @@ func TestSupervisorStatusEventAppliesThenNotifiesAndSuppressesReplay(t *testing.
 	}
 }
 
+func TestSupervisorNotificationDeliveryDoesNotBlockStatusLoopAndCoalescesLatest(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(
+		supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
+		supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
+	))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	im := newGatedNotifierIM()
+	harness.supervisor.notifier = mustNotifierWithGetter(t, im, matchingSupervisorAgent, harness.reader.ReadRecent)
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "异步通知基线", func() bool { return serviceAvailable(harness.service) })
+
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	<-im.firstStarted
+	status.Emit(supervisorStatusEvent("pane-2", "workspace-1", "claude", herdr.AgentStatusWorking))
+	status.Emit(supervisorStatusEvent("pane-2", "workspace-1", "claude", herdr.AgentStatusBlocked))
+	status.Emit(supervisorStatusEvent("pane-2", "workspace-1", "claude", herdr.AgentStatusDone))
+	awaitSupervisorCondition(t, "阻塞发送期间处理最新状态", func() bool {
+		for _, target := range harness.registry.CreateListSnapshot() {
+			if target.PaneID == "pane-2" {
+				return target.Status == herdr.AgentStatusDone
+			}
+		}
+		return false
+	})
+	close(im.firstRelease)
+	awaitSupervisorCondition(t, "异步状态通知", func() bool { return len(im.Messages()) == 2 })
+	messages := strings.Join(im.Messages(), "\n")
+	if !strings.Contains(messages, "开始工作") || !strings.Contains(messages, "已完成") || strings.Contains(messages, "已阻塞") {
+		t.Fatalf("异步状态合并通知 = %q", messages)
+	}
+}
+
+func TestSupervisorCycleEndDropsStatusButKeepsInvalidationDelivery(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	initial := supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))
+	empty := supervisorSnapshot()
+	client := newSupervisorClient(initial, initial, empty, empty)
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	im := newEpochNotifierIM()
+	harness.supervisor.notifier = mustNotifierWithGetter(t, im, matchingSupervisorAgent, harness.reader.ReadRecent)
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "epoch 基线", func() bool { return serviceAvailable(harness.service) })
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	<-im.firstStarted
+
+	lifecycle.Emit(supervisorLifecycleEvent("pane.closed"))
+	debounce := awaitSupervisorWait(t, harness.waiter)
+	debounce.Release()
+	awaitSupervisorCondition(t, "失效任务入队", func() bool {
+		return client.SnapshotCount() == 4 && status.CloseCount() == 1 && len(harness.registry.AgentPaneIDs()) == 0
+	})
+	lifecycle.End(io.EOF)
+	retry := awaitSupervisorWait(t, harness.waiter)
+	if retry.delay != time.Second {
+		t.Fatalf("周期结束重试等待 = %v，期望 1s", retry.delay)
+	}
+	awaitSupervisorCondition(t, "跨周期 invalidation 通知", func() bool { return len(im.Messages()) == 1 })
+	if message := im.Messages()[0]; !strings.Contains(message, "目标已失效") || strings.Contains(message, "开始工作") {
+		t.Fatalf("周期结束后的通知 = %q", message)
+	}
+}
+
+func TestSupervisorNotificationQueueFullIsFatalAndClosesCycle(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(
+		supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
+		supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
+		supervisorPane("pane-3", "terminal-3", "gemini", herdr.AgentStatusIdle),
+	))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	im := newGatedNotifierIM()
+	harness.supervisor.notifier = mustNotifierWithGetter(t, im, matchingSupervisorAgent, harness.reader.ReadRecent)
+	harness.supervisor.notificationQueueCapacity = 1
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancel()
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "队列满测试基线", func() bool { return serviceAvailable(harness.service) })
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	<-im.firstStarted
+	status.Emit(supervisorStatusEvent("pane-2", "workspace-1", "claude", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "填满通知队列", func() bool {
+		for _, target := range harness.registry.CreateListSnapshot() {
+			if target.PaneID == "pane-2" {
+				return target.Status == herdr.AgentStatusWorking
+			}
+		}
+		return false
+	})
+	status.Emit(supervisorStatusEvent("pane-3", "workspace-1", "gemini", herdr.AgentStatusWorking))
+	err := awaitSupervisorResult(t, result)
+	if !errors.Is(err, ErrNotificationQueueFull) {
+		t.Fatalf("Run() error = %v，期望 ErrNotificationQueueFull", err)
+	}
+	if serviceAvailable(harness.service) || lifecycle.CloseCount() != 1 || status.CloseCount() != 1 {
+		t.Fatalf("队列满后未完整 degraded：available=%v lifecycleClose=%d statusClose=%d", serviceAvailable(harness.service), lifecycle.CloseCount(), status.CloseCount())
+	}
+	if harness.factory.ConnectCount() != 1 || harness.backoff.NextCount() != 0 || len(harness.waiter.requests) != 0 {
+		t.Fatalf("队列满后发生重连：connect=%d backoff=%d waits=%d", harness.factory.ConnectCount(), harness.backoff.NextCount(), len(harness.waiter.requests))
+	}
+}
+
 func TestSupervisorLifecycleEventsDebounceSnapshotAndRebuildStatusStream(t *testing.T) {
 	lifecycle := newSupervisorStream()
 	oldStatus := newSupervisorStream()
@@ -808,6 +929,43 @@ type supervisorHarness struct {
 	waiter     *supervisorWaiter
 	backoff    *supervisorBackoff
 	log        *supervisorCallLog
+}
+
+type epochNotifierIM struct {
+	mu           sync.Mutex
+	calls        int
+	messages     []string
+	firstStarted chan struct{}
+}
+
+func newEpochNotifierIM() *epochNotifierIM {
+	return &epochNotifierIM{firstStarted: make(chan struct{})}
+}
+
+func (i *epochNotifierIM) RespondMarkdown(context.Context, string, string) error {
+	return errors.New("Notifier 不应回复入站回调")
+}
+
+func (i *epochNotifierIM) SendMarkdown(ctx context.Context, content string) error {
+	i.mu.Lock()
+	i.calls++
+	call := i.calls
+	i.mu.Unlock()
+	if call == 1 {
+		close(i.firstStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	i.mu.Lock()
+	i.messages = append(i.messages, content)
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *epochNotifierIM) Messages() []string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]string(nil), i.messages...)
 }
 
 func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisorHarness {
