@@ -24,6 +24,7 @@ type Buffer struct {
 	lines     []string
 	page      int
 	oldest    bool
+	newestLen int
 }
 
 // Refresh 替换为最新 100 行并回到第 0 页。
@@ -35,6 +36,7 @@ func (b *Buffer) Refresh(targetKey string, lines []string) {
 	b.lines = append([]string(nil), lines...)
 	b.page = 0
 	b.oldest = false
+	b.newestLen = len(b.lines)
 }
 
 // NextReadSize 返回下一次 pageup 需要的 agent.read lines。
@@ -95,11 +97,22 @@ func (b *Buffer) Render() []string {
 	if len(b.lines) == 0 {
 		return nil
 	}
-	end := len(b.lines) - b.page*PageSize
+	newestLen := b.newestLen
+	if newestLen <= 0 || newestLen > len(b.lines) {
+		newestLen = min(PageSize, len(b.lines))
+	}
+	end := len(b.lines)
+	if b.page > 0 {
+		end -= newestLen + (b.page-1)*PageSize
+	}
 	if end <= 0 {
 		return nil
 	}
-	start := end - PageSize
+	pageSize := PageSize
+	if b.page == 0 {
+		pageSize = newestLen
+	}
+	start := end - pageSize
 	if start < 0 {
 		start = 0
 	}
@@ -112,6 +125,7 @@ func (b *Buffer) Reset() {
 	b.lines = nil
 	b.page = 0
 	b.oldest = false
+	b.newestLen = 0
 }
 
 func lastContiguousIndex(snapshot, anchor []string) int {

@@ -62,6 +62,10 @@ func stripANSI(text string) string {
 					index += 2
 					break
 				}
+				if text[index] == 0xc2 && index+1 < len(text) && text[index+1] == 0x9c {
+					index += 2
+					break
+				}
 				index++
 			}
 		default:

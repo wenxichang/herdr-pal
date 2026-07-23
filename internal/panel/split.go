@@ -54,23 +54,36 @@ func SplitMarkdown(content string, limit int) []string {
 }
 
 func splitRenderedPage(header, body string, limit int) []string {
-	digits := len(strconv.Itoa(max(1, utf8.RuneCountInString(body))))
-	markerReserve := "\n分段 " + strings.Repeat("9", digits) + "/" + strings.Repeat("9", digits)
-	payloadLimit := limit - len(header) - len(markerReserve) - len(codeFenceOpen) - len(codeFenceClose)
 	if body == "" {
-		if payloadLimit < 0 {
+		part := fmt.Sprintf("%s\n分段 1/1%s%s", header, codeFenceOpen, codeFenceClose)
+		if len(part) > limit {
 			return nil
 		}
-		return []string{fmt.Sprintf("%s\n分段 1/1%s%s", header, codeFenceOpen, codeFenceClose)}
-	}
-	if payloadLimit <= 0 {
-		return nil
+		return []string{part}
 	}
 
-	parts := splitPlain(body, payloadLimit)
-	if len(parts) == 0 {
-		return nil
+	maxDigits := len(strconv.Itoa(max(1, len(body))))
+	for digits := 1; digits <= maxDigits; {
+		markerReserve := "\n分段 " + strings.Repeat("9", digits) + "/" + strings.Repeat("9", digits)
+		payloadLimit := limit - len(header) - len(markerReserve) - len(codeFenceOpen) - len(codeFenceClose)
+		if payloadLimit <= 0 {
+			return nil
+		}
+		parts := splitPlain(body, payloadLimit)
+		if len(parts) == 0 {
+			return nil
+		}
+		requiredDigits := len(strconv.Itoa(len(parts)))
+		if requiredDigits > digits {
+			digits = requiredDigits
+			continue
+		}
+		return wrapRenderedParts(header, parts)
 	}
+	return nil
+}
+
+func wrapRenderedParts(header string, parts []string) []string {
 	result := make([]string, len(parts))
 	for index, part := range parts {
 		result[index] = fmt.Sprintf("%s\n分段 %d/%d%s%s%s", header, index+1, len(parts), codeFenceOpen, part, codeFenceClose)

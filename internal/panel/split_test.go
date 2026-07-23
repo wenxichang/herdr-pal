@@ -115,3 +115,77 @@ func TestSplitMarkdownAllowsEmptyTerminalPageAtExactWrapperLimit(t *testing.T) {
 		t.Fatalf("SplitMarkdown(..., %d) = %#v, want nil", limit-1, got)
 	}
 }
+
+func TestSplitMarkdownUsesActualOneDigitPartCountAtExactLimit(t *testing.T) {
+	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{"abcdefghij"})
+	header, body, ok := renderedPageParts(content)
+	if !ok {
+		t.Fatalf("RenderPage() = %q, want rendered terminal page", content)
+	}
+	limit := len(header) + len("\n分段 1/5") + len(codeFenceOpen) + len(codeFenceClose) + 2
+
+	parts := SplitMarkdown(content, limit)
+	if len(parts) != 5 {
+		t.Fatalf("part count = %d, want 5", len(parts))
+	}
+	if got := joinRenderedBodies(t, parts); got != body {
+		t.Fatalf("joined body = %q, want %q", got, body)
+	}
+	for index, part := range parts {
+		if len(part) > limit || !strings.Contains(part, fmt.Sprintf("分段 %d/5", index+1)) {
+			t.Fatalf("part %d = %q", index, part)
+		}
+	}
+}
+
+func TestSplitMarkdownRecalculatesBudgetWhenPartCountReachesTen(t *testing.T) {
+	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{strings.Repeat("aaa\n", 10)})
+	header, body, ok := renderedPageParts(content)
+	if !ok {
+		t.Fatalf("RenderPage() = %q, want rendered terminal page", content)
+	}
+	limit := len(header) + len("\n分段 99/99") + len(codeFenceOpen) + len(codeFenceClose) + 4
+
+	parts := SplitMarkdown(content, limit)
+	if len(parts) != 10 {
+		t.Fatalf("part count = %d, want 10", len(parts))
+	}
+	if got := joinRenderedBodies(t, parts); got != body {
+		t.Fatalf("joined body = %q, want %q", got, body)
+	}
+	for index, part := range parts {
+		if len(part) > limit || !strings.Contains(part, fmt.Sprintf("分段 %d/10", index+1)) {
+			t.Fatalf("part %d = %q", index, part)
+		}
+	}
+}
+
+func TestSplitMarkdownNonEmptyUnicodeRequiresRuneAndWrapperSpace(t *testing.T) {
+	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{"😀"})
+	header, body, ok := renderedPageParts(content)
+	if !ok {
+		t.Fatalf("RenderPage() = %q, want rendered terminal page", content)
+	}
+	limit := len(header) + len("\n分段 1/1") + len(codeFenceOpen) + len(codeFenceClose) + len(body)
+
+	parts := SplitMarkdown(content, limit)
+	if len(parts) != 1 || len(parts[0]) != limit || joinRenderedBodies(t, parts) != body {
+		t.Fatalf("SplitMarkdown() = %#v, want one exact UTF-8 part", parts)
+	}
+	if got := SplitMarkdown(content, limit-1); got != nil {
+		t.Fatalf("SplitMarkdown(..., %d) = %#v, want nil", limit-1, got)
+	}
+}
+
+func joinRenderedBodies(t *testing.T, parts []string) string {
+	t.Helper()
+	var body strings.Builder
+	for index, part := range parts {
+		_, fragment, ok := renderedPageParts(part)
+		if !ok {
+			t.Fatalf("part %d is not a rendered page: %q", index, part)
+		}
+		body.WriteString(fragment)
+	}
+	return body.String()
+}

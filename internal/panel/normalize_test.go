@@ -44,3 +44,13 @@ func TestNormalizeReplacesInvalidUTF8(t *testing.T) {
 		t.Fatalf("Normalize() = %#v, want %#v", got, want)
 	}
 }
+
+func TestNormalizeStopsOSCAtC1StringTerminator(t *testing.T) {
+	input := "\x1b]0;窗口标题\u009c终端可见内容"
+
+	got := Normalize(input)
+	want := []string{"终端可见内容"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Normalize() = %#v, want %#v", got, want)
+	}
+}

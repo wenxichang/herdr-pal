@@ -120,6 +120,72 @@ func TestBufferRenderAllPagesAndPageDownUsesCache(t *testing.T) {
 	}
 }
 
+func TestBufferRenderKeepsShortLatestPageSeparateFromHistory(t *testing.T) {
+	latest := numberedLinesRange(200, 230)
+	history := numberedLinesRange(150, 200)
+	var buffer Buffer
+	buffer.Refresh("target-a", latest)
+
+	if err := buffer.Expand("target-a", append(append([]string(nil), history...), latest...)); err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	got := buffer.Render()
+	if !reflect.DeepEqual(got, history) {
+		t.Fatalf("older page = %#v, want %#v", got, history)
+	}
+	got[0] = "changed-render"
+	if !reflect.DeepEqual(buffer.Render(), history) {
+		t.Fatalf("Render() exposed internal history slice")
+	}
+	if err := buffer.PageDown(); err != nil {
+		t.Fatalf("PageDown() error = %v", err)
+	}
+	if got := buffer.Render(); !reflect.DeepEqual(got, latest) {
+		t.Fatalf("latest page = %#v, want %#v", got, latest)
+	}
+}
+
+func TestBufferShortLatestPagePaginatesLongAndMultipleHistory(t *testing.T) {
+	latest := numberedLinesRange(200, 230)
+	firstHistory := numberedLinesRange(50, 200)
+	var buffer Buffer
+	buffer.Refresh("target-a", latest)
+	firstSnapshot := append(append([]string(nil), firstHistory...), latest...)
+	if err := buffer.Expand("target-a", firstSnapshot); err != nil {
+		t.Fatalf("first Expand() error = %v", err)
+	}
+	if got, want := buffer.Render(), numberedLinesRange(100, 200); !reflect.DeepEqual(got, want) {
+		t.Fatalf("first older page = %#v, want %#v", got, want)
+	}
+
+	buffer.page = 2
+	if got, want := buffer.Render(), numberedLinesRange(50, 100); !reflect.DeepEqual(got, want) {
+		t.Fatalf("partial oldest page = %#v, want %#v", got, want)
+	}
+
+	buffer.page = 1
+	olderHistory := numberedLinesRange(0, 50)
+	secondSnapshot := append(append([]string(nil), olderHistory...), firstSnapshot...)
+	if err := buffer.Expand("target-a", secondSnapshot); err != nil {
+		t.Fatalf("second Expand() error = %v", err)
+	}
+	if got, want := buffer.Render(), numberedLinesRange(0, 100); !reflect.DeepEqual(got, want) {
+		t.Fatalf("second older page = %#v, want %#v", got, want)
+	}
+	if err := buffer.PageDown(); err != nil {
+		t.Fatalf("first PageDown() error = %v", err)
+	}
+	if got, want := buffer.Render(), numberedLinesRange(100, 200); !reflect.DeepEqual(got, want) {
+		t.Fatalf("page down history = %#v, want %#v", got, want)
+	}
+	if err := buffer.PageDown(); err != nil {
+		t.Fatalf("second PageDown() error = %v", err)
+	}
+	if got := buffer.Render(); !reflect.DeepEqual(got, latest) {
+		t.Fatalf("page down latest = %#v, want %#v", got, latest)
+	}
+}
+
 func numberedLines(count int) []string {
 	return numberedLinesRange(0, count)
 }
