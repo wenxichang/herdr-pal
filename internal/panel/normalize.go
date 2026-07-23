@@ -46,6 +46,9 @@ func stripANSI(text string) string {
 			index += 2
 			for index < len(text) {
 				current := text[index]
+				if current == '\n' || current == '\r' {
+					break
+				}
 				index++
 				if current >= 0x40 && current <= 0x7e {
 					break
@@ -55,14 +58,24 @@ func stripANSI(text string) string {
 			index = skipControlString(text, index+2, true)
 		case 'P', '_', '^', 'X':
 			index = skipControlString(text, index+2, false)
-		case '7', '8':
-			index += 2
 		default:
-			result.WriteByte(text[index])
-			index++
+			index = skipEscapeSequence(text, index+1)
 		}
 	}
 	return result.String()
+}
+
+func skipEscapeSequence(text string, index int) int {
+	for index < len(text) && text[index] >= 0x20 && text[index] <= 0x2f {
+		index++
+	}
+	if index >= len(text) || text[index] == '\n' || text[index] == '\r' {
+		return index
+	}
+	if text[index] >= 0x30 && text[index] <= 0x7e {
+		return index + 1
+	}
+	return index
 }
 
 func skipControlString(text string, index int, bellTerminates bool) int {

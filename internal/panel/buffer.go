@@ -44,13 +44,14 @@ func (b *Buffer) Refresh(targetKey string, lines []string) {
 // 即使下一页已在缓存中，仍返回受 MaxLines 限制的正数，保持调用方“读取后调用 Expand”
 // 的流程不变；Expand 会优先消费缓存页。
 func (b *Buffer) NextReadSize() (int, error) {
+	normalSize := min((b.page+2)*PageSize, MaxLines)
 	if b.hasCachedOlderPage() {
-		return len(b.lines), nil
+		return max(normalSize, len(b.lines)), nil
 	}
 	if b.oldest || (b.page+2)*PageSize > MaxLines {
 		return 0, ErrOldestPage
 	}
-	return min((b.page+2)*PageSize, MaxLines), nil
+	return normalSize, nil
 }
 
 // Expand 用旧缓存作为连续重叠锚点扩充更早内容。
@@ -67,6 +68,10 @@ func (b *Buffer) Expand(targetKey string, snapshot []string) error {
 	}
 	anchor := lastContiguousIndex(snapshot, b.lines)
 	if anchor < 0 {
+		if b.hasCachedOlderPage() && isRolledForward(snapshot, b.lines) {
+			b.page++
+			return nil
+		}
 		b.Reset()
 		return ErrPanelChanged
 	}
@@ -159,4 +164,23 @@ func lastContiguousIndex(snapshot, anchor []string) int {
 		}
 	}
 	return -1
+}
+
+func isRolledForward(snapshot, previous []string) bool {
+	if len(snapshot) != MaxLines || len(previous) != MaxLines {
+		return false
+	}
+	for overlap := MaxLines - 1; overlap >= PageSize; overlap-- {
+		matched := true
+		for index := 0; index < overlap; index++ {
+			if snapshot[index] != previous[len(previous)-overlap+index] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }

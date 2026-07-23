@@ -89,6 +89,51 @@ func TestNormalizeConsumesTerminatedControlStringsAcrossLines(t *testing.T) {
 	}
 }
 
+func TestNormalizeDoesNotLetUnterminatedCSICrossPhysicalBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "completed before newline",
+			input: "\x1b[31mred\nvisible",
+			want:  []string{"red", "visible"},
+		},
+		{
+			name:  "newline before final",
+			input: "\x1b[31\nvisible",
+			want:  []string{"", "visible"},
+		},
+		{
+			name:  "carriage return before final",
+			input: "\x1b[31\rvisible",
+			want:  []string{"visible"},
+		},
+		{
+			name:  "end of input before final",
+			input: "before\x1b[31",
+			want:  []string{"before"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := panel.Normalize(test.input); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("Normalize() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeRemovesStandardEscapeSequencesConservatively(t *testing.T) {
+	input := "\x1bcA\x1bDB\x1bMC\x1b7D\x1b8E\x1b(BF\nstart\x1b(\nvisible\nend\x1b("
+
+	got := panel.Normalize(input)
+	want := []string{"ABCDEF", "start", "visible", "end"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Normalize() = %#v, want %#v", got, want)
+	}
+}
+
 func TestBufferPageUpConsumesAllCachedHistoricalPages(t *testing.T) {
 	latest := externalLines(200, 230)
 	history := externalLines(50, 200)
@@ -185,7 +230,7 @@ func TestBufferNextReadSizeRetainsCompleteCachedAnchor(t *testing.T) {
 			latestStart: 200,
 			historyFrom: 50,
 			historyTo:   200,
-			wantSize:    180,
+			wantSize:    300,
 			wantPage:    externalLines(50, 100),
 		},
 	} {
@@ -206,7 +251,11 @@ func TestBufferNextReadSizeRetainsCompleteCachedAnchor(t *testing.T) {
 			if readSize != test.wantSize {
 				t.Fatalf("NextReadSize() = %d, want %d", readSize, test.wantSize)
 			}
-			recent := snapshot[len(snapshot)-readSize:]
+			recentStart := len(snapshot) - readSize
+			if recentStart < 0 {
+				recentStart = 0
+			}
+			recent := snapshot[recentStart:]
 			if err := buffer.Expand("target-a", recent); err != nil {
 				t.Fatalf("Expand(recent) error = %v", err)
 			}
@@ -214,6 +263,51 @@ func TestBufferNextReadSizeRetainsCompleteCachedAnchor(t *testing.T) {
 				t.Fatalf("cached next page = %#v, want %#v", got, test.wantPage)
 			}
 		})
+	}
+}
+
+func TestBufferConsumesCachedPageAfterMaxWindowRollsForward(t *testing.T) {
+	latest := externalLines(1000, 1030)
+	history := externalLines(30, 1000)
+	snapshot := append(append([]string(nil), history...), latest...)
+	var buffer panel.Buffer
+	buffer.Refresh("target-a", latest)
+	if err := externalPageUp(&buffer, "target-a", snapshot); err != nil {
+		t.Fatalf("first pageup error = %v", err)
+	}
+
+	readSize, err := buffer.NextReadSize()
+	if err != nil || readSize != panel.MaxLines {
+		t.Fatalf("NextReadSize() = %d, %v; want %d, nil", readSize, err, panel.MaxLines)
+	}
+	rolled := append(append([]string(nil), snapshot[1:]...), "new output")
+	if err := buffer.Expand("target-a", rolled[len(rolled)-readSize:]); err != nil {
+		t.Fatalf("Expand(rolled) error = %v", err)
+	}
+	if got, want := buffer.Render(), externalLines(800, 900); !reflect.DeepEqual(got, want) {
+		t.Fatalf("cached page after roll = %#v, want %#v", got, want)
+	}
+}
+
+func TestBufferRejectsShortRollingOverlap(t *testing.T) {
+	latest := externalLines(1000, 1030)
+	history := externalLines(30, 1000)
+	snapshot := append(append([]string(nil), history...), latest...)
+	var buffer panel.Buffer
+	buffer.Refresh("target-a", latest)
+	if err := externalPageUp(&buffer, "target-a", snapshot); err != nil {
+		t.Fatalf("first pageup error = %v", err)
+	}
+
+	rolled := append([]string(nil), snapshot[len(snapshot)-99:]...)
+	for index := len(rolled); index < panel.MaxLines; index++ {
+		rolled = append(rolled, fmt.Sprintf("unrelated-%04d", index))
+	}
+	if err := buffer.Expand("target-a", rolled); !errors.Is(err, panel.ErrPanelChanged) {
+		t.Fatalf("Expand(short overlap) error = %v, want ErrPanelChanged", err)
+	}
+	if got := buffer.Render(); got != nil {
+		t.Fatalf("buffer was not reset: %#v", got)
 	}
 }
 
