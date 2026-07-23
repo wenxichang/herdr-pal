@@ -357,7 +357,13 @@ func (n *Notifier) Reset() {
 	n.mu.Lock()
 	n.epoch++
 	n.recent = make(map[string]notificationKey)
-	n.pending = make(map[string]*notificationProgress)
+	pending := make(map[string]*notificationProgress)
+	for paneID, progress := range n.pending {
+		if progress.key.kind == "invalidated" {
+			pending[paneID] = progress
+		}
+	}
+	n.pending = pending
 	n.mu.Unlock()
 }
 
@@ -446,7 +452,8 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 		n.inflight[paneID] = completed
 		deliveryEpoch := n.epoch
 		progress := n.pending[paneID]
-		if progress == nil || progress.epoch != deliveryEpoch || !sameNotificationIdentity(progress.key, key) {
+		if progress == nil || !sameNotificationIdentity(progress.key, key) ||
+			(progress.key.kind != "invalidated" && progress.epoch != deliveryEpoch) {
 			progress = &notificationProgress{
 				key: key, parts: append([]string(nil), parts...), epoch: deliveryEpoch,
 			}
@@ -462,14 +469,14 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 				break
 			}
 			n.mu.Lock()
-			if n.epoch == deliveryEpoch && n.pending[paneID] == progress {
+			if n.notificationProgressCurrentLocked(paneID, progress) {
 				progress.next = index + 1
 			}
 			n.mu.Unlock()
 		}
 
 		n.mu.Lock()
-		if err == nil && n.epoch == deliveryEpoch && n.pending[paneID] == progress {
+		if err == nil && n.notificationProgressCurrentLocked(paneID, progress) {
 			n.recent[paneID] = progress.key
 			delete(n.pending, paneID)
 		}
@@ -478,6 +485,14 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 		n.mu.Unlock()
 		return err
 	}
+}
+
+func (n *Notifier) notificationProgressCurrentLocked(paneID string, progress *notificationProgress) bool {
+	if n.pending[paneID] != progress {
+		return false
+	}
+	// invalidation 任务属于 Dispatcher 的 Run 生命周期，必须跨健康 epoch 保留进度。
+	return progress.key.kind == "invalidated" || n.epoch == progress.epoch
 }
 
 func sameNotificationIdentity(left, right notificationKey) bool {

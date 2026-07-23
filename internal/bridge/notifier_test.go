@@ -555,6 +555,43 @@ func TestNotificationDispatcherRetriesOnlyFailedNotificationParts(t *testing.T) 
 	}
 }
 
+func TestNotificationDispatcherKeepsInvalidationProgressAcrossReset(t *testing.T) {
+	target := notificationTarget()
+	target.Title = strings.Repeat("中", panel.WeComContentLimit)
+	expected := renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target)
+	if len(expected) < 2 {
+		t.Fatalf("测试目标未生成多段 invalidation：%d", len(expected))
+	}
+	im := &failOnceNotifierIM{failAt: 2}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	waiter := newNotificationRetryWaiter()
+	retry := &notificationRetry{delay: time.Second}
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  retry,
+		Wait:     waiter.Wait,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+
+	if err := dispatcher.EnqueueInvalidated(target); err != nil {
+		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
+	}
+	wait := <-waiter.started
+	notifier.Reset()
+	close(wait.release)
+	awaitNotifierCondition(t, "跨 Reset invalidation 重试完成", func() bool { return retry.ResetCount() == 1 })
+	if messages := im.Messages(); !reflect.DeepEqual(messages, expected) || im.CallCount() != len(expected)+1 {
+		t.Fatalf("跨 Reset 重复已成功 invalidation 分段：calls=%d messages=%#v want=%#v", im.CallCount(), messages, expected)
+	}
+
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
 func TestNotificationDispatcherReturnsInjectedWaitError(t *testing.T) {
 	waitErr := errors.New("notification wait failed")
 	im := &failOnceNotifierIM{failAt: 1}
