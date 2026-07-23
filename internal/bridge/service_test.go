@@ -172,6 +172,184 @@ func TestServiceKeyMismatchClearsSelectionWithoutSending(t *testing.T) {
 	}
 }
 
+func TestServiceInputMismatchDoesNotInvalidateNewSelection(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		content string
+	}{
+		{name: "prompt", content: "prompt"},
+		{name: "key", content: "/key enter"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, fake := newTestService(t)
+			service.registry.Replace(twoTargetSnapshot(), false)
+			selectTarget(t, service)
+			fake.setAgent(agentInfo("pane-1", "terminal-1", "other"))
+			fake.blockGet = make(chan struct{})
+			fake.getStarted = make(chan struct{}, 1)
+			requestDone := make(chan struct{})
+			go func() {
+				service.HandleMessage(context.Background(), incoming("input-mismatch-"+test.name, test.content))
+				close(requestDone)
+			}()
+			awaitSignal(t, fake.getStarted, "GetAgent")
+			selectDone := make(chan struct{})
+			go func() {
+				service.HandleMessage(context.Background(), incoming("input-mismatch-select-"+test.name, "/sel 2"))
+				close(selectDone)
+			}()
+			waitForCondition(t, func() bool {
+				service.opMu.Lock()
+				defer service.opMu.Unlock()
+				return service.inputBlocked > 0
+			}, "/sel input barrier")
+			close(fake.blockGet)
+			awaitSignal(t, selectDone, "/sel B")
+			awaitSignal(t, requestDone, "mismatched input")
+			selected, err := service.registry.ValidateSelected()
+			if err != nil || selected.PaneID != "pane-2" {
+				t.Fatalf("new selection was invalidated: %#v, %v", selected, err)
+			}
+			if len(fake.prompts()) != 0 || len(fake.keys()) != 0 {
+				t.Fatalf("mismatched input reached Herdr: prompts=%#v keys=%#v", fake.prompts(), fake.keys())
+			}
+		})
+	}
+}
+
+func TestServiceReadMismatchDoesNotInvalidateNewSelectionOrPanel(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		prepareOld func(*Service, *fakeHerdr)
+		content    string
+	}{
+		{
+			name:       "content",
+			prepareOld: func(_ *Service, _ *fakeHerdr) {},
+			content:    "/con",
+		},
+		{
+			name: "pageup",
+			prepareOld: func(service *Service, fake *fakeHerdr) {
+				fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("A", 100, 200)}, nil)
+				service.HandleMessage(context.Background(), incoming("read-mismatch-pageup-content", "/con"))
+			},
+			content: "/pageup",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, fake := newTestService(t)
+			service.registry.Replace(twoTargetSnapshot(), false)
+			selectTarget(t, service)
+			test.prepareOld(service, fake)
+			oldReadBlock := make(chan struct{})
+			fake.setRead(herdr.ReadResult{PaneID: "wrong-pane", Text: "OLD-MISMATCH"}, oldReadBlock)
+			fake.readStarted = make(chan struct{}, 1)
+			oldDone := make(chan struct{})
+			go func() {
+				service.HandleMessage(context.Background(), incoming("read-mismatch-"+test.name, test.content))
+				close(oldDone)
+			}()
+			awaitSignal(t, fake.readStarted, "old ReadRecent")
+			service.HandleMessage(context.Background(), incoming("read-mismatch-list-"+test.name, "/ls"))
+			service.HandleMessage(context.Background(), incoming("read-mismatch-select-"+test.name, "/sel 2"))
+			fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: namedLines("B", 100, 200)}, nil)
+			service.HandleMessage(context.Background(), incoming("read-mismatch-new-"+test.name, "/con"))
+			close(oldReadBlock)
+			awaitSignal(t, oldDone, "old mismatched read")
+			selected, err := service.registry.ValidateSelected()
+			if err != nil || selected.PaneID != "pane-2" {
+				t.Fatalf("new selection was invalidated: %#v, %v", selected, err)
+			}
+			service.stateMu.Lock()
+			cached := strings.Join(service.panel.Render(), "\n")
+			ready := service.panelReady
+			service.stateMu.Unlock()
+			if !ready || !strings.Contains(cached, "B-100") || strings.Contains(cached, "OLD-MISMATCH") {
+				t.Fatalf("new panel was invalidated or replaced: ready=%t cache=%q", ready, cached)
+			}
+			service.HandleMessage(context.Background(), incoming("read-mismatch-pagedown-"+test.name, "/pagedn"))
+			if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-MISMATCH") {
+				t.Fatalf("old read leaked through pagedown: %q", reply)
+			}
+		})
+	}
+}
+
+func TestServiceReplaceSnapshotWaitsForInputAndResetsInvalidSelection(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.blockPrompt = make(chan struct{})
+	fake.promptStarted = make(chan struct{}, 1)
+	promptDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("replace-blocked-prompt", "prompt"))
+		close(promptDone)
+	}()
+	awaitSignal(t, fake.promptStarted, "Prompt")
+	replaceDone := make(chan session.ChangeSet, 1)
+	go func() { replaceDone <- service.ReplaceSnapshot(replacedSnapshot(), false) }()
+	waitForCondition(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.inputBlocked > 0
+	}, "ReplaceSnapshot input barrier")
+	before := fake.callCount()
+	service.HandleMessage(context.Background(), incoming("replace-new-key", "/key enter"))
+	if fake.callCount() != before {
+		t.Fatalf("new input passed through ReplaceSnapshot: %#v", fake)
+	}
+	close(fake.blockPrompt)
+	awaitSignal(t, promptDone, "Prompt")
+	changes := awaitChangeSet(t, replaceDone, "ReplaceSnapshot")
+	if !changes.SelectionInvalidated || len(changes.ReplacedTargets) != 1 {
+		t.Fatalf("replacement changes = %#v", changes)
+	}
+	if _, err := service.registry.ValidateSelected(); err == nil {
+		t.Fatal("replacement did not clear selection")
+	}
+	service.stateMu.Lock()
+	ready := service.panelReady
+	service.stateMu.Unlock()
+	if ready {
+		t.Fatal("replacement did not reset panel")
+	}
+
+	service.registry.Replace(testSnapshot(), false)
+	service.HandleMessage(context.Background(), incoming("replace-reconnect-list", "/ls"))
+	service.HandleMessage(context.Background(), incoming("replace-reconnect-select", "/sel 1"))
+	changes = service.ReplaceSnapshot(testSnapshot(), true)
+	if !changes.SelectionInvalidated {
+		t.Fatalf("reconnect changes = %#v", changes)
+	}
+}
+
+func TestServiceReplaceSnapshotWaitsForKey(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.blockKey = make(chan struct{})
+	fake.keyStarted = make(chan struct{}, 1)
+	keyDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("replace-blocked-key", "/key enter"))
+		close(keyDone)
+	}()
+	awaitSignal(t, fake.keyStarted, "SendKey")
+	replaceDone := make(chan session.ChangeSet, 1)
+	go func() { replaceDone <- service.ReplaceSnapshot(testSnapshot(), true) }()
+	waitForCondition(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.inputBlocked > 0
+	}, "ReplaceSnapshot key barrier")
+	close(fake.blockKey)
+	awaitSignal(t, keyDone, "SendKey")
+	changes := awaitChangeSet(t, replaceDone, "ReplaceSnapshot")
+	if !changes.SelectionInvalidated {
+		t.Fatalf("reconnect changes = %#v", changes)
+	}
+}
+
 func TestServiceLiveMismatchClearsSelectionWithoutInput(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
@@ -708,6 +886,20 @@ func textLines(start, end int) string {
 	return strings.Join(lines, "\n")
 }
 
+func namedLines(prefix string, start, end int) string {
+	lines := make([]string, 0, end-start)
+	for index := start; index < end; index++ {
+		lines = append(lines, fmt.Sprintf("%s-%03d", prefix, index))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func replacedSnapshot() herdr.Snapshot {
+	snapshot := testSnapshot()
+	snapshot.Panes[0] = herdr.Pane{PaneID: "pane-1", TerminalID: "terminal-replaced", WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude"), AgentStatus: herdr.AgentStatusWorking}
+	return snapshot
+}
+
 type promptCall struct{ target, text string }
 type keyCall struct{ target, key string }
 type readCall struct {
@@ -790,6 +982,12 @@ func (f *fakeHerdr) setAgent(agent herdr.AgentInfo) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agent = agent
+}
+func (f *fakeHerdr) setRead(result herdr.ReadResult, block chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.read = result
+	f.blockRead = block
 }
 func (f *fakeHerdr) prompts() []promptCall {
 	f.mu.Lock()
@@ -903,6 +1101,17 @@ func assertNotClosed(t *testing.T, channel <-chan struct{}, name string) {
 	case <-channel:
 		t.Fatal(name)
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func awaitChangeSet(t *testing.T, channel <-chan session.ChangeSet, name string) session.ChangeSet {
+	t.Helper()
+	select {
+	case changes := <-channel:
+		return changes
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+		return session.ChangeSet{}
 	}
 }
 

@@ -127,6 +127,27 @@ func (s *Service) InvalidateSelection() {
 	s.transitionMu.Unlock()
 }
 
+// ReplaceSnapshot 用新的 Herdr 会话快照原子替换目标索引。
+//
+// reconnect 为 true 或当前选择因 occupant 变化失效时，会同时清空手工终端分页缓存。
+// 调用期间会阻止新输入并等待已开始的 Prompt 或 SendKey 完成。
+func (s *Service) ReplaceSnapshot(snapshot herdr.Snapshot, reconnect bool) session.ChangeSet {
+	if s == nil {
+		return session.ChangeSet{}
+	}
+	s.transitionMu.Lock()
+	s.beginInputBarrierLocked()
+	s.stateMu.Lock()
+	changes := s.registry.Replace(snapshot, reconnect)
+	if reconnect || changes.SelectionInvalidated {
+		s.resetPanelLocked()
+	}
+	s.stateMu.Unlock()
+	s.endInputBarrierLocked()
+	s.transitionMu.Unlock()
+	return changes
+}
+
 // HandleMessage 处理一条已完成企业微信协议校验的文本回调。
 func (s *Service) HandleMessage(ctx context.Context, message wecom.IncomingText) {
 	if s == nil || s.guard.Authorize(policy.Identity{UserID: message.UserID, ChatType: message.ChatType}) != nil {
@@ -235,7 +256,7 @@ func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, 
 	}
 	if !session.MatchesAgent(target, current) {
 		release()
-		s.InvalidateSelection()
+		s.invalidateExpected(target)
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
@@ -268,7 +289,7 @@ func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key
 	}
 	if !session.MatchesAgent(target, current) {
 		release()
-		s.InvalidateSelection()
+		s.invalidateExpected(target)
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
@@ -305,7 +326,7 @@ func (s *Service) handleContent(ctx context.Context, message wecom.IncomingText)
 		return
 	}
 	if result.PaneID != target.PaneID {
-		s.InvalidateSelection()
+		s.invalidateExpected(target)
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
@@ -336,7 +357,7 @@ func (s *Service) handlePageUp(ctx context.Context, message wecom.IncomingText) 
 		return
 	}
 	if result.PaneID != target.PaneID {
-		s.InvalidateSelection()
+		s.invalidateExpected(target)
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
@@ -383,6 +404,24 @@ func (s *Service) selectedTarget() (session.Target, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.registry.ValidateSelected()
+}
+
+// invalidateExpected 仅在旧请求的选择仍是当前选择时才清理状态。不能以分页 generation
+// 判断，因为翻页不代表 Agent occupant 已替换。
+func (s *Service) invalidateExpected(expected session.Target) bool {
+	s.transitionMu.Lock()
+	s.beginInputBarrierLocked()
+	s.stateMu.Lock()
+	current, err := s.registry.ValidateSelected()
+	invalidated := err == nil && sameTarget(current, expected)
+	if invalidated {
+		s.registry.ClearSelection()
+		s.resetPanelLocked()
+	}
+	s.stateMu.Unlock()
+	s.endInputBarrierLocked()
+	s.transitionMu.Unlock()
+	return invalidated
 }
 
 func (s *Service) captureContentTarget() (session.Target, uint64, error) {
