@@ -69,6 +69,10 @@ type Service struct {
 	panelReady bool
 	page       int
 	generation uint64
+
+	// 仅供同包并发回归测试在关键临界区建立确定性同步点；nil 时没有运行时行为。
+	beforeInvalidateStateChange func()
+	beforePageDownReply         func()
 }
 
 // NewService 创建入站命令服务并校验全部依赖。
@@ -113,6 +117,9 @@ func (s *Service) InvalidateSelection() {
 	s.transitionMu.Lock()
 	s.beginInputBarrierLocked()
 	s.stateMu.Lock()
+	if s.beforeInvalidateStateChange != nil {
+		s.beforeInvalidateStateChange()
+	}
 	s.registry.ClearSelection()
 	s.resetPanelLocked()
 	s.stateMu.Unlock()
@@ -344,6 +351,9 @@ func (s *Service) handlePageUp(ctx context.Context, message wecom.IncomingText) 
 func (s *Service) handlePageDown(ctx context.Context, message wecom.IncomingText) {
 	s.stateMu.Lock()
 	target, err := s.registry.ValidateSelected()
+	if err == nil && s.beforePageDownReply != nil {
+		s.beforePageDownReply()
+	}
 	if err == nil && !s.panelReady {
 		err = panel.ErrPanelChanged
 	}

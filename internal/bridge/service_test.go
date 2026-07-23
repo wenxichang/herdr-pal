@@ -259,6 +259,39 @@ func TestServiceBlockedReadCannotRestoreOldPanelAfterSelectionChanges(t *testing
 	}
 }
 
+func TestServiceBlockedReadCannotRestoreOldPanelAfterInvalidation(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: "OLD-INVALIDATED-CONTENT"}
+	fake.blockRead = make(chan struct{})
+	fake.readStarted = make(chan struct{}, 1)
+	readDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("invalidate-read", "/con"))
+		close(readDone)
+	}()
+	awaitSignal(t, fake.readStarted, "ReadRecent")
+	hookEntered, releaseHook := make(chan struct{}, 1), make(chan struct{})
+	service.beforeInvalidateStateChange = func() {
+		signal(hookEntered)
+		<-releaseHook
+	}
+	invalidated := make(chan struct{})
+	go func() { service.InvalidateSelection(); close(invalidated) }()
+	awaitSignal(t, hookEntered, "InvalidateSelection hook")
+	close(releaseHook)
+	awaitSignal(t, invalidated, "InvalidateSelection")
+	close(fake.blockRead)
+	awaitSignal(t, readDone, "old /con")
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-INVALIDATED-CONTENT") || strings.Contains(reply, "终端近期快照") {
+		t.Fatalf("old read was applied after invalidation: %q", reply)
+	}
+	service.HandleMessage(context.Background(), incoming("invalidate-read-pagedown", "/pagedn"))
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-INVALIDATED-CONTENT") || strings.Contains(reply, "终端近期快照") {
+		t.Fatalf("old panel leaked after invalidation: %q", reply)
+	}
+}
+
 func TestServiceContentNormalizesTerminalControls(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
@@ -435,16 +468,50 @@ func TestServiceSetNilWaitsForHerdrOperationAndThenBlocksNewOperations(t *testin
 func TestServiceConcurrentInvalidationsDoNotLetInputThrough(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
-	service.InvalidateSelection()
-	selectTarget(t, service)
-	service.stateMu.Lock()
-	secondDone := make(chan struct{})
-	go func() { service.InvalidateSelection(); close(secondDone) }()
+	fake.blockPrompt = make(chan struct{})
+	fake.promptStarted = make(chan struct{}, 1)
+	promptInFlight := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("multi-invalidate-in-flight", "prompt"))
+		close(promptInFlight)
+	}()
+	awaitSignal(t, fake.promptStarted, "in-flight Prompt")
+	firstHook, secondHook := make(chan struct{}, 1), make(chan struct{}, 1)
+	releaseFirst, releaseSecond := make(chan struct{}), make(chan struct{})
+	var hookMu sync.Mutex
+	hookCount := 0
+	service.beforeInvalidateStateChange = func() {
+		hookMu.Lock()
+		hookCount++
+		count := hookCount
+		hookMu.Unlock()
+		if count == 1 {
+			signal(firstHook)
+			<-releaseFirst
+			return
+		}
+		signal(secondHook)
+		<-releaseSecond
+	}
+	firstDone, secondDone := make(chan struct{}), make(chan struct{})
+	go func() { service.InvalidateSelection(); close(firstDone) }()
 	waitForCondition(t, func() bool {
 		service.opMu.Lock()
 		defer service.opMu.Unlock()
 		return service.inputBlocked > 0
-	}, "second invalidation input barrier")
+	}, "first invalidation input barrier")
+	go func() { service.InvalidateSelection(); close(secondDone) }()
+	assertNotClosed(t, firstDone, "first InvalidateSelection returned before Prompt")
+	close(fake.blockPrompt)
+	awaitSignal(t, promptInFlight, "in-flight prompt")
+	awaitSignal(t, firstHook, "first invalidation hook")
+	close(releaseFirst)
+	awaitSignal(t, firstDone, "first InvalidateSelection")
+	awaitSignal(t, secondHook, "second invalidation hook")
+	service.registry.CreateListSnapshot()
+	if _, err := service.registry.Select(1); err != nil {
+		t.Fatalf("failed to reconstruct test selection: %v", err)
+	}
 	before := fake.callCount()
 	promptDone, keyDone := make(chan struct{}), make(chan struct{})
 	go func() {
@@ -458,13 +525,12 @@ func TestServiceConcurrentInvalidationsDoNotLetInputThrough(t *testing.T) {
 	awaitSignal(t, promptDone, "blocked prompt")
 	awaitSignal(t, keyDone, "blocked key")
 	if fake.callCount() != before {
-		t.Fatalf("input passed through active invalidation: %#v", fake)
+		t.Fatalf("input passed through pending second invalidation: %#v", fake)
 	}
-	service.stateMu.Unlock()
+	close(releaseSecond)
 	awaitSignal(t, secondDone, "second InvalidateSelection")
-	service.HandleMessage(context.Background(), incoming("multi-invalidate-after", "prompt"))
-	if fake.callCount() != before {
-		t.Fatalf("input passed after invalidation completed: %#v", fake)
+	if _, err := service.registry.ValidateSelected(); err == nil {
+		t.Fatal("second invalidation did not clear the reconstructed selection")
 	}
 }
 
@@ -532,25 +598,27 @@ func TestServiceConcurrentSelectAndPageDownNeverMixTargetAndPanel(t *testing.T) 
 	service.HandleMessage(context.Background(), incoming("mix-pageup", "/pageup"))
 	im := fakeIMFromService(t, service)
 	beforeReplies := im.replyCount()
-	service.stateMu.Lock()
-	start := make(chan struct{})
+	hookEntered, releaseHook := make(chan struct{}, 1), make(chan struct{})
+	service.beforePageDownReply = func() {
+		signal(hookEntered)
+		<-releaseHook
+	}
 	pageDone, selectDone := make(chan struct{}), make(chan struct{})
 	go func() {
-		<-start
 		service.HandleMessage(context.Background(), incoming("mix-pagedown", "/pagedn"))
 		close(pageDone)
 	}()
+	awaitSignal(t, hookEntered, "/pagedn hook")
 	go func() {
-		<-start
 		service.HandleMessage(context.Background(), incoming("mix-select-two", "/sel 2"))
 		close(selectDone)
 	}()
-	close(start)
-	service.stateMu.Unlock()
+	assertNotClosed(t, selectDone, "/sel completed before /pagedn released state")
+	close(releaseHook)
 	awaitSignal(t, pageDone, "/pagedn")
 	awaitSignal(t, selectDone, "/sel")
 	for _, reply := range im.repliesFrom(beforeReplies) {
-		if strings.Contains(reply, "line-000") && strings.Contains(reply, "Claude（pane-2）") {
+		if strings.Contains(reply, "line-100") && strings.Contains(reply, "Claude（pane-2）") {
 			t.Fatalf("new target title was combined with old panel: %q", reply)
 		}
 	}
