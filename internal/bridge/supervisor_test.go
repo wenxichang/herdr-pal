@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"reflect"
 	"runtime"
 	"strings"
@@ -102,6 +103,10 @@ func TestSupervisorLifecycleEventsDebounceSnapshotAndRebuildStatusStream(t *test
 	client.lifecycleStreams = []*supervisorStream{lifecycle}
 	client.statusStreams = []*supervisorStream{oldStatus, newStatus}
 	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	observed := make(chan supervisorMessage, 32)
+	harness.supervisor.messageObserved = func(message supervisorMessage) {
+		observed <- message
+	}
 
 	cancel, result := runSupervisor(t, harness.supervisor)
 	defer cancelAndAwaitSupervisor(t, cancel, result)
@@ -129,8 +134,22 @@ func TestSupervisorLifecycleEventsDebounceSnapshotAndRebuildStatusStream(t *test
 		t.Fatalf("重建 status specs = %#v，期望 %#v", rebuilt, want)
 	}
 	awaitSupervisorCondition(t, "关闭旧 status stream", func() bool { return oldStatus.CloseCount() == 1 })
+	if err := awaitSupervisorRecvEnded(t, oldStatus); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("旧 status Recv() 结束错误 = %v", err)
+	}
+	awaitSupervisorObservedMessage(t, observed, func(message supervisorMessage) bool {
+		return message.kind == supervisorStreamStatus && message.generation == 1 && message.err != nil
+	})
+	newStatus.Emit(supervisorStatusEvent("pane-2", "workspace-1", "claude", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "新 status stream 事件", func() bool {
+		targets := harness.registry.CreateListSnapshot()
+		return len(harness.im.Messages()) == 1 && len(targets) == 2 && targets[1].Status == herdr.AgentStatusWorking
+	})
 	if got := harness.factory.ConnectCount(); got != 1 {
 		t.Fatalf("主动关闭旧 status stream 被误判为断线，Connect 次数 = %d", got)
+	}
+	if got := harness.backoff.NextCount(); got != 0 || len(harness.waiter.requests) != 0 {
+		t.Fatalf("旧 generation 错误触发重连：backoff=%d waits=%d", got, len(harness.waiter.requests))
 	}
 	if got := client.SnapshotCount(); got != 2 {
 		t.Fatalf("合并后的 snapshot 次数 = %d，期望 2（初始加一次 debounce）", got)
@@ -303,27 +322,45 @@ func TestSupervisorCurrentStreamEndDegradesAndReconnectsFromFreshBaseline(t *tes
 }
 
 func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
-	client := newSupervisorClient()
-	client.checkErr = herdr.ErrProtocolMismatch
-	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	first := newSupervisorClient()
+	first.checkErr = herdr.ErrProtocolMismatch
+	second := newSupervisorClient()
+	second.checkErr = herdr.ErrProtocolMismatch
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	compatible := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
+	compatible.lifecycleStreams = []*supervisorStream{lifecycle}
+	compatible.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{first, second, compatible})
 
 	cancel, result := runSupervisor(t, harness.supervisor)
-	wait := awaitSupervisorWait(t, harness.waiter)
-	if wait.delay != 30*time.Second {
-		t.Fatalf("协议不匹配探测间隔 = %v，期望 30s", wait.delay)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	firstWait := awaitSupervisorWait(t, harness.waiter)
+	if firstWait.delay != 30*time.Second {
+		t.Fatalf("首次协议不匹配探测间隔 = %v，期望 30s", firstWait.delay)
 	}
-	if client.SnapshotCount() != 0 || client.SubscribeCount() != 0 {
-		t.Fatalf("协议不匹配后仍调用业务 API：snapshot=%d subscribe=%d", client.SnapshotCount(), client.SubscribeCount())
+	if first.SnapshotCount() != 0 || first.SubscribeCount() != 0 {
+		t.Fatalf("首次协议不匹配后仍调用业务 API：snapshot=%d subscribe=%d", first.SnapshotCount(), first.SubscribeCount())
 	}
 	if serviceAvailable(harness.service) {
 		t.Fatal("协议不匹配时 Service 允许输入")
 	}
+	firstWait.Release()
+	secondWait := awaitSupervisorWait(t, harness.waiter)
+	if secondWait.delay != 30*time.Second {
+		t.Fatalf("第二次协议不匹配探测间隔 = %v，期望 30s", secondWait.delay)
+	}
+	if second.SnapshotCount() != 0 || second.SubscribeCount() != 0 || harness.factory.ConnectCount() != 2 {
+		t.Fatalf("第二次慢探测越过兼容检查：snapshot=%d subscribe=%d connect=%d", second.SnapshotCount(), second.SubscribeCount(), harness.factory.ConnectCount())
+	}
 	if harness.backoff.NextCount() != 0 {
 		t.Fatalf("协议不匹配使用了普通退避：Next=%d", harness.backoff.NextCount())
 	}
-	cancel()
-	if err := awaitSupervisorResult(t, result); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	secondWait.Release()
+	awaitSupervisorSubscribe(t, compatible)
+	awaitSupervisorSubscribe(t, compatible)
+	if !serviceAvailable(harness.service) || compatible.SnapshotCount() != 1 || compatible.SubscribeCount() != 2 {
+		t.Fatalf("协议恢复后未建立健康周期：available=%v snapshot=%d subscribe=%d", serviceAvailable(harness.service), compatible.SnapshotCount(), compatible.SubscribeCount())
 	}
 }
 
@@ -469,6 +506,40 @@ func TestDefaultSupervisorRetryGrowsCapsAndResets(t *testing.T) {
 	retry.Reset()
 	if got := retry.Next(); got != time.Second {
 		t.Fatalf("Reset 后退避 = %v", got)
+	}
+}
+
+func TestDefaultSupervisorRetryClampsJitterToConfiguredBounds(t *testing.T) {
+	tests := []struct {
+		name   string
+		random float64
+		want   time.Duration
+	}{
+		{name: "zero", random: 0, want: time.Second},
+		{name: "one", random: 1, want: 1200 * time.Millisecond},
+		{name: "negative", random: -1, want: time.Second},
+		{name: "above one", random: 2, want: 1200 * time.Millisecond},
+		{name: "nan", random: math.NaN(), want: 1200 * time.Millisecond},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			retry := newDefaultSupervisorRetry(time.Second, 30*time.Second, func() float64 { return test.random })
+			if got := retry.Next(); got != test.want {
+				t.Fatalf("首次退避 = %v，期望 %v", got, test.want)
+			}
+		})
+	}
+	configured := newDefaultSupervisorRetry(2*time.Second, 5*time.Second, func() float64 { return 0 })
+	if got := configured.Next(); got != 2*time.Second {
+		t.Fatalf("自定义 minimum 未生效：%v", got)
+	}
+
+	retry := newDefaultSupervisorRetry(time.Second, 30*time.Second, func() float64 { return 1 })
+	for attempt := 0; attempt < 20; attempt++ {
+		delay := retry.Next()
+		if delay < time.Second || delay > 30*time.Second {
+			t.Fatalf("第 %d 次退避越界：%v", attempt+1, delay)
+		}
 	}
 }
 
@@ -807,16 +878,25 @@ type supervisorStreamItem struct {
 type supervisorStream struct {
 	items     chan supervisorStreamItem
 	closed    chan struct{}
+	recvEnded chan error
 	closeOnce sync.Once
 	mu        sync.Mutex
 	closes    int
 }
 
 func newSupervisorStream() *supervisorStream {
-	return &supervisorStream{items: make(chan supervisorStreamItem, 32), closed: make(chan struct{})}
+	return &supervisorStream{items: make(chan supervisorStreamItem, 32), closed: make(chan struct{}), recvEnded: make(chan error, 8)}
 }
 
-func (s *supervisorStream) Recv(ctx context.Context) (herdr.Event, error) {
+func (s *supervisorStream) Recv(ctx context.Context) (event herdr.Event, err error) {
+	defer func() {
+		if err != nil {
+			select {
+			case s.recvEnded <- err:
+			default:
+			}
+		}
+	}()
 	select {
 	case <-ctx.Done():
 		return herdr.Event{}, ctx.Err()
@@ -824,6 +904,32 @@ func (s *supervisorStream) Recv(ctx context.Context) (herdr.Event, error) {
 		return herdr.Event{}, io.ErrClosedPipe
 	case item := <-s.items:
 		return item.event, item.err
+	}
+}
+
+func awaitSupervisorRecvEnded(t *testing.T, stream *supervisorStream) error {
+	t.Helper()
+	select {
+	case err := <-stream.recvEnded:
+		return err
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 SubscriptionStream.Recv 结束超时")
+		return nil
+	}
+}
+
+func awaitSupervisorObservedMessage(t *testing.T, observed <-chan supervisorMessage, match func(supervisorMessage) bool) supervisorMessage {
+	t.Helper()
+	for {
+		select {
+		case message := <-observed:
+			if match(message) {
+				return message
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("等待 Supervisor 主循环观察消息超时")
+			return supervisorMessage{}
+		}
 	}
 }
 

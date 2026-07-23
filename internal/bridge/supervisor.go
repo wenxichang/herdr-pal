@@ -74,6 +74,9 @@ type Supervisor struct {
 	wait                  SupervisorWaitFunc
 	debounceDelay         time.Duration
 	protocolProbeInterval time.Duration
+
+	// 仅供同包测试观察主循环已取出的消息；nil 时没有运行时行为。
+	messageObserved func(supervisorMessage)
 }
 
 // NewSupervisor 创建 Herdr 状态监督器并补全默认重连策略。
@@ -199,6 +202,9 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 		case <-ctx.Done():
 			return ctx.Err()
 		case message := <-messages:
+			if s.messageObserved != nil {
+				s.messageObserved(message)
+			}
 			switch message.kind {
 			case supervisorStreamLifecycle:
 				if message.err != nil {
@@ -395,6 +401,9 @@ func (r *defaultSupervisorRetry) Next() time.Duration {
 		random = 1
 	}
 	delay := time.Duration(float64(base) * (0.8 + random*0.4))
+	if delay < r.min {
+		return r.min
+	}
 	if delay > r.max {
 		return r.max
 	}
