@@ -3,7 +3,7 @@
 ## 1. 文档状态
 
 - 日期：2026-07-23
-- 状态：已确认并批准进入实现计划
+- 状态：第一版已实现并通过 fake 端到端验收；真实 protocol 17 联调待升级本机 Herdr
 - Herdr 审计基线：`2a20e90`，协议版本 `17`
 - 目标企业微信能力：智能机器人 API 模式长连接
 - 实现语言：Go
@@ -447,6 +447,11 @@ pane 创建、关闭、退出、Agent detected 或 occupant 变化时重新计�
 第一版生命周期订阅至少包含 `pane.created`、`pane.closed`、`pane.exited`、
 `pane.agent_detected` 和 `pane.updated`。
 
+两类订阅的事件起点不同：专用 `pane.agent_status_changed` 从创建时记录的
+`current_sequence` 开始，只接收后续状态；通用 lifecycle 订阅才会读取 EventHub 当前
+保留队列中的事件。实现不能把状态订阅描述成从 sequence 0 重放，也不能用 lifecycle
+保留事件代替订阅后的权威 `session.snapshot`。
+
 ## 11. 错误处理
 
 内部错误至少分为：
@@ -616,6 +621,11 @@ testdata/
 10. Herdr 或企业微信断线后能自动重连且不会重放旧动作。
 11. 未授权用户、重复消息和失效目标不会产生终端输入。
 
+截至 2026-07-24，上述行为已经由本地 fake Herdr protocol 17 与 fake 企业微信
+WebSocket 的端到端测试覆盖。当前开发机 Herdr 0.7.1 的运行协议为 14，可选真实集成
+测试会明确 `Skip`；第 3 条中的真实双连接联调仍需升级到 protocol 17 后确认，不能用
+fake 验收替代该事实。
+
 ## 17. 后续演进方向
 
 后续版本可以独立评估：
@@ -628,3 +638,32 @@ testdata/
 - `launchd` 或其他常驻服务安装方式。
 - 官方 Go SDK 出现后的兼容层替换。
 - 根据实际使用结果优化不同 Agent 的 TUI 清理规则。
+
+## 18. 实现复核记录
+
+第一版实现目录与本文模块边界一致，并补充了：
+
+- `internal/app`：配置、进程锁、依赖装配、三个运行循环和 10 秒优雅退出。
+- `internal/testkit`：公开 protocol 17 fake Herdr 与 httptest WebSocket fake 企业微信。
+- `internal/integration`：通过真实 `app.Run` 启动的端到端测试。
+
+端到端覆盖以下场景：
+
+1. 启动后的 protocol gate、双 snapshot、lifecycle/status 订阅和企业微信订阅。
+2. `/ls`、`/sel 1` 和普通 prompt。
+3. `/key enter` 与 `/space`。
+4. `/con` 读取 100 行、`/pageup` 读取 200 行、`/pagedn` 零 Herdr 读取。
+5. `blocked` 与 `done` 每次只读最近 100 行。
+6. 重复 `msgid` 不重复 prompt 或按键。
+7. 未授权用户和群聊零 Herdr 输入。
+8. 同 pane occupant 替换使旧选择失效。
+9. Herdr 断线期间暂停输入，重连后必须重新 `/ls`、`/sel`。
+10. 企业微信断线重连后不重放已经确认的旧消息或通知。
+
+集成测试暴露并修复了一个真实内容分段缺口：原 `SplitMarkdown` 会把本来已经小于
+企业微信限制、但正文包含换行的最后一行单独拆段。当前只在正文确实超过分段边界时
+才优先寻找换行，避免产生无意义的额外主动消息。
+
+应用内部保留一个不进入 CLI 或 JSON Schema 的 `app.Options.WeComEndpoint` 注入点，
+用于兼容端点和本地集成测试。空值始终使用官方 `wecom.DefaultEndpoint`，生产配置方式
+没有变化。

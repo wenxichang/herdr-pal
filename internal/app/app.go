@@ -58,6 +58,8 @@ type Options struct {
 	Stdout io.Writer
 	// Stderr 接收结构化运行日志；nil 时使用 os.Stderr。
 	Stderr io.Writer
+	// WeComEndpoint 覆盖企业微信长连接地址；空值使用官方端点。该入口用于兼容端点和集成测试，CLI 与配置文件不暴露它。
+	WeComEndpoint string
 
 	dependencies *appDependencies
 }
@@ -159,6 +161,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
+	loaded.WeCom.Endpoint = strings.TrimSpace(options.WeComEndpoint)
 	logger, err := newLogger(stderr, loaded.Log.Level)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
@@ -247,8 +250,12 @@ func assembleRuntime(loaded config.Config, socketPath string, _ *slog.Logger, de
 	if client == nil {
 		return nil, errors.New("Herdr Client 无效")
 	}
+	endpoint := loaded.WeCom.Endpoint
+	if endpoint == "" {
+		endpoint = wecom.DefaultEndpoint
+	}
 	im, err := dependencies.newWeCom(wecom.ClientConfig{
-		Endpoint:      wecom.DefaultEndpoint,
+		Endpoint:      endpoint,
 		BotID:         loaded.WeCom.BotID,
 		Secret:        loaded.WeCom.Secret,
 		AllowedUserID: loaded.WeCom.AllowedUserID,

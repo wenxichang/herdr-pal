@@ -157,6 +157,21 @@ func TestAssembleRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testing.T) {
 	}
 }
 
+func TestAssembleRuntimeUsesOfficialWeComEndpointByDefault(t *testing.T) {
+	dependencies := defaultAssemblyDependencies()
+	dependencies.newHerdr = func(string) bridge.ManagedHerdr { return newFakeManagedHerdr() }
+	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (weComRuntime, error) {
+		if clientConfig.Endpoint != wecom.DefaultEndpoint {
+			t.Fatalf("WeCom endpoint = %q, want %q", clientConfig.Endpoint, wecom.DefaultEndpoint)
+		}
+		return newFakeWeCom(), nil
+	}
+
+	if _, err := assembleRuntime(testConfig(), "/tmp/shared.sock", slog.New(slog.NewTextHandler(io.Discard, nil)), dependencies); err != nil {
+		t.Fatalf("assembleRuntime() error = %v", err)
+	}
+}
+
 func TestRunStartsAllLoopsAndConsumesMessages(t *testing.T) {
 	im := newFakeWeCom()
 	supervisor := newFakeRunner()

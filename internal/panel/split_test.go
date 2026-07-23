@@ -138,6 +138,20 @@ func TestSplitMarkdownUsesActualOneDigitPartCountAtExactLimit(t *testing.T) {
 	}
 }
 
+func TestSplitMarkdownDoesNotSplitContentThatAlreadyFits(t *testing.T) {
+	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{
+		"line-001",
+		"line-002",
+	})
+	parts := SplitMarkdown(content, WeComContentLimit)
+	if len(parts) != 1 {
+		t.Fatalf("SplitMarkdown() part count = %d, want 1 for %d-byte content", len(parts), len(content))
+	}
+	if body := joinRenderedBodies(t, parts); body != "line-001\nline-002" {
+		t.Fatalf("joined body = %q", body)
+	}
+}
+
 func TestSplitMarkdownRecalculatesBudgetWhenPartCountReachesTen(t *testing.T) {
 	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{strings.Repeat("aaa\n", 10)})
 	header, body, ok := renderedPageParts(content)

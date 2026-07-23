@@ -24,6 +24,8 @@ type WeComConfig struct {
 	BotID         string `json:"bot_id"`
 	AllowedUserID string `json:"allowed_user_id"`
 	Secret        string `json:"-"`
+	// Endpoint 只由应用装配层注入，不属于配置文件字段。
+	Endpoint string `json:"-"`
 }
 
 // HerdrConfig 是 Herdr 本地 Socket 连接配置。

@@ -1,202 +1,153 @@
 # Herdr Pal 交接上下文
 
-## 1. 用户目标
+## 1. 当前状态
 
-用户希望把 Herdr 与传统 IM 软件结合，实现：
+Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与自己的企业微信智能机器人
+单聊连接起来。程序手工启动，使用 `CGO_ENABLED=0` 构建为 `dist/herdr-pal` 单文件，
+运行状态只保存在内存中。
 
-1. Agent 状态变化通知到 IM。
-2. 在 IM 中查看 Agent 的阶段性输出。
-3. 从 IM 向 Agent 发送输入。
-4. 在可控和安全的前提下处理 Agent 的 blocked 交互。
+当前实现包括：
 
-Herdr 是一个类似 tmux、针对 AI Agent 优化的终端管理工具。目标不是替代 Herdr，
-而是在 Herdr 之外增加一个常驻 bridge。
+- 企业微信智能机器人 API 模式 WebSocket 长连接、订阅、心跳、`req_id` 响应关联和重连。
+- Herdr 公共 Unix Socket NDJSON 客户端、精确 protocol 17 门禁、快照和两类事件订阅。
+- 全部 Agent pane 的动态索引、occupant 身份校验和重连后最新状态接管。
+- 单聊命令、100 行分页、普通 prompt、受限按键和 `msgid` 幂等。
+- 状态通知异步队列、失败重试、合并、去重和 pane 失效通知。
+- 本机进程锁、结构化安全日志、SIGINT/SIGTERM 和 10 秒优雅退出。
+- fake Herdr、fake 企业微信和十个核心端到端场景。
 
-## 2. 已完成的判断过程
+## 2. 固定产品决策
 
-### 2.1 Plugin 路线
+- IM 平台：企业微信智能机器人长连接。
+- 用户范围：一个配置指定的企业微信帐号，只支持单聊。
+- 技术栈：Go 1.26，单文件分发。
+- 运行方式：手工启动和停止，不安装常驻服务。
+- Herdr 集成：只使用公共 Local Socket API、公共 CLI 和审计过的 JSON 模型。
+- 协议：只接受精确 protocol 17，不能按“17 或更高”处理。
+- 状态恢复：进程重启和 Herdr 重连后以最新 `session.snapshot` 接管，不恢复旧选择或分页。
+- 输出：只称为终端近期快照，不承诺完整对话、结构化 assistant 消息或 LLM transcript。
+- 审批：不自动批准权限请求；只有用户明确输入白名单按键命令时才发送按键。
 
-Herdr plugin 可以接收事件 hook，并通过 `HERDR_PLUGIN_EVENT_JSON` 获得事件内容。
-但是 plugin startup hook 是一次性初始化命令，不是受 Herdr 监管的常驻 daemon。
-
-结论：plugin 可用于简单的单向通知或安装辅助，但不适合承担长期 IM 连接、双向路由、
-断线恢复和持久化。
-
-### 2.2 MCP 路线
-
-Herdr 当前不是 MCP Server，但它已经有完整的本地 Socket API。可以额外适配 MCP，
-但传统 IM 平台通常不是 MCP Client，MCP 也不能替代 IM webhook、bot SDK 和通知路由。
-
-用户明确决定：本项目不走 MCP 路线。
-
-### 2.3 本地 API 路线
-
-源码审计确认本地 API 已经覆盖：
-
-- `session.snapshot` 初始化。
-- Agent 和 pane 查询。
-- Agent 状态长连接订阅。
-- pane 生命周期事件。
-- Agent/pane 终端快照读取。
-- Agent prompt、按键和原始 pane 输入。
-- 状态等待和输出文本匹配。
-
-结论：第一版 Herdr Pal 不需要修改 Herdr。
-
-## 3. 当前正式决策
-
-- 新工程目录为 `/Users/wxc/Code/herdr-pal`。
-- Herdr 源码目录为 `/Users/wxc/Code/herdr`。
-- Herdr Pal 是独立进程，不在 Herdr 仓库内开发。
-- Herdr Pal 使用 Herdr 公共本地 Socket API。
-- 不使用 MCP 作为 Herdr 集成层。
-- 不使用 plugin startup hook 承载常驻 bridge。
-- 第一版采用“状态事件触发输出快照读取”。
-- 第一版使用 `agent.prompt` 处理普通 IM 文本。
-- 第一版只对显式动作使用 `agent.send_keys`。
-- 第一版不自动批准权限请求。
-- 当前只创建文档，不初始化代码、依赖、Git、build 脚本或测试脚本。
-- IM 平台和技术栈尚未决定。
-
-## 4. 关键技术事实
-
-### 4.1 状态事件可用
-
-`events.subscribe` 可以长连接推送 `pane.agent_status_changed`。状态包括
-`working`、`blocked`、`idle`、`done`、`unknown`。
-
-限制：状态订阅必须指定 pane，没有全局通配符。状态相同但展示元数据变化时也可能
-收到事件。
-
-### 4.2 输入通路可用
-
-`agent.prompt` 会验证当前 Agent occupant、处理 bracketed paste 并追加 Enter，适合
-普通 IM 消息。
-
-`agent.send_keys` 适合交互 UI。`pane.send_input` 等原始接口不验证 Agent occupant，
-不应作为普通消息的默认通路。
-
-### 4.3 输出只能读取终端快照
-
-`agent.read` 和 `pane.read` 可以读取 visible、recent、recent_unwrapped、detection。
-这不是结构化 LLM output，内容可能混合 prompt、回复、工具日志、spinner 和 TUI。
-
-全屏 Agent 的 alternate-screen 历史可能丢失。
-
-### 4.4 没有实时增量输出
-
-当前没有可订阅的通用 `pane.output_changed` 流，也没有公开原始 PTY 字节。
-`PaneReadResult.revision` 当前固定为 0，bridge 必须自行差分和去重。
-
-### 4.5 事件不能断点续传
-
-Herdr EventHub 只保留有限内存事件，并且不公开事件 cursor。重连后必须重新获取
-`session.snapshot`，重建订阅并处理重复通知。
-
-## 5. 推荐 MVP 行为
+## 3. 已实现命令
 
 ```text
-启动
-  → session.snapshot
-  → 找到当前 Agent pane
-  → 订阅 pane 生命周期
-  → 为 Agent pane 订阅状态
-
-working
-  → 更新 IM 状态
-
-blocked
-  → 读取 recent_unwrapped
-  → 发送阻塞通知和近期输出
-  → 展示安全的显式操作入口
-
-done / idle
-  → 读取 recent_unwrapped
-  → 和上次快照做差分
-  → 发送新增内容
-
-IM 普通回复
-  → 身份和绑定校验
-  → agent.prompt
-
-IM 控制按钮
-  → 风险校验
-  → agent.send_keys
+/ls
+/sel N
+/con
+/pageup
+/pagedn
+/keyup       /key up
+/keydn       /key down
+/enter       /key enter
+/esc         /key esc
+/space       /key space
+/key X
 ```
 
-## 6. 明确不承诺的能力
+`X` 只允许单个 ASCII 字母或数字。其他不以 `/` 开头的文本通过 `agent.prompt` 发送；
+未知 `/` 命令不会降级为 prompt。按键命令不二次确认。
 
-- LLM token streaming。
-- 完整原生对话 transcript。
-- 精确区分 user/assistant/tool message。
-- exactly-once 事件交付。
-- 自动处理所有 Agent 的权限 UI。
-- 在没有显式绑定时允许任意 IM 用户控制本机终端。
+分页固定 100 行一页。`/con` 读取最后 100 行并重置页码，`/pageup` 逐步扩大到最多
+1000 行，`/pagedn` 只访问缓存。`blocked`、`done` 和需要输出的 `idle` 主动通知每次也
+只读取最近 100 行，不读取全部新增内容。
 
-## 7. 尚未决定的问题
+## 4. Herdr API 关键事实
 
-开始代码设计前，应逐项确认：
+### 4.1 启动与重连
 
-1. 第一版 IM：企业微信、飞书、钉钉、Slack、Telegram 或其他平台。
-2. 运行时语言：Rust、Go、TypeScript/Node.js 或其他。
-3. IM 接入模式：公网 webhook、WebSocket/长连接、轮询或内网代理。
-4. 部署模式：用户登录进程、systemd/launchd、容器或手工运行。
-5. 绑定 UX：配置文件、IM 命令、Herdr pane 元数据或本地管理页。
-6. 是否需要多用户和角色权限。
-7. 是否需要 SQLite 等本地持久化。
-8. 输出通知采用新消息、更新同一消息还是 thread 回复。
+每个健康周期按以下顺序建立：
 
-## 8. 新会话建议起点
+1. `ping`，要求 protocol 精确等于 17。
+2. discovery `session.snapshot`。
+3. 建立通用 pane lifecycle 订阅。
+4. 为当前 Agent pane 建立批量 `pane.agent_status_changed` 订阅，每项显式包含 `pane_id`。
+5. 再读取权威 `session.snapshot`，消除 snapshot 与订阅确认之间的窗口。
+6. 若 pane/occupant 集合变化，重建状态订阅并再次 snapshot，直到计划稳定。
+7. 用基线替换 Registry，不发送历史状态通知，然后开放输入。
 
-在 `/Users/wxc/Code/herdr-pal` 启动新的开发会话后，建议先让 Agent 阅读：
+Herdr 断线时立即进入 degraded，暂停 prompt/按键、清空选择和分页；重连后必须重新
+`/ls`、`/sel`。
 
-```text
-请先阅读 README.md、AGENTS.md、docs/HANDOFF_CONTEXT.md、
-docs/HERDR_API_AUDIT.md 和 docs/BRIDGE_ARCHITECTURE.md。
-本项目不修改 ../herdr，通过 Herdr 本地 Socket API 实现 IM bridge。
-在写代码前，先和我确认第一版 IM 平台、技术栈和 MVP 范围。
+### 4.2 订阅的序列语义
+
+不要笼统写成“所有订阅都从 sequence 0 重放”：
+
+- 专用 `pane.agent_status_changed` 订阅在创建时取得 `current_sequence`，从该位置开始
+  接收新状态，不读取订阅前保留的状态事件。
+- 通用 lifecycle 订阅才会从 EventHub 当前保留队列的 sequence 0 读取，因此可能看到
+  保留的 `pane.created`、`pane.updated` 等事件。
+
+外部协议没有可持久化 cursor。重连仍必须依靠权威 snapshot 和业务幂等，而不是假定
+事件 exactly-once 或可断点续传。
+
+### 4.3 输出限制
+
+`agent.read(recent_unwrapped)` 返回终端快照，内容可能包含 prompt、Agent 回复、工具日志、
+spinner、状态栏、权限界面和 TUI 重绘。`PaneReadResult.revision` 在审计基线中固定为 0，
+没有可用的 `pane.output_changed` 公共流，也不能恢复已经丢失的 alternate-screen 历史。
+
+## 5. 企业微信关键事实
+
+- 连接官方 `wss://openws.work.weixin.qq.com`。
+- 使用 `aibot_subscribe`、`aibot_msg_callback`、`aibot_respond_msg`、
+  `aibot_send_msg`、`ping` 和 `disconnected_event` 必要子集。
+- 主动单聊发送的 `chatid` 是 `allowed_user_id`，`chat_type` 为 `1`。
+- 用户必须先给机器人发过消息，企业微信才允许主动推送；失败只在当前进程重试，不做
+  持久化补发。
+- Secret 只从 `HERDR_PAL_WECOM_SECRET` 读取，配置文件不接受 Secret 字段。
+- `internal/app.Options.WeComEndpoint` 只为兼容端点和本地集成测试注入；CLI 和 JSON
+  配置不暴露 endpoint，空值始终使用官方地址。
+
+## 6. 代码边界
+
+- `internal/herdr`：公共 NDJSON 请求、严格响应模型、订阅和 Socket 解析。
+- `internal/wecom`：WebSocket 协议、请求关联、心跳和重连。
+- `internal/session`：快照索引、列表编号、选择和 occupant 身份。
+- `internal/command`：纯命令解析。
+- `internal/panel`：终端规范化、100 行分页和 UTF-8 安全分段。
+- `internal/policy`：单用户单聊权限、按键白名单、幂等和审计模型。
+- `internal/bridge`：入站 Service、状态 Notifier 和 EventSupervisor。
+- `internal/app`：配置、进程锁、依赖装配、三个运行循环和退出协调。
+- `internal/testkit`：仅供测试使用的公开 protocol 17 fake，不包含 Herdr 私有实现。
+
+不要把 IM SDK、Herdr 协议、命令路由和输出提取合并成 god object。
+
+## 7. 验证状态
+
+常规验证：
+
+```sh
+./unittest.sh
+./build.sh
+go test ./internal/integration -run TestBridgeEndToEnd
 ```
 
-确定技术栈后，应再次从实际运行的 Herdr 二进制导出 Schema：
+端到端覆盖：启动订阅、`/ls`/`/sel`/prompt、Enter/Space、分页读取次数、blocked/done
+100 行、`msgid` 去重、未授权与群聊、occupant 替换、Herdr 断线重选、企业微信断线不重放。
 
-```bash
-herdr api schema --json
-herdr api snapshot
+可选真实 Herdr 测试：
+
+```sh
+HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
 ```
 
-不要仅根据本文手写所有协议类型；应根据 Schema 生成或校验客户端模型，并为关键
-兼容性行为保留 fixture 测试。
+该测试先运行 `herdr status server --json`，只有 protocol 17 才继续读取真实 snapshot；
+企业微信始终使用 fake，不需要外网或真实 Secret。
 
-## 9. 源码审计依据
+截至 2026-07-24，本机 `/opt/homebrew/bin/herdr` 为 0.7.1，运行服务 protocol 14，真实
+测试按设计 `Skip`。这不是成功的真实 Herdr 联调记录。
 
-Herdr 基线：
+## 8. 安全边界
 
-```text
-/Users/wxc/Code/herdr
-commit 2a20e90
-protocol 17
-audited 2026-07-23
-```
+- 不在 `/Users/wxc/Code/herdr` 中实现或修改 Herdr Pal。
+- 不使用 MCP、plugin startup hook、私有 TUI socket、`AppState` 或未公开 Rust 模块。
+- 不暴露原始 Herdr Socket 到网络。
+- 不记录完整 Secret、Cookie、prompt 或终端快照。
+- 未授权用户、群聊、未知 pane、失效 terminal/occupant 和 degraded 状态都不能产生输入。
+- 没有 `server.stop`、`pane.close`、`pane.send_text`、`pane.send_input` 或自动审批入口。
 
-重点文件：
+## 9. 后续工作
 
-- `src/api/schema.rs`
-- `src/api/schema/events.rs`
-- `src/api/schema/agents.rs`
-- `src/api/schema/panes.rs`
-- `src/api/schema/session.rs`
-- `src/api/server.rs`
-- `src/api/client.rs`
-- `src/api/subscriptions.rs`
-- `src/api/wait.rs`
-- `src/app/api.rs`
-- `src/app/api/agents.rs`
-- `src/app/api/panes.rs`
-- `src/app/api_helpers.rs`
-- `src/api/event_hub.rs`
-- `src/pane.rs`
-- `docs/next/website/src/content/docs/socket-api.mdx`
-- `docs/next/website/src/content/docs/agent-automation.mdx`
-- `docs/next/website/src/content/docs/plugins.mdx`
-
-详细结论见 `docs/HERDR_API_AUDIT.md`。
+首版范围完成后再独立评估：真实 protocol 17 联调、多用户/群聊、持久化恢复、模板卡片、
+更多安全按键、`launchd`、多媒体输入，以及官方 Go SDK 出现后的替换策略。任何需要
+实时结构化输出的需求都应先形成 Herdr 公共 API 提案，不能依赖私有内部状态。

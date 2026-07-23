@@ -619,7 +619,7 @@ func TestServicePanelChangedResetsSelectionAndCache(t *testing.T) {
 func TestServiceSplitsTerminalReplyAndStopsAfterIMFailure(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
-	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: strings.Repeat("中文终端内容\n", 9000)}
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: oversizedTerminalText()}
 	im := fakeIMFromService(t, service)
 	beforeReplies, beforePushes := im.deliveryCounts()
 	service.HandleMessage(context.Background(), incoming("split", "/con"))
@@ -647,7 +647,7 @@ func TestServiceSplitsTerminalReplyAndStopsAfterIMFailure(t *testing.T) {
 func TestServiceStopsAfterFirstPushFailure(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
-	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: strings.Repeat("终端行\n", 9000)}
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: oversizedTerminalText()}
 	im := fakeIMFromService(t, service)
 	im.sendErr = errors.New("network")
 	_, beforePushes := im.deliveryCounts()
@@ -946,6 +946,11 @@ func textLines(start, end int) string {
 		lines = append(lines, fmt.Sprintf("line-%03d", index))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func oversizedTerminalText() string {
+	line := strings.Repeat("中文终端内容", 120)
+	return strings.Repeat(line+"\n", panel.PageSize)
 }
 
 func namedLines(prefix string, start, end int) string {

@@ -107,8 +107,10 @@ func splitPlain(content string, limit int) []string {
 		if end == start {
 			return nil
 		}
-		if newline := strings.LastIndexByte(content[start:end], '\n'); newline >= 0 {
-			end = start + newline + 1
+		if end < len(content) {
+			if newline := strings.LastIndexByte(content[start:end], '\n'); newline >= 0 {
+				end = start + newline + 1
+			}
 		}
 		parts = append(parts, content[start:end])
 		start = end

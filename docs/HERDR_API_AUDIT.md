@@ -7,6 +7,7 @@
 - Herdr 源码目录：`/Users/wxc/Code/herdr`
 - 基线提交：`2a20e90 fix: preserve physical escape on windows`
 - 审计日期：`2026-07-23`
+- Herdr Pal 实现复核：`2026-07-24`
 - 本文中的源码路径均相对于 Herdr 仓库根目录。
 
 结论只覆盖该基线源码。运行时应通过 `herdr api schema --json` 检查已安装二进制
@@ -195,8 +196,13 @@ Herdr 提供本地 Socket API：
 ### 5.4 事件恢复限制
 
 `EventHub` 只在内存中保留最近 512 个事件，内部 sequence 没有暴露给外部客户端。
-通用事件订阅内部从 sequence 0 开始读取当前保留队列，因此客户端不应假设连接后
-只会看到严格意义上的“新事件”。
+不同订阅实现的起点不能混为一谈：
+
+- 专用 `pane.agent_status_changed` 订阅在创建时记录 EventHub 的 `current_sequence`，从
+  该位置开始接收后续状态事件；它不会从 sequence 0 重放订阅前保留的状态事件。
+- 通用 pane lifecycle 订阅内部从 sequence 0 读取当前保留队列，因此连接建立后可能
+  先看到保留的 `pane.created`、`pane.updated` 等事件，不能假定全部都是严格意义上的
+  “连接后新事件”。
 
 断线恢复必须：
 
@@ -410,3 +416,36 @@ IM 显式控制按钮
 - exactly-once 事件交付。
 
 这些限制应由产品文案、输出提取策略和重连逻辑明确处理，而不是在第一版中隐式承诺。
+
+## 9. Herdr Pal 当前实现与验证
+
+Herdr Pal 客户端固定 `RequiredProtocol = 17`，每次启动和重连都先调用 `ping` 做精确
+协议门禁。只有门禁通过后才会读取 discovery snapshot、建立 lifecycle/status 订阅并
+读取订阅后的权威 snapshot；pane/occupant 集合不稳定时继续重建状态订阅和 snapshot，
+直到订阅计划与快照一致。
+
+当前实现不依赖事件重放恢复状态：
+
+1. 通用 lifecycle 保留事件只作为触发重新 snapshot 的信号。
+2. 专用状态订阅只消费创建后的状态事件。
+3. 启动和重连的通知基线来自订阅后的权威 snapshot，不发送历史状态通知。
+4. 外部没有 cursor，重复 lifecycle、重复状态展示和重复企业微信回调分别由 snapshot
+   收敛、状态迁移去重和 `msgid` 幂等处理。
+
+测试目录中的 fake Herdr Server 只实现本文列出的公开 NDJSON protocol 17 子集：
+`ping`、`session.snapshot`、`agent.get`、`agent.read`、`agent.prompt`、
+`agent.send_keys`、`events.subscribe`、事件注入和订阅断线。它不导入、复制或模拟 Herdr
+私有 `AppState`、PTY 或 Rust 模块。
+
+可选真实测试命令：
+
+```sh
+HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
+```
+
+测试先执行公共 CLI `herdr status server --json`。只有运行中服务精确返回 protocol 17
+才继续调用真实 `ping` 和 `session.snapshot`；企业微信侧始终使用本地 fake。
+
+截至 2026-07-24，当前开发机安装的 Herdr 0.7.1 返回 protocol 14，因此该测试明确
+`Skip`。这只说明本机二进制尚未达到审计协议，不代表 protocol 17 fake 测试失败，也
+不能表述为真实 Herdr 联调成功。
