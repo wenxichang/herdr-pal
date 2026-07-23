@@ -3,8 +3,10 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ const (
 	defaultProtocolProbeInterval   = 30 * time.Second
 	defaultSupervisorBackoffMin    = time.Second
 	defaultSupervisorBackoffMax    = 30 * time.Second
+	defaultSupervisorStableWindow  = 30 * time.Second
 	supervisorEventChannelCapacity = 64
 )
 
@@ -61,6 +64,10 @@ type SupervisorOptions struct {
 	DebounceDelay time.Duration
 	// ProtocolProbeInterval 是协议不匹配时的慢探测间隔。
 	ProtocolProbeInterval time.Duration
+	// StableWindow 是健康周期持续多久后才重置普通退避。
+	StableWindow time.Duration
+	// Now 返回当前时间，使稳定窗口可在测试中推进。
+	Now func() time.Time
 }
 
 // Supervisor 维护 Herdr snapshot、生命周期订阅、状态订阅和重连状态机。
@@ -74,6 +81,8 @@ type Supervisor struct {
 	wait                  SupervisorWaitFunc
 	debounceDelay         time.Duration
 	protocolProbeInterval time.Duration
+	stableWindow          time.Duration
+	now                   func() time.Time
 
 	// 仅供同包测试观察主循环已取出的消息；nil 时没有运行时行为。
 	messageObserved func(supervisorMessage)
@@ -96,10 +105,17 @@ func NewSupervisor(factory HerdrFactory, registry *session.Registry, service *Se
 	if options.ProtocolProbeInterval <= 0 {
 		options.ProtocolProbeInterval = defaultProtocolProbeInterval
 	}
+	if options.StableWindow <= 0 {
+		options.StableWindow = defaultSupervisorStableWindow
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
 	return &Supervisor{
 		factory: factory, registry: registry, service: service, notifier: notifier,
 		backoff: options.Backoff, wait: options.Wait,
 		debounceDelay: options.DebounceDelay, protocolProbeInterval: options.ProtocolProbeInterval,
+		stableWindow: options.StableWindow, now: options.Now,
 	}, nil
 }
 
@@ -116,61 +132,42 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		client, err := s.factory.Connect(ctx)
 		if err != nil {
 			s.degrade()
-			if err := s.waitRetry(ctx, s.backoff.Next()); err != nil {
+			if err := s.waitCycleRetry(ctx, err); err != nil {
 				return err
 			}
 			continue
 		}
 		if err := client.CheckCompatible(ctx); err != nil {
 			s.degrade()
-			var delay time.Duration
-			if errors.Is(err, herdr.ErrProtocolMismatch) {
-				delay = s.protocolProbeInterval
-			} else {
-				delay = s.backoff.Next()
-			}
-			if err := s.waitRetry(ctx, delay); err != nil {
-				return err
-			}
-			continue
-		}
-		snapshot, err := client.Snapshot(ctx)
-		if err != nil {
-			s.degrade()
-			if err := s.waitRetry(ctx, s.backoff.Next()); err != nil {
+			if err := s.waitCycleRetry(ctx, err); err != nil {
 				return err
 			}
 			continue
 		}
 
-		s.service.ReplaceSnapshot(snapshot, true)
-		s.notifier.Reset()
-		s.service.SetHerdr(client)
-		err = s.runHealthyCycle(ctx, client)
+		stable, err := s.runHealthyCycle(ctx, client)
 		s.degrade()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := s.waitRetry(ctx, s.backoff.Next()); err != nil {
+		if stable {
+			s.backoff.Reset()
+		}
+		if err := s.waitCycleRetry(ctx, err); err != nil {
 			return err
 		}
 	}
 }
 
-func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) error {
-	lifecycle, err := client.Subscribe(ctx, herdr.LifecycleSubscriptions())
+func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) (bool, error) {
+	lifecycle, status, statusSpecs, baseline, err := s.prepareSubscriptions(ctx, client)
 	if err != nil {
-		return err
+		return false, err
 	}
-	statusSpecs := herdr.StatusSubscriptions(s.registry.AgentPaneIDs())
-	var status herdr.SubscriptionStream
-	if len(statusSpecs) > 0 {
-		status, err = client.Subscribe(ctx, statusSpecs)
-		if err != nil {
-			_ = lifecycle.Close()
-			return err
-		}
-	}
+	healthyStarted := s.now()
+	s.service.ReplaceSnapshot(baseline, true)
+	s.notifier.Reset()
+	s.service.SetHerdr(client)
 
 	cycleContext, cancelCycle := context.WithCancel(ctx)
 	messages := make(chan supervisorMessage, supervisorEventChannelCapacity)
@@ -181,7 +178,9 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 		statusGeneration++
 		startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
 	}
-	s.backoff.Reset()
+	finish := func(err error) (bool, error) {
+		return !s.now().Before(healthyStarted.Add(s.stableWindow)), err
+	}
 
 	var debounceCancel context.CancelFunc
 	defer func() {
@@ -200,7 +199,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return finish(ctx.Err())
 		case message := <-messages:
 			if s.messageObserved != nil {
 				s.messageObserved(message)
@@ -208,7 +207,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 			switch message.kind {
 			case supervisorStreamLifecycle:
 				if message.err != nil {
-					return message.err
+					return finish(message.err)
 				}
 				if !isLifecycleEvent(message.event.Kind) {
 					continue
@@ -223,11 +222,11 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 					continue
 				}
 				if message.err != nil {
-					return message.err
+					return finish(message.err)
 				}
 				event, err := herdr.DecodeAgentStatusEvent(message.event)
 				if err != nil {
-					return err
+					return finish(err)
 				}
 				// ApplyStatus 只在 Registry 自身锁内更新状态字段；occupant、选择与 Panel 的
 				// 复合变化仍统一由 Service.ReplaceSnapshot 串行处理。
@@ -236,7 +235,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 					if errors.Is(err, session.ErrUnknownPane) || errors.Is(err, session.ErrStaleAgentEvent) {
 						continue
 					}
-					return err
+					return finish(err)
 				}
 				_ = s.notifier.HandleTransition(ctx, transition)
 			case supervisorDebounceElapsed:
@@ -247,38 +246,146 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr) e
 					debounceCancel()
 				}
 				debounceCancel = nil
-				snapshot, err := client.Snapshot(ctx)
+				discovery, err := s.snapshot(ctx, client)
 				if err != nil {
-					return err
+					return finish(err)
 				}
-				changes := s.service.ReplaceSnapshot(snapshot, false)
+				rebuilds := 0
+				status, statusSpecs, discovery, rebuilds, err = s.reconcileStatusSubscriptions(
+					ctx, client, status, statusSpecs, discovery,
+					func() { statusGeneration++ },
+				)
+				if err != nil {
+					return finish(err)
+				}
+				changes := s.service.ReplaceSnapshot(discovery, false)
 				for _, target := range changes.RemovedTargets {
 					_ = s.notifier.TargetInvalidated(ctx, target)
 				}
 				for _, target := range changes.ReplacedTargets {
 					_ = s.notifier.TargetInvalidated(ctx, target)
 				}
-				if !changes.AgentSetChanged {
-					continue
+				if rebuilds > 0 && status != nil {
+					startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
 				}
-
-				statusGeneration++
-				if status != nil {
-					_ = status.Close()
-					status = nil
-				}
-				statusSpecs = herdr.StatusSubscriptions(s.registry.AgentPaneIDs())
-				if len(statusSpecs) == 0 {
-					continue
-				}
-				status, err = client.Subscribe(ctx, statusSpecs)
-				if err != nil {
-					return err
-				}
-				startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
 			}
 		}
 	}
+}
+
+func (s *Supervisor) prepareSubscriptions(ctx context.Context, client ManagedHerdr) (lifecycle herdr.SubscriptionStream, status herdr.SubscriptionStream, statusSpecs []herdr.SubscriptionSpec, baseline herdr.Snapshot, err error) {
+	discovery, err := s.snapshot(ctx, client)
+	if err != nil {
+		return nil, nil, nil, herdr.Snapshot{}, err
+	}
+	lifecycle, err = client.Subscribe(ctx, herdr.LifecycleSubscriptions())
+	if err != nil {
+		return nil, nil, nil, herdr.Snapshot{}, err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = lifecycle.Close()
+			if status != nil {
+				_ = status.Close()
+			}
+		}
+	}()
+	statusSpecs = statusSubscriptionsFromSnapshot(discovery)
+	status, err = subscribeStatus(ctx, client, statusSpecs)
+	if err != nil {
+		return lifecycle, nil, nil, herdr.Snapshot{}, err
+	}
+	baseline, err = s.snapshot(ctx, client)
+	if err != nil {
+		return lifecycle, status, statusSpecs, herdr.Snapshot{}, err
+	}
+	status, statusSpecs, baseline, _, err = s.reconcileStatusSubscriptions(ctx, client, status, statusSpecs, baseline, nil)
+	if err != nil {
+		return lifecycle, status, statusSpecs, herdr.Snapshot{}, err
+	}
+	cleanup = false
+	return lifecycle, status, statusSpecs, baseline, nil
+}
+
+func (s *Supervisor) reconcileStatusSubscriptions(
+	ctx context.Context,
+	client ManagedHerdr,
+	status herdr.SubscriptionStream,
+	statusSpecs []herdr.SubscriptionSpec,
+	snapshot herdr.Snapshot,
+	beforeReplace func(),
+) (herdr.SubscriptionStream, []herdr.SubscriptionSpec, herdr.Snapshot, int, error) {
+	rebuilds := 0
+	for {
+		desired := statusSubscriptionsFromSnapshot(snapshot)
+		if sameSubscriptionSpecs(statusSpecs, desired) {
+			return status, statusSpecs, snapshot, rebuilds, nil
+		}
+		if beforeReplace != nil {
+			beforeReplace()
+		}
+		if status != nil {
+			_ = status.Close()
+			status = nil
+		}
+		statusSpecs = desired
+		var err error
+		status, err = subscribeStatus(ctx, client, statusSpecs)
+		if err != nil {
+			return status, statusSpecs, herdr.Snapshot{}, rebuilds, err
+		}
+		rebuilds++
+		snapshot, err = s.snapshot(ctx, client)
+		if err != nil {
+			return status, statusSpecs, herdr.Snapshot{}, rebuilds, err
+		}
+	}
+}
+
+func (s *Supervisor) snapshot(ctx context.Context, client ManagedHerdr) (herdr.Snapshot, error) {
+	snapshot, err := client.Snapshot(ctx)
+	if err != nil {
+		return herdr.Snapshot{}, err
+	}
+	if snapshot.Protocol != herdr.RequiredProtocol {
+		return herdr.Snapshot{}, fmt.Errorf("%w: expected %d, got %d", herdr.ErrProtocolMismatch, herdr.RequiredProtocol, snapshot.Protocol)
+	}
+	return snapshot, nil
+}
+
+func statusSubscriptionsFromSnapshot(snapshot herdr.Snapshot) []herdr.SubscriptionSpec {
+	unique := make(map[string]struct{}, len(snapshot.Panes))
+	for _, pane := range snapshot.Panes {
+		if pane.Agent != nil && pane.PaneID != "" {
+			unique[pane.PaneID] = struct{}{}
+		}
+	}
+	paneIDs := make([]string, 0, len(unique))
+	for paneID := range unique {
+		paneIDs = append(paneIDs, paneID)
+	}
+	sort.Strings(paneIDs)
+	return herdr.StatusSubscriptions(paneIDs)
+}
+
+func subscribeStatus(ctx context.Context, client ManagedHerdr, specs []herdr.SubscriptionSpec) (herdr.SubscriptionStream, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	return client.Subscribe(ctx, specs)
+}
+
+func sameSubscriptionSpecs(left, right []herdr.SubscriptionSpec) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Supervisor) degrade() {
@@ -294,6 +401,13 @@ func (s *Supervisor) waitRetry(ctx context.Context, delay time.Duration) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Supervisor) waitCycleRetry(ctx context.Context, cycleErr error) error {
+	if errors.Is(cycleErr, herdr.ErrProtocolMismatch) {
+		return s.waitRetry(ctx, s.protocolProbeInterval)
+	}
+	return s.waitRetry(ctx, s.backoff.Next())
 }
 
 type supervisorMessageKind uint8
