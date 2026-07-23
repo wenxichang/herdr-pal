@@ -38,6 +38,13 @@ type notificationKey struct {
 	snapshotAvailable bool
 }
 
+type notificationProgress struct {
+	key   notificationKey
+	parts []string
+	next  int
+	epoch uint64
+}
+
 type notificationTaskKind uint8
 
 const (
@@ -157,6 +164,7 @@ func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.
 
 func (d *notificationDispatcher) EnqueueInvalidated(target session.Target) error {
 	d.mu.Lock()
+	d.dropPaneStatusLocked(target.PaneID)
 	key := target.PaneID + "\x00" + target.OccupantKey
 	if d.pendingInvalidated[key] != nil {
 		d.mu.Unlock()
@@ -193,7 +201,9 @@ func (d *notificationDispatcher) Run(ctx context.Context) error {
 				if taskContext.Err() != nil {
 					break
 				}
-				continue
+				d.backoff.Reset()
+				d.finish(task.id, cancel)
+				return fmt.Errorf("主动通知重试等待失败: %w", waitErr)
 			}
 			if !d.taskCurrent(task) {
 				break
@@ -284,6 +294,23 @@ func (d *notificationDispatcher) dropStatusLocked(epoch uint64) {
 	}
 }
 
+func (d *notificationDispatcher) dropPaneStatusLocked(paneID string) {
+	pending := d.pendingStatus[paneID]
+	if pending != nil {
+		kept := d.queue[:0]
+		for _, task := range d.queue {
+			if task != pending {
+				kept = append(kept, task)
+			}
+		}
+		d.queue = kept
+		delete(d.pendingStatus, paneID)
+	}
+	if d.active != nil && d.active.kind == notificationTaskStatus && d.active.paneID == paneID && d.activeCancel != nil {
+		d.activeCancel()
+	}
+}
+
 func (d *notificationDispatcher) signal() {
 	select {
 	case d.wake <- struct{}{}:
@@ -303,6 +330,7 @@ type Notifier struct {
 	mu       sync.Mutex
 	recent   map[string]notificationKey
 	inflight map[string]chan struct{}
+	pending  map[string]*notificationProgress
 	epoch    uint64
 }
 
@@ -317,6 +345,7 @@ func NewNotifier(im IMAdapter, get GetAgentFunc, read ReadRecentFunc) (*Notifier
 		read:     read,
 		recent:   make(map[string]notificationKey),
 		inflight: make(map[string]chan struct{}),
+		pending:  make(map[string]*notificationProgress),
 	}, nil
 }
 
@@ -328,6 +357,7 @@ func (n *Notifier) Reset() {
 	n.mu.Lock()
 	n.epoch++
 	n.recent = make(map[string]notificationKey)
+	n.pending = make(map[string]*notificationProgress)
 	n.mu.Unlock()
 }
 
@@ -415,13 +445,33 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 		completed := make(chan struct{})
 		n.inflight[paneID] = completed
 		deliveryEpoch := n.epoch
+		progress := n.pending[paneID]
+		if progress == nil || progress.epoch != deliveryEpoch || !sameNotificationIdentity(progress.key, key) {
+			progress = &notificationProgress{
+				key: key, parts: append([]string(nil), parts...), epoch: deliveryEpoch,
+			}
+			n.pending[paneID] = progress
+		}
+		deliveryParts := progress.parts
+		start := progress.next
 		n.mu.Unlock()
 
-		err := n.sendParts(ctx, parts)
+		var err error
+		for index := start; index < len(deliveryParts); index++ {
+			if err = n.im.SendMarkdown(ctx, deliveryParts[index]); err != nil {
+				break
+			}
+			n.mu.Lock()
+			if n.epoch == deliveryEpoch && n.pending[paneID] == progress {
+				progress.next = index + 1
+			}
+			n.mu.Unlock()
+		}
 
 		n.mu.Lock()
-		if err == nil && n.epoch == deliveryEpoch {
-			n.recent[paneID] = key
+		if err == nil && n.epoch == deliveryEpoch && n.pending[paneID] == progress {
+			n.recent[paneID] = progress.key
+			delete(n.pending, paneID)
 		}
 		delete(n.inflight, paneID)
 		close(completed)
@@ -430,13 +480,13 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 	}
 }
 
-func (n *Notifier) sendParts(ctx context.Context, parts []string) error {
-	for _, part := range parts {
-		if err := n.im.SendMarkdown(ctx, part); err != nil {
-			return err
-		}
-	}
-	return nil
+func sameNotificationIdentity(left, right notificationKey) bool {
+	// 快照可用性变化表示 occupant 校验或读取结果已变化，不能续传旧快照分段。
+	return left.paneID == right.paneID &&
+		left.occupantKey == right.occupantKey &&
+		left.kind == right.kind &&
+		left.status == right.status &&
+		left.snapshotAvailable == right.snapshotAvailable
 }
 
 func renderStatusTitle(title string, target session.Target) string {

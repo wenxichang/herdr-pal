@@ -43,9 +43,9 @@ type HerdrFactory interface {
 	Connect(ctx context.Context) (ManagedHerdr, error)
 }
 
-// RetryPolicy 提供普通 Herdr 断线后的有上限退避。
+// RetryPolicy 提供可重置的有上限退避，供 Herdr 重连或通知重试使用。
 type RetryPolicy interface {
-	// Next 返回下一次重连前的等待时间。
+	// Next 返回下一次重试前的等待时间。
 	Next() time.Duration
 	// Reset 在健康订阅周期建立后重置退避级数。
 	Reset()
@@ -144,43 +144,56 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s == nil {
 		return ErrInvalidSupervisorDependency
 	}
+	parentContext := ctx
+	runContext, cancelRun := context.WithCancelCause(ctx)
 	dispatcher := newNotificationDispatcher(s.notifier, notificationDispatcherOptions{
 		Capacity: s.notificationQueueCapacity,
 		Backoff:  s.notificationBackoff,
 		Wait:     s.notificationWait,
 	})
-	dispatcherContext, cancelDispatcher := context.WithCancel(ctx)
 	dispatcherResult := make(chan error, 1)
-	go func() { dispatcherResult <- dispatcher.Run(dispatcherContext) }()
+	go func() {
+		err := dispatcher.Run(runContext)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			cancelRun(err)
+		}
+		dispatcherResult <- err
+	}()
 	defer func() {
-		cancelDispatcher()
+		cancelRun(context.Canceled)
 		<-dispatcherResult
 	}()
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := supervisorRunError(parentContext, runContext, nil); err != nil {
 			return err
 		}
 
-		client, err := s.factory.Connect(ctx)
+		client, err := s.factory.Connect(runContext)
 		if err != nil {
 			s.degrade()
-			if err := s.waitCycleRetry(ctx, err); err != nil {
-				return err
+			if runErr := supervisorRunError(parentContext, runContext, nil); runErr != nil {
+				return runErr
+			}
+			if waitErr := s.waitCycleRetry(runContext, err); waitErr != nil {
+				return supervisorRunError(parentContext, runContext, waitErr)
 			}
 			continue
 		}
-		if err := client.CheckCompatible(ctx); err != nil {
+		if err := client.CheckCompatible(runContext); err != nil {
 			s.degrade()
-			if err := s.waitCycleRetry(ctx, err); err != nil {
-				return err
+			if runErr := supervisorRunError(parentContext, runContext, nil); runErr != nil {
+				return runErr
+			}
+			if waitErr := s.waitCycleRetry(runContext, err); waitErr != nil {
+				return supervisorRunError(parentContext, runContext, waitErr)
 			}
 			continue
 		}
 
-		stable, err := s.runHealthyCycle(ctx, client, dispatcher)
+		stable, err := s.runHealthyCycle(runContext, client, dispatcher)
 		s.degrade()
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if runErr := supervisorRunError(parentContext, runContext, nil); runErr != nil {
+			return runErr
 		}
 		if errors.Is(err, ErrNotificationQueueFull) {
 			return err
@@ -188,10 +201,23 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if stable {
 			s.backoff.Reset()
 		}
-		if err := s.waitCycleRetry(ctx, err); err != nil {
-			return err
+		if waitErr := s.waitCycleRetry(runContext, err); waitErr != nil {
+			return supervisorRunError(parentContext, runContext, waitErr)
 		}
 	}
+}
+
+func supervisorRunError(parentContext, runContext context.Context, fallback error) error {
+	if err := parentContext.Err(); err != nil {
+		return err
+	}
+	if runContext.Err() != nil {
+		if cause := context.Cause(runContext); cause != nil {
+			return cause
+		}
+		return runContext.Err()
+	}
+	return fallback
 }
 
 func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, dispatcher *notificationDispatcher) (bool, error) {

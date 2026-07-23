@@ -185,7 +185,7 @@ func TestSupervisorNotificationDeliveryDoesNotBlockStatusLoopAndCoalescesLatest(
 	}
 }
 
-func TestSupervisorCycleEndDropsStatusButKeepsInvalidationDelivery(t *testing.T) {
+func TestSupervisorInvalidationCancelsStatusBeforeCycleEnds(t *testing.T) {
 	lifecycle := newSupervisorStream()
 	status := newSupervisorStream()
 	initial := supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))
@@ -211,14 +211,14 @@ func TestSupervisorCycleEndDropsStatusButKeepsInvalidationDelivery(t *testing.T)
 	awaitSupervisorCondition(t, "失效任务入队", func() bool {
 		return client.SnapshotCount() == 4 && status.CloseCount() == 1 && len(harness.registry.AgentPaneIDs()) == 0
 	})
+	awaitSupervisorCondition(t, "同周期 invalidation 通知", func() bool { return len(im.Messages()) == 1 })
+	if message := im.Messages()[0]; !strings.Contains(message, "目标已失效") || strings.Contains(message, "开始工作") {
+		t.Fatalf("同周期失效通知 = %q", message)
+	}
 	lifecycle.End(io.EOF)
 	retry := awaitSupervisorWait(t, harness.waiter)
 	if retry.delay != time.Second {
 		t.Fatalf("周期结束重试等待 = %v，期望 1s", retry.delay)
-	}
-	awaitSupervisorCondition(t, "跨周期 invalidation 通知", func() bool { return len(im.Messages()) == 1 })
-	if message := im.Messages()[0]; !strings.Contains(message, "目标已失效") || strings.Contains(message, "开始工作") {
-		t.Fatalf("周期结束后的通知 = %q", message)
 	}
 }
 
@@ -263,6 +263,37 @@ func TestSupervisorNotificationQueueFullIsFatalAndClosesCycle(t *testing.T) {
 	}
 	if harness.factory.ConnectCount() != 1 || harness.backoff.NextCount() != 0 || len(harness.waiter.requests) != 0 {
 		t.Fatalf("队列满后发生重连：connect=%d backoff=%d waits=%d", harness.factory.ConnectCount(), harness.backoff.NextCount(), len(harness.waiter.requests))
+	}
+}
+
+func TestSupervisorNotificationWaitErrorIsFatalAndClosesCycle(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	waitErr := errors.New("notification wait failed")
+	im := &failOnceNotifierIM{failAt: 1}
+	harness.supervisor.notifier = mustNotifierWithGetter(t, im, matchingSupervisorAgent, harness.reader.ReadRecent)
+	harness.supervisor.notificationBackoff = &notificationRetry{delay: time.Second}
+	harness.supervisor.notificationWait = func(context.Context, time.Duration) error { return waitErr }
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancel()
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "通知 wait 错误测试基线", func() bool { return serviceAvailable(harness.service) })
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	err := awaitSupervisorResult(t, result)
+	if !errors.Is(err, waitErr) {
+		t.Fatalf("Run() error = %v，期望注入 wait 错误", err)
+	}
+	if serviceAvailable(harness.service) || lifecycle.CloseCount() != 1 || status.CloseCount() != 1 {
+		t.Fatalf("通知 wait 错误后未完整 degraded：available=%v lifecycleClose=%d statusClose=%d", serviceAvailable(harness.service), lifecycle.CloseCount(), status.CloseCount())
+	}
+	if harness.factory.ConnectCount() != 1 || harness.backoff.NextCount() != 0 || len(harness.waiter.requests) != 0 {
+		t.Fatalf("通知 wait 错误后发生重连：connect=%d backoff=%d waits=%d", harness.factory.ConnectCount(), harness.backoff.NextCount(), len(harness.waiter.requests))
 	}
 }
 
