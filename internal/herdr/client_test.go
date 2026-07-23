@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -223,4 +225,230 @@ func (d *pipeDialer) ClientConnections() []net.Conn {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]net.Conn(nil), d.connections...)
+}
+
+func TestClientCheckCompatibleSendsPingAndAcceptsRequiredProtocol(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"pong","version":"0.17.0","protocol":17,"unknown":true}`, func(request map[string]any) {
+		assertBusinessRequest(t, request, "ping", map[string]any{})
+	})
+
+	if err := client.CheckCompatible(context.Background()); err != nil {
+		t.Fatalf("CheckCompatible() 返回错误：%v", err)
+	}
+}
+
+func TestClientCheckCompatibleRejectsInvalidPong(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+		match  error
+		parts  []string
+	}{
+		{name: "协议过低", result: `{"type":"pong","version":"0.14.0","protocol":14}`, match: ErrProtocolMismatch, parts: []string{"expected 17", "got 14"}},
+		{name: "协议过高", result: `{"type":"pong","version":"0.18.0","protocol":18}`, match: ErrProtocolMismatch, parts: []string{"expected 17", "got 18"}},
+		{name: "缺少 type", result: `{"version":"0.17.0","protocol":17}`, match: ErrProtocol},
+		{name: "type 不匹配", result: `{"type":"ok","version":"0.17.0","protocol":17}`, match: ErrProtocol},
+		{name: "缺少 protocol", result: `{"type":"pong","version":"0.17.0"}`, match: ErrProtocol},
+		{name: "protocol 类型错误", result: `{"type":"pong","version":"0.17.0","protocol":"17"}`, match: ErrProtocol},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newBusinessTestClient(t, test.result, nil)
+			err := client.CheckCompatible(context.Background())
+			if !errors.Is(err, test.match) {
+				t.Fatalf("CheckCompatible() 错误 = %v，期望匹配 %v", err, test.match)
+			}
+			if errors.Is(err, ErrProtocolMismatch) && errors.Is(err, ErrUnavailable) {
+				t.Fatalf("CheckCompatible() 错误 = %v，不应同时匹配 ErrUnavailable", err)
+			}
+			for _, part := range test.parts {
+				if !strings.Contains(err.Error(), part) {
+					t.Fatalf("CheckCompatible() 错误 = %q，缺少 %q", err, part)
+				}
+			}
+		})
+	}
+}
+
+func TestClientSnapshotDecodesMinimalSnapshot(t *testing.T) {
+	result := `{"type":"session_snapshot","snapshot":{"version":"0.17.0","protocol":17,"workspaces":[{"workspace_id":"w1","number":1,"label":"主工作区","ignored":true}],"tabs":[{"tab_id":"t1","workspace_id":"w1","number":2,"label":"终端"}],"panes":[{"pane_id":"p1","terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent":"codex","title":"实现","display_agent":"Codex","agent_status":"working","agent_session":{"source":"codex","agent":"codex","kind":"thread","value":"session-1"}}],"agents":[{"terminal_id":"term1","name":"任务","agent":"codex","title":"实现","terminal_title":"term","terminal_title_stripped":"term","display_agent":"Codex","agent_status":"working","agent_session":{"source":"codex","agent":"codex","kind":"thread","value":"session-1"},"workspace_id":"w1","tab_id":"t1","pane_id":"p1"}],"layouts":[]}}`
+	client := newBusinessTestClient(t, result, func(request map[string]any) {
+		assertBusinessRequest(t, request, "session.snapshot", map[string]any{})
+	})
+
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() 返回错误：%v", err)
+	}
+	if snapshot.Version != "0.17.0" || snapshot.Protocol != 17 || len(snapshot.Workspaces) != 1 || snapshot.Workspaces[0].WorkspaceID != "w1" {
+		t.Fatalf("Snapshot() = %+v，未解码快照最小字段", snapshot)
+	}
+	if len(snapshot.Agents) != 1 || snapshot.Agents[0].AgentSession == nil || snapshot.Agents[0].AgentSession.Value != "session-1" {
+		t.Fatalf("Snapshot() agents = %+v，未解码 AgentSession", snapshot.Agents)
+	}
+}
+
+func TestClientSnapshotRejectsInvalidResult(t *testing.T) {
+	for _, result := range []string{
+		`{"type":"ok","snapshot":{}}`,
+		`{"type":"session_snapshot"}`,
+		`{"type":"session_snapshot","snapshot":"invalid"}`,
+	} {
+		client := newBusinessTestClient(t, result, nil)
+		if _, err := client.Snapshot(context.Background()); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("Snapshot() result %s 错误 = %v，期望 ErrProtocol", result, err)
+		}
+	}
+}
+
+func TestClientGetAgentSendsTargetAndDecodesAgent(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":{"terminal_id":"term1","agent_status":"blocked","workspace_id":"w1","tab_id":"t1","pane_id":"p1","unknown":1}}`, func(request map[string]any) {
+		assertBusinessRequest(t, request, "agent.get", map[string]any{"target": "p1"})
+	})
+
+	agent, err := client.GetAgent(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("GetAgent() 返回错误：%v", err)
+	}
+	if agent.TerminalID != "term1" || agent.PaneID != "p1" || agent.AgentStatus != AgentStatusBlocked {
+		t.Fatalf("GetAgent() = %+v", agent)
+	}
+}
+
+func TestClientGetAgentRejectsInvalidInputOrResult(t *testing.T) {
+	dialer := &pipeDialer{}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	if _, err := client.GetAgent(context.Background(), " \t "); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("GetAgent() 空 target 错误 = %v，期望 ErrProtocol", err)
+	}
+	if dialer.Count() != 0 {
+		t.Fatalf("GetAgent() 无效 target 仍拨号 %d 次", dialer.Count())
+	}
+	for _, result := range []string{`{"type":"ok","agent":{}}`, `{"type":"agent_info"}`, `{"type":"agent_info","agent":"invalid"}`} {
+		client := newBusinessTestClient(t, result, nil)
+		if _, err := client.GetAgent(context.Background(), "p1"); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("GetAgent() result %s 错误 = %v，期望 ErrProtocol", result, err)
+		}
+	}
+}
+
+func TestClientReadRecentSendsExactParametersAndDecodesRead(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","text":"输出","truncated":true,"revision":0}}`, func(request map[string]any) {
+		assertBusinessRequest(t, request, "agent.read", map[string]any{"target": "p1", "source": "recent_unwrapped", "lines": float64(42), "format": "text", "strip_ansi": true})
+	})
+
+	read, err := client.ReadRecent(context.Background(), "p1", 42)
+	if err != nil {
+		t.Fatalf("ReadRecent() 返回错误：%v", err)
+	}
+	if read.PaneID != "p1" || read.Text != "输出" || !read.Truncated {
+		t.Fatalf("ReadRecent() = %+v", read)
+	}
+}
+
+func TestClientReadRecentRejectsInvalidInputOrResult(t *testing.T) {
+	dialer := &pipeDialer{}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	if _, err := client.ReadRecent(context.Background(), " \t ", 1); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("ReadRecent() 空 target 错误 = %v，期望 ErrProtocol", err)
+	}
+	if dialer.Count() != 0 {
+		t.Fatalf("ReadRecent() 空 target 仍拨号")
+	}
+	for _, lines := range []int{0, -1, 1001} {
+		dialer := &pipeDialer{}
+		client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+		if _, err := client.ReadRecent(context.Background(), "p1", lines); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("ReadRecent() lines %d 错误 = %v，期望 ErrProtocol", lines, err)
+		}
+		if dialer.Count() != 0 {
+			t.Fatalf("ReadRecent() 无效 lines %d 仍拨号", lines)
+		}
+	}
+	for _, result := range []string{`{"type":"ok","read":{}}`, `{"type":"pane_read"}`, `{"type":"pane_read","read":"invalid"}`} {
+		client := newBusinessTestClient(t, result, nil)
+		if _, err := client.ReadRecent(context.Background(), "p1", 1); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("ReadRecent() result %s 错误 = %v，期望 ErrProtocol", result, err)
+		}
+	}
+}
+
+func TestClientPromptSendsExactParameters(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"agent_prompted","agent":{"terminal_id":"term1","agent_status":"working","workspace_id":"w1","tab_id":"t1","pane_id":"p1"}}`, func(request map[string]any) {
+		assertBusinessRequest(t, request, "agent.prompt", map[string]any{"target": "p1", "text": ""})
+	})
+
+	if err := client.Prompt(context.Background(), "p1", ""); err != nil {
+		t.Fatalf("Prompt() 返回错误：%v", err)
+	}
+}
+
+func TestClientPromptRejectsEmptyTargetAndInvalidResult(t *testing.T) {
+	dialer := &pipeDialer{}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	if err := client.Prompt(context.Background(), " ", "text"); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("Prompt() 空 target 错误 = %v，期望 ErrProtocol", err)
+	}
+	if dialer.Count() != 0 {
+		t.Fatalf("Prompt() 无效 target 仍拨号")
+	}
+	for _, result := range []string{`{"type":"ok","agent":{}}`, `{"type":"agent_prompted"}`, `{"type":"agent_prompted","agent":"invalid"}`} {
+		client := newBusinessTestClient(t, result, nil)
+		if err := client.Prompt(context.Background(), "p1", "text"); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("Prompt() result %s 错误 = %v，期望 ErrProtocol", result, err)
+		}
+	}
+}
+
+func TestClientSendKeySendsExactParameters(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"ok","ignored":true}`, func(request map[string]any) {
+		assertBusinessRequest(t, request, "agent.send_keys", map[string]any{"target": "p1", "keys": []any{"enter"}})
+	})
+
+	if err := client.SendKey(context.Background(), "p1", "enter"); err != nil {
+		t.Fatalf("SendKey() 返回错误：%v", err)
+	}
+}
+
+func TestClientSendKeyRejectsInvalidInputAndResult(t *testing.T) {
+	for _, input := range []struct{ target, key string }{{"", "enter"}, {"p1", " \t "}} {
+		dialer := &pipeDialer{}
+		client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+		if err := client.SendKey(context.Background(), input.target, input.key); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("SendKey(%q, %q) 错误 = %v，期望 ErrProtocol", input.target, input.key, err)
+		}
+		if dialer.Count() != 0 {
+			t.Fatalf("SendKey() 无效输入仍拨号")
+		}
+	}
+	client := newBusinessTestClient(t, `{"type":"agent_prompted"}`, nil)
+	if err := client.SendKey(context.Background(), "p1", "enter"); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("SendKey() type 不匹配错误 = %v，期望 ErrProtocol", err)
+	}
+}
+
+func newBusinessTestClient(t *testing.T, result string, check func(map[string]any)) *Client {
+	t.Helper()
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) {
+		if check != nil {
+			check(request)
+		}
+		_, _ = io.WriteString(conn, `{"id":"`+request["id"].(string)+`","result":`+result+"}\n")
+	}}
+	return NewClient("/tmp/herdr.sock", dialer, time.Second)
+}
+
+func assertBusinessRequest(t *testing.T, request map[string]any, method string, params map[string]any) {
+	t.Helper()
+	if request["method"] != method {
+		t.Fatalf("method = %q，期望 %q", request["method"], method)
+	}
+	actual, ok := request["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params 类型 = %T，期望 object", request["params"])
+	}
+	if !reflect.DeepEqual(actual, params) {
+		t.Fatalf("params = %#v，期望 %#v", actual, params)
+	}
 }

@@ -3,10 +3,12 @@ package herdr
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -90,4 +92,248 @@ func unavailableContextError(ctx context.Context, err error) error {
 		err = errors.Join(err, context.DeadlineExceeded)
 	}
 	return unavailableError(err)
+}
+
+// CheckCompatible 检查已连接 Herdr 的协议版本是否与客户端精确兼容。
+func (c *Client) CheckCompatible(ctx context.Context) error {
+	var result pongResult
+	if err := c.call(ctx, "ping", map[string]any{}, &result); err != nil {
+		return err
+	}
+	if err := validateResultType(result.Type, "pong"); err != nil {
+		return err
+	}
+	if result.Version == nil || strings.TrimSpace(*result.Version) == "" {
+		return protocolError("pong 响应缺少 version")
+	}
+	if result.Protocol == nil {
+		return protocolError("pong 响应缺少 protocol")
+	}
+	if *result.Protocol != RequiredProtocol {
+		return fmt.Errorf("%w: expected %d, got %d", ErrProtocolMismatch, RequiredProtocol, *result.Protocol)
+	}
+	return nil
+}
+
+// Snapshot 读取当前 Herdr 会话的最小快照。
+func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
+	var result snapshotResult
+	if err := c.call(ctx, "session.snapshot", map[string]any{}, &result); err != nil {
+		return Snapshot{}, err
+	}
+	if err := validateResultType(result.Type, "session_snapshot"); err != nil {
+		return Snapshot{}, err
+	}
+	var snapshot Snapshot
+	if err := decodeRequiredPayload(result.Snapshot, "snapshot", &snapshot); err != nil {
+		return Snapshot{}, err
+	}
+	if err := validateSnapshot(snapshot); err != nil {
+		return Snapshot{}, err
+	}
+	return snapshot, nil
+}
+
+// GetAgent 查询 target 指向的 Agent 信息。
+func (c *Client) GetAgent(ctx context.Context, target string) (AgentInfo, error) {
+	if err := validateTarget(target); err != nil {
+		return AgentInfo{}, err
+	}
+	var result agentResult
+	if err := c.call(ctx, "agent.get", agentTargetParams{Target: target}, &result); err != nil {
+		return AgentInfo{}, err
+	}
+	if err := validateResultType(result.Type, "agent_info"); err != nil {
+		return AgentInfo{}, err
+	}
+	var agent AgentInfo
+	if err := decodeRequiredPayload(result.Agent, "agent", &agent); err != nil {
+		return AgentInfo{}, err
+	}
+	if err := validateAgentInfo(agent); err != nil {
+		return AgentInfo{}, err
+	}
+	return agent, nil
+}
+
+// ReadRecent 读取 target 的 recent_unwrapped 纯文本终端快照。
+func (c *Client) ReadRecent(ctx context.Context, target string, lines int) (ReadResult, error) {
+	if err := validateTarget(target); err != nil {
+		return ReadResult{}, err
+	}
+	if lines < 1 || lines > 1000 {
+		return ReadResult{}, protocolError("recent_unwrapped 行数必须在 1 到 1000 之间")
+	}
+	var result paneReadResult
+	params := agentReadParams{Target: target, Source: "recent_unwrapped", Lines: lines, Format: "text", StripANSI: true}
+	if err := c.call(ctx, "agent.read", params, &result); err != nil {
+		return ReadResult{}, err
+	}
+	if err := validateResultType(result.Type, "pane_read"); err != nil {
+		return ReadResult{}, err
+	}
+	var read ReadResult
+	if err := decodeRequiredPayload(result.Read, "read", &read); err != nil {
+		return ReadResult{}, err
+	}
+	if err := validateReadResult(read); err != nil {
+		return ReadResult{}, err
+	}
+	return read, nil
+}
+
+// Prompt 向 target 对应的 Agent 发送普通文本输入。
+func (c *Client) Prompt(ctx context.Context, target, text string) error {
+	if err := validateTarget(target); err != nil {
+		return err
+	}
+	var result agentResult
+	if err := c.call(ctx, "agent.prompt", agentPromptParams{Target: target, Text: text}, &result); err != nil {
+		return err
+	}
+	if err := validateResultType(result.Type, "agent_prompted"); err != nil {
+		return err
+	}
+	var agent AgentInfo
+	if err := decodeRequiredPayload(result.Agent, "agent", &agent); err != nil {
+		return err
+	}
+	return validateAgentInfo(agent)
+}
+
+// SendKey 向 target 对应的 Agent 发送一个显式 UI 控制按键。
+func (c *Client) SendKey(ctx context.Context, target, key string) error {
+	if err := validateTarget(target); err != nil {
+		return err
+	}
+	if strings.TrimSpace(key) == "" {
+		return protocolError("发送 Herdr 按键失败：key 不能为空")
+	}
+	var result typedResult
+	if err := c.call(ctx, "agent.send_keys", agentSendKeysParams{Target: target, Keys: []string{key}}, &result); err != nil {
+		return err
+	}
+	return validateResultType(result.Type, "ok")
+}
+
+type typedResult struct {
+	Type string `json:"type"`
+}
+
+type pongResult struct {
+	Type     string  `json:"type"`
+	Version  *string `json:"version"`
+	Protocol *uint32 `json:"protocol"`
+}
+
+type snapshotResult struct {
+	Type     string          `json:"type"`
+	Snapshot json.RawMessage `json:"snapshot"`
+}
+
+type agentResult struct {
+	Type  string          `json:"type"`
+	Agent json.RawMessage `json:"agent"`
+}
+
+type paneReadResult struct {
+	Type string          `json:"type"`
+	Read json.RawMessage `json:"read"`
+}
+
+type agentTargetParams struct {
+	Target string `json:"target"`
+}
+
+type agentReadParams struct {
+	Target    string `json:"target"`
+	Source    string `json:"source"`
+	Lines     int    `json:"lines"`
+	Format    string `json:"format"`
+	StripANSI bool   `json:"strip_ansi"`
+}
+
+type agentPromptParams struct {
+	Target string `json:"target"`
+	Text   string `json:"text"`
+}
+
+type agentSendKeysParams struct {
+	Target string   `json:"target"`
+	Keys   []string `json:"keys"`
+}
+
+func validateResultType(actual, expected string) error {
+	if strings.TrimSpace(actual) == "" {
+		return protocolError("Herdr result 缺少 type")
+	}
+	if actual != expected {
+		return protocolError(fmt.Sprintf("Herdr result type 为 %q，期望 %q", actual, expected))
+	}
+	return nil
+}
+
+func decodeRequiredPayload(raw json.RawMessage, name string, destination any) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return protocolError(fmt.Sprintf("Herdr result 缺少 %s", name))
+	}
+	if err := json.Unmarshal(raw, destination); err != nil {
+		return fmt.Errorf("%w: 解码 Herdr result.%s: %w", ErrProtocol, name, err)
+	}
+	return nil
+}
+
+func validateTarget(target string) error {
+	if strings.TrimSpace(target) == "" {
+		return protocolError("Herdr target 不能为空")
+	}
+	return nil
+}
+
+func validateSnapshot(snapshot Snapshot) error {
+	if strings.TrimSpace(snapshot.Version) == "" {
+		return protocolError("session_snapshot 缺少 version")
+	}
+	if snapshot.Workspaces == nil || snapshot.Tabs == nil || snapshot.Panes == nil || snapshot.Agents == nil {
+		return protocolError("session_snapshot 缺少资源列表")
+	}
+	for _, pane := range snapshot.Panes {
+		if err := validatePane(pane); err != nil {
+			return err
+		}
+	}
+	for _, agent := range snapshot.Agents {
+		if err := validateAgentInfo(agent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePane(pane Pane) error {
+	if strings.TrimSpace(pane.PaneID) == "" || strings.TrimSpace(pane.TerminalID) == "" || strings.TrimSpace(pane.WorkspaceID) == "" || strings.TrimSpace(pane.TabID) == "" {
+		return protocolError("pane 信息缺少标识")
+	}
+	return nil
+}
+
+func validateAgentInfo(agent AgentInfo) error {
+	if strings.TrimSpace(agent.TerminalID) == "" || strings.TrimSpace(agent.WorkspaceID) == "" || strings.TrimSpace(agent.TabID) == "" || strings.TrimSpace(agent.PaneID) == "" {
+		return protocolError("agent 信息缺少标识")
+	}
+	if strings.TrimSpace(string(agent.AgentStatus)) == "" {
+		return protocolError("agent 信息缺少状态")
+	}
+	return nil
+}
+
+func validateReadResult(read ReadResult) error {
+	if strings.TrimSpace(read.PaneID) == "" || strings.TrimSpace(read.WorkspaceID) == "" || strings.TrimSpace(read.TabID) == "" {
+		return protocolError("pane_read 缺少标识")
+	}
+	return nil
+}
+
+func protocolError(message string) error {
+	return fmt.Errorf("%w: %s", ErrProtocol, message)
 }
