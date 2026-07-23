@@ -113,7 +113,8 @@ func TestNotifierSuppressesSameNormalizedSnapshotAndAllowsDistinctKey(t *testing
 		{PaneID: "pane-1", Text: "相同内容\n"},
 	}}
 	im := &notifierIM{}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
+	getter := &notifierAgentGetter{agent: notificationAgentInfo("")}
+	notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
 	transition := notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked)
 
 	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
@@ -122,7 +123,8 @@ func TestNotifierSuppressesSameNormalizedSnapshotAndAllowsDistinctKey(t *testing
 	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
 		t.Fatalf("重复 HandleTransition() 返回错误：%v", err)
 	}
-	transition.Target.OccupantKey = "occupant-2"
+	transition.Target = notificationTargetWithSession("session-2")
+	getter.SetAgent(notificationAgentInfo("session-2"))
 	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
 		t.Fatalf("新 occupant HandleTransition() 返回错误：%v", err)
 	}
@@ -154,6 +156,67 @@ func TestNotifierReadFailureStillSendsStatusTitleAndCanRetryWithSnapshot(t *test
 	}
 	if messages := im.Messages(); len(messages) != 3 || !strings.Contains(messages[2], "恢复后的内容") {
 		t.Fatalf("恢复后未补发快照：%#v", messages)
+	}
+}
+
+func TestNotifierPreReadOccupantValidationFailureSkipsTerminalRead(t *testing.T) {
+	tests := []struct {
+		name   string
+		agent  herdr.AgentInfo
+		getErr error
+	}{
+		{name: "occupant replaced", agent: notificationAgentInfo("session-new")},
+		{name: "get failed", getErr: errors.New("get failed")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := notificationTargetWithSession("session-old")
+			getter := &notifierAgentGetter{agent: test.agent, err: test.getErr}
+			reader := &notifierReader{result: herdr.ReadResult{PaneID: target.PaneID, Text: "不应读取"}}
+			im := &notifierIM{}
+			notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
+
+			transition := session.Transition{Target: target, Previous: herdr.AgentStatusWorking, Current: herdr.AgentStatusBlocked}
+			if err := notifier.HandleTransition(context.Background(), transition); err != nil {
+				t.Fatalf("HandleTransition() 返回错误：%v", err)
+			}
+			if calls := reader.Calls(); len(calls) != 0 {
+				t.Fatalf("occupant 前置校验失败后仍读取终端：%#v", calls)
+			}
+			messages := im.Messages()
+			if len(messages) != 1 || !strings.Contains(messages[0], "已阻塞") || strings.Contains(messages[0], "不应读取") {
+				t.Fatalf("前置校验失败通知 = %#v", messages)
+			}
+		})
+	}
+}
+
+func TestNotifierPostReadOccupantReplacementDoesNotLeakSnapshot(t *testing.T) {
+	target := notificationTargetWithSession("session-old")
+	getter := &notifierAgentGetter{agent: notificationAgentInfo("session-old")}
+	reader := &blockingNotifierReader{
+		result:  herdr.ReadResult{PaneID: target.PaneID, Text: "SENSITIVE-MARKER"},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	im := &notifierIM{}
+	notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
+	transition := session.Transition{Target: target, Previous: herdr.AgentStatusWorking, Current: herdr.AgentStatusDone}
+	result := make(chan error, 1)
+	go func() { result <- notifier.HandleTransition(context.Background(), transition) }()
+	<-reader.started
+
+	getter.SetAgent(notificationAgentInfo("session-new"))
+	close(reader.release)
+	if err := <-result; err != nil {
+		t.Fatalf("HandleTransition() 返回错误：%v", err)
+	}
+	messages := im.Messages()
+	if len(messages) != 1 || !strings.Contains(messages[0], "已完成") || strings.Contains(strings.Join(messages, "\n"), "SENSITIVE-MARKER") {
+		t.Fatalf("post-read occupant 替换后泄露终端快照：%#v", messages)
+	}
+	if got := getter.CallCount(); got != 2 {
+		t.Fatalf("GetAgent 调用次数 = %d，期望读取前后各一次", got)
 	}
 }
 
@@ -289,7 +352,12 @@ func TestNotifierResetDoesNotLetOldInflightDeliveryRestoreDedupe(t *testing.T) {
 
 func mustNotifier(t *testing.T, im IMAdapter, read ReadRecentFunc) *Notifier {
 	t.Helper()
-	notifier, err := NewNotifier(im, read)
+	return mustNotifierWithGetter(t, im, matchingNotificationAgent, read)
+}
+
+func mustNotifierWithGetter(t *testing.T, im IMAdapter, get GetAgentFunc, read ReadRecentFunc) *Notifier {
+	t.Helper()
+	notifier, err := NewNotifier(im, get, read)
 	if err != nil {
 		t.Fatalf("NewNotifier() 返回错误：%v", err)
 	}
@@ -301,7 +369,39 @@ func notificationTransition(previous, current herdr.AgentStatus) session.Transit
 }
 
 func notificationTarget() session.Target {
-	return session.Target{PaneID: "pane-1", TerminalID: "terminal-1", OccupantKey: "occupant-1", Agent: "claude", DisplayAgent: "Claude", Title: "修复 <问题>", Status: herdr.AgentStatusWorking}
+	return notificationTargetWithSession("")
+}
+
+func notificationTargetWithSession(value string) session.Target {
+	var agentSession *herdr.AgentSession
+	if value != "" {
+		agentSession = &herdr.AgentSession{Source: "claude", Agent: "claude", Kind: "id", Value: value}
+	}
+	registry := &session.Registry{}
+	registry.Replace(herdr.Snapshot{
+		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-1", Number: 1, Label: "workspace-1"}},
+		Tabs:       []herdr.Tab{{TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "tab-1"}},
+		Panes: []herdr.Pane{{
+			PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1",
+			Agent: stringRef("claude"), DisplayAgent: stringRef("Claude"), Title: stringRef("修复 <问题>"),
+			AgentStatus: herdr.AgentStatusWorking, AgentSession: agentSession,
+		}},
+	}, false)
+	return registry.CreateListSnapshot()[0]
+}
+
+func matchingNotificationAgent(context.Context, string) (herdr.AgentInfo, error) {
+	return notificationAgentInfo(""), nil
+}
+
+func notificationAgentInfo(sessionValue string) herdr.AgentInfo {
+	var agentSession *herdr.AgentSession
+	if sessionValue != "" {
+		agentSession = &herdr.AgentSession{Source: "claude", Agent: "claude", Kind: "id", Value: sessionValue}
+	}
+	return herdr.AgentInfo{
+		PaneID: "pane-1", TerminalID: "terminal-1", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude"), AgentSession: agentSession,
+	}
 }
 
 func numberedNotificationLines(count int) string {
@@ -324,6 +424,46 @@ type notifierReader struct {
 	results []herdr.ReadResult
 	errors  []error
 	calls   []notifierReadCall
+}
+
+type notifierAgentGetter struct {
+	mu    sync.Mutex
+	agent herdr.AgentInfo
+	err   error
+	calls int
+}
+
+func (g *notifierAgentGetter) GetAgent(context.Context, string) (herdr.AgentInfo, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls++
+	return g.agent, g.err
+}
+
+func (g *notifierAgentGetter) SetAgent(agent herdr.AgentInfo) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.agent = agent
+	g.err = nil
+}
+
+func (g *notifierAgentGetter) CallCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
+type blockingNotifierReader struct {
+	result  herdr.ReadResult
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingNotifierReader) ReadRecent(context.Context, string, int) (herdr.ReadResult, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return r.result, nil
 }
 
 func (r *notifierReader) ReadRecent(_ context.Context, target string, lines int) (herdr.ReadResult, error) {

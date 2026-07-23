@@ -622,7 +622,7 @@ func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisor
 		t.Fatal(err)
 	}
 	reader := &notifierReader{}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
+	notifier := mustNotifierWithGetter(t, im, matchingSupervisorAgent, reader.ReadRecent)
 	log := &supervisorCallLog{}
 	for _, client := range clients {
 		client.log = log
@@ -640,6 +640,12 @@ func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisor
 		t.Fatalf("NewSupervisor() 返回错误：%v", err)
 	}
 	return &supervisorHarness{supervisor: supervisor, registry: registry, service: service, im: im, reader: reader, factory: factory, waiter: waiter, backoff: backoff, log: log}
+}
+
+func matchingSupervisorAgent(_ context.Context, target string) (herdr.AgentInfo, error) {
+	return herdr.AgentInfo{
+		PaneID: "pane-1", TerminalID: target, Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"),
+	}, nil
 }
 
 func runSupervisor(t *testing.T, supervisor *Supervisor) (context.CancelFunc, <-chan error) {

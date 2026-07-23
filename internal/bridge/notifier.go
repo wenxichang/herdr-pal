@@ -19,6 +19,9 @@ var ErrInvalidNotifierDependency = errors.New("Notifier 依赖无效")
 // ReadRecentFunc 读取目标的 recent_unwrapped 终端快照。
 type ReadRecentFunc func(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
 
+// GetAgentFunc 查询目标当前的 Agent occupant，供自动快照读取前后校验。
+type GetAgentFunc func(ctx context.Context, target string) (herdr.AgentInfo, error)
+
 type notificationKey struct {
 	paneID            string
 	occupantKey       string
@@ -34,6 +37,7 @@ type notificationKey struct {
 // 元数据，不跨越 Herdr 读取或企业微信发送调用。
 type Notifier struct {
 	im   IMAdapter
+	get  GetAgentFunc
 	read ReadRecentFunc
 
 	mu       sync.Mutex
@@ -42,13 +46,14 @@ type Notifier struct {
 	epoch    uint64
 }
 
-// NewNotifier 创建状态通知器并校验必需依赖。
-func NewNotifier(im IMAdapter, read ReadRecentFunc) (*Notifier, error) {
-	if im == nil || read == nil {
+// NewNotifier 创建状态通知器，并要求自动读取前后可实时校验 Agent occupant。
+func NewNotifier(im IMAdapter, get GetAgentFunc, read ReadRecentFunc) (*Notifier, error) {
+	if im == nil || get == nil || read == nil {
 		return nil, ErrInvalidNotifierDependency
 	}
 	return &Notifier{
 		im:       im,
+		get:      get,
 		read:     read,
 		recent:   make(map[string]notificationKey),
 		inflight: make(map[string]chan struct{}),
@@ -84,12 +89,16 @@ func (n *Notifier) HandleTransition(ctx context.Context, transition session.Tran
 	}
 	parts := renderStatusTitleParts(title, transition.Target)
 	if includeSnapshot {
-		result, err := n.read(ctx, transition.Target.TerminalID, panel.PageSize)
-		if err == nil && result.PaneID == transition.Target.PaneID {
-			lines := lastNotificationLines(panel.Normalize(result.Text))
-			key.snapshotAvailable = true
-			key.snapshotHash = notificationHash(lines)
-			parts = append(parts, renderNotificationSnapshot(transition.Target, lines)...)
+		before, err := n.get(ctx, transition.Target.TerminalID)
+		if err == nil && session.MatchesAgent(transition.Target, before) {
+			result, readErr := n.read(ctx, transition.Target.TerminalID, panel.PageSize)
+			after, getErr := n.get(ctx, transition.Target.TerminalID)
+			if readErr == nil && getErr == nil && session.MatchesAgent(transition.Target, after) && result.PaneID == transition.Target.PaneID {
+				lines := lastNotificationLines(panel.Normalize(result.Text))
+				key.snapshotAvailable = true
+				key.snapshotHash = notificationHash(lines)
+				parts = append(parts, renderNotificationSnapshot(transition.Target, lines)...)
+			}
 		}
 	}
 	return n.deliverOnce(ctx, transition.Target.PaneID, key, parts)
