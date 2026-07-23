@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +49,76 @@ func TestClientSubscribesBeforeDeliveringCallbacksAndReplies(t *testing.T) {
 		t.Fatalf("RespondMarkdown() error = %v", err)
 	}
 
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientBuffersCallbackUntilSubscribeResponse(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	subscribe := socket.nextWrite(t)
+	socket.push(textCallbackJSON("callback-before-subscribe"))
+	select {
+	case event := <-client.Events():
+		t.Fatalf("event delivered before subscribe confirmation: %+v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+	socket.push(responseJSON(requestIDOf(t, subscribe), 0))
+	select {
+	case event := <-client.Events():
+		if event.RequestID != "callback-before-subscribe" {
+			t.Fatalf("event = %+v, want buffered callback", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("buffered callback was not delivered")
+	}
+	select {
+	case event := <-client.Events():
+		t.Fatalf("callback delivered more than once: %+v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientWaitsBackoffAfterSubscribedSessionEnds(t *testing.T) {
+	first := newFakeSocket()
+	second := newFakeSocket()
+	calls := 0
+	client := newTestClient(t, func(context.Context, string) (Socket, error) {
+		calls++
+		if calls == 1 {
+			return first, nil
+		}
+		return second, nil
+	})
+	client.backoff = NewBackoff(time.Second, 30*time.Second, func() float64 { return 0.5 })
+	waits := make(chan time.Duration, 2)
+	releaseWait := make(chan struct{})
+	client.wait = func(_ context.Context, delay time.Duration) error { waits <- delay; <-releaseWait; return nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, first)
+	first.push([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-1"},"body":{"msgid":"event-message-1","create_time":1720000000,"aibotid":"bot-1","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`))
+	select {
+	case got := <-waits:
+		if got != time.Second {
+			t.Fatalf("backoff wait = %s, want 1s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscribed session end did not wait backoff")
+	}
+	select {
+	case write := <-second.writes:
+		t.Fatalf("redial happened before backoff was released: %s", write)
+	default:
+	}
+	close(releaseWait)
+	if commandOf(t, second.nextWrite(t)).Cmd != "aibot_subscribe" {
+		t.Fatal("did not reconnect after wait")
+	}
 	cancel()
 	awaitDone(t, done)
 }
@@ -238,6 +312,157 @@ func TestClientRequestContextCancelsWithoutEndingSession(t *testing.T) {
 	awaitDone(t, done)
 }
 
+func TestClientProductionWebSocketReconnectsAndReplacesPendingSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var connections atomic.Int32
+	firstSubscribed := make(chan struct{}, 1)
+	releaseSubscribe := make(chan struct{})
+	pendingSeen := make(chan struct{}, 1)
+	secondSubscribed := make(chan struct{}, 1)
+	secondSend := make(chan string, 1)
+	serverErrors := make(chan error, 4)
+	recordError := func(err error) {
+		select {
+		case serverErrors <- err:
+		default:
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			recordError(err)
+			return
+		}
+		defer connection.CloseNow()
+		index := connections.Add(1)
+		_, subscribe, err := connection.Read(ctx)
+		if err != nil {
+			recordError(err)
+			return
+		}
+		if commandOfJSON(subscribe) != "aibot_subscribe" {
+			recordError(fmt.Errorf("first frame = %s", subscribe))
+			return
+		}
+		requestID := requestIDOfJSON(subscribe)
+		if index == 1 {
+			if err := connection.Write(ctx, websocket.MessageText, textCallbackJSON("real-callback")); err != nil {
+				recordError(err)
+				return
+			}
+			firstSubscribed <- struct{}{}
+			select {
+			case <-releaseSubscribe:
+			case <-ctx.Done():
+				return
+			}
+			if err := connection.Write(ctx, websocket.MessageText, responseJSON(requestID, 0)); err != nil {
+				recordError(err)
+				return
+			}
+			_, pending, err := connection.Read(ctx)
+			if err != nil {
+				recordError(err)
+				return
+			}
+			if commandOfJSON(pending) != "aibot_send_msg" {
+				recordError(fmt.Errorf("pending command = %s", pending))
+				return
+			}
+			pendingSeen <- struct{}{}
+			_ = connection.Close(websocket.StatusNormalClosure, "test disconnect")
+			return
+		}
+		if index == 2 {
+			if err := connection.Write(ctx, websocket.MessageText, responseJSON(requestID, 0)); err != nil {
+				recordError(err)
+				return
+			}
+			secondSubscribed <- struct{}{}
+			_, send, err := connection.Read(ctx)
+			if err != nil {
+				recordError(err)
+				return
+			}
+			if commandOfJSON(send) != "aibot_send_msg" {
+				recordError(fmt.Errorf("second command = %s", send))
+				return
+			}
+			secondSend <- requestIDOfJSON(send)
+			if err := connection.Write(ctx, websocket.MessageText, responseJSON(requestIDOfJSON(send), 0)); err != nil {
+				recordError(err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{Endpoint: strings.Replace(server.URL, "http://", "ws://", 1), BotID: "bot-1", Secret: "secret", AllowedUserID: "user-1", Dial: productionDial, RequestID: sequentialIDs(), RequestTimeout: 500 * time.Millisecond, HeartbeatInterval: time.Hour, Wait: func(context.Context, time.Duration) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := runClient(t, client, ctx)
+	select {
+	case <-firstSubscribed:
+	case <-ctx.Done():
+		t.Fatal("first real websocket did not subscribe")
+	}
+	select {
+	case event := <-client.Events():
+		t.Fatalf("event delivered before subscribe response: %+v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseSubscribe)
+	select {
+	case event := <-client.Events():
+		if event.RequestID != "real-callback" {
+			t.Fatalf("event = %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("buffered real callback missing")
+	}
+
+	pendingResult := make(chan error, 1)
+	go func() { pendingResult <- client.SendMarkdown(ctx, "first pending") }()
+	select {
+	case <-pendingSeen:
+	case <-ctx.Done():
+		t.Fatal("first real session did not receive pending send")
+	}
+	select {
+	case err := <-pendingResult:
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("pending result = %v, want ErrUnavailable", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("pending request was not cancelled")
+	}
+	select {
+	case <-secondSubscribed:
+	case <-ctx.Done():
+		t.Fatal("second real websocket did not subscribe")
+	}
+	waitForCurrent(t, ctx, client)
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- client.SendMarkdown(ctx, "second send") }()
+	select {
+	case <-secondSend:
+	case <-ctx.Done():
+		t.Fatal("new session did not receive send")
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("new session SendMarkdown() = %v", err)
+	}
+	cancel()
+	awaitDone(t, runDone)
+	select {
+	case err := <-serverErrors:
+		t.Fatalf("websocket server error: %v", err)
+	default:
+	}
+}
+
 type fakeSocket struct {
 	reads    chan fakeRead
 	writes   chan []byte
@@ -326,6 +551,21 @@ func awaitDone(t *testing.T, done <-chan error) {
 		t.Fatal("Run() did not stop")
 	}
 }
+func waitForCurrent(t *testing.T, ctx context.Context, client *Client) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if client.getCurrent() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("current session was not installed")
+		case <-ticker.C:
+		}
+	}
+}
 func completeSubscribe(t *testing.T, client *Client, socket *fakeSocket) {
 	t.Helper()
 	subscribe := socket.nextWrite(t)
@@ -371,6 +611,22 @@ func requestIDOf(t *testing.T, data []byte) string {
 	}
 	if err := json.Unmarshal(data, &request); err != nil {
 		t.Fatal(err)
+	}
+	return request.Headers.RequestID
+}
+func commandOfJSON(data []byte) string {
+	var command wireCommand
+	if json.Unmarshal(data, &command) != nil {
+		return ""
+	}
+	return command.Cmd
+}
+func requestIDOfJSON(data []byte) string {
+	var request struct {
+		Headers Headers `json:"headers"`
+	}
+	if json.Unmarshal(data, &request) != nil {
+		return ""
 	}
 	return request.Headers.RequestID
 }

@@ -150,6 +150,9 @@ func (c *Client) Run(ctx context.Context) error {
 		go c.heartbeat(session)
 		<-session.done
 		c.clearIfCurrent(session)
+		if err := c.wait(ctx, c.backoff.Next()); err != nil {
+			return err
+		}
 	}
 }
 
