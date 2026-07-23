@@ -43,7 +43,7 @@ func TestClientRequestUsesIndependentConnectionsAndClosesThem(t *testing.T) {
 }
 
 func TestClientRequestReadsResponseWrittenInParts(t *testing.T) {
-	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) {
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
 		id, _ := request["id"].(string)
 		for _, part := range []string{
 			`{"id":"` + id,
@@ -51,9 +51,10 @@ func TestClientRequestReadsResponseWrittenInParts(t *testing.T) {
 			"\n",
 		} {
 			if _, err := io.WriteString(conn, part); err != nil {
-				return
+				return err
 			}
 		}
+		return nil
 	}}
 	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
 
@@ -87,7 +88,7 @@ func TestClientRequestClassifiesDialTimeoutAsDeadlineExceeded(t *testing.T) {
 }
 
 func TestClientRequestClassifiesEmptyEOFAsUnavailable(t *testing.T) {
-	dialer := &pipeDialer{handler: func(net.Conn, map[string]any) {}}
+	dialer := &pipeDialer{handler: func(net.Conn, map[string]any) error { return nil }}
 	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
 
 	err := client.call(context.Background(), "test.method", map[string]any{}, nil)
@@ -116,8 +117,9 @@ func TestClientRequestRejectsUnencodableParamsBeforeDialing(t *testing.T) {
 }
 
 func TestClientRequestDeadlineTerminatesBlockedRead(t *testing.T) {
-	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) {
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
 		_, _ = conn.Read(make([]byte, 1))
+		return nil
 	}}
 	client := NewClient("/tmp/herdr.sock", dialer, 20*time.Millisecond)
 
@@ -136,9 +138,10 @@ func TestClientRequestDeadlineTerminatesBlockedRead(t *testing.T) {
 
 func TestClientRequestCancellationTerminatesBlockedRead(t *testing.T) {
 	started := make(chan struct{})
-	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) {
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
 		close(started)
 		_, _ = conn.Read(make([]byte, 1))
+		return nil
 	}}
 	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -183,10 +186,12 @@ func (d waitingDialer) DialContext(ctx context.Context, network, address string)
 }
 
 type pipeDialer struct {
-	handler func(net.Conn, map[string]any)
+	handler func(net.Conn, map[string]any) error
 
 	mu          sync.Mutex
 	connections []net.Conn
+	handlerErrs []error
+	wg          sync.WaitGroup
 }
 
 func (d *pipeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -195,7 +200,9 @@ func (d *pipeDialer) DialContext(ctx context.Context, network, address string) (
 	d.connections = append(d.connections, client)
 	d.mu.Unlock()
 
+	d.wg.Add(1)
 	go func() {
+		defer d.wg.Done()
 		defer server.Close()
 		requestLine, err := bufio.NewReader(server).ReadBytes('\n')
 		if err != nil {
@@ -203,17 +210,47 @@ func (d *pipeDialer) DialContext(ctx context.Context, network, address string) (
 		}
 		var request map[string]any
 		if err := json.Unmarshal(requestLine, &request); err != nil {
+			d.recordHandlerError(err)
 			return
 		}
 		if d.handler != nil {
-			d.handler(server, request)
+			d.recordHandlerError(d.handler(server, request))
 			return
 		}
-		index := int(request["params"].(map[string]any)["index"].(float64))
-		_, _ = io.WriteString(server, `{"id":"`+request["id"].(string)+`","result":{"value":`+strconv.Itoa(index)+"}}\n")
+		params, ok := request["params"].(map[string]any)
+		if !ok {
+			d.recordHandlerError(errors.New("请求 params 不是对象"))
+			return
+		}
+		index, ok := params["index"].(float64)
+		if !ok {
+			d.recordHandlerError(errors.New("请求缺少 index"))
+			return
+		}
+		_, err = io.WriteString(server, `{"id":"`+request["id"].(string)+`","result":{"value":`+strconv.Itoa(int(index))+"}}\n")
+		d.recordHandlerError(err)
 	}()
 
 	return client, nil
+}
+
+func (d *pipeDialer) recordHandlerError(err error) {
+	if err == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.handlerErrs = append(d.handlerErrs, err)
+}
+
+func (d *pipeDialer) assertNoHandlerError(t *testing.T) {
+	t.Helper()
+	d.wg.Wait()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.handlerErrs) != 0 {
+		t.Errorf("测试服务端处理请求失败：%v", d.handlerErrs[0])
+	}
 }
 
 func (d *pipeDialer) Count() int {
@@ -229,9 +266,7 @@ func (d *pipeDialer) ClientConnections() []net.Conn {
 }
 
 func TestClientCheckCompatibleSendsPingAndAcceptsRequiredProtocol(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"pong","version":"0.17.0","protocol":17,"unknown":true}`, func(request map[string]any) {
-		assertBusinessRequest(t, request, "ping", map[string]any{})
-	})
+	client := newBusinessTestClient(t, `{"type":"pong","version":"0.17.0","protocol":17,"unknown":true}`, businessRequestCheck("ping", map[string]any{}))
 
 	if err := client.CheckCompatible(context.Background()); err != nil {
 		t.Fatalf("CheckCompatible() 返回错误：%v", err)
@@ -273,10 +308,8 @@ func TestClientCheckCompatibleRejectsInvalidPong(t *testing.T) {
 }
 
 func TestClientSnapshotDecodesMinimalSnapshot(t *testing.T) {
-	result := `{"type":"session_snapshot","snapshot":{"version":"0.17.0","protocol":17,"workspaces":[{"workspace_id":"w1","number":1,"label":"主工作区","ignored":true}],"tabs":[{"tab_id":"t1","workspace_id":"w1","number":2,"label":"终端"}],"panes":[{"pane_id":"p1","terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent":"codex","title":"实现","display_agent":"Codex","agent_status":"working","agent_session":{"source":"codex","agent":"codex","kind":"thread","value":"session-1"}}],"agents":[{"terminal_id":"term1","name":"任务","agent":"codex","title":"实现","terminal_title":"term","terminal_title_stripped":"term","display_agent":"Codex","agent_status":"working","agent_session":{"source":"codex","agent":"codex","kind":"thread","value":"session-1"},"workspace_id":"w1","tab_id":"t1","pane_id":"p1"}],"layouts":[]}}`
-	client := newBusinessTestClient(t, result, func(request map[string]any) {
-		assertBusinessRequest(t, request, "session.snapshot", map[string]any{})
-	})
+	result := snapshotResultJSON(t, nil)
+	client := newBusinessTestClient(t, result, businessRequestCheck("session.snapshot", map[string]any{}))
 
 	snapshot, err := client.Snapshot(context.Background())
 	if err != nil {
@@ -344,7 +377,13 @@ func TestClientSnapshotRejectsMissingRequiredWireFields(t *testing.T) {
 }
 
 func TestClientSnapshotAcceptsExplicitZeroProtocol(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"session_snapshot","snapshot":{"version":"0.17.0","protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[]}}`, nil)
+	client := newBusinessTestClient(t, snapshotResultJSON(t, func(snapshot map[string]any) {
+		snapshot["protocol"] = 0
+		snapshot["workspaces"] = []any{}
+		snapshot["tabs"] = []any{}
+		snapshot["panes"] = []any{}
+		snapshot["agents"] = []any{}
+	}), nil)
 
 	snapshot, err := client.Snapshot(context.Background())
 	if err != nil {
@@ -356,8 +395,17 @@ func TestClientSnapshotAcceptsExplicitZeroProtocol(t *testing.T) {
 }
 
 func TestClientSnapshotAcceptsZeroNumbersAndEmptyLabels(t *testing.T) {
-	result := `{"type":"session_snapshot","snapshot":{"version":"0.17.0","protocol":0,"workspaces":[{"workspace_id":"w1","number":0,"label":""}],"tabs":[{"tab_id":"t1","workspace_id":"w1","number":0,"label":""}],"panes":[],"agents":[]}}`
-	client := newBusinessTestClient(t, result, nil)
+	client := newBusinessTestClient(t, snapshotResultJSON(t, func(snapshot map[string]any) {
+		snapshot["protocol"] = 0
+		workspace := snapshot["workspaces"].([]any)[0].(map[string]any)
+		workspace["number"] = 0
+		workspace["label"] = ""
+		tab := snapshot["tabs"].([]any)[0].(map[string]any)
+		tab["number"] = 0
+		tab["label"] = ""
+		snapshot["panes"] = []any{}
+		snapshot["agents"] = []any{}
+	}), nil)
 
 	snapshot, err := client.Snapshot(context.Background())
 	if err != nil {
@@ -368,10 +416,104 @@ func TestClientSnapshotAcceptsZeroNumbersAndEmptyLabels(t *testing.T) {
 	}
 }
 
+func TestClientSnapshotRejectsMissingProtocol17RequiredFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "顶层缺 version", mutate: func(snapshot map[string]any) { delete(snapshot, "version") }},
+		{name: "顶层空白 version", mutate: func(snapshot map[string]any) { snapshot["version"] = " \t " }},
+		{name: "顶层缺 protocol", mutate: func(snapshot map[string]any) { delete(snapshot, "protocol") }},
+		{name: "顶层缺 workspaces", mutate: func(snapshot map[string]any) { delete(snapshot, "workspaces") }},
+		{name: "顶层缺 tabs", mutate: func(snapshot map[string]any) { delete(snapshot, "tabs") }},
+		{name: "顶层缺 panes", mutate: func(snapshot map[string]any) { delete(snapshot, "panes") }},
+		{name: "顶层缺 layouts", mutate: func(snapshot map[string]any) { delete(snapshot, "layouts") }},
+		{name: "顶层缺 agents", mutate: func(snapshot map[string]any) { delete(snapshot, "agents") }},
+		{name: "Workspace 缺 workspace_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "workspace_id") }},
+		{name: "Workspace 缺 number", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "number") }},
+		{name: "Workspace 缺 label", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "label") }},
+		{name: "Workspace 缺 focused", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "focused") }},
+		{name: "Workspace 缺 pane_count", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "pane_count") }},
+		{name: "Workspace 缺 tab_count", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "tab_count") }},
+		{name: "Workspace 缺 active_tab_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "workspaces"), "active_tab_id") }},
+		{name: "Workspace 负 number", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "workspaces")["number"] = -1 }},
+		{name: "Workspace 负 pane_count", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "workspaces")["pane_count"] = -1 }},
+		{name: "Workspace 负 tab_count", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "workspaces")["tab_count"] = -1 }},
+		{name: "Workspace 非法状态", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "workspaces")["agent_status"] = "invalid" }},
+		{name: "Tab 缺 tab_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "tabs"), "tab_id") }},
+		{name: "Tab 缺 workspace_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "tabs"), "workspace_id") }},
+		{name: "Tab 缺 number", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "tabs"), "number") }},
+		{name: "Tab 缺 label", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "tabs"), "label") }},
+		{name: "Tab 缺 focused", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "tabs"), "focused") }},
+		{name: "Tab 缺 pane_count", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "tabs"), "pane_count") }},
+		{name: "Tab 负 number", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "tabs")["number"] = -1 }},
+		{name: "Tab 负 pane_count", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "tabs")["pane_count"] = -1 }},
+		{name: "Tab 非法状态", mutate: func(snapshot map[string]any) { firstSnapshotObject(snapshot, "tabs")["agent_status"] = "invalid" }},
+		{name: "Pane 缺 pane_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "pane_id") }},
+		{name: "Pane 缺 terminal_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "terminal_id") }},
+		{name: "Pane 缺 workspace_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "workspace_id") }},
+		{name: "Pane 缺 tab_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "tab_id") }},
+		{name: "Pane 缺 focused", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "focused") }},
+		{name: "Pane 缺 agent_status", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "agent_status") }},
+		{name: "Pane 缺 revision", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "panes"), "revision") }},
+		{name: "Agent 缺 terminal_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "terminal_id") }},
+		{name: "Agent 缺 workspace_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "workspace_id") }},
+		{name: "Agent 缺 tab_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "tab_id") }},
+		{name: "Agent 缺 pane_id", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "pane_id") }},
+		{name: "Agent 缺 focused", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "focused") }},
+		{name: "Agent 缺 agent_status", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "agent_status") }},
+		{name: "Agent 缺 revision", mutate: func(snapshot map[string]any) { delete(firstSnapshotObject(snapshot, "agents"), "revision") }},
+		{name: "会话非法 kind", mutate: func(snapshot map[string]any) {
+			firstSnapshotObject(snapshot, "agents")["agent_session"].(map[string]any)["kind"] = "thread"
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newBusinessTestClient(t, snapshotResultJSON(t, test.mutate), nil)
+			if _, err := client.Snapshot(context.Background()); !errors.Is(err, ErrProtocol) {
+				t.Fatalf("Snapshot() 错误 = %v，期望 ErrProtocol", err)
+			}
+		})
+	}
+}
+
+func TestClientReadRecentRejectsMismatchedRequiredWireFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "缺 pane_id", mutate: func(read map[string]any) { delete(read, "pane_id") }},
+		{name: "缺 workspace_id", mutate: func(read map[string]any) { delete(read, "workspace_id") }},
+		{name: "缺 tab_id", mutate: func(read map[string]any) { delete(read, "tab_id") }},
+		{name: "缺 source", mutate: func(read map[string]any) { delete(read, "source") }},
+		{name: "非法 source", mutate: func(read map[string]any) { read["source"] = "other" }},
+		{name: "source 与请求不符", mutate: func(read map[string]any) { read["source"] = "recent" }},
+		{name: "缺 format", mutate: func(read map[string]any) { delete(read, "format") }},
+		{name: "非法 format", mutate: func(read map[string]any) { read["format"] = "html" }},
+		{name: "format 与请求不符", mutate: func(read map[string]any) { read["format"] = "ansi" }},
+		{name: "缺 text", mutate: func(read map[string]any) { delete(read, "text") }},
+		{name: "缺 revision", mutate: func(read map[string]any) { delete(read, "revision") }},
+		{name: "缺 truncated", mutate: func(read map[string]any) { delete(read, "truncated") }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			read := validReadResult(t)
+			test.mutate(read)
+			client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, read)+`}`, nil)
+			if _, err := client.ReadRecent(context.Background(), "p1", 1); !errors.Is(err, ErrProtocol) {
+				t.Fatalf("ReadRecent() 错误 = %v，期望 ErrProtocol", err)
+			}
+		})
+	}
+}
+
 func TestClientGetAgentSendsTargetAndDecodesAgent(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"agent_info","agent":{"terminal_id":"term1","agent_status":"blocked","workspace_id":"w1","tab_id":"t1","pane_id":"p1","unknown":1}}`, func(request map[string]any) {
-		assertBusinessRequest(t, request, "agent.get", map[string]any{"target": "p1"})
-	})
+	agentPayload := validAgentInfo(t)
+	agentPayload["agent_status"] = "blocked"
+	agentJSON := mustJSON(t, agentPayload)
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+agentJSON+`}`, businessRequestCheck("agent.get", map[string]any{"target": "p1"}))
 
 	agent, err := client.GetAgent(context.Background(), "p1")
 	if err != nil {
@@ -401,29 +543,34 @@ func TestClientGetAgentRejectsInvalidInputOrResult(t *testing.T) {
 
 func TestClientGetAgentAndPromptRejectInvalidAgentInfo(t *testing.T) {
 	tests := []struct {
-		name  string
-		agent string
+		name   string
+		mutate func(map[string]any)
 	}{
-		{name: "缺 terminal_id", agent: `{"workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle"}`},
-		{name: "缺 workspace_id", agent: `{"terminal_id":"term1","tab_id":"t1","pane_id":"p1","agent_status":"idle"}`},
-		{name: "缺 tab_id", agent: `{"terminal_id":"term1","workspace_id":"w1","pane_id":"p1","agent_status":"idle"}`},
-		{name: "缺 pane_id", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent_status":"idle"}`},
-		{name: "缺 agent_status", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1"}`},
-		{name: "非法 agent_status", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"running"}`},
-		{name: "会话缺 source", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"agent":"codex","kind":"id","value":"session-1"}}`},
-		{name: "会话缺 agent", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":"codex","kind":"id","value":"session-1"}}`},
-		{name: "会话缺 kind", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":"codex","agent":"codex","value":"session-1"}}`},
-		{name: "会话缺 value", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":"codex","agent":"codex","kind":"id"}}`},
-		{name: "会话空白必填字段", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":" ","agent":"codex","kind":"id","value":"session-1"}}`},
+		{name: "缺 terminal_id", mutate: func(agent map[string]any) { delete(agent, "terminal_id") }},
+		{name: "缺 workspace_id", mutate: func(agent map[string]any) { delete(agent, "workspace_id") }},
+		{name: "缺 tab_id", mutate: func(agent map[string]any) { delete(agent, "tab_id") }},
+		{name: "缺 pane_id", mutate: func(agent map[string]any) { delete(agent, "pane_id") }},
+		{name: "缺 focused", mutate: func(agent map[string]any) { delete(agent, "focused") }},
+		{name: "缺 revision", mutate: func(agent map[string]any) { delete(agent, "revision") }},
+		{name: "缺 agent_status", mutate: func(agent map[string]any) { delete(agent, "agent_status") }},
+		{name: "非法 agent_status", mutate: func(agent map[string]any) { agent["agent_status"] = "running" }},
+		{name: "会话缺 source", mutate: func(agent map[string]any) { delete(agent["agent_session"].(map[string]any), "source") }},
+		{name: "会话缺 agent", mutate: func(agent map[string]any) { delete(agent["agent_session"].(map[string]any), "agent") }},
+		{name: "会话缺 kind", mutate: func(agent map[string]any) { delete(agent["agent_session"].(map[string]any), "kind") }},
+		{name: "会话缺 value", mutate: func(agent map[string]any) { delete(agent["agent_session"].(map[string]any), "value") }},
+		{name: "会话非法 kind", mutate: func(agent map[string]any) { agent["agent_session"].(map[string]any)["kind"] = "thread" }},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			getClient := newBusinessTestClient(t, `{"type":"agent_info","agent":`+test.agent+`}`, nil)
+			agent := validAgentInfo(t)
+			test.mutate(agent)
+			payload := mustJSON(t, agent)
+			getClient := newBusinessTestClient(t, `{"type":"agent_info","agent":`+payload+`}`, nil)
 			if _, err := getClient.GetAgent(context.Background(), "p1"); !errors.Is(err, ErrProtocol) {
 				t.Fatalf("GetAgent() 错误 = %v，期望 ErrProtocol", err)
 			}
-			promptClient := newBusinessTestClient(t, `{"type":"agent_prompted","agent":`+test.agent+`}`, nil)
+			promptClient := newBusinessTestClient(t, `{"type":"agent_prompted","agent":`+payload+`}`, nil)
 			if err := promptClient.Prompt(context.Background(), "p1", "text"); !errors.Is(err, ErrProtocol) {
 				t.Fatalf("Prompt() 错误 = %v，期望 ErrProtocol", err)
 			}
@@ -432,9 +579,10 @@ func TestClientGetAgentAndPromptRejectInvalidAgentInfo(t *testing.T) {
 }
 
 func TestClientReadRecentSendsExactParametersAndDecodesRead(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"pane_read","read":{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","text":"输出","truncated":true,"revision":0}}`, func(request map[string]any) {
-		assertBusinessRequest(t, request, "agent.read", map[string]any{"target": "p1", "source": "recent_unwrapped", "lines": float64(42), "format": "text", "strip_ansi": true})
-	})
+	readPayload := validReadResult(t)
+	readPayload["text"] = "输出"
+	readPayload["truncated"] = true
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, readPayload)+`}`, businessRequestCheck("agent.read", map[string]any{"target": "p1", "source": "recent_unwrapped", "lines": float64(42), "format": "text", "strip_ansi": true}))
 
 	read, err := client.ReadRecent(context.Background(), "p1", 42)
 	if err != nil {
@@ -483,7 +631,8 @@ func TestClientReadRecentDistinguishesMissingFieldsFromZeroValues(t *testing.T) 
 		}
 	}
 
-	client := newBusinessTestClient(t, `{"type":"pane_read","read":{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","text":"","truncated":false}}`, nil)
+	valid := validReadResult(t)
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, valid)+`}`, nil)
 	read, err := client.ReadRecent(context.Background(), "p1", 1)
 	if err != nil {
 		t.Fatalf("ReadRecent() 返回错误：%v", err)
@@ -494,9 +643,7 @@ func TestClientReadRecentDistinguishesMissingFieldsFromZeroValues(t *testing.T) 
 }
 
 func TestClientPromptSendsExactParameters(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"agent_prompted","agent":{"terminal_id":"term1","agent_status":"working","workspace_id":"w1","tab_id":"t1","pane_id":"p1"}}`, func(request map[string]any) {
-		assertBusinessRequest(t, request, "agent.prompt", map[string]any{"target": "p1", "text": ""})
-	})
+	client := newBusinessTestClient(t, `{"type":"agent_prompted","agent":`+validAgentInfoJSON(t)+`}`, businessRequestCheck("agent.prompt", map[string]any{"target": "p1", "text": ""}))
 
 	if err := client.Prompt(context.Background(), "p1", ""); err != nil {
 		t.Fatalf("Prompt() 返回错误：%v", err)
@@ -521,9 +668,7 @@ func TestClientPromptRejectsEmptyTargetAndInvalidResult(t *testing.T) {
 }
 
 func TestClientSendKeySendsExactParameters(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"ok","ignored":true}`, func(request map[string]any) {
-		assertBusinessRequest(t, request, "agent.send_keys", map[string]any{"target": "p1", "keys": []any{"enter"}})
-	})
+	client := newBusinessTestClient(t, `{"type":"ok","ignored":true}`, businessRequestCheck("agent.send_keys", map[string]any{"target": "p1", "keys": []any{"enter"}}))
 
 	if err := client.SendKey(context.Background(), "p1", "enter"); err != nil {
 		t.Fatalf("SendKey() 返回错误：%v", err)
@@ -547,27 +692,161 @@ func TestClientSendKeyRejectsInvalidInputAndResult(t *testing.T) {
 	}
 }
 
-func newBusinessTestClient(t *testing.T, result string, check func(map[string]any)) *Client {
+func newBusinessTestClient(t *testing.T, result string, check func(map[string]any) error) *Client {
 	t.Helper()
-	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) {
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
 		if check != nil {
-			check(request)
+			if err := check(request); err != nil {
+				return err
+			}
 		}
-		_, _ = io.WriteString(conn, `{"id":"`+request["id"].(string)+`","result":`+result+"}\n")
+		id, ok := request["id"].(string)
+		if !ok {
+			return errors.New("请求缺少 id")
+		}
+		_, err := io.WriteString(conn, `{"id":"`+id+`","result":`+result+"}\n")
+		return err
 	}}
+	t.Cleanup(func() { dialer.assertNoHandlerError(t) })
 	return NewClient("/tmp/herdr.sock", dialer, time.Second)
 }
 
-func assertBusinessRequest(t *testing.T, request map[string]any, method string, params map[string]any) {
+func businessRequestCheck(method string, params map[string]any) func(map[string]any) error {
+	return func(request map[string]any) error {
+		if request["method"] != method {
+			return fmt.Errorf("method = %q，期望 %q", request["method"], method)
+		}
+		actual, ok := request["params"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("params 类型 = %T，期望 object", request["params"])
+		}
+		if !reflect.DeepEqual(actual, params) {
+			return fmt.Errorf("params = %#v，期望 %#v", actual, params)
+		}
+		return nil
+	}
+}
+
+func snapshotResultJSON(t *testing.T, mutate func(map[string]any)) string {
 	t.Helper()
-	if request["method"] != method {
-		t.Fatalf("method = %q，期望 %q", request["method"], method)
+	snapshot := validSnapshot(t)
+	if mutate != nil {
+		mutate(snapshot)
 	}
-	actual, ok := request["params"].(map[string]any)
-	if !ok {
-		t.Fatalf("params 类型 = %T，期望 object", request["params"])
+	return `{"type":"session_snapshot","snapshot":` + mustJSON(t, snapshot) + `}`
+}
+
+func validSnapshot(t *testing.T) map[string]any {
+	t.Helper()
+	return map[string]any{
+		"version":    "0.17.0",
+		"protocol":   17,
+		"workspaces": []any{validWorkspace()},
+		"tabs":       []any{validTab()},
+		"panes":      []any{validPane()},
+		"layouts":    []any{},
+		"agents":     []any{validAgentInfo(t)},
 	}
-	if !reflect.DeepEqual(actual, params) {
-		t.Fatalf("params = %#v，期望 %#v", actual, params)
+}
+
+func validWorkspace() map[string]any {
+	return map[string]any{
+		"workspace_id":  "w1",
+		"number":        1,
+		"label":         "工作区",
+		"focused":       false,
+		"pane_count":    1,
+		"tab_count":     1,
+		"active_tab_id": "t1",
+		"agent_status":  "working",
 	}
+}
+
+func firstSnapshotObject(snapshot map[string]any, key string) map[string]any {
+	return snapshot[key].([]any)[0].(map[string]any)
+}
+
+func validTab() map[string]any {
+	return map[string]any{
+		"tab_id":       "t1",
+		"workspace_id": "w1",
+		"number":       1,
+		"label":        "标签页",
+		"focused":      false,
+		"pane_count":   1,
+		"agent_status": "working",
+	}
+}
+
+func validPane() map[string]any {
+	return map[string]any{
+		"pane_id":       "p1",
+		"terminal_id":   "term1",
+		"workspace_id":  "w1",
+		"tab_id":        "t1",
+		"focused":       false,
+		"agent":         "codex",
+		"title":         "实现",
+		"display_agent": "Codex",
+		"agent_status":  "working",
+		"agent_session": validAgentSession(),
+		"revision":      0,
+	}
+}
+
+func validAgentInfo(t *testing.T) map[string]any {
+	t.Helper()
+	return map[string]any{
+		"terminal_id":             "term1",
+		"name":                    "任务",
+		"agent":                   "codex",
+		"title":                   "实现",
+		"terminal_title":          "term",
+		"terminal_title_stripped": "term",
+		"display_agent":           "Codex",
+		"agent_status":            "working",
+		"agent_session":           validAgentSession(),
+		"workspace_id":            "w1",
+		"tab_id":                  "t1",
+		"pane_id":                 "p1",
+		"focused":                 false,
+		"revision":                0,
+	}
+}
+
+func validAgentInfoJSON(t *testing.T) string {
+	t.Helper()
+	return mustJSON(t, validAgentInfo(t))
+}
+
+func validAgentSession() map[string]any {
+	return map[string]any{
+		"source": "codex",
+		"agent":  "codex",
+		"kind":   "id",
+		"value":  "session-1",
+	}
+}
+
+func validReadResult(t *testing.T) map[string]any {
+	t.Helper()
+	return map[string]any{
+		"pane_id":      "p1",
+		"workspace_id": "w1",
+		"tab_id":       "t1",
+		"source":       "recent_unwrapped",
+		"format":       "text",
+		"text":         "",
+		"revision":     0,
+		"truncated":    false,
+	}
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("编码测试 fixture 失败：%v", err)
+	}
+	return string(encoded)
 }

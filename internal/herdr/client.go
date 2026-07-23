@@ -170,7 +170,14 @@ func (c *Client) ReadRecent(ctx context.Context, target string, lines int) (Read
 	if err := decodeRequiredPayload(result.Read, "read", &wire); err != nil {
 		return ReadResult{}, err
 	}
-	return readResultFromWire(wire)
+	decoded, err := readResultFromWire(wire)
+	if err != nil {
+		return ReadResult{}, err
+	}
+	if decoded.Source != "recent_unwrapped" || decoded.Format != "text" {
+		return ReadResult{}, protocolError("pane_read 返回来源或格式与请求不一致")
+	}
+	return decoded.Result, nil
 }
 
 // Prompt 向 target 对应的 Agent 发送普通文本输入。
@@ -233,70 +240,6 @@ type paneReadResult struct {
 	Read json.RawMessage `json:"read"`
 }
 
-type wireSnapshot struct {
-	Version    *string         `json:"version"`
-	Protocol   *uint32         `json:"protocol"`
-	Workspaces []wireWorkspace `json:"workspaces"`
-	Tabs       []wireTab       `json:"tabs"`
-	Panes      []wirePane      `json:"panes"`
-	Agents     []wireAgentInfo `json:"agents"`
-}
-
-type wireWorkspace struct {
-	WorkspaceID *string `json:"workspace_id"`
-	Number      *int    `json:"number"`
-	Label       *string `json:"label"`
-}
-
-type wireTab struct {
-	TabID       *string `json:"tab_id"`
-	WorkspaceID *string `json:"workspace_id"`
-	Number      *int    `json:"number"`
-	Label       *string `json:"label"`
-}
-
-type wirePane struct {
-	PaneID       *string           `json:"pane_id"`
-	TerminalID   *string           `json:"terminal_id"`
-	WorkspaceID  *string           `json:"workspace_id"`
-	TabID        *string           `json:"tab_id"`
-	Agent        *string           `json:"agent"`
-	Title        *string           `json:"title"`
-	DisplayAgent *string           `json:"display_agent"`
-	AgentStatus  *string           `json:"agent_status"`
-	AgentSession *wireAgentSession `json:"agent_session"`
-}
-
-type wireAgentInfo struct {
-	TerminalID            *string           `json:"terminal_id"`
-	Name                  *string           `json:"name"`
-	Agent                 *string           `json:"agent"`
-	Title                 *string           `json:"title"`
-	TerminalTitle         *string           `json:"terminal_title"`
-	TerminalTitleStripped *string           `json:"terminal_title_stripped"`
-	DisplayAgent          *string           `json:"display_agent"`
-	AgentStatus           *string           `json:"agent_status"`
-	AgentSession          *wireAgentSession `json:"agent_session"`
-	WorkspaceID           *string           `json:"workspace_id"`
-	TabID                 *string           `json:"tab_id"`
-	PaneID                *string           `json:"pane_id"`
-}
-
-type wireAgentSession struct {
-	Source *string `json:"source"`
-	Agent  *string `json:"agent"`
-	Kind   *string `json:"kind"`
-	Value  *string `json:"value"`
-}
-
-type wireReadResult struct {
-	PaneID      *string `json:"pane_id"`
-	WorkspaceID *string `json:"workspace_id"`
-	TabID       *string `json:"tab_id"`
-	Text        *string `json:"text"`
-	Truncated   *bool   `json:"truncated"`
-}
-
 type agentTargetParams struct {
 	Target string `json:"target"`
 }
@@ -344,132 +287,6 @@ func validateTarget(target string) error {
 		return protocolError("Herdr target 不能为空")
 	}
 	return nil
-}
-
-func snapshotFromWire(wire wireSnapshot) (Snapshot, error) {
-	if wire.Version == nil || strings.TrimSpace(*wire.Version) == "" {
-		return Snapshot{}, protocolError("session_snapshot 缺少 version")
-	}
-	if wire.Protocol == nil {
-		return Snapshot{}, protocolError("session_snapshot 缺少 protocol")
-	}
-	if wire.Workspaces == nil || wire.Tabs == nil || wire.Panes == nil || wire.Agents == nil {
-		return Snapshot{}, protocolError("session_snapshot 缺少资源列表")
-	}
-	snapshot := Snapshot{
-		Version:    *wire.Version,
-		Protocol:   *wire.Protocol,
-		Workspaces: make([]Workspace, 0, len(wire.Workspaces)),
-		Tabs:       make([]Tab, 0, len(wire.Tabs)),
-		Panes:      make([]Pane, 0, len(wire.Panes)),
-		Agents:     make([]AgentInfo, 0, len(wire.Agents)),
-	}
-	for _, workspace := range wire.Workspaces {
-		converted, err := workspaceFromWire(workspace)
-		if err != nil {
-			return Snapshot{}, err
-		}
-		snapshot.Workspaces = append(snapshot.Workspaces, converted)
-	}
-	for _, tab := range wire.Tabs {
-		converted, err := tabFromWire(tab)
-		if err != nil {
-			return Snapshot{}, err
-		}
-		snapshot.Tabs = append(snapshot.Tabs, converted)
-	}
-	for _, pane := range wire.Panes {
-		converted, err := paneFromWire(pane)
-		if err != nil {
-			return Snapshot{}, err
-		}
-		snapshot.Panes = append(snapshot.Panes, converted)
-	}
-	for _, agent := range wire.Agents {
-		converted, err := agentInfoFromWire(agent)
-		if err != nil {
-			return Snapshot{}, err
-		}
-		snapshot.Agents = append(snapshot.Agents, converted)
-	}
-	return snapshot, nil
-}
-
-func workspaceFromWire(wire wireWorkspace) (Workspace, error) {
-	if wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.Number == nil || wire.Label == nil {
-		return Workspace{}, protocolError("workspace 信息缺少必填字段")
-	}
-	return Workspace{WorkspaceID: *wire.WorkspaceID, Number: *wire.Number, Label: *wire.Label}, nil
-}
-
-func tabFromWire(wire wireTab) (Tab, error) {
-	if wire.TabID == nil || strings.TrimSpace(*wire.TabID) == "" || wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.Number == nil || wire.Label == nil {
-		return Tab{}, protocolError("tab 信息缺少必填字段")
-	}
-	return Tab{TabID: *wire.TabID, WorkspaceID: *wire.WorkspaceID, Number: *wire.Number, Label: *wire.Label}, nil
-}
-
-func paneFromWire(wire wirePane) (Pane, error) {
-	if wire.PaneID == nil || strings.TrimSpace(*wire.PaneID) == "" || wire.TerminalID == nil || strings.TrimSpace(*wire.TerminalID) == "" || wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.TabID == nil || strings.TrimSpace(*wire.TabID) == "" {
-		return Pane{}, protocolError("pane 信息缺少标识")
-	}
-	status, err := agentStatusFromWire(wire.AgentStatus)
-	if err != nil {
-		return Pane{}, err
-	}
-	session, err := agentSessionFromWire(wire.AgentSession)
-	if err != nil {
-		return Pane{}, err
-	}
-	return Pane{PaneID: *wire.PaneID, TerminalID: *wire.TerminalID, WorkspaceID: *wire.WorkspaceID, TabID: *wire.TabID, Agent: wire.Agent, Title: wire.Title, DisplayAgent: wire.DisplayAgent, AgentStatus: status, AgentSession: session}, nil
-}
-
-func agentInfoFromWire(wire wireAgentInfo) (AgentInfo, error) {
-	if wire.TerminalID == nil || strings.TrimSpace(*wire.TerminalID) == "" || wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.TabID == nil || strings.TrimSpace(*wire.TabID) == "" || wire.PaneID == nil || strings.TrimSpace(*wire.PaneID) == "" {
-		return AgentInfo{}, protocolError("agent 信息缺少标识")
-	}
-	status, err := agentStatusFromWire(wire.AgentStatus)
-	if err != nil {
-		return AgentInfo{}, err
-	}
-	session, err := agentSessionFromWire(wire.AgentSession)
-	if err != nil {
-		return AgentInfo{}, err
-	}
-	return AgentInfo{TerminalID: *wire.TerminalID, Name: wire.Name, Agent: wire.Agent, Title: wire.Title, TerminalTitle: wire.TerminalTitle, TerminalTitleStripped: wire.TerminalTitleStripped, DisplayAgent: wire.DisplayAgent, AgentStatus: status, AgentSession: session, WorkspaceID: *wire.WorkspaceID, TabID: *wire.TabID, PaneID: *wire.PaneID}, nil
-}
-
-func agentStatusFromWire(status *string) (AgentStatus, error) {
-	if status == nil || !isValidAgentStatus(*status) {
-		return "", protocolError("agent 信息缺少有效状态")
-	}
-	return AgentStatus(*status), nil
-}
-
-func isValidAgentStatus(status string) bool {
-	switch AgentStatus(status) {
-	case AgentStatusIdle, AgentStatusWorking, AgentStatusBlocked, AgentStatusDone, AgentStatusUnknown:
-		return true
-	default:
-		return false
-	}
-}
-
-func agentSessionFromWire(wire *wireAgentSession) (*AgentSession, error) {
-	if wire == nil {
-		return nil, nil
-	}
-	if wire.Source == nil || strings.TrimSpace(*wire.Source) == "" || wire.Agent == nil || strings.TrimSpace(*wire.Agent) == "" || wire.Kind == nil || strings.TrimSpace(*wire.Kind) == "" || wire.Value == nil || strings.TrimSpace(*wire.Value) == "" {
-		return nil, protocolError("agent_session 缺少必填字段")
-	}
-	return &AgentSession{Source: *wire.Source, Agent: *wire.Agent, Kind: *wire.Kind, Value: *wire.Value}, nil
-}
-
-func readResultFromWire(wire wireReadResult) (ReadResult, error) {
-	if wire.PaneID == nil || strings.TrimSpace(*wire.PaneID) == "" || wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.TabID == nil || strings.TrimSpace(*wire.TabID) == "" || wire.Text == nil || wire.Truncated == nil {
-		return ReadResult{}, protocolError("pane_read 缺少必填字段")
-	}
-	return ReadResult{PaneID: *wire.PaneID, WorkspaceID: *wire.WorkspaceID, TabID: *wire.TabID, Text: *wire.Text, Truncated: *wire.Truncated}, nil
 }
 
 func protocolError(message string) error {

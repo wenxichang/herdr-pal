@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeCommandRunner struct {
@@ -125,6 +126,47 @@ func TestResolveSocketRejectsUnavailableOrMalformedCLIResults(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveSocketPreservesCanceledRunnerContextWithoutLeakingOutput(t *testing.T) {
+	sentinel := errors.New("runner failed with /tmp/sensitive.sock")
+	runner := waitingCommandRunner{err: sentinel}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ResolveSocket(ctx, "", "default", runner)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ResolveSocket() 错误 = %v，期望匹配 context.Canceled", err)
+	}
+	if strings.Contains(err.Error(), "/tmp/sensitive.sock") {
+		t.Fatalf("ResolveSocket() 错误泄露 runner 信息：%v", err)
+	}
+}
+
+func TestResolveSocketPreservesDeadlineRunnerContextWithoutLeakingOutput(t *testing.T) {
+	sentinel := errors.New("runner failed with /tmp/sensitive.sock")
+	runner := waitingCommandRunner{err: sentinel}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	_, err := ResolveSocket(ctx, "", "default", runner)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ResolveSocket() 错误 = %v，期望匹配 context.DeadlineExceeded", err)
+	}
+	if strings.Contains(err.Error(), "/tmp/sensitive.sock") {
+		t.Fatalf("ResolveSocket() 错误泄露 runner 信息：%v", err)
+	}
+}
+
+type waitingCommandRunner struct {
+	err error
+}
+
+func (r waitingCommandRunner) Output(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+	<-ctx.Done()
+	return []byte(`{"socket":"/tmp/sensitive.sock"}`), r.err
 }
 
 func assertCommandCall(t *testing.T, runner *fakeCommandRunner, name string, args ...string) {

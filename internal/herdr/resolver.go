@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -44,7 +45,7 @@ func ResolveSocket(ctx context.Context, explicitPath, sessionName string, runner
 func resolveDefaultSocket(ctx context.Context, runner CommandRunner) (string, error) {
 	output, err := runner.Output(ctx, "herdr", "status", "server", "--json")
 	if err != nil {
-		return "", errors.New("查询 Herdr 默认服务状态失败")
+		return "", resolverCommandError(ctx, "查询 Herdr 默认服务状态失败")
 	}
 	var status serverStatus
 	if err := json.Unmarshal(output, &status); err != nil {
@@ -62,7 +63,7 @@ func resolveDefaultSocket(ctx context.Context, runner CommandRunner) (string, er
 func resolveNamedSocket(ctx context.Context, sessionName string, runner CommandRunner) (string, error) {
 	output, err := runner.Output(ctx, "herdr", "session", "list", "--json")
 	if err != nil {
-		return "", errors.New("查询 Herdr 命名会话失败")
+		return "", resolverCommandError(ctx, "查询 Herdr 命名会话失败")
 	}
 	var list sessionList
 	if err := json.Unmarshal(output, &list); err != nil {
@@ -81,4 +82,11 @@ func resolveNamedSocket(ctx context.Context, sessionName string, runner CommandR
 		return *session.SocketPath, nil
 	}
 	return "", errors.New("未找到 Herdr 命名会话")
+}
+
+func resolverCommandError(ctx context.Context, message string) error {
+	if contextError := ctx.Err(); contextError != nil {
+		return fmt.Errorf("%s: %w", message, contextError)
+	}
+	return errors.New(message)
 }
