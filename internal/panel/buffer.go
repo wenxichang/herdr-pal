@@ -1,0 +1,134 @@
+package panel
+
+import "errors"
+
+const (
+	// PageSize 是一页终端快照包含的逻辑行数。
+	PageSize = 100
+	// MaxLines 是可在本地分页访问的终端快照行数上限。
+	MaxLines = 1000
+)
+
+var (
+	// ErrPanelChanged 表示扩大读取后的快照无法与现有缓存可靠对齐。
+	ErrPanelChanged = errors.New("终端内容已变化")
+	// ErrNewestPage 表示已经处于最新一页。
+	ErrNewestPage = errors.New("已经是最新内容")
+	// ErrOldestPage 表示已经没有可读取的更早内容。
+	ErrOldestPage = errors.New("已经是最早可读取内容")
+)
+
+// Buffer 保存单个已选择目标的终端快照分页缓存。
+type Buffer struct {
+	targetKey string
+	lines     []string
+	page      int
+	oldest    bool
+}
+
+// Refresh 替换为最新 100 行并回到第 0 页。
+func (b *Buffer) Refresh(targetKey string, lines []string) {
+	if len(lines) > PageSize {
+		lines = lines[len(lines)-PageSize:]
+	}
+	b.targetKey = targetKey
+	b.lines = append([]string(nil), lines...)
+	b.page = 0
+	b.oldest = false
+}
+
+// NextReadSize 返回下一次 pageup 需要的 agent.read lines。
+func (b *Buffer) NextReadSize() (int, error) {
+	if b.oldest || b.page >= MaxLines/PageSize-1 {
+		return 0, ErrOldestPage
+	}
+	return (b.page + 2) * PageSize, nil
+}
+
+// Expand 用旧缓存作为连续重叠锚点扩充更早内容。
+//
+// 同一缓存可能在新快照中重复出现，因此始终使用最后一次完整连续匹配，避免把较早的
+// 重复输出误认为最新缓存。锚点后的内容是读取期间产生的新输出，不进入当前分页缓存。
+func (b *Buffer) Expand(targetKey string, snapshot []string) error {
+	if targetKey != b.targetKey || len(b.lines) == 0 {
+		b.Reset()
+		return ErrPanelChanged
+	}
+	if len(b.lines) >= MaxLines {
+		b.oldest = true
+		return ErrOldestPage
+	}
+	if len(snapshot) > MaxLines {
+		snapshot = snapshot[len(snapshot)-MaxLines:]
+	}
+	anchor := lastContiguousIndex(snapshot, b.lines)
+	if anchor < 0 {
+		b.Reset()
+		return ErrPanelChanged
+	}
+	prefix := snapshot[:anchor]
+	room := MaxLines - len(b.lines)
+	if len(prefix) > room {
+		prefix = prefix[len(prefix)-room:]
+	}
+	if len(prefix) == 0 {
+		b.oldest = true
+		return ErrOldestPage
+	}
+	b.lines = append(append([]string(nil), prefix...), b.lines...)
+	b.page++
+	b.oldest = len(b.lines) >= MaxLines
+	return nil
+}
+
+// PageDown 向更新内容移动一页，不读取或刷新终端。
+func (b *Buffer) PageDown() error {
+	if b.page == 0 {
+		return ErrNewestPage
+	}
+	b.page--
+	return nil
+}
+
+// Render 返回当前页的副本。
+func (b *Buffer) Render() []string {
+	if len(b.lines) == 0 {
+		return nil
+	}
+	end := len(b.lines) - b.page*PageSize
+	if end <= 0 {
+		return nil
+	}
+	start := end - PageSize
+	if start < 0 {
+		start = 0
+	}
+	return append([]string(nil), b.lines[start:end]...)
+}
+
+// Reset 清空全部分页状态。
+func (b *Buffer) Reset() {
+	b.targetKey = ""
+	b.lines = nil
+	b.page = 0
+	b.oldest = false
+}
+
+func lastContiguousIndex(snapshot, anchor []string) int {
+	if len(anchor) == 0 || len(anchor) > len(snapshot) {
+		return -1
+	}
+	for index := len(snapshot) - len(anchor); index >= 0; index-- {
+		matched := true
+		for offset, line := range anchor {
+			if snapshot[index+offset] != line {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return index
+		}
+	}
+	return -1
+}
