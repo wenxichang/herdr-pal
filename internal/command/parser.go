@@ -39,11 +39,15 @@ type Action struct {
 // ErrInvalidCommand 表示输入为空或命令格式不受支持。
 var ErrInvalidCommand = errors.New("无效命令")
 
+const generalUsage = "用法: 可用命令为 /ls、/sel N、/con、/pageup、/pagedn、/key up|down|enter|esc|space|X"
+
+const keyUsage = "/key 用法: /key up|down|enter|esc|space|X"
+
 // Parse 将输入文本解析为受限动作。非命令文本会保留原始内容作为提示。
 func Parse(input string) (Action, error) {
 	trimmed := strings.TrimSpace(input)
 	if trimmed == "" {
-		return Action{}, invalidCommand("命令不能为空")
+		return Action{}, invalidCommand(generalUsage)
 	}
 	if !strings.HasPrefix(trimmed, "/") {
 		return Action{Kind: KindPrompt, Text: input}, nil
@@ -75,7 +79,7 @@ func Parse(input string) (Action, error) {
 	case "/key":
 		return parseKey(fields)
 	default:
-		return Action{}, invalidCommand("未知命令")
+		return Action{}, invalidCommand(generalUsage)
 	}
 }
 
@@ -100,7 +104,7 @@ func parseSelect(fields []string) (Action, error) {
 
 func parseKey(fields []string) (Action, error) {
 	if len(fields) != 2 || !isAllowedKey(fieldsAt(fields, 1)) {
-		return Action{}, invalidCommand("/key 用法: /key KEY")
+		return Action{}, invalidCommand(keyUsage)
 	}
 	return Action{Kind: KindKey, Key: fields[1]}, nil
 }

@@ -63,25 +63,28 @@ func TestParseInvalidCommands(t *testing.T) {
 		input string
 		usage string
 	}{
-		{name: "empty", input: "", usage: "命令不能为空"},
-		{name: "whitespace", input: " \t\n ", usage: "命令不能为空"},
+		{name: "empty", input: "", usage: "可用命令"},
+		{name: "whitespace", input: " \t\n ", usage: "可用命令"},
 		{name: "select missing index", input: "/sel", usage: "/sel N"},
 		{name: "select zero", input: "/sel 0", usage: "/sel N"},
 		{name: "select negative", input: "/sel -1", usage: "/sel N"},
 		{name: "select plus sign", input: "/sel +1", usage: "/sel N"},
+		{name: "select full width digit", input: "/sel １", usage: "/sel N"},
 		{name: "select multiple indices", input: "/sel 1 2", usage: "/sel N"},
 		{name: "select overflow", input: "/sel " + overflow, usage: "/sel N"},
-		{name: "key missing value", input: "/key", usage: "/key KEY"},
-		{name: "key unsupported special", input: "/key tab", usage: "/key KEY"},
-		{name: "key control sequence", input: "/key ctrl+c", usage: "/key KEY"},
-		{name: "key non ascii", input: "/key 中", usage: "/key KEY"},
-		{name: "key multiple characters", input: "/key aa", usage: "/key KEY"},
-		{name: "key uppercase special", input: "/key UP", usage: "/key KEY"},
-		{name: "key title case special", input: "/key Enter", usage: "/key KEY"},
-		{name: "uppercase command", input: "/KEY up", usage: "未知命令"},
-		{name: "uppercase list", input: "/LS", usage: "未知命令"},
-		{name: "unknown command", input: "/unknown", usage: "未知命令"},
-		{name: "unknown command after whitespace", input: "  /unknown", usage: "未知命令"},
+		{name: "key missing value", input: "/key", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key special with extra argument", input: "/key up extra", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key character with extra argument", input: "/key A extra", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key unsupported special", input: "/key tab", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key control sequence", input: "/key ctrl+c", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key non ascii", input: "/key 中", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key multiple characters", input: "/key aa", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key uppercase special", input: "/key UP", usage: "/key up|down|enter|esc|space|X"},
+		{name: "key title case special", input: "/key Enter", usage: "/key up|down|enter|esc|space|X"},
+		{name: "uppercase command", input: "/KEY up", usage: "可用命令"},
+		{name: "uppercase list", input: "/LS", usage: "可用命令"},
+		{name: "unknown command", input: "/unknown", usage: "可用命令"},
+		{name: "unknown command after whitespace", input: "  /unknown", usage: "可用命令"},
 		{name: "key alias with argument", input: "/keyup x", usage: "/keyup"},
 		{name: "list with argument", input: "/ls x", usage: "/ls"},
 		{name: "content with argument", input: "/con x", usage: "/con"},
@@ -101,9 +104,25 @@ func TestParseInvalidCommands(t *testing.T) {
 			if !errors.Is(err, ErrInvalidCommand) {
 				t.Fatalf("Parse(%q) error = %v, want errors.Is(err, ErrInvalidCommand)", tt.input, err)
 			}
+			if !strings.Contains(err.Error(), "用法") {
+				t.Fatalf("Parse(%q) error = %q, want usage guidance", tt.input, err)
+			}
 			if !strings.Contains(err.Error(), tt.usage) {
 				t.Fatalf("Parse(%q) error = %q, want usage containing %q", tt.input, err, tt.usage)
 			}
 		})
+	}
+}
+
+func TestParseDoesNotEchoUnknownCommand(t *testing.T) {
+	t.Parallel()
+
+	const input = "/secret-command-with-private-data"
+	_, err := Parse(input)
+	if !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("Parse(%q) error = %v, want errors.Is(err, ErrInvalidCommand)", input, err)
+	}
+	if strings.Contains(err.Error(), input) || strings.Contains(err.Error(), "secret-command-with-private-data") {
+		t.Fatalf("Parse(%q) error = %q, must not echo the unknown command", input, err)
 	}
 }
