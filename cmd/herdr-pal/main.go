@@ -3,17 +3,22 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
 
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Println(version.String())
-		return
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == "--version" {
+		fmt.Fprintln(stdout, version.String())
+		return 0
 	}
 
-	fmt.Fprintln(os.Stderr, "用法: herdr-pal --version")
-	os.Exit(2)
+	fmt.Fprintln(stderr, "用法: herdr-pal --version")
+	return 2
 }
