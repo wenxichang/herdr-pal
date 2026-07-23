@@ -1,0 +1,13 @@
+{
+  "cmd": "aibot_msg_callback",
+  "headers": {"req_id": "callback-1"},
+  "body": {
+    "msgid": "message-1",
+    "aibotid": "bot-1",
+    "chattype": "single",
+    "from": {"userid": "user-1"},
+    "msgtype": "text",
+    "text": {"content": "/ls"},
+    "future_field": true
+  }
+}
