@@ -319,8 +319,10 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 	}, results)
 
 	collected := make([]componentResult, 0, 3)
+	shutdownTriggeredByParent := false
 	select {
 	case <-parent.Done():
+		shutdownTriggeredByParent = true
 	case result := <-results:
 		collected = append(collected, result)
 	}
@@ -336,13 +338,13 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 			collected = append(collected, result)
 		case <-timer.C:
 			componentsDone := collectRemainingComponents(results, 3-len(collected))
-			if rootErr := runtimeRootError(parent, collected); rootErr != nil {
+			if rootErr := runtimeRootError(shutdownTriggeredByParent, collected); rootErr != nil {
 				return runtimeOutcome{err: errors.Join(rootErr, ErrShutdownTimeout), componentsDone: componentsDone}
 			}
 			return runtimeOutcome{err: ErrShutdownTimeout, componentsDone: componentsDone}
 		}
 	}
-	return runtimeOutcome{err: runtimeRootError(parent, collected)}
+	return runtimeOutcome{err: runtimeRootError(shutdownTriggeredByParent, collected)}
 }
 
 func runComponent(ctx context.Context, name string, run func(context.Context) error, results chan<- componentResult) {
@@ -354,8 +356,8 @@ func runComponent(ctx context.Context, name string, run func(context.Context) er
 	}
 }
 
-func runtimeRootError(parent context.Context, results []componentResult) error {
-	if parent.Err() != nil {
+func runtimeRootError(shutdownTriggeredByParent bool, results []componentResult) error {
+	if shutdownTriggeredByParent {
 		return nil
 	}
 	for _, result := range results {

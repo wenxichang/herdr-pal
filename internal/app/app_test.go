@@ -267,6 +267,76 @@ func TestRunPreservesWeComFatalRegardlessOfResultOrder(t *testing.T) {
 	}
 }
 
+func TestRunKeepsFatalThatTriggeredShutdownWhenParentCancelsDuringDrain(t *testing.T) {
+	fatal := errors.New("wecom fatal")
+	releaseSupervisor := make(chan struct{})
+	supervisor := newGatedCancellationRunner(releaseSupervisor)
+	im := newOrderedResultWeCom(fatal)
+	options := testOptions(t)
+	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, supervisor.canceled, "fatal-triggered Supervisor cancellation")
+	cancel()
+	close(releaseSupervisor)
+
+	err := waitResult(t, result)
+	if !errors.Is(err, fatal) {
+		t.Fatalf("Run() error = %v, want original fatal after late parent cancellation", err)
+	}
+}
+
+func TestRunTimeoutKeepsFatalThatTriggeredShutdownBeforeParentCancellation(t *testing.T) {
+	fatal := errors.New("wecom fatal")
+	releaseSupervisor := make(chan struct{})
+	supervisor := newGatedCancellationRunner(releaseSupervisor)
+	im := newOrderedResultWeCom(fatal)
+	lock := &fakeLock{}
+	options := testOptions(t)
+	options.dependencies.shutdownTimeout = 20 * time.Millisecond
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
+	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, supervisor.canceled, "fatal-triggered Supervisor cancellation")
+	cancel()
+
+	err := waitResult(t, result)
+	if !errors.Is(err, fatal) || !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Run() error = %v, want fatal joined with ErrShutdownTimeout", err)
+	}
+	if got := lock.releases.Load(); got != 0 {
+		t.Fatalf("lock releases = %d, want 0 while Supervisor remains blocked", got)
+	}
+	close(releaseSupervisor)
+	waitLockReleasedAndUnretained(t, lock)
+}
+
+func TestRunParentCancellationFirstRemainsNormal(t *testing.T) {
+	im := newFakeWeCom()
+	supervisor := newFakeRunner()
+	options := testOptions(t)
+	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, im.started, "WeCom Run")
+	waitClosed(t, supervisor.started, "Supervisor Run")
+	cancel()
+
+	if err := waitResult(t, result); err != nil {
+		t.Fatalf("Run() error = %v, want nil when parent cancellation triggered shutdown", err)
+	}
+}
+
 func TestRunTreatsIndependentEventsClosureAsUnexpectedLoopStop(t *testing.T) {
 	supervisor := newFakeRunner()
 	im := newOrderedResultWeCom(nil)
@@ -589,6 +659,22 @@ func (w *orderedResultWeCom) Events() <-chan wecom.IncomingText { return w.event
 func (w *orderedResultWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
 
 func (w *orderedResultWeCom) SendMarkdown(context.Context, string) error { return nil }
+
+type gatedCancellationRunner struct {
+	canceled chan struct{}
+	release  <-chan struct{}
+}
+
+func newGatedCancellationRunner(release <-chan struct{}) *gatedCancellationRunner {
+	return &gatedCancellationRunner{canceled: make(chan struct{}), release: release}
+}
+
+func (r *gatedCancellationRunner) Run(ctx context.Context) error {
+	<-ctx.Done()
+	close(r.canceled)
+	<-r.release
+	return ctx.Err()
+}
 
 type fakeManagedHerdr struct {
 	mu       sync.Mutex
