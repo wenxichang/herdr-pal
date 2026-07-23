@@ -131,18 +131,14 @@ func (d *notificationDispatcher) EndEpoch(epoch uint64) {
 }
 
 func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.Transition) error {
-	if _, _, notify := notificationPolicy(transition); !notify {
-		return nil
-	}
 	d.mu.Lock()
 	if epoch == 0 || d.currentEpoch != epoch {
 		d.mu.Unlock()
 		return nil
 	}
 	paneID := transition.Target.PaneID
-	if pending := d.pendingStatus[paneID]; pending != nil {
-		pending.epoch = epoch
-		pending.transition = transition
+	d.dropPaneStatusLocked(paneID)
+	if _, _, notify := notificationPolicy(transition); !notify {
 		d.mu.Unlock()
 		return nil
 	}
@@ -154,9 +150,6 @@ func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.
 	task := &notificationTask{id: d.nextTaskID, kind: notificationTaskStatus, epoch: epoch, paneID: paneID, transition: transition}
 	d.queue = append(d.queue, task)
 	d.pendingStatus[paneID] = task
-	if d.active != nil && d.active.kind == notificationTaskStatus && d.active.paneID == paneID && d.activeCancel != nil {
-		d.activeCancel()
-	}
 	d.mu.Unlock()
 	d.signal()
 	return nil
@@ -285,9 +278,11 @@ func (d *notificationDispatcher) finish(taskID uint64, cancel context.CancelFunc
 
 func (d *notificationDispatcher) dropStatusLocked(epoch uint64) {
 	kept := d.queue[:0]
+	droppedPanes := make(map[string]struct{})
 	clear(d.pendingStatus)
 	for _, task := range d.queue {
 		if task.kind == notificationTaskStatus && (epoch == 0 || task.epoch == epoch) {
+			droppedPanes[task.paneID] = struct{}{}
 			continue
 		}
 		kept = append(kept, task)
@@ -296,8 +291,14 @@ func (d *notificationDispatcher) dropStatusLocked(epoch uint64) {
 		}
 	}
 	d.queue = kept
-	if d.active != nil && d.active.kind == notificationTaskStatus && (epoch == 0 || d.active.epoch == epoch) && d.activeCancel != nil {
-		d.activeCancel()
+	if d.active != nil && d.active.kind == notificationTaskStatus && (epoch == 0 || d.active.epoch == epoch) {
+		droppedPanes[d.active.paneID] = struct{}{}
+		if d.activeCancel != nil {
+			d.activeCancel()
+		}
+	}
+	for paneID := range droppedPanes {
+		d.notifier.discardStatus(paneID)
 	}
 }
 
@@ -316,6 +317,7 @@ func (d *notificationDispatcher) dropPaneStatusLocked(paneID string) {
 	if d.active != nil && d.active.kind == notificationTaskStatus && d.active.paneID == paneID && d.activeCancel != nil {
 		d.activeCancel()
 	}
+	d.notifier.discardStatus(paneID)
 }
 
 func (d *notificationDispatcher) signal() {
@@ -371,6 +373,24 @@ func (n *Notifier) Reset() {
 		}
 	}
 	n.pending = pending
+	n.mu.Unlock()
+}
+
+// discardStatus 废弃指定 pane 的状态通知进度和去重结果。
+//
+// inflight 任务由 Dispatcher 的 context 取消；其后续更新会因 pending 指针变化失效。
+// invalidation 进度和去重结果不属于状态迁移，必须跨抢占与重连保留。
+func (n *Notifier) discardStatus(paneID string) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	if progress := n.pending[paneID]; progress != nil && progress.key.kind == "status" {
+		delete(n.pending, paneID)
+	}
+	if recent, exists := n.recent[paneID]; exists && recent.kind == "status" {
+		delete(n.recent, paneID)
+	}
 	n.mu.Unlock()
 }
 

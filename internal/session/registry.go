@@ -98,10 +98,30 @@ type listEntry struct {
 
 // Replace 用完整 snapshot 替换当前 Agent 视图，并返回集合变化。
 func (r *Registry) Replace(snapshot herdr.Snapshot, reconnect bool) ChangeSet {
+	return r.replace(snapshot, reconnect, false)
+}
+
+// ReplacePreservingStatus 用结构快照替换 Agent 视图，并为相同 occupant 保留当前状态。
+//
+// 新增或替换的 occupant 仍使用 snapshot 中的状态。该方法用于状态订阅连续有效时，
+// 避免结构快照覆盖已经接收或即将处理的状态事件。
+func (r *Registry) ReplacePreservingStatus(snapshot herdr.Snapshot) ChangeSet {
+	return r.replace(snapshot, false, true)
+}
+
+func (r *Registry) replace(snapshot herdr.Snapshot, reconnect, preserveStatus bool) ChangeSet {
 	nextTargets, nextOrders := targetsFromSnapshot(snapshot)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if preserveStatus {
+		for paneID, next := range nextTargets {
+			if current, exists := r.targets[paneID]; exists && current.OccupantKey == next.OccupantKey {
+				next.Status = current.Status
+				nextTargets[paneID] = next
+			}
+		}
+	}
 
 	changes := ChangeSet{}
 	previousOrders := r.orders

@@ -131,6 +131,33 @@ func TestPaneReplacementInvalidatesSelectionEvenWhenOccupantKeyMatches(t *testin
 	}
 }
 
+func TestReplacePreservingStatusKeepsOnlyMatchingOccupantStatus(t *testing.T) {
+	registry := &Registry{}
+	current := testAgentPane("pane-1", "terminal-1", "codex", &herdr.AgentSession{
+		Source: "codex", Kind: "id", Value: "session-old",
+	})
+	current.AgentStatus = herdr.AgentStatusWorking
+	registry.Replace(testSnapshot(current), false)
+
+	sameOccupant := current
+	sameOccupant.AgentStatus = herdr.AgentStatusDone
+	sameOccupant.Title = stringPtr("更新后的标题")
+	registry.ReplacePreservingStatus(testSnapshot(sameOccupant))
+	targets := registry.CreateListSnapshot()
+	if len(targets) != 1 || targets[0].Status != herdr.AgentStatusWorking || targets[0].Title != "更新后的标题" {
+		t.Fatalf("同 occupant 结构替换未保留当前状态：%#v", targets)
+	}
+
+	replacement := sameOccupant
+	replacement.AgentSession = &herdr.AgentSession{Source: "codex", Kind: "id", Value: "session-new"}
+	replacement.AgentStatus = herdr.AgentStatusBlocked
+	changes := registry.ReplacePreservingStatus(testSnapshot(replacement))
+	targets = registry.CreateListSnapshot()
+	if len(targets) != 1 || targets[0].Status != herdr.AgentStatusBlocked || len(changes.ReplacedTargets) != 1 {
+		t.Fatalf("替换 occupant 错误保留旧状态：targets=%#v changes=%#v", targets, changes)
+	}
+}
+
 func TestStatusChangeKeepsSelectionAndApplyStatusDoesNotCreateTargets(t *testing.T) {
 	registry := &Registry{}
 	pane := testAgentPane("pane-1", "terminal-1", "codex", nil)

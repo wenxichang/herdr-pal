@@ -452,6 +452,45 @@ func TestNotificationDispatcherDropsOldEpochStatusButKeepsInvalidation(t *testin
 	}
 }
 
+func TestNotificationDispatcherStaleEpochDoesNotEvictCurrentStatus(t *testing.T) {
+	im := newGatedNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  &notificationRetry{delay: time.Second},
+		Wait:     waitSupervisorDelay,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+	epoch := dispatcher.BeginEpoch()
+
+	blocker := notificationTarget()
+	blocker.PaneID = "pane-2"
+	blocker.OccupantKey = "occupant-pane-2"
+	if err := dispatcher.EnqueueInvalidated(blocker); err != nil {
+		t.Fatalf("blocker EnqueueInvalidated() 返回错误：%v", err)
+	}
+	<-im.firstStarted
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
+		t.Fatalf("当前 epoch EnqueueStatus() 返回错误：%v", err)
+	}
+	if err := dispatcher.EnqueueStatus(epoch+1, notificationTransition(herdr.AgentStatusDone, herdr.AgentStatusIdle)); err != nil {
+		t.Fatalf("过期 epoch EnqueueStatus() 返回错误：%v", err)
+	}
+	close(im.firstRelease)
+	awaitNotifierCondition(t, "当前 epoch 状态保留", func() bool { return len(im.Messages()) == 2 })
+	if messages := strings.Join(im.Messages(), "\n"); !strings.Contains(messages, "目标已失效") || !strings.Contains(messages, "已完成") {
+		t.Fatalf("过期 epoch 错误淘汰当前状态：%q", messages)
+	}
+
+	dispatcher.EndEpoch(epoch)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
 func TestNotificationDispatcherRetriesInvalidationWithInjectedWait(t *testing.T) {
 	im := &notifierIM{failAt: 1}
 	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
@@ -756,6 +795,205 @@ func TestNotificationDispatcherInvalidationRemovesPendingSamePaneStatus(t *testi
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherNonNotifyTransitionRemovesPendingStatus(t *testing.T) {
+	im := newGatedNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  &notificationRetry{delay: time.Second},
+		Wait:     waitSupervisorDelay,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+	epoch := dispatcher.BeginEpoch()
+
+	blocker := notificationTarget()
+	blocker.PaneID = "pane-2"
+	blocker.OccupantKey = "occupant-pane-2"
+	if err := dispatcher.EnqueueInvalidated(blocker); err != nil {
+		t.Fatalf("blocker EnqueueInvalidated() 返回错误：%v", err)
+	}
+	<-im.firstStarted
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
+		t.Fatalf("done EnqueueStatus() 返回错误：%v", err)
+	}
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusDone, herdr.AgentStatusIdle)); err != nil {
+		t.Fatalf("non-notify idle EnqueueStatus() 返回错误：%v", err)
+	}
+	close(im.firstRelease)
+	awaitNotifierCondition(t, "non-notify 淘汰 pending status", func() bool { return len(im.Messages()) == 1 })
+	if messages := strings.Join(im.Messages(), "\n"); strings.Contains(messages, "已完成") || !strings.Contains(messages, "目标已失效") {
+		t.Fatalf("non-notify 未淘汰旧 done：%q", messages)
+	}
+
+	dispatcher.EndEpoch(epoch)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherLatestTransitionCancelsActiveStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		first     session.Transition
+		next      session.Transition
+		wantText  string
+		wantCount int
+	}{
+		{
+			name:  "non-notify idle drops done",
+			first: notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone),
+			next:  notificationTransition(herdr.AgentStatusDone, herdr.AgentStatusIdle),
+		},
+		{
+			name:      "unknown replaces working",
+			first:     notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking),
+			next:      notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusUnknown),
+			wantText:  "无法可靠识别",
+			wantCount: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			im := &failOnceNotifierIM{failAt: 1}
+			notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+			waiter := newNotificationRetryWaiter()
+			dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+				Capacity: 1,
+				Backoff:  &notificationRetry{delay: time.Minute},
+				Wait:     waiter.Wait,
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- dispatcher.Run(ctx) }()
+			epoch := dispatcher.BeginEpoch()
+
+			if err := dispatcher.EnqueueStatus(epoch, test.first); err != nil {
+				t.Fatalf("first EnqueueStatus() 返回错误：%v", err)
+			}
+			wait := <-waiter.started
+			if err := dispatcher.EnqueueStatus(epoch, test.next); err != nil {
+				t.Fatalf("next EnqueueStatus() 返回错误：%v", err)
+			}
+			if err := <-wait.done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("旧 status 重试等待 = %v，期望被最新迁移取消", err)
+			}
+			awaitNotifierCondition(t, "最新迁移处理", func() bool { return len(im.Messages()) == test.wantCount })
+			if messages := strings.Join(im.Messages(), "\n"); strings.Contains(messages, "已完成") || strings.Contains(messages, "开始工作") || (test.wantText != "" && !strings.Contains(messages, test.wantText)) {
+				t.Fatalf("最新迁移未正确取代旧状态：%q", messages)
+			}
+
+			dispatcher.EndEpoch(epoch)
+			cancel()
+			if err := <-result; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+			}
+		})
+	}
+}
+
+func TestNotificationDispatcherSupersedeDiscardsStatusProgress(t *testing.T) {
+	tests := []struct {
+		name         string
+		secondResult herdr.ReadResult
+		secondError  error
+		wantMessages int
+		wantSnapshot string
+	}{
+		{
+			name:         "new done sends title and snapshot",
+			secondResult: herdr.ReadResult{PaneID: "pane-1", Text: "新快照"},
+			wantMessages: 3,
+			wantSnapshot: "新快照",
+		},
+		{
+			name:         "new done without snapshot still sends title",
+			secondError:  errors.New("read failed"),
+			wantMessages: 2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &notifierReader{
+				results: []herdr.ReadResult{
+					{PaneID: "pane-1", Text: "旧快照"},
+					test.secondResult,
+				},
+				errors: []error{nil, test.secondError},
+			}
+			im := &failOnceNotifierIM{failAt: 2}
+			notifier := mustNotifier(t, im, reader.ReadRecent)
+			waiter := newCancellationGateWaiter()
+			dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+				Capacity: 1,
+				Backoff:  &notificationRetry{delay: time.Minute},
+				Wait:     waiter.Wait,
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- dispatcher.Run(ctx) }()
+			epoch := dispatcher.BeginEpoch()
+
+			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
+				t.Fatalf("首次 done EnqueueStatus() 返回错误：%v", err)
+			}
+			wait := <-waiter.started
+			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusDone, herdr.AgentStatusIdle)); err != nil {
+				t.Fatalf("idle EnqueueStatus() 返回错误：%v", err)
+			}
+			<-wait.canceled
+			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)); err != nil {
+				t.Fatalf("working EnqueueStatus() 返回错误：%v", err)
+			}
+			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
+				t.Fatalf("再次 done EnqueueStatus() 返回错误：%v", err)
+			}
+			close(wait.release)
+			if err := <-wait.done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("旧 done 重试等待 = %v，期望 context.Canceled", err)
+			}
+			awaitNotifierCondition(t, "再次 done 完整发送", func() bool { return len(im.Messages()) == test.wantMessages })
+			messages := strings.Join(im.Messages(), "\n")
+			if strings.Count(messages, "已完成") != 2 || strings.Contains(messages, "开始工作") {
+				t.Fatalf("再次 done 复用了旧分段进度：%#v", im.Messages())
+			}
+			if test.wantSnapshot != "" && !strings.Contains(messages, test.wantSnapshot) {
+				t.Fatalf("再次 done 缺少新快照：%#v", im.Messages())
+			}
+
+			dispatcher.EndEpoch(epoch)
+			cancel()
+			if err := <-result; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+			}
+		})
+	}
+}
+
+func TestNotifierDiscardStatusPreservesInvalidationProgress(t *testing.T) {
+	target := notificationTarget()
+	target.Title = strings.Repeat("中", panel.WeComContentLimit)
+	expected := renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target)
+	if len(expected) < 2 {
+		t.Fatalf("测试目标未生成多段 invalidation：%d", len(expected))
+	}
+	im := &failOnceNotifierIM{failAt: 2}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	if err := notifier.TargetInvalidated(context.Background(), target); err == nil {
+		t.Fatal("首轮 invalidation 分段发送未失败")
+	}
+
+	notifier.discardStatus(target.PaneID)
+	if err := notifier.TargetInvalidated(context.Background(), target); err != nil {
+		t.Fatalf("invalidation 重试返回错误：%v", err)
+	}
+	if messages := im.Messages(); !reflect.DeepEqual(messages, expected) {
+		t.Fatalf("discardStatus 错误清除 invalidation 进度：%#v", messages)
 	}
 }
 
@@ -1076,6 +1314,35 @@ func (w *notificationRetryWaiter) Wait(ctx context.Context, delay time.Duration)
 		err = ctx.Err()
 	case <-request.release:
 	}
+	request.done <- err
+	return err
+}
+
+type cancellationGateWait struct {
+	canceled chan struct{}
+	release  chan struct{}
+	done     chan error
+}
+
+type cancellationGateWaiter struct {
+	started chan *cancellationGateWait
+}
+
+func newCancellationGateWaiter() *cancellationGateWaiter {
+	return &cancellationGateWaiter{started: make(chan *cancellationGateWait, 1)}
+}
+
+func (w *cancellationGateWaiter) Wait(ctx context.Context, _ time.Duration) error {
+	request := &cancellationGateWait{
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		done:     make(chan error, 1),
+	}
+	w.started <- request
+	<-ctx.Done()
+	close(request.canceled)
+	<-request.release
+	err := ctx.Err()
 	request.done <- err
 	return err
 }

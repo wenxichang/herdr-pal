@@ -300,6 +300,9 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 					}
 					return finish(err)
 				}
+				if transition.Previous == transition.Current {
+					continue
+				}
 				if err := dispatcher.EnqueueStatus(epoch, transition); err != nil {
 					return finish(err)
 				}
@@ -323,7 +326,12 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 				if err != nil {
 					return finish(err)
 				}
-				changes := s.service.ReplaceSnapshot(discovery, false)
+				var changes session.ChangeSet
+				if rebuilds == 0 {
+					changes = s.service.ReplaceSnapshotPreservingStatus(discovery)
+				} else {
+					changes = s.service.ReplaceSnapshot(discovery, false)
+				}
 				for _, target := range changes.RemovedTargets {
 					if err := dispatcher.EnqueueInvalidated(target); err != nil {
 						return finish(err)

@@ -424,6 +424,58 @@ func TestSupervisorSamePaneOccupantReplacementRebuildsStatusStream(t *testing.T)
 	}
 }
 
+func TestSupervisorContinuousStatusStreamPreservesStateAcrossLifecycleSnapshot(t *testing.T) {
+	for _, current := range []herdr.AgentStatus{herdr.AgentStatusBlocked, herdr.AgentStatusDone} {
+		t.Run(string(current), func(t *testing.T) {
+			lifecycle := newSupervisorStream()
+			status := newSupervisorStream()
+			initial := supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking))
+			structural := supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", current))
+			client := newSupervisorClient(initial, initial, structural)
+			client.lifecycleStreams = []*supervisorStream{lifecycle}
+			client.statusStreams = []*supervisorStream{status}
+			harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+			cancel, result := runSupervisor(t, harness.supervisor)
+			defer cancelAndAwaitSupervisor(t, cancel, result)
+			awaitSupervisorSubscribe(t, client)
+			awaitSupervisorSubscribe(t, client)
+			awaitSupervisorCondition(t, "连续 status stream 基线", func() bool { return serviceAvailable(harness.service) })
+
+			harness.service.stateMu.Lock()
+			stateLocked := true
+			defer func() {
+				if stateLocked {
+					harness.service.stateMu.Unlock()
+				}
+			}()
+			lifecycle.Emit(supervisorLifecycleEvent("pane.updated"))
+			debounce := awaitSupervisorWait(t, harness.waiter)
+			debounce.Release()
+			awaitSupervisorCondition(t, "生命周期结构快照已读取", func() bool { return client.SnapshotCount() == 3 })
+			status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", current))
+			harness.service.stateMu.Unlock()
+			stateLocked = false
+
+			awaitSupervisorCondition(t, "生命周期交错状态通知", func() bool { return len(harness.im.Messages()) == 1 })
+			targets := harness.registry.CreateListSnapshot()
+			if len(targets) != 1 || targets[0].Status != current {
+				t.Fatalf("交错后的 Registry 状态 = %#v", targets)
+			}
+			messages := strings.Join(harness.im.Messages(), "\n")
+			if current == herdr.AgentStatusBlocked && !strings.Contains(messages, "已阻塞") {
+				t.Fatalf("blocked 通知 = %q", messages)
+			}
+			if current == herdr.AgentStatusDone && !strings.Contains(messages, "已完成") {
+				t.Fatalf("done 通知 = %q", messages)
+			}
+			if status.CloseCount() != 0 || client.SubscribeCount() != 2 {
+				t.Fatalf("连续 occupant 错误重建 status：close=%d subscribe=%d", status.CloseCount(), client.SubscribeCount())
+			}
+		})
+	}
+}
+
 func TestSupervisorAllLifecycleKindsTriggerSnapshot(t *testing.T) {
 	for _, kind := range []string{"pane.created", "pane.closed", "pane.updated", "pane.exited", "pane.agent_detected"} {
 		t.Run(kind, func(t *testing.T) {

@@ -132,13 +132,29 @@ func (s *Service) InvalidateSelection() {
 // reconnect 为 true 或当前选择因 occupant 变化失效时，会同时清空手工终端分页缓存。
 // 调用期间会阻止新输入并等待已开始的 Prompt 或 SendKey 完成。
 func (s *Service) ReplaceSnapshot(snapshot herdr.Snapshot, reconnect bool) session.ChangeSet {
+	return s.replaceSnapshot(snapshot, reconnect, false)
+}
+
+// ReplaceSnapshotPreservingStatus 原子替换结构快照，并为相同 occupant 保留当前状态。
+//
+// 仅当现有 status stream 连续有效时使用；新增或替换 occupant 仍采用 snapshot 状态。
+func (s *Service) ReplaceSnapshotPreservingStatus(snapshot herdr.Snapshot) session.ChangeSet {
+	return s.replaceSnapshot(snapshot, false, true)
+}
+
+func (s *Service) replaceSnapshot(snapshot herdr.Snapshot, reconnect, preserveStatus bool) session.ChangeSet {
 	if s == nil {
 		return session.ChangeSet{}
 	}
 	s.transitionMu.Lock()
 	s.beginInputBarrierLocked()
 	s.stateMu.Lock()
-	changes := s.registry.Replace(snapshot, reconnect)
+	var changes session.ChangeSet
+	if preserveStatus {
+		changes = s.registry.ReplacePreservingStatus(snapshot)
+	} else {
+		changes = s.registry.Replace(snapshot, reconnect)
+	}
 	if reconnect || changes.SelectionInvalidated {
 		s.resetPanelLocked()
 	}

@@ -358,6 +358,60 @@ func TestServiceReplaceSnapshotWaitsForKey(t *testing.T) {
 	}
 }
 
+func TestServiceReplaceSnapshotPreservingStatusUsesBarrierAndInvalidatesReplacement(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("preserve", 100, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("preserve-preload-content", "/con"))
+	assertPanelState(t, service, true, 0, "preserve-100")
+
+	fake.blockPrompt = make(chan struct{})
+	fake.promptStarted = make(chan struct{}, 1)
+	promptDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("preserve-blocked-prompt", "prompt"))
+		close(promptDone)
+	}()
+	awaitSignal(t, fake.promptStarted, "Prompt")
+
+	sameOccupant := testSnapshot()
+	sameOccupant.Panes[0].AgentStatus = herdr.AgentStatusDone
+	sameOccupant.Panes[0].Title = stringRef("更新后的标题")
+	replaceDone := make(chan session.ChangeSet, 1)
+	go func() { replaceDone <- service.ReplaceSnapshotPreservingStatus(sameOccupant) }()
+	waitForCondition(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.inputBlocked > 0
+	}, "ReplaceSnapshotPreservingStatus input barrier")
+	close(fake.blockPrompt)
+	awaitSignal(t, promptDone, "Prompt")
+	changes := awaitChangeSet(t, replaceDone, "ReplaceSnapshotPreservingStatus")
+	if changes.SelectionInvalidated || len(changes.ReplacedTargets) != 0 {
+		t.Fatalf("same occupant changes = %#v", changes)
+	}
+	selected, err := service.registry.ValidateSelected()
+	if err != nil || selected.Status != herdr.AgentStatusWorking || selected.Title != "更新后的标题" {
+		t.Fatalf("same occupant selected = %#v, err = %v", selected, err)
+	}
+	assertPanelState(t, service, true, 0, "preserve-100")
+
+	replacement := replacedSnapshot()
+	replacement.Panes[0].AgentStatus = herdr.AgentStatusBlocked
+	changes = service.ReplaceSnapshotPreservingStatus(replacement)
+	if !changes.SelectionInvalidated || len(changes.ReplacedTargets) != 1 {
+		t.Fatalf("replacement changes = %#v", changes)
+	}
+	if _, err := service.registry.ValidateSelected(); err == nil {
+		t.Fatal("preserving replace did not clear replacement selection")
+	}
+	targets := service.registry.CreateListSnapshot()
+	if len(targets) != 1 || targets[0].Status != herdr.AgentStatusBlocked {
+		t.Fatalf("replacement targets = %#v", targets)
+	}
+	assertPanelState(t, service, false, 0, "")
+}
+
 func TestServiceLiveMismatchClearsSelectionWithoutInput(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
