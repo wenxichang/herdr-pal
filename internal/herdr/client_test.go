@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
@@ -302,6 +303,71 @@ func TestClientSnapshotRejectsInvalidResult(t *testing.T) {
 	}
 }
 
+func TestClientSnapshotRejectsMissingRequiredWireFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		fragment string
+	}{
+		{name: "缺 protocol", fragment: `"workspaces":[],"tabs":[],"panes":[],"agents":[]`},
+		{name: "Workspace 缺 workspace_id", fragment: `"protocol":0,"workspaces":[{"number":0,"label":""}],"tabs":[],"panes":[],"agents":[]`},
+		{name: "Workspace 缺 number", fragment: `"protocol":0,"workspaces":[{"workspace_id":"w1","label":""}],"tabs":[],"panes":[],"agents":[]`},
+		{name: "Workspace 缺 label", fragment: `"protocol":0,"workspaces":[{"workspace_id":"w1","number":0}],"tabs":[],"panes":[],"agents":[]`},
+		{name: "Tab 缺 tab_id", fragment: `"protocol":0,"workspaces":[],"tabs":[{"workspace_id":"w1","number":0,"label":""}],"panes":[],"agents":[]`},
+		{name: "Tab 缺 workspace_id", fragment: `"protocol":0,"workspaces":[],"tabs":[{"tab_id":"t1","number":0,"label":""}],"panes":[],"agents":[]`},
+		{name: "Tab 缺 number", fragment: `"protocol":0,"workspaces":[],"tabs":[{"tab_id":"t1","workspace_id":"w1","label":""}],"panes":[],"agents":[]`},
+		{name: "Tab 缺 label", fragment: `"protocol":0,"workspaces":[],"tabs":[{"tab_id":"t1","workspace_id":"w1","number":0}],"panes":[],"agents":[]`},
+		{name: "Pane 缺 pane_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent_status":"idle"}],"agents":[]`},
+		{name: "Pane 缺 terminal_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","agent_status":"idle"}],"agents":[]`},
+		{name: "Pane 缺 workspace_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"pane_id":"p1","terminal_id":"term1","tab_id":"t1","agent_status":"idle"}],"agents":[]`},
+		{name: "Pane 缺 tab_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"pane_id":"p1","terminal_id":"term1","workspace_id":"w1","agent_status":"idle"}],"agents":[]`},
+		{name: "Pane 缺 agent_status", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"pane_id":"p1","terminal_id":"term1","workspace_id":"w1","tab_id":"t1"}],"agents":[]`},
+		{name: "Pane 非法 agent_status", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"pane_id":"p1","terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent_status":"running"}],"agents":[]`},
+		{name: "Pane 会话缺 source", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[{"pane_id":"p1","terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent_status":"idle","agent_session":{"agent":"codex","kind":"id","value":"session-1"}}],"agents":[]`},
+		{name: "Agent 缺 terminal_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle"}]`},
+		{name: "Agent 缺 workspace_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"terminal_id":"term1","tab_id":"t1","pane_id":"p1","agent_status":"idle"}]`},
+		{name: "Agent 缺 tab_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"terminal_id":"term1","workspace_id":"w1","pane_id":"p1","agent_status":"idle"}]`},
+		{name: "Agent 缺 pane_id", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent_status":"idle"}]`},
+		{name: "Agent 缺 agent_status", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1"}]`},
+		{name: "Agent 非法 agent_status", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"running"}]`},
+		{name: "Agent 会话缺 source", fragment: `"protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"agent":"codex","kind":"id","value":"session-1"}}]`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := fmt.Sprintf(`{"type":"session_snapshot","snapshot":{"version":"0.17.0",%s}}`, test.fragment)
+			client := newBusinessTestClient(t, result, nil)
+			if _, err := client.Snapshot(context.Background()); !errors.Is(err, ErrProtocol) {
+				t.Fatalf("Snapshot() 错误 = %v，期望 ErrProtocol", err)
+			}
+		})
+	}
+}
+
+func TestClientSnapshotAcceptsExplicitZeroProtocol(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"session_snapshot","snapshot":{"version":"0.17.0","protocol":0,"workspaces":[],"tabs":[],"panes":[],"agents":[]}}`, nil)
+
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() 返回错误：%v", err)
+	}
+	if snapshot.Protocol != 0 {
+		t.Fatalf("Snapshot().Protocol = %d，期望 0", snapshot.Protocol)
+	}
+}
+
+func TestClientSnapshotAcceptsZeroNumbersAndEmptyLabels(t *testing.T) {
+	result := `{"type":"session_snapshot","snapshot":{"version":"0.17.0","protocol":0,"workspaces":[{"workspace_id":"w1","number":0,"label":""}],"tabs":[{"tab_id":"t1","workspace_id":"w1","number":0,"label":""}],"panes":[],"agents":[]}}`
+	client := newBusinessTestClient(t, result, nil)
+
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() 返回错误：%v", err)
+	}
+	if snapshot.Workspaces[0].Number != 0 || snapshot.Workspaces[0].Label != "" || snapshot.Tabs[0].Number != 0 || snapshot.Tabs[0].Label != "" {
+		t.Fatalf("Snapshot() = %+v，未保留合法零值", snapshot)
+	}
+}
+
 func TestClientGetAgentSendsTargetAndDecodesAgent(t *testing.T) {
 	client := newBusinessTestClient(t, `{"type":"agent_info","agent":{"terminal_id":"term1","agent_status":"blocked","workspace_id":"w1","tab_id":"t1","pane_id":"p1","unknown":1}}`, func(request map[string]any) {
 		assertBusinessRequest(t, request, "agent.get", map[string]any{"target": "p1"})
@@ -330,6 +396,38 @@ func TestClientGetAgentRejectsInvalidInputOrResult(t *testing.T) {
 		if _, err := client.GetAgent(context.Background(), "p1"); !errors.Is(err, ErrProtocol) {
 			t.Fatalf("GetAgent() result %s 错误 = %v，期望 ErrProtocol", result, err)
 		}
+	}
+}
+
+func TestClientGetAgentAndPromptRejectInvalidAgentInfo(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent string
+	}{
+		{name: "缺 terminal_id", agent: `{"workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle"}`},
+		{name: "缺 workspace_id", agent: `{"terminal_id":"term1","tab_id":"t1","pane_id":"p1","agent_status":"idle"}`},
+		{name: "缺 tab_id", agent: `{"terminal_id":"term1","workspace_id":"w1","pane_id":"p1","agent_status":"idle"}`},
+		{name: "缺 pane_id", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","agent_status":"idle"}`},
+		{name: "缺 agent_status", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1"}`},
+		{name: "非法 agent_status", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"running"}`},
+		{name: "会话缺 source", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"agent":"codex","kind":"id","value":"session-1"}}`},
+		{name: "会话缺 agent", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":"codex","kind":"id","value":"session-1"}}`},
+		{name: "会话缺 kind", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":"codex","agent":"codex","value":"session-1"}}`},
+		{name: "会话缺 value", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":"codex","agent":"codex","kind":"id"}}`},
+		{name: "会话空白必填字段", agent: `{"terminal_id":"term1","workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_status":"idle","agent_session":{"source":" ","agent":"codex","kind":"id","value":"session-1"}}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			getClient := newBusinessTestClient(t, `{"type":"agent_info","agent":`+test.agent+`}`, nil)
+			if _, err := getClient.GetAgent(context.Background(), "p1"); !errors.Is(err, ErrProtocol) {
+				t.Fatalf("GetAgent() 错误 = %v，期望 ErrProtocol", err)
+			}
+			promptClient := newBusinessTestClient(t, `{"type":"agent_prompted","agent":`+test.agent+`}`, nil)
+			if err := promptClient.Prompt(context.Background(), "p1", "text"); !errors.Is(err, ErrProtocol) {
+				t.Fatalf("Prompt() 错误 = %v，期望 ErrProtocol", err)
+			}
+		})
 	}
 }
 
@@ -371,6 +469,27 @@ func TestClientReadRecentRejectsInvalidInputOrResult(t *testing.T) {
 		if _, err := client.ReadRecent(context.Background(), "p1", 1); !errors.Is(err, ErrProtocol) {
 			t.Fatalf("ReadRecent() result %s 错误 = %v，期望 ErrProtocol", result, err)
 		}
+	}
+}
+
+func TestClientReadRecentDistinguishesMissingFieldsFromZeroValues(t *testing.T) {
+	for _, read := range []string{
+		`{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","truncated":false}`,
+		`{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","text":""}`,
+	} {
+		client := newBusinessTestClient(t, `{"type":"pane_read","read":`+read+`}`, nil)
+		if _, err := client.ReadRecent(context.Background(), "p1", 1); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("ReadRecent() 缺字段错误 = %v，期望 ErrProtocol", err)
+		}
+	}
+
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","text":"","truncated":false}}`, nil)
+	read, err := client.ReadRecent(context.Background(), "p1", 1)
+	if err != nil {
+		t.Fatalf("ReadRecent() 返回错误：%v", err)
+	}
+	if read.Text != "" || read.Truncated {
+		t.Fatalf("ReadRecent() = %+v，期望空 text 和 truncated=false", read)
 	}
 }
 
