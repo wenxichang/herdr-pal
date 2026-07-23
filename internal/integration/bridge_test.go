@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,14 +108,16 @@ func TestBridgeEndToEnd(t *testing.T) {
 			t.Fatalf("blocked 事件写入订阅数 = %d, want 1", delivered)
 		}
 		harness.herdr.WaitCallCount(t, "agent.read", 1)
-		harness.wecom.WaitRequestCount(t, "aibot_send_msg", 1)
+		blockedMessages := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+		assertRecentNotification(t, blockedMessages[:2])
 		if delivered := harness.herdr.EmitStatus(herdr.AgentStatusEvent{
 			PaneID: "pane-1", WorkspaceID: "workspace-1", AgentStatus: herdr.AgentStatusDone, Agent: &agent,
 		}); delivered != 1 {
 			t.Fatalf("done 事件写入订阅数 = %d, want 1", delivered)
 		}
 		calls := harness.herdr.WaitCallCount(t, "agent.read", 2)
-		harness.wecom.WaitRequestCount(t, "aibot_send_msg", 2)
+		doneMessages := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 4)
+		assertRecentNotification(t, doneMessages[2:4])
 		for _, call := range calls {
 			assertCallParams(t, call, map[string]any{"lines": float64(100)})
 		}
@@ -139,6 +142,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	t.Run("未授权用户与群聊不会产生 Herdr 输入", func(t *testing.T) {
 		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
 		defer harness.stop(t)
+		harness.selectFirst(t)
 
 		harness.wecom.InjectText(t, "unauthorized", "other-user", "single", "禁止输入")
 		harness.wecom.InjectText(t, "group-message", testUserID, "group", "/enter")
@@ -183,13 +187,31 @@ func TestBridgeEndToEnd(t *testing.T) {
 			t.Fatalf("Herdr 断线期间仍发送 prompt：%#v", calls)
 		}
 
+		lifecycleSpecs := herdr.LifecycleSubscriptions()
+		statusSpecs := []herdr.SubscriptionSpec{{Type: "pane.agent_status_changed", PaneID: "pane-1"}}
+		sentBeforeReconnect := len(harness.wecom.Requests("aibot_send_msg"))
 		harness.herdr.SetAvailable(true)
 		harness.herdr.WaitCallCount(t, "ping", 3)
+		harness.herdr.WaitSubscriptionCount(t, lifecycleSpecs, 2)
+		harness.herdr.WaitSubscriptionCount(t, statusSpecs, 2)
 		harness.herdr.WaitCallCount(t, "session.snapshot", 4)
-		harness.waitReady(t)
-		reselect := harness.send(t, "message-reconnected", testUserID, "single", "重连后仍不得沿用选择")
-		if !strings.Contains(reselect.Content, "/ls") || !strings.Contains(reselect.Content, "/sel") {
-			t.Fatalf("Herdr 重连后的回复 = %q", reselect.Content)
+		beforeProbe := len(harness.herdr.Calls("session.snapshot"))
+		if delivered := harness.herdr.EmitLifecycle("pane.updated", "pane-1"); delivered != 1 {
+			t.Fatalf("重连后的 lifecycle 投递数 = %d, want 1", delivered)
+		}
+		harness.herdr.WaitCallCount(t, "session.snapshot", beforeProbe+1)
+		assertStableCount(t, func() int { return len(harness.wecom.Requests("aibot_send_msg")) }, sentBeforeReconnect)
+
+		reselect := harness.send(t, "message-reconnected-select", testUserID, "single", "/sel 1")
+		if !strings.Contains(reselect.Content, "先执行 /ls") {
+			t.Fatalf("Herdr 重连后旧列表编号仍可用：%q", reselect.Content)
+		}
+		withoutSelection := harness.send(t, "message-reconnected-prompt", testUserID, "single", "重连后仍不得沿用选择")
+		if !strings.Contains(withoutSelection.Content, "/ls") || !strings.Contains(withoutSelection.Content, "/sel") {
+			t.Fatalf("Herdr 重连后的普通文本回复 = %q", withoutSelection.Content)
+		}
+		if calls := harness.herdr.Calls("agent.prompt"); len(calls) != 0 {
+			t.Fatalf("Herdr 重连后未重新选择却发送 prompt：%#v", calls)
 		}
 		harness.selectFirst(t)
 		harness.send(t, "message-after-reselect", testUserID, "single", "重新选择后允许发送")
@@ -220,6 +242,25 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.send(t, "message-after-wecom-reconnect", testUserID, "single", "重连后新消息")
 		harness.herdr.WaitCallCount(t, "agent.prompt", 2)
 	})
+}
+
+func TestApplicationHarnessCleanupReleasesProcessLock(t *testing.T) {
+	t.Run("依赖测试清理停止应用", func(t *testing.T) {
+		herdrServer := testkit.NewHerdrServer(t, integrationSnapshot("cleanup-1", herdr.AgentStatusWorking))
+		weComServer := testkit.NewWeComServer(t, testBotID, testSecret)
+		application := startApplication(t, herdrServer.SocketPath(), weComServer.Endpoint())
+		weComServer.WaitSubscribeCount(t, 1)
+		if err := application.ctx.Err(); err != nil {
+			t.Fatalf("应用提前停止：%v", err)
+		}
+	})
+
+	herdrServer := testkit.NewHerdrServer(t, integrationSnapshot("cleanup-2", herdr.AgentStatusWorking))
+	weComServer := testkit.NewWeComServer(t, testBotID, testSecret)
+	application := startApplication(t, herdrServer.SocketPath(), weComServer.Endpoint())
+	weComServer.WaitSubscribeCount(t, 1)
+	application.stop(t)
+	application.stop(t)
 }
 
 func TestRealHerdr(t *testing.T) {
@@ -257,35 +298,34 @@ func TestRealHerdr(t *testing.T) {
 	}
 
 	weComServer := testkit.NewWeComServer(t, testBotID, testSecret)
-	_, stop, result := startApplication(t, status.Socket, weComServer.Endpoint())
+	application := startApplication(t, status.Socket, weComServer.Endpoint())
 	weComServer.WaitSubscribeCount(t, 1)
-	stopApplication(t, stop, result)
+	application.stop(t)
 }
 
 type bridgeHarness struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	result <-chan error
-	herdr  *testkit.HerdrServer
-	wecom  *testkit.WeComServer
+	ctx   context.Context
+	run   *applicationRun
+	herdr *testkit.HerdrServer
+	wecom *testkit.WeComServer
 }
 
 func newBridgeHarness(t *testing.T, status herdr.AgentStatus) *bridgeHarness {
 	t.Helper()
 	herdrServer := testkit.NewHerdrServer(t, integrationSnapshot("session-1", status))
 	weComServer := testkit.NewWeComServer(t, testBotID, testSecret)
-	ctx, cancel, result := startApplication(t, herdrServer.SocketPath(), weComServer.Endpoint())
+	application := startApplication(t, herdrServer.SocketPath(), weComServer.Endpoint())
 	weComServer.WaitSubscribeCount(t, 1)
 	herdrServer.WaitCallCount(t, "ping", 1)
 	herdrServer.WaitCallCount(t, "session.snapshot", 2)
 	herdrServer.WaitSubscription(t, herdr.LifecycleSubscriptions())
 	herdrServer.WaitSubscription(t, []herdr.SubscriptionSpec{{Type: "pane.agent_status_changed", PaneID: "pane-1"}})
-	harness := &bridgeHarness{ctx: ctx, cancel: cancel, result: result, herdr: herdrServer, wecom: weComServer}
+	harness := &bridgeHarness{ctx: application.ctx, run: application, herdr: herdrServer, wecom: weComServer}
 	harness.waitReady(t)
 	return harness
 }
 
-func (h *bridgeHarness) stop(t *testing.T) { stopApplication(t, h.cancel, h.result) }
+func (h *bridgeHarness) stop(t *testing.T) { h.run.stop(t) }
 
 func (h *bridgeHarness) waitReady(t *testing.T) {
 	t.Helper()
@@ -298,7 +338,7 @@ func (h *bridgeHarness) waitReady(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	stopApplication(t, h.cancel, h.result)
+	h.run.stop(t)
 	t.Fatal("BridgeService 未在上限内接管启动快照")
 }
 
@@ -363,7 +403,34 @@ func numberedLines(count int) []string {
 	return lines
 }
 
-func startApplication(t *testing.T, socketPath, endpoint string) (context.Context, context.CancelFunc, <-chan error) {
+func assertRecentNotification(t *testing.T, messages []testkit.WeComRequest) {
+	t.Helper()
+	var content strings.Builder
+	for _, message := range messages {
+		if message.ChatID != testUserID || message.ChatType != 1 {
+			t.Fatalf("主动消息目标 = chatid %q chat_type %d, want %q/1", message.ChatID, message.ChatType, testUserID)
+		}
+		content.WriteString(message.Content)
+		content.WriteByte('\n')
+	}
+	joined := content.String()
+	if !strings.Contains(joined, "line-081") || !strings.Contains(joined, "line-180") || strings.Contains(joined, "line-080") {
+		t.Fatalf("主动通知不是最后 100 行：%q", joined)
+	}
+}
+
+type applicationRun struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	mu         sync.Mutex
+	err        error
+	stopErr    error
+	stopOnce   sync.Once
+	reportOnce sync.Once
+}
+
+func startApplication(t *testing.T, socketPath, endpoint string) *applicationRun {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	contents, err := json.Marshal(map[string]any{
@@ -379,30 +446,46 @@ func startApplication(t *testing.T, socketPath, endpoint string) (context.Contex
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
+	application := &applicationRun{ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	go func() {
-		result <- app.Run(ctx, app.Options{
+		err := app.Run(ctx, app.Options{
 			ConfigPath:    configPath,
 			Getenv:        func(string) string { return testSecret },
 			Stdout:        io.Discard,
 			Stderr:        io.Discard,
 			WeComEndpoint: endpoint,
 		})
+		application.mu.Lock()
+		application.err = err
+		application.mu.Unlock()
+		close(application.done)
 	}()
-	return ctx, cancel, result
+	t.Cleanup(func() { application.stop(t) })
+	return application
 }
 
-func stopApplication(t *testing.T, cancel context.CancelFunc, result <-chan error) {
+func (a *applicationRun) stop(t *testing.T) {
 	t.Helper()
-	cancel()
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatalf("app.Run() 退出错误：%v", err)
+	a.stopOnce.Do(func() {
+		a.cancel()
+		select {
+		case <-a.done:
+			a.mu.Lock()
+			a.stopErr = a.err
+			a.mu.Unlock()
+		case <-time.After(3 * time.Second):
+			a.mu.Lock()
+			a.stopErr = fmt.Errorf("app.Run() 未在集成测试退出上限内停止")
+			a.mu.Unlock()
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("app.Run() 未在集成测试退出上限内停止")
-	}
+	})
+	a.reportOnce.Do(func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.stopErr != nil {
+			t.Errorf("应用测试清理失败：%v", a.stopErr)
+		}
+	})
 }
 
 func integrationSnapshot(sessionID string, status herdr.AgentStatus) herdr.Snapshot {

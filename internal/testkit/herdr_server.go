@@ -3,6 +3,7 @@ package testkit
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,15 +33,16 @@ type HerdrServer struct {
 	listener net.Listener
 	path     string
 
-	mu            sync.Mutex
-	snapshot      herdr.Snapshot
-	output        []string
-	calls         []HerdrCall
-	subscriptions map[*herdrSubscription]struct{}
-	connections   map[net.Conn]struct{}
-	closed        bool
-	available     bool
-	changed       chan struct{}
+	mu             sync.Mutex
+	snapshot       herdr.Snapshot
+	output         []string
+	calls          []HerdrCall
+	subscriptions  map[*herdrSubscription]struct{}
+	subscribeCount map[string]int
+	connections    map[net.Conn]struct{}
+	closed         bool
+	available      bool
+	changed        chan struct{}
 }
 
 type herdrSubscription struct {
@@ -61,12 +63,17 @@ func NewHerdrServer(t testing.TB, snapshot herdr.Snapshot) *HerdrServer {
 	if snapshot.Protocol != herdr.RequiredProtocol {
 		t.Fatalf("fake Herdr snapshot protocol = %d, want %d", snapshot.Protocol, herdr.RequiredProtocol)
 	}
-	directory, err := os.MkdirTemp("", "herdr-pal-")
-	if err != nil {
-		t.Fatalf("创建 fake Herdr 临时目录：%v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	directory := t.TempDir()
 	path := filepath.Join(directory, "herdr.sock")
+	if len(path) >= 96 {
+		digest := sha256.Sum256([]byte(directory))
+		alias := filepath.Join("/tmp", fmt.Sprintf("herdr-pal-%x", digest[:8]))
+		if err := os.Symlink(directory, alias); err != nil {
+			t.Fatalf("创建 fake Herdr 短路径：%v", err)
+		}
+		t.Cleanup(func() { _ = os.Remove(alias) })
+		path = filepath.Join(alias, "herdr.sock")
+	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("启动 fake Herdr：%v", err)
@@ -74,11 +81,22 @@ func NewHerdrServer(t testing.TB, snapshot herdr.Snapshot) *HerdrServer {
 	server := &HerdrServer{
 		listener: listener, path: path, snapshot: cloneSnapshot(snapshot),
 		subscriptions: make(map[*herdrSubscription]struct{}), connections: make(map[net.Conn]struct{}),
-		available: true, changed: make(chan struct{}, 1),
+		subscribeCount: make(map[string]int), available: true, changed: make(chan struct{}, 1),
 	}
 	t.Cleanup(func() { _ = server.Close() })
 	go server.acceptLoop()
 	return server
+}
+
+// WaitSubscriptionCount 等待与 specs 等价的成功订阅累计达到 count 代。
+func (s *HerdrServer) WaitSubscriptionCount(t testing.TB, specs []herdr.SubscriptionSpec, count int) {
+	t.Helper()
+	key := subscriptionKey(specs)
+	s.wait(t, fmt.Sprintf("Herdr 订阅 %v 累计达到 %d 代", canonicalSpecs(specs), count), func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.subscribeCount[key] >= count
+	})
 }
 
 // SetAvailable 控制新请求是否能获得响应；关闭时连接会在记录调用后直接断开。
@@ -264,7 +282,7 @@ func (s *HerdrServer) handleConnection(connection net.Conn) {
 		var params struct {
 			Subscriptions []herdr.SubscriptionSpec `json:"subscriptions"`
 		}
-		if json.Unmarshal(request.Params, &params) != nil || len(params.Subscriptions) == 0 {
+		if json.Unmarshal(request.Params, &params) != nil || validateFakeSubscriptionSpecs(params.Subscriptions) != nil {
 			s.writeError(connection, request.ID, "invalid_params", "subscriptions required")
 			return
 		}
@@ -274,6 +292,7 @@ func (s *HerdrServer) handleConnection(connection net.Conn) {
 		subscription := &herdrSubscription{conn: connection, specs: append([]herdr.SubscriptionSpec(nil), params.Subscriptions...)}
 		s.mu.Lock()
 		s.subscriptions[subscription] = struct{}{}
+		s.subscribeCount[subscriptionKey(params.Subscriptions)]++
 		s.mu.Unlock()
 		s.signal()
 		keepOpen = true
@@ -311,7 +330,12 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 	case "session.snapshot":
 		result = map[string]any{"type": "session_snapshot", "snapshot": snapshotWire(snapshot)}
 	case "agent.get":
-		agent, ok := agentForParams(snapshot, request.Params)
+		target, ok := requiredTarget(request.Params)
+		if !ok {
+			s.writeError(connection, request.ID, "invalid_params", "invalid target")
+			return
+		}
+		agent, ok := findAgent(snapshot, target)
 		if !ok {
 			s.writeError(connection, request.ID, "agent_not_found", "agent not found")
 			return
@@ -319,10 +343,15 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		result = map[string]any{"type": "agent_info", "agent": agentWire(agent)}
 	case "agent.read":
 		var params struct {
-			Target string `json:"target"`
-			Lines  int    `json:"lines"`
+			Target    string `json:"target"`
+			Source    string `json:"source"`
+			Lines     int    `json:"lines"`
+			Format    string `json:"format"`
+			StripANSI *bool  `json:"strip_ansi"`
 		}
-		if json.Unmarshal(request.Params, &params) != nil || params.Lines < 1 || params.Lines > 1000 {
+		if json.Unmarshal(request.Params, &params) != nil || strings.TrimSpace(params.Target) == "" ||
+			params.Source != "recent_unwrapped" || params.Lines < 1 || params.Lines > 1000 ||
+			params.Format != "text" || params.StripANSI == nil || !*params.StripANSI {
 			s.writeError(connection, request.ID, "invalid_params", "invalid read")
 			return
 		}
@@ -340,14 +369,31 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 			"revision": 0, "truncated": false,
 		}}
 	case "agent.prompt":
-		agent, ok := agentForParams(snapshot, request.Params)
+		var params struct {
+			Target string  `json:"target"`
+			Text   *string `json:"text"`
+		}
+		if json.Unmarshal(request.Params, &params) != nil || strings.TrimSpace(params.Target) == "" || params.Text == nil {
+			s.writeError(connection, request.ID, "invalid_params", "invalid prompt")
+			return
+		}
+		agent, ok := findAgent(snapshot, params.Target)
 		if !ok {
 			s.writeError(connection, request.ID, "agent_not_found", "agent not found")
 			return
 		}
 		result = map[string]any{"type": "agent_prompted", "agent": agentWire(agent)}
 	case "agent.send_keys":
-		if _, ok := agentForParams(snapshot, request.Params); !ok {
+		var params struct {
+			Target string   `json:"target"`
+			Keys   []string `json:"keys"`
+		}
+		if json.Unmarshal(request.Params, &params) != nil || strings.TrimSpace(params.Target) == "" ||
+			len(params.Keys) != 1 || strings.TrimSpace(params.Keys[0]) == "" {
+			s.writeError(connection, request.ID, "invalid_params", "invalid keys")
+			return
+		}
+		if _, ok := findAgent(snapshot, params.Target); !ok {
 			s.writeError(connection, request.ID, "agent_not_found", "agent not found")
 			return
 		}
@@ -443,14 +489,44 @@ func canonicalSpecs(specs []herdr.SubscriptionSpec) []herdr.SubscriptionSpec {
 	return result
 }
 
-func agentForParams(snapshot herdr.Snapshot, raw json.RawMessage) (herdr.AgentInfo, bool) {
+func subscriptionKey(specs []herdr.SubscriptionSpec) string {
+	encoded, err := json.Marshal(canonicalSpecs(specs))
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
+func validateFakeSubscriptionSpecs(specs []herdr.SubscriptionSpec) error {
+	if len(specs) == 0 {
+		return errors.New("empty subscriptions")
+	}
+	allowed := map[string]bool{
+		"pane.created": true, "pane.closed": true, "pane.updated": true,
+		"pane.exited": true, "pane.agent_detected": true, "pane.agent_status_changed": true,
+	}
+	for _, spec := range specs {
+		if !allowed[spec.Type] {
+			return errors.New("unsupported subscription")
+		}
+		if spec.Type == "pane.agent_status_changed" && strings.TrimSpace(spec.PaneID) == "" {
+			return errors.New("status pane required")
+		}
+		if spec.Type != "pane.agent_status_changed" && spec.PaneID != "" {
+			return errors.New("lifecycle pane forbidden")
+		}
+	}
+	return nil
+}
+
+func requiredTarget(raw json.RawMessage) (string, bool) {
 	var params struct {
 		Target string `json:"target"`
 	}
-	if json.Unmarshal(raw, &params) != nil {
-		return herdr.AgentInfo{}, false
+	if json.Unmarshal(raw, &params) != nil || strings.TrimSpace(params.Target) == "" {
+		return "", false
 	}
-	return findAgent(snapshot, params.Target)
+	return params.Target, true
 }
 
 func findAgent(snapshot herdr.Snapshot, target string) (herdr.AgentInfo, bool) {
