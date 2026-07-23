@@ -35,8 +35,12 @@ func stripANSI(text string) string {
 			index++
 			continue
 		}
-		if text[index] != 0x1b || index+1 >= len(text) {
+		if text[index] != 0x1b {
 			result.WriteByte(text[index])
+			index++
+			continue
+		}
+		if index+1 >= len(text) {
 			index++
 			continue
 		}

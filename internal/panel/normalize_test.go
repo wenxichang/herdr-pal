@@ -134,6 +134,28 @@ func TestNormalizeRemovesStandardEscapeSequencesConservatively(t *testing.T) {
 	}
 }
 
+func TestNormalizeDropsBareTrailingEscapePrefix(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		input     string
+		want      []string
+		wantEmpty bool
+	}{
+		{name: "after visible text", input: "visible\x1b", want: []string{"visible"}},
+		{name: "only escape", input: "\x1b", wantEmpty: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := panel.Normalize(test.input)
+			if test.wantEmpty && len(got) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("Normalize() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestBufferPageUpConsumesAllCachedHistoricalPages(t *testing.T) {
 	latest := externalLines(200, 230)
 	history := externalLines(50, 200)
