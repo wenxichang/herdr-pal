@@ -174,6 +174,9 @@ func (c *Client) Run(ctx context.Context) error {
 			session.finish(ErrUnavailable)
 			session.wait()
 			c.clearIfCurrent(session)
+			if flushErr := session.flushQueued(ctx); flushErr != nil {
+				return flushErr
+			}
 			if err := c.wait(ctx, c.backoff.Next()); err != nil {
 				return err
 			}
@@ -348,9 +351,10 @@ type session struct {
 	reasonMu   sync.Mutex
 	finalErr   error
 
-	readyMu sync.Mutex
-	ready   bool
-	queued  []IncomingText
+	readyMu    sync.Mutex
+	ready      bool
+	overflowed bool
+	queued     []IncomingText
 }
 
 func newSession(parent context.Context, socket Socket, events chan<- IncomingText) *session {
@@ -449,6 +453,9 @@ func (s *session) readLoop() {
 			s.pending.resolve(*frame.Response)
 		case FrameIncomingText:
 			if err := s.enqueue(*frame.IncomingText); err != nil {
+				if errors.Is(err, ErrEventQueueFull) && !s.isReady() {
+					continue
+				}
 				s.finish(ErrUnavailable)
 				return
 			}
@@ -463,7 +470,12 @@ func (s *session) enqueue(event IncomingText) error {
 	s.readyMu.Lock()
 	defer s.readyMu.Unlock()
 	if !s.ready {
-		if len(s.queued) >= cap(s.events)+1 {
+		if s.overflowed {
+			return ErrUnavailable
+		}
+		if len(s.queued) >= cap(s.events) {
+			s.queued = append(s.queued, event)
+			s.overflowed = true
 			return ErrEventQueueFull
 		}
 		s.queued = append(s.queued, event)
@@ -476,6 +488,12 @@ func (s *session) enqueue(event IncomingText) error {
 		s.queued = append(s.queued, event)
 		return ErrEventQueueFull
 	}
+}
+
+func (s *session) isReady() bool {
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	return s.ready
 }
 
 func (s *session) finish(err error) {

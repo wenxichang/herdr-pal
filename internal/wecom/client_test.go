@@ -83,6 +83,39 @@ func TestClientBuffersCallbackUntilSubscribeResponse(t *testing.T) {
 	awaitDone(t, done)
 }
 
+func TestClientPreservesPreReadyOverflowAfterSubscribeConfirmation(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	client.events = make(chan IncomingText, 1)
+	client.events <- IncomingText{RequestID: "existing"}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	subscribe := socket.nextWrite(t)
+	socket.push(textCallbackJSON("before-1"))
+	socket.push(textCallbackJSON("before-2"))
+	if len(client.events) != 1 {
+		t.Fatalf("event queue len = %d before confirmation, want existing item only", len(client.events))
+	}
+	socket.push(responseJSON(requestIDOf(t, subscribe), 0))
+	select {
+	case <-socket.closed:
+	case <-time.After(time.Second):
+		t.Fatal("activate overflow did not finish the session")
+	}
+	for _, requestID := range []string{"existing", "before-1", "before-2"} {
+		select {
+		case event := <-client.Events():
+			if event.RequestID != requestID {
+				t.Fatalf("event = %q, want %q", event.RequestID, requestID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing retained event %q", requestID)
+		}
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
 func TestClientWaitsBackoffAfterSubscribedSessionEnds(t *testing.T) {
 	first := newFakeSocket()
 	second := newFakeSocket()
