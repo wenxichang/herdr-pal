@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestProtocolEncodeSubscribe(t *testing.T) {
@@ -185,13 +186,31 @@ func TestProtocolDecodeResponseAndErrors(t *testing.T) {
 		t.Fatalf("response frame = %+v", frame)
 	}
 
-	_, err = DecodeFrame([]byte(`{"headers":{"req_id":"request-2"},"errcode":40001,"errmsg":"rejected"}`))
-	if !errors.Is(err, ErrProtocol) {
-		t.Fatalf("DecodeFrame(error response) error = %v, want ErrProtocol", err)
+	failedFrame, err := DecodeFrame([]byte(`{"headers":{"req_id":"request-2"},"errcode":40001,"errmsg":"rejected"}`))
+	if err != nil {
+		t.Fatalf("DecodeFrame(error response) error = %v", err)
+	}
+	if failedFrame.Kind != FrameResponse || failedFrame.Response == nil || failedFrame.Response.ErrCode != 40001 {
+		t.Fatalf("failed response frame = %+v", failedFrame)
+	}
+	var pending pendingRequests
+	wait, err := pending.register("request-2")
+	if err != nil {
+		t.Fatalf("register() error = %v", err)
+	}
+	if !pending.resolve(*failedFrame.Response) {
+		t.Fatal("resolve(error response) = false, want true")
+	}
+	result := <-wait
+	if !errors.Is(result.Err, ErrProtocol) {
+		t.Fatalf("pending result = %+v, want ErrProtocol", result)
 	}
 	var protocolErr *ProtocolError
-	if !errors.As(err, &protocolErr) || protocolErr.RequestID != "request-2" || protocolErr.ErrCode != 40001 || protocolErr.Message != "rejected" {
+	if !errors.As(result.Err, &protocolErr) || protocolErr.RequestID != "request-2" || protocolErr.ErrCode != 40001 || protocolErr.Message != "rejected" {
 		t.Fatalf("ProtocolError = %#v", protocolErr)
+	}
+	if pending.resolve(Response{Headers: Headers{RequestID: "unknown"}, ErrCode: 40001, ErrMsg: "rejected"}) {
+		t.Fatal("resolve(unknown response) = true, want false")
 	}
 
 	for _, data := range [][]byte{
@@ -211,6 +230,23 @@ func TestProtocolDecodeResponseAndErrors(t *testing.T) {
 	}
 }
 
+func TestProtocolDecodeRejectsTrailingJSONAndAllowsWhitespace(t *testing.T) {
+	valid := []byte(`{"headers":{"req_id":"request-1"},"errcode":0,"errmsg":"ok"}`)
+	for _, suffix := range []string{
+		"]",
+		"}",
+		` {"headers":{"req_id":"request-2"},"errcode":0,"errmsg":"ok"}`,
+		" garbage",
+	} {
+		if _, err := DecodeFrame(append(append([]byte(nil), valid...), suffix...)); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("DecodeFrame(trailing %q) error = %v, want ErrProtocol", suffix, err)
+		}
+	}
+	if _, err := DecodeFrame(append(valid, []byte(" \n\t ")...)); err != nil {
+		t.Fatalf("DecodeFrame(valid with whitespace) error = %v", err)
+	}
+}
+
 func TestProtocolDecodeDisconnectedAndUnknownFrames(t *testing.T) {
 	assertDisconnectedFixtureShape(t, readFixture(t, "testdata/event_disconnected.json"))
 	disconnected, err := DecodeFrame(readFixture(t, "testdata/event_disconnected.json"))
@@ -221,12 +257,17 @@ func TestProtocolDecodeDisconnectedAndUnknownFrames(t *testing.T) {
 		t.Fatalf("disconnected frame = %+v", disconnected)
 	}
 
-	event, err := DecodeFrame([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-2"},"body":{"msgid":"event-message-2","create_time":1720000000,"aibotid":"bot-1","msgtype":"event","event":{"eventtype":"future_event"}}}`))
+	futureEventData := []byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-2"},"body":{"msgid":"event-message-2","create_time":1720000000,"aibotid":"bot-1","msgtype":"event","event":{"eventtype":"future_event"}}}`)
+	event, err := DecodeFrame(futureEventData)
 	if err != nil {
 		t.Fatalf("DecodeFrame(future event) error = %v", err)
 	}
-	if event.Kind != FrameUnknown || event.IncomingText != nil {
+	if event.Kind != FrameUnknown || event.IncomingText != nil || string(event.Raw) != string(futureEventData) {
 		t.Fatalf("future event frame = %+v, want non-text unknown frame", event)
+	}
+	futureEventData[0] = '['
+	if event.Raw[0] != '{' {
+		t.Fatalf("unknown event Raw aliases caller input: %q", event.Raw)
 	}
 	if _, err := DecodeFrame([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-3"},"body":{"msgid":"event-message-3","aibotid":"bot-1","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`)); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("DecodeFrame(invalid event) error = %v, want ErrProtocol", err)
@@ -245,6 +286,31 @@ func TestProtocolDecodeDisconnectedAndUnknownFrames(t *testing.T) {
 	}
 	if unknown.Kind != FrameUnknown || unknown.Raw == nil || unknown.IncomingText != nil {
 		t.Fatalf("unknown frame = %+v", unknown)
+	}
+}
+
+func TestProtocolUnsupportedCallbackKeepsRawReservedForUnknownFrames(t *testing.T) {
+	frame, err := DecodeFrame([]byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":"callback-2"},"body":{"msgid":"message-2","aibotid":"bot-1","chattype":"single","from":{"userid":"user-1"},"msgtype":"image"}}`))
+	if err != nil {
+		t.Fatalf("DecodeFrame() error = %v", err)
+	}
+	if frame.Kind != FrameUnsupportedCallback || frame.Raw != nil {
+		t.Fatalf("unsupported callback = %+v, want no Raw", frame)
+	}
+}
+
+func TestProtocolErrorSanitizesLogFields(t *testing.T) {
+	requestID := "request\r\nforged\tentry"
+	serverMessage := strings.Repeat("界", 100) + "\r\nforged"
+	err := newProtocolError(requestID, 42, serverMessage)
+	if strings.ContainsAny(err.Error(), "\r\n\t") || !utf8.ValidString(err.Error()) || len(err.Error()) > 256 {
+		t.Fatalf("Error() = %q, must be bounded valid single-line UTF-8", err.Error())
+	}
+	if strings.Contains(err.Error(), requestID) || strings.Contains(err.Error(), serverMessage) {
+		t.Fatalf("Error() leaked raw injected field: %q", err.Error())
+	}
+	if strings.ContainsAny(err.RequestID, "\r\n\t") || strings.ContainsAny(err.Message, "\r\n\t") || !utf8.ValidString(err.RequestID) || !utf8.ValidString(err.Message) {
+		t.Fatalf("ProtocolError fields are not safe: %#v", err)
 	}
 }
 

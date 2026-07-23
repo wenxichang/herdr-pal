@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -16,6 +18,7 @@ const (
 	DefaultEndpoint = "wss://openws.work.weixin.qq.com"
 	// MarkdownByteLimit 是企业微信 Markdown 正文允许的最大 UTF-8 字节数。
 	MarkdownByteLimit = 20480
+	logFieldByteLimit = 80
 )
 
 var (
@@ -61,13 +64,18 @@ func (e *ProtocolError) Error() string {
 	if e == nil {
 		return ErrProtocol.Error()
 	}
-	if e.RequestID == "" {
+	requestID := sanitizeLogField(e.RequestID)
+	if requestID == "" {
 		return ErrProtocol.Error()
 	}
 	if e.ErrCode == 0 {
-		return fmt.Sprintf("%s: 请求 %s", ErrProtocol, e.RequestID)
+		return fmt.Sprintf("%s: 请求 %s", ErrProtocol, requestID)
 	}
-	return fmt.Sprintf("%s: 请求 %s 失败（错误码 %d）", ErrProtocol, e.RequestID, e.ErrCode)
+	message := sanitizeLogField(e.Message)
+	if message == "" {
+		return fmt.Sprintf("%s: 请求 %s 失败（错误码 %d）", ErrProtocol, requestID, e.ErrCode)
+	}
+	return fmt.Sprintf("%s: 请求 %s 失败（错误码 %d）：%s", ErrProtocol, requestID, e.ErrCode, message)
 }
 
 // Unwrap 使 ProtocolError 可被 errors.Is 识别为 ErrProtocol。
@@ -212,7 +220,8 @@ func DecodeFrame(data []byte) (Frame, error) {
 	if err := decoder.Decode(&values); err != nil || values == nil {
 		return Frame{}, newProtocolError("", 0, "JSON 帧无效")
 	}
-	if decoder.More() {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
 		return Frame{}, newProtocolError("", 0, "JSON 帧包含尾随内容")
 	}
 
@@ -235,13 +244,13 @@ func DecodeFrame(data []byte) (Frame, error) {
 	case "aibot_msg_callback":
 		return decodeCallback(headers, values)
 	case "aibot_event_callback":
-		return decodeEventCallback(headers, values)
+		return decodeEventCallback(headers, values, data)
 	default:
 		return Frame{Kind: FrameUnknown, Headers: headers, Raw: append(json.RawMessage(nil), data...)}, nil
 	}
 }
 
-func decodeEventCallback(headers Headers, values map[string]json.RawMessage) (Frame, error) {
+func decodeEventCallback(headers Headers, values map[string]json.RawMessage, data []byte) (Frame, error) {
 	body, err := objectField(values, "body")
 	if err != nil {
 		return Frame{}, newProtocolError(headers.RequestID, 0, "事件正文无效")
@@ -270,7 +279,7 @@ func decodeEventCallback(headers Headers, values map[string]json.RawMessage) (Fr
 	if eventType == "disconnected_event" {
 		return Frame{Kind: FrameDisconnected, Headers: headers}, nil
 	}
-	return Frame{Kind: FrameUnknown, Headers: headers}, nil
+	return Frame{Kind: FrameUnknown, Headers: headers, Raw: append(json.RawMessage(nil), data...)}, nil
 }
 
 func decodeResponse(values map[string]json.RawMessage, data []byte) (Frame, error) {
@@ -286,11 +295,8 @@ func decodeResponse(values map[string]json.RawMessage, data []byte) (Frame, erro
 	if err != nil || !ok {
 		return Frame{}, newProtocolError(headers.RequestID, errCode, "响应说明无效")
 	}
-	response := Response{Headers: headers, ErrCode: errCode, ErrMsg: sanitizeMessage(errMsg)}
+	response := Response{Headers: headers, ErrCode: errCode, ErrMsg: sanitizeLogField(errMsg)}
 	frame := Frame{Kind: FrameResponse, Headers: headers, Response: &response, Raw: append(json.RawMessage(nil), data...)}
-	if errCode != 0 {
-		return frame, newProtocolError(headers.RequestID, errCode, response.ErrMsg)
-	}
 	return frame, nil
 }
 
@@ -405,22 +411,38 @@ func isJSONNull(raw json.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-func sanitizeMessage(message string) string {
-	message = strings.TrimSpace(message)
-	message = strings.Map(func(r rune) rune {
-		if r < 0x20 && r != '\n' && r != '\t' {
-			return -1
+func sanitizeLogField(value string) string {
+	var cleaned strings.Builder
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			continue
 		}
-		return r
-	}, message)
-	if len(message) > 256 {
-		return message[:256]
+		cleaned.WriteRune(character)
 	}
-	return message
+	return truncateUTF8(strings.TrimSpace(cleaned.String()), logFieldByteLimit)
+}
+
+func truncateUTF8(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	const suffix = "…"
+	if limit <= len(suffix) {
+		return ""
+	}
+	var truncated strings.Builder
+	for _, character := range value {
+		encoded := string(character)
+		if truncated.Len()+len(encoded)+len(suffix) > limit {
+			break
+		}
+		truncated.WriteString(encoded)
+	}
+	return truncated.String() + suffix
 }
 
 func newProtocolError(requestID string, errCode int, message string) *ProtocolError {
-	return &ProtocolError{RequestID: requestID, ErrCode: errCode, Message: sanitizeMessage(message)}
+	return &ProtocolError{RequestID: sanitizeLogField(requestID), ErrCode: errCode, Message: sanitizeLogField(message)}
 }
 
 type requestResult struct {
