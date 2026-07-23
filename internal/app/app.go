@@ -411,15 +411,23 @@ func consumeMessages(ctx context.Context, events <-chan wecom.IncomingText, hand
 		case <-ctx.Done():
 			return ctx.Err()
 		case message, ok := <-events:
-			if !ok {
-				return nil
+			done, err := consumeSelectedMessage(ctx, handler, message, ok)
+			if done {
+				return err
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			handler.HandleMessage(ctx, message)
 		}
 	}
+}
+
+func consumeSelectedMessage(ctx context.Context, handler messageHandler, message wecom.IncomingText, ok bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	if !ok {
+		return true, nil
+	}
+	handler.HandleMessage(ctx, message)
+	return false, nil
 }
 
 func newLogger(destination io.Writer, level string) (*slog.Logger, error) {

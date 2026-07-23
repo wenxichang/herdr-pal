@@ -337,6 +337,47 @@ func TestRunParentCancellationFirstRemainsNormal(t *testing.T) {
 	}
 }
 
+func TestRunParentCancellationWithWeComClosingEventsRemainsNormal(t *testing.T) {
+	for iteration := range 50 {
+		im := newCancelClosingWeCom()
+		supervisor := newFakeRunner()
+		handler := &fakeHandler{handled: make(chan wecom.IncomingText, 1)}
+		options := testOptions(t)
+		options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+			return &applicationRuntime{wecom: im, supervisor: supervisor, handler: handler}, nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- Run(ctx, options) }()
+		waitClosed(t, im.started, "WeCom Run")
+		waitClosed(t, supervisor.started, "Supervisor Run")
+		im.events <- incoming(fmt.Sprintf("warmup-%d", iteration), "/ls")
+		select {
+		case <-handler.handled:
+		case <-time.After(time.Second):
+			t.Fatal("message consumer did not process warmup event")
+		}
+		cancel()
+		if err := waitResult(t, result); err != nil {
+			t.Fatalf("iteration %d: Run() error = %v, want nil", iteration, err)
+		}
+	}
+}
+
+func TestConsumeSelectedMessagePrefersCancellationOverClosedEvents(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done, err := consumeSelectedMessage(ctx, &fakeHandler{}, wecom.IncomingText{}, false)
+	if !done || !errors.Is(err, context.Canceled) {
+		t.Fatalf("consumeSelectedMessage() = %v, %v, want done with context.Canceled", done, err)
+	}
+
+	done, err = consumeSelectedMessage(context.Background(), &fakeHandler{}, wecom.IncomingText{}, false)
+	if !done || err != nil {
+		t.Fatalf("active closed Events = %v, %v, want clean unexpected closure", done, err)
+	}
+}
+
 func TestParentTriggeredShutdownClassifiesSimultaneousResultDeterministically(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -681,6 +722,28 @@ func (w *orderedResultWeCom) Events() <-chan wecom.IncomingText { return w.event
 func (w *orderedResultWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
 
 func (w *orderedResultWeCom) SendMarkdown(context.Context, string) error { return nil }
+
+type cancelClosingWeCom struct {
+	events  chan wecom.IncomingText
+	started chan struct{}
+}
+
+func newCancelClosingWeCom() *cancelClosingWeCom {
+	return &cancelClosingWeCom{events: make(chan wecom.IncomingText, 1), started: make(chan struct{})}
+}
+
+func (w *cancelClosingWeCom) Run(ctx context.Context) error {
+	close(w.started)
+	<-ctx.Done()
+	close(w.events)
+	return ctx.Err()
+}
+
+func (w *cancelClosingWeCom) Events() <-chan wecom.IncomingText { return w.events }
+
+func (w *cancelClosingWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
+
+func (w *cancelClosingWeCom) SendMarkdown(context.Context, string) error { return nil }
 
 type gatedCancellationRunner struct {
 	canceled chan struct{}
