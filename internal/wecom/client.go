@@ -161,7 +161,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := c.subscribe(ctx, session); err != nil {
 			session.finish(ErrUnavailable)
 			session.wait()
-			if errors.Is(err, ErrProtocol) {
+			if errors.Is(err, ErrProtocol) || errors.Is(err, ErrEventQueueFull) {
 				return err
 			}
 			if err := c.wait(ctx, c.backoff.Next()); err != nil {
@@ -394,6 +394,9 @@ func (s *session) request(ctx context.Context, requestID string, payload []byte)
 		return (<-wait).Err
 	case <-s.done:
 		if s.pending.cancel(requestID) {
+			if reason := s.reason(); reason != nil {
+				return reason
+			}
 			return ErrUnavailable
 		}
 		return (<-wait).Err
@@ -453,10 +456,7 @@ func (s *session) readLoop() {
 			s.pending.resolve(*frame.Response)
 		case FrameIncomingText:
 			if err := s.enqueue(*frame.IncomingText); err != nil {
-				if errors.Is(err, ErrEventQueueFull) && !s.isReady() {
-					continue
-				}
-				s.finish(ErrUnavailable)
+				s.finish(err)
 				return
 			}
 		case FrameDisconnected:
