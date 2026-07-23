@@ -23,6 +23,15 @@ var lifecycleSubscriptionTypes = []string{
 	"pane.agent_detected",
 }
 
+var allowedSubscriptionTypes = map[string]bool{
+	"pane.created":              true,
+	"pane.closed":               true,
+	"pane.updated":              true,
+	"pane.exited":               true,
+	"pane.agent_detected":       true,
+	"pane.agent_status_changed": true,
+}
+
 // LifecycleSubscriptions 返回 bridge 用于跟踪 pane 生命周期的标准订阅列表。
 func LifecycleSubscriptions() []SubscriptionSpec {
 	specs := make([]SubscriptionSpec, len(lifecycleSubscriptionTypes))
@@ -125,9 +134,23 @@ func (c *Client) Subscribe(ctx context.Context, specs []SubscriptionSpec) (Subsc
 	}
 
 	stream := &subscriptionStream{conn: conn, reader: reader, closeDone: make(chan struct{})}
-	stream.stopParent = context.AfterFunc(ctx, func() {
+	stopParent := context.AfterFunc(ctx, func() {
 		_ = stream.Close()
 	})
+	stream.stateMu.Lock()
+	closed := stream.closed
+	parentErr := ctx.Err()
+	if !closed {
+		stream.stopParent = stopParent
+	}
+	stream.stateMu.Unlock()
+	if closed || parentErr != nil {
+		stopParent()
+		if closed {
+			<-stream.closeDone
+		}
+		return nil, unavailableContextError(ctx, net.ErrClosed)
+	}
 	closeOnError = false
 	return stream, nil
 }
@@ -138,18 +161,17 @@ func validateSubscriptionSpecs(specs []SubscriptionSpec) error {
 	if len(specs) == 0 {
 		return protocolError("事件订阅不能为空")
 	}
-	lifecycleTypes := make(map[string]struct{}, len(lifecycleSubscriptionTypes))
-	for _, eventType := range lifecycleSubscriptionTypes {
-		lifecycleTypes[eventType] = struct{}{}
-	}
 	for _, spec := range specs {
 		if strings.TrimSpace(spec.Type) == "" {
 			return protocolError("事件订阅 type 不能为空")
 		}
+		if !allowedSubscriptionTypes[spec.Type] {
+			return protocolError("事件订阅 type 不受当前 bridge 支持")
+		}
 		if spec.Type == "pane.agent_status_changed" && strings.TrimSpace(spec.PaneID) == "" {
 			return protocolError("pane.agent_status_changed 订阅必须指定 pane_id")
 		}
-		if _, ok := lifecycleTypes[spec.Type]; ok && spec.PaneID != "" {
+		if spec.Type != "pane.agent_status_changed" && spec.PaneID != "" {
 			return protocolError("pane 生命周期订阅不能指定 pane_id")
 		}
 	}
@@ -219,6 +241,7 @@ func (s *subscriptionStream) Close() error {
 	}
 	s.closed = true
 	stopParent := s.stopParent
+	s.stopParent = nil
 	s.stateMu.Unlock()
 
 	if stopParent != nil {

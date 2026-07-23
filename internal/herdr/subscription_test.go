@@ -177,7 +177,14 @@ func TestClientSubscribeRejectsInvalidSpecBeforeDialing(t *testing.T) {
 		{name: "空列表"},
 		{name: "空类型", specs: []SubscriptionSpec{{}}},
 		{name: "状态事件缺 pane", specs: []SubscriptionSpec{{Type: "pane.agent_status_changed"}}},
-		{name: "生命周期事件含 pane", specs: []SubscriptionSpec{{Type: "pane.created", PaneID: "p1"}}},
+		{name: "创建事件含 pane", specs: []SubscriptionSpec{{Type: "pane.created", PaneID: "p1"}}},
+		{name: "关闭事件含 pane", specs: []SubscriptionSpec{{Type: "pane.closed", PaneID: "p1"}}},
+		{name: "更新事件含 pane", specs: []SubscriptionSpec{{Type: "pane.updated", PaneID: "p1"}}},
+		{name: "退出事件含 pane", specs: []SubscriptionSpec{{Type: "pane.exited", PaneID: "p1"}}},
+		{name: "检测事件含 pane", specs: []SubscriptionSpec{{Type: "pane.agent_detected", PaneID: "p1"}}},
+		{name: "未知类型", specs: []SubscriptionSpec{{Type: "pane.unknown"}}},
+		{name: "滚动事件", specs: []SubscriptionSpec{{Type: "pane.scroll_changed"}}},
+		{name: "输出匹配事件", specs: []SubscriptionSpec{{Type: "pane.output_matched"}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -191,6 +198,24 @@ func TestClientSubscribeRejectsInvalidSpecBeforeDialing(t *testing.T) {
 				t.Fatalf("DialContext() 调用次数 = %d，期望 0", dialer.Count())
 			}
 		})
+	}
+}
+
+func TestClientSubscribeDoesNotReturnClosedStreamWhenParentCancelsDuringHandoff(t *testing.T) {
+	for attempt := 0; attempt < 20; attempt++ {
+		parentCtx, cancel := context.WithCancel(context.Background())
+		dialer := newHandoffCancellationDialer(cancel)
+		client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+		stream, err := client.Subscribe(parentCtx, []SubscriptionSpec{{Type: "pane.created"}})
+		if err == nil {
+			if stream != nil {
+				_ = stream.Close()
+			}
+			t.Fatalf("第 %d 次 Subscribe() 返回已失效 stream 而非取消错误", attempt+1)
+		}
+		if !errors.Is(err, ErrUnavailable) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("第 %d 次 Subscribe() 错误 = %v，期望匹配 ErrUnavailable 和 context.Canceled", attempt+1, err)
+		}
 	}
 }
 
@@ -279,6 +304,125 @@ func TestSubscriptionStreamCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSubscriptionStreamCloseUnblocksBlockingRecv(t *testing.T) {
+	started := make(chan struct{})
+	trackedConn := &activatedReadConn{readStarted: make(chan struct{})}
+	dialer := &subscriptionDialer{wrapClient: func(conn net.Conn) net.Conn {
+		trackedConn.Conn = conn
+		return trackedConn
+	}, handler: func(conn net.Conn, request map[string]any) error {
+		id, _ := request["id"].(string)
+		if _, err := io.WriteString(conn, `{"id":"`+id+`","result":{"type":"subscription_started"}}`+"\n"); err != nil {
+			return err
+		}
+		close(started)
+		_, err := io.Copy(io.Discard, conn)
+		return err
+	}}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	stream, err := client.Subscribe(context.Background(), []SubscriptionSpec{{Type: "pane.created"}})
+	if err != nil {
+		t.Fatalf("Subscribe() 返回错误：%v", err)
+	}
+	<-started
+	trackedConn.activate()
+	recvErr := make(chan error, 1)
+	go func() {
+		_, err := stream.Recv(context.Background())
+		recvErr <- err
+	}()
+	select {
+	case <-trackedConn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Recv() 没有进入底层阻塞读取")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() 返回错误：%v", err)
+	}
+	select {
+	case err := <-recvErr:
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("Recv() 错误 = %v，期望 ErrUnavailable", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close() 未解除阻塞的 Recv()")
+	}
+}
+
+func TestSubscriptionStreamConcurrentCloseReturnsSameResult(t *testing.T) {
+	closeFailure := errors.New("模拟关闭失败")
+	dialer := &subscriptionDialer{handler: func(conn net.Conn, request map[string]any) error {
+		id, _ := request["id"].(string)
+		if _, err := io.WriteString(conn, `{"id":"`+id+`","result":{"type":"subscription_started"}}`+"\n"); err != nil {
+			return err
+		}
+		_, err := io.Copy(io.Discard, conn)
+		return err
+	}, wrapClient: func(conn net.Conn) net.Conn {
+		return &closeErrorConn{Conn: conn, err: closeFailure}
+	}}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	stream, err := client.Subscribe(context.Background(), []SubscriptionSpec{{Type: "pane.created"}})
+	if err != nil {
+		t.Fatalf("Subscribe() 返回错误：%v", err)
+	}
+	const callers = 32
+	errs := make(chan error, callers)
+	var wait sync.WaitGroup
+	for index := 0; index < callers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs <- stream.Close()
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	var first error
+	for err := range errs {
+		if !errors.Is(err, ErrUnavailable) || !errors.Is(err, closeFailure) {
+			t.Fatalf("并发 Close() 错误 = %v，期望匹配 ErrUnavailable 和首次关闭错误", err)
+		}
+		if first == nil {
+			first = err
+			continue
+		}
+		if fmt.Sprint(err) != fmt.Sprint(first) {
+			t.Fatalf("并发 Close() 结果不一致：%v 和 %v", first, err)
+		}
+	}
+}
+
+func TestSubscriptionStreamDeadlineClosesStream(t *testing.T) {
+	started := make(chan struct{})
+	dialer := &subscriptionDialer{handler: func(conn net.Conn, request map[string]any) error {
+		id, _ := request["id"].(string)
+		if _, err := io.WriteString(conn, `{"id":"`+id+`","result":{"type":"subscription_started"}}`+"\n"); err != nil {
+			return err
+		}
+		close(started)
+		_, err := io.Copy(io.Discard, conn)
+		return err
+	}}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	stream, err := client.Subscribe(context.Background(), []SubscriptionSpec{{Type: "pane.created"}})
+	if err != nil {
+		t.Fatalf("Subscribe() 返回错误：%v", err)
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := stream.Recv(ctx); !errors.Is(err, ErrUnavailable) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Recv() 错误 = %v，期望匹配 ErrUnavailable 和 context.DeadlineExceeded", err)
+	}
+	if _, err := stream.Recv(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("关闭后 Recv() 错误 = %v，期望 ErrUnavailable", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("关闭后 Close() 错误 = %v，期望稳定返回首次结果", err)
+	}
+}
+
 func TestDecodeAgentStatusEventValidatesRequiredFields(t *testing.T) {
 	valid := Event{Kind: "pane.agent_status_changed", Data: json.RawMessage(`{"pane_id":"p1","workspace_id":"w1","agent_status":"blocked","agent":"claude","title":"确认","display_agent":"Claude","state_labels":{"permission":"required"},"future":true}`)}
 	got, err := DecodeAgentStatusEvent(valid)
@@ -335,7 +479,8 @@ func TestSubscriptionStreamRecvsContextCancellationAndClose(t *testing.T) {
 }
 
 type subscriptionDialer struct {
-	handler func(net.Conn, map[string]any) error
+	handler    func(net.Conn, map[string]any) error
+	wrapClient func(net.Conn) net.Conn
 
 	mu          sync.Mutex
 	connections []net.Conn
@@ -343,8 +488,65 @@ type subscriptionDialer struct {
 	wg          sync.WaitGroup
 }
 
+type handoffCancellationDialer struct {
+	cancel       context.CancelFunc
+	clearStarted chan struct{}
+	releaseClear chan struct{}
+
+	once sync.Once
+}
+
+func newHandoffCancellationDialer(cancel context.CancelFunc) *handoffCancellationDialer {
+	return &handoffCancellationDialer{
+		cancel:       cancel,
+		clearStarted: make(chan struct{}),
+		releaseClear: make(chan struct{}),
+	}
+}
+
+func (d *handoffCancellationDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		line, err := bufio.NewReader(server).ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var request map[string]any
+		if err := json.Unmarshal(line, &request); err != nil {
+			return
+		}
+		id, _ := request["id"].(string)
+		if _, err := io.WriteString(server, `{"id":"`+id+`","result":{"type":"subscription_started"}}`+"\n"); err != nil {
+			return
+		}
+		<-d.clearStarted
+		d.cancel()
+		close(d.releaseClear)
+	}()
+	return &handoffCancellationConn{Conn: client, dialer: d}, nil
+}
+
+type handoffCancellationConn struct {
+	net.Conn
+	dialer *handoffCancellationDialer
+}
+
+func (c *handoffCancellationConn) SetDeadline(deadline time.Time) error {
+	if deadline.IsZero() {
+		c.dialer.once.Do(func() {
+			close(c.dialer.clearStarted)
+			<-c.dialer.releaseClear
+		})
+	}
+	return c.Conn.SetDeadline(deadline)
+}
+
 func (d *subscriptionDialer) DialContext(context.Context, string, string) (net.Conn, error) {
 	client, server := net.Pipe()
+	if d.wrapClient != nil {
+		client = d.wrapClient(client)
+	}
 	d.mu.Lock()
 	d.connections = append(d.connections, client)
 	d.mu.Unlock()
@@ -366,6 +568,41 @@ func (d *subscriptionDialer) DialContext(context.Context, string, string) (net.C
 		}
 	}()
 	return client, nil
+}
+
+type activatedReadConn struct {
+	net.Conn
+
+	mu          sync.Mutex
+	active      bool
+	readStarted chan struct{}
+	once        sync.Once
+}
+
+type closeErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c *closeErrorConn) Close() error {
+	_ = c.Conn.Close()
+	return c.err
+}
+
+func (c *activatedReadConn) activate() {
+	c.mu.Lock()
+	c.active = true
+	c.mu.Unlock()
+}
+
+func (c *activatedReadConn) Read(buffer []byte) (int, error) {
+	c.mu.Lock()
+	active := c.active
+	c.mu.Unlock()
+	if active {
+		c.once.Do(func() { close(c.readStarted) })
+	}
+	return c.Conn.Read(buffer)
 }
 
 func (d *subscriptionDialer) Count() int {
