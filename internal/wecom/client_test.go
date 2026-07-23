@@ -1,0 +1,387 @@
+package wecom
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+func TestClientSubscribesBeforeDeliveringCallbacksAndReplies(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+
+	subscribe := socket.nextWrite(t)
+	if commandOf(t, subscribe).Cmd != "aibot_subscribe" {
+		t.Fatalf("first command = %q, want aibot_subscribe", commandOf(t, subscribe).Cmd)
+	}
+	socket.push(responseJSON(requestIDOf(t, subscribe), 0))
+	socket.push([]byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":"callback-1"},"body":{"msgid":"message-1","aibotid":"bot-1","chattype":"single","from":{"userid":"user-1"},"msgtype":"text","text":{"content":"/ls"}}}`))
+
+	select {
+	case event := <-client.Events():
+		if event.RequestID != "callback-1" || event.Content != "/ls" {
+			t.Fatalf("event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Events() did not receive callback")
+	}
+
+	replyDone := make(chan error, 1)
+	go func() { replyDone <- client.RespondMarkdown(context.Background(), "callback-1", "收到") }()
+	reply := socket.nextWrite(t)
+	if commandOf(t, reply).Cmd != "aibot_respond_msg" || requestIDOf(t, reply) != "callback-1" {
+		t.Fatalf("reply = %s, want callback request id", reply)
+	}
+	socket.push(responseJSON("callback-1", 0))
+	if err := <-replyDone; err != nil {
+		t.Fatalf("RespondMarkdown() error = %v", err)
+	}
+
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientSendMarkdownTargetsConfiguredUserAndWaitsResponse(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, socket)
+
+	result := make(chan error, 1)
+	go func() { result <- client.SendMarkdown(context.Background(), "主动通知") }()
+	write := socket.nextWrite(t)
+	var request struct {
+		Cmd     string  `json:"cmd"`
+		Headers Headers `json:"headers"`
+		Body    struct {
+			ChatID   string `json:"chatid"`
+			ChatType int    `json:"chat_type"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(write, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Cmd != "aibot_send_msg" || request.Headers.RequestID == "" || request.Body.ChatID != "user-1" || request.Body.ChatType != 1 {
+		t.Fatalf("send request = %s", write)
+	}
+	socket.push(responseJSON(request.Headers.RequestID, 0))
+	if err := <-result; err != nil {
+		t.Fatalf("SendMarkdown() error = %v", err)
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientHeartbeatTimeoutReconnects(t *testing.T) {
+	first := newFakeSocket()
+	second := newFakeSocket()
+	var calls int
+	client := newTestClient(t, func(context.Context, string) (Socket, error) {
+		calls++
+		if calls == 1 {
+			return first, nil
+		}
+		return second, nil
+	})
+	client.heartbeatInterval = 10 * time.Millisecond
+	client.requestTimeout = 15 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, first)
+	ping := first.nextWrite(t)
+	if commandOf(t, ping).Cmd != "ping" {
+		t.Fatalf("command = %q, want ping", commandOf(t, ping).Cmd)
+	}
+	if commandOf(t, second.nextWrite(t)).Cmd != "aibot_subscribe" {
+		t.Fatal("second session did not subscribe")
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientDisconnectAndFullEventQueueReconnect(t *testing.T) {
+	first := newFakeSocket()
+	second := newFakeSocket()
+	var calls int
+	client := newTestClient(t, func(context.Context, string) (Socket, error) {
+		calls++
+		if calls == 1 {
+			return first, nil
+		}
+		return second, nil
+	})
+	client.events = make(chan IncomingText, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, first)
+	first.push(textCallbackJSON("callback-1"))
+	first.push(textCallbackJSON("callback-2"))
+	if commandOf(t, second.nextWrite(t)).Cmd != "aibot_subscribe" {
+		t.Fatal("full event queue did not reconnect")
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientDisconnectedAndBinaryFramesReconnect(t *testing.T) {
+	for _, frame := range []fakeRead{
+		{typ: websocket.MessageText, data: []byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-1"},"body":{"msgid":"event-message-1","create_time":1720000000,"aibotid":"bot-1","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`)},
+		{typ: websocket.MessageBinary, data: []byte("binary")},
+	} {
+		t.Run(fmt.Sprintf("type-%d", frame.typ), func(t *testing.T) {
+			first := newFakeSocket()
+			second := newFakeSocket()
+			calls := 0
+			client := newTestClient(t, func(context.Context, string) (Socket, error) {
+				calls++
+				if calls == 1 {
+					return first, nil
+				}
+				return second, nil
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runClient(t, client, ctx)
+			completeSubscribe(t, client, first)
+			first.reads <- frame
+			if commandOf(t, second.nextWrite(t)).Cmd != "aibot_subscribe" {
+				t.Fatal("invalid session frame did not reconnect")
+			}
+			cancel()
+			awaitDone(t, done)
+		})
+	}
+}
+
+func TestClientReplacingSessionCancelsOldPendingRequest(t *testing.T) {
+	first := newFakeSocket()
+	second := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return first, nil })
+	session := newSession(context.Background(), first, client.events)
+	client.install(session)
+	result := make(chan error, 1)
+	go func() { result <- client.SendMarkdown(context.Background(), "content") }()
+	_ = first.nextWrite(t)
+	next := newSession(context.Background(), second, client.events)
+	client.install(next)
+	if err := <-result; !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("pending request = %v, want ErrUnavailable", err)
+	}
+	next.finish(ErrUnavailable)
+}
+
+func TestClientUnavailableTimeoutAndNoSecretLeak(t *testing.T) {
+	secret := "super-secret"
+	client, err := NewClient(ClientConfig{Endpoint: "ws://fake", BotID: "bot-1", Secret: secret, AllowedUserID: "user-1", Dial: func(context.Context, string) (Socket, error) { return nil, errors.New("dial failed") }, Wait: func(ctx context.Context, _ time.Duration) error { return ctx.Err() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendMarkdown(context.Background(), "content"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("SendMarkdown() = %v, want unavailable", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = client.Run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if err != nil && contains(err.Error(), secret) {
+		t.Fatalf("error leaked secret: %v", err)
+	}
+}
+
+func TestClientWriteFailureDoesNotLeakSecret(t *testing.T) {
+	secret := "write-secret"
+	socket := newFakeSocket()
+	socket.writeErr = errors.New(secret)
+	client, err := NewClient(ClientConfig{Endpoint: "ws://fake", BotID: "bot-1", Secret: secret, AllowedUserID: "user-1", Dial: func(context.Context, string) (Socket, error) { return socket, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.install(newSession(context.Background(), socket, client.events))
+	err = client.SendMarkdown(context.Background(), "content")
+	if !errors.Is(err, ErrUnavailable) || contains(err.Error(), secret) {
+		t.Fatalf("SendMarkdown() error = %v, want safe ErrUnavailable", err)
+	}
+}
+
+func TestClientRequestContextCancelsWithoutEndingSession(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	runCtx, stop := context.WithCancel(context.Background())
+	done := runClient(t, client, runCtx)
+	completeSubscribe(t, client, socket)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- client.SendMarkdown(ctx, "content") }()
+	_ = socket.nextWrite(t)
+	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendMarkdown() = %v", err)
+	}
+	second := make(chan error, 1)
+	go func() { second <- client.SendMarkdown(context.Background(), "content") }()
+	write := socket.nextWrite(t)
+	socket.push(responseJSON(requestIDOf(t, write), 0))
+	if err := <-second; err != nil {
+		t.Fatalf("second SendMarkdown() = %v, want healthy session", err)
+	}
+	stop()
+	awaitDone(t, done)
+}
+
+type fakeSocket struct {
+	reads    chan fakeRead
+	writes   chan []byte
+	closed   chan struct{}
+	once     sync.Once
+	writeErr error
+}
+type fakeRead struct {
+	typ  websocket.MessageType
+	data []byte
+	err  error
+}
+
+func newFakeSocket() *fakeSocket {
+	return &fakeSocket{reads: make(chan fakeRead, 16), writes: make(chan []byte, 32), closed: make(chan struct{})}
+}
+func (s *fakeSocket) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	select {
+	case value := <-s.reads:
+		return value.typ, value.data, value.err
+	case <-s.closed:
+		return 0, nil, ErrUnavailable
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+}
+func (s *fakeSocket) Write(ctx context.Context, typ websocket.MessageType, data []byte) error {
+	if typ != websocket.MessageText {
+		return fmt.Errorf("unexpected message type")
+	}
+	if s.writeErr != nil {
+		return s.writeErr
+	}
+	select {
+	case s.writes <- append([]byte(nil), data...):
+		return nil
+	case <-s.closed:
+		return ErrUnavailable
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (s *fakeSocket) Close(websocket.StatusCode, string) error {
+	s.once.Do(func() { close(s.closed) })
+	return nil
+}
+func (s *fakeSocket) push(data []byte) { s.reads <- fakeRead{typ: websocket.MessageText, data: data} }
+func (s *fakeSocket) nextWrite(t *testing.T) []byte {
+	t.Helper()
+	select {
+	case value := <-s.writes:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket write")
+		return nil
+	}
+}
+
+func newTestClient(t *testing.T, dial DialFunc) *Client {
+	t.Helper()
+	client, err := NewClient(ClientConfig{Endpoint: "ws://fake", BotID: "bot-1", Secret: "secret", AllowedUserID: "user-1", Dial: dial, RequestID: sequentialIDs(), HeartbeatInterval: time.Hour, RequestTimeout: 100 * time.Millisecond, EventsCapacity: 4, Wait: func(context.Context, time.Duration) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+func sequentialIDs() func() string {
+	var mu sync.Mutex
+	next := 0
+	return func() string { mu.Lock(); defer mu.Unlock(); next++; return fmt.Sprintf("request-%d", next) }
+}
+func runClient(t *testing.T, client *Client, ctx context.Context) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	return done
+}
+func awaitDone(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not stop")
+	}
+}
+func completeSubscribe(t *testing.T, client *Client, socket *fakeSocket) {
+	t.Helper()
+	subscribe := socket.nextWrite(t)
+	if commandOf(t, subscribe).Cmd != "aibot_subscribe" {
+		t.Fatalf("command = %q, want subscribe", commandOf(t, subscribe).Cmd)
+	}
+	socket.push(responseJSON(requestIDOf(t, subscribe), 0))
+	deadline := time.After(time.Second)
+	for {
+		if client.getCurrent() != nil {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("subscription did not install current session")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+func responseJSON(requestID string, code int) []byte {
+	return []byte(fmt.Sprintf(`{"headers":{"req_id":%q},"errcode":%d,"errmsg":"ok"}`, requestID, code))
+}
+func textCallbackJSON(requestID string) []byte {
+	return []byte(fmt.Sprintf(`{"cmd":"aibot_msg_callback","headers":{"req_id":%q},"body":{"msgid":"message-%s","aibotid":"bot-1","chattype":"single","from":{"userid":"user-1"},"msgtype":"text","text":{"content":"/ls"}}}`, requestID, requestID))
+}
+
+type wireCommand struct {
+	Cmd string `json:"cmd"`
+}
+
+func commandOf(t *testing.T, data []byte) wireCommand {
+	t.Helper()
+	var command wireCommand
+	if err := json.Unmarshal(data, &command); err != nil {
+		t.Fatal(err)
+	}
+	return command
+}
+func requestIDOf(t *testing.T, data []byte) string {
+	t.Helper()
+	var request struct {
+		Headers Headers `json:"headers"`
+	}
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatal(err)
+	}
+	return request.Headers.RequestID
+}
+func contains(value, fragment string) bool {
+	return len(fragment) > 0 && len(value) >= len(fragment) && (value == fragment || (len(value) > len(fragment) && (containsAt(value, fragment))))
+}
+func containsAt(value, fragment string) bool {
+	for index := 0; index+len(fragment) <= len(value); index++ {
+		if value[index:index+len(fragment)] == fragment {
+			return true
+		}
+	}
+	return false
+}
