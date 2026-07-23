@@ -29,19 +29,56 @@ type errorBody struct {
 }
 
 func writeRequest(writer io.Writer, request requestEnvelope) error {
-	if err := json.NewEncoder(writer).Encode(request); err != nil {
-		return fmt.Errorf("编码 Herdr 请求: %w", err)
+	encoded, err := encodeRequest(request)
+	if err != nil {
+		return err
+	}
+	return writeFrame(writer, encoded)
+}
+
+func encodeRequest(request requestEnvelope) ([]byte, error) {
+	var encoded bytes.Buffer
+	if err := json.NewEncoder(&encoded).Encode(request); err != nil {
+		return nil, fmt.Errorf("%w: 编码 Herdr 请求: %w", ErrProtocol, err)
+	}
+	return encoded.Bytes(), nil
+}
+
+func writeFrame(writer io.Writer, frame []byte) error {
+	written, err := writer.Write(frame)
+	if err != nil {
+		return err
+	}
+	if written != len(frame) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
 
 func readLine(reader *bufio.Reader) ([]byte, error) {
 	var line []byte
+	var pendingCR bool
 	for {
 		fragment, err := reader.ReadSlice('\n')
+		if pendingCR {
+			if !(err == nil && len(fragment) == 1 && fragment[0] == '\n') {
+				if len(line) == maxFrameBytes {
+					return nil, fmt.Errorf("%w: 最大允许 %d 字节", ErrFrameTooLarge, maxFrameBytes)
+				}
+				line = append(line, '\r')
+			}
+			pendingCR = false
+		}
+
 		content := fragment
 		if err == nil {
 			content = fragment[:len(fragment)-1]
+			if len(content) > 0 && content[len(content)-1] == '\r' {
+				content = content[:len(content)-1]
+			}
+		} else if err == bufio.ErrBufferFull && len(content) > 0 && content[len(content)-1] == '\r' {
+			content = content[:len(content)-1]
+			pendingCR = true
 		}
 		if len(line)+len(content) > maxFrameBytes {
 			return nil, fmt.Errorf("%w: 最大允许 %d 字节", ErrFrameTooLarge, maxFrameBytes)
@@ -50,9 +87,6 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 
 		switch err {
 		case nil:
-			if len(line) > 0 && line[len(line)-1] == '\r' {
-				line = line[:len(line)-1]
-			}
 			if len(line) == 0 {
 				return nil, fmt.Errorf("%w: 收到空行", ErrProtocol)
 			}
@@ -61,7 +95,7 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 			continue
 		case io.EOF:
 			if len(line) == 0 {
-				return nil, fmt.Errorf("%w: %w", ErrProtocol, io.EOF)
+				return nil, io.EOF
 			}
 			return line, nil
 		default:

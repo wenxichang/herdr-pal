@@ -41,9 +41,19 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	requestContext, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	request := requestEnvelope{
+		ID:     fmt.Sprintf("pal:%d", c.nextID.Add(1)),
+		Method: method,
+		Params: params,
+	}
+	encodedRequest, err := encodeRequest(request)
+	if err != nil {
+		return err
+	}
+
 	conn, err := c.dialer.DialContext(requestContext, "unix", c.socketPath)
 	if err != nil {
-		return unavailableError(err)
+		return unavailableContextError(requestContext, err)
 	}
 	defer conn.Close()
 
@@ -56,12 +66,7 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	})
 	defer stopClose()
 
-	request := requestEnvelope{
-		ID:     fmt.Sprintf("pal:%d", c.nextID.Add(1)),
-		Method: method,
-		Params: params,
-	}
-	if err := writeRequest(conn, request); err != nil {
+	if err := writeFrame(conn, encodedRequest); err != nil {
 		return unavailableContextError(requestContext, err)
 	}
 	line, err := readLine(bufio.NewReader(conn))
@@ -81,6 +86,8 @@ func unavailableError(err error) error {
 func unavailableContextError(ctx context.Context, err error) error {
 	if contextError := ctx.Err(); contextError != nil {
 		err = errors.Join(err, contextError)
+	} else if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		err = errors.Join(err, context.DeadlineExceeded)
 	}
 	return unavailableError(err)
 }

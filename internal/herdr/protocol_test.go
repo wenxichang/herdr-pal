@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -61,29 +62,78 @@ func TestNDJSONReadLineRemovesOnlyTrailingCR(t *testing.T) {
 	}
 }
 
-func TestNDJSONReadLineRejectsEmptyLineAndEmptyEOF(t *testing.T) {
+func TestNDJSONReadLineRejectsEmptyLineAsProtocolError(t *testing.T) {
+	_, err := readLine(bufio.NewReader(strings.NewReader("\n")))
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("readLine() 错误 = %v，期望 ErrProtocol", err)
+	}
+}
+
+func TestNDJSONReadLineReturnsEmptyEOF(t *testing.T) {
+	_, err := readLine(bufio.NewReader(strings.NewReader("")))
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("readLine() 错误 = %v，期望 io.EOF", err)
+	}
+	if errors.Is(err, ErrProtocol) {
+		t.Fatalf("readLine() 错误 = %v，不应匹配 ErrProtocol", err)
+	}
+}
+
+func TestNDJSONReadLineAcceptsNonEmptyEOFFrame(t *testing.T) {
+	line, err := readLine(bufio.NewReader(strings.NewReader("tail")))
+	if err != nil {
+		t.Fatalf("readLine() 返回错误：%v", err)
+	}
+	if got, want := string(line), "tail"; got != want {
+		t.Fatalf("readLine() = %q，期望 %q", got, want)
+	}
+}
+
+func TestNDJSONReadLineEnforcesPayloadSizeForLFAndCRLF(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
+		name    string
+		size    int
+		ending  string
+		wantErr bool
 	}{
-		{name: "空行", input: "\n"},
-		{name: "空 EOF", input: ""},
+		{name: "LF 恰好上限", size: maxFrameBytes, ending: "\n"},
+		{name: "CRLF 恰好上限", size: maxFrameBytes, ending: "\r\n"},
+		{name: "CRLF 跨缓冲区边界", size: maxFrameBytes - 1, ending: "\r\n"},
+		{name: "LF 超过上限", size: maxFrameBytes + 1, ending: "\n", wantErr: true},
+		{name: "CRLF 超过上限", size: maxFrameBytes + 1, ending: "\r\n", wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := readLine(bufio.NewReader(strings.NewReader(test.input)))
-			if !errors.Is(err, ErrProtocol) {
-				t.Fatalf("readLine() 错误 = %v，期望 ErrProtocol", err)
+			payload := strings.Repeat("x", test.size)
+			input := io.MultiReader(strings.NewReader(payload), strings.NewReader(test.ending))
+			line, err := readLine(bufio.NewReaderSize(input, 1024))
+			if test.wantErr {
+				if !errors.Is(err, ErrFrameTooLarge) {
+					t.Fatalf("readLine() 错误 = %v，期望 ErrFrameTooLarge", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readLine() 返回错误：%v", err)
+			}
+			if !bytes.Equal(line, []byte(payload)) {
+				t.Fatalf("readLine() 返回 payload 长度 = %d，期望 %d", len(line), len(payload))
 			}
 		})
 	}
 }
 
-func TestNDJSONReadLineRejectsFrameLargerThanEightMiB(t *testing.T) {
-	input := strings.Repeat("x", 8*1024*1024+1) + "\n"
-	_, err := readLine(bufio.NewReaderSize(strings.NewReader(input), 1024))
-	if !errors.Is(err, ErrFrameTooLarge) {
-		t.Fatalf("readLine() 错误 = %v，期望 ErrFrameTooLarge", err)
+func TestNDJSONReadLineAcceptsMaxPayloadWhenCRLFSplitsAcrossBuffer(t *testing.T) {
+	payload := strings.Repeat("x", maxFrameBytes)
+	input := io.MultiReader(strings.NewReader(payload), strings.NewReader("\r\n"))
+	bufferSize := (maxFrameBytes + 1) / 3
+
+	line, err := readLine(bufio.NewReaderSize(input, bufferSize))
+	if err != nil {
+		t.Fatalf("readLine() 返回错误：%v", err)
+	}
+	if !bytes.Equal(line, []byte(payload)) {
+		t.Fatalf("readLine() 返回 payload 长度 = %d，期望 %d", len(line), len(payload))
 	}
 }
 

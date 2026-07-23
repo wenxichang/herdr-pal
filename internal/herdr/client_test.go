@@ -73,6 +73,45 @@ func TestClientRequestWrapsDialFailureAsUnavailable(t *testing.T) {
 	}
 }
 
+func TestClientRequestClassifiesDialTimeoutAsDeadlineExceeded(t *testing.T) {
+	dialError := errors.New("拨号被中止")
+	client := NewClient("/tmp/herdr.sock", waitingDialer{err: dialError}, 20*time.Millisecond)
+
+	err := client.call(context.Background(), "test.method", map[string]any{}, nil)
+	if !errors.Is(err, ErrUnavailable) || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, dialError) {
+		t.Fatalf("call() 错误 = %v，期望匹配 ErrUnavailable、context.DeadlineExceeded 和底层错误", err)
+	}
+}
+
+func TestClientRequestClassifiesEmptyEOFAsUnavailable(t *testing.T) {
+	dialer := &pipeDialer{handler: func(net.Conn, map[string]any) {}}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+
+	err := client.call(context.Background(), "test.method", map[string]any{}, nil)
+	if !errors.Is(err, ErrUnavailable) || !errors.Is(err, io.EOF) {
+		t.Fatalf("call() 错误 = %v，期望匹配 ErrUnavailable 和 io.EOF", err)
+	}
+	if errors.Is(err, ErrProtocol) {
+		t.Fatalf("call() 错误 = %v，不应匹配 ErrProtocol", err)
+	}
+}
+
+func TestClientRequestRejectsUnencodableParamsBeforeDialing(t *testing.T) {
+	dialer := &pipeDialer{}
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+
+	err := client.call(context.Background(), "test.method", make(chan int), nil)
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("call() 错误 = %v，期望 ErrProtocol", err)
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Fatalf("call() 错误 = %v，不应匹配 ErrUnavailable", err)
+	}
+	if got := dialer.Count(); got != 0 {
+		t.Fatalf("DialContext() 调用次数 = %d，期望 0", got)
+	}
+}
+
 func TestClientRequestDeadlineTerminatesBlockedRead(t *testing.T) {
 	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) {
 		_, _ = conn.Read(make([]byte, 1))
@@ -83,6 +122,9 @@ func TestClientRequestDeadlineTerminatesBlockedRead(t *testing.T) {
 	err := client.call(context.Background(), "test.method", map[string]any{}, nil)
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("call() 错误 = %v，期望 ErrUnavailable", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("call() 错误 = %v，期望 context.DeadlineExceeded", err)
 	}
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("call() 阻塞过久：%s", elapsed)
@@ -125,6 +167,15 @@ type failingDialer struct {
 }
 
 func (d failingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, d.err
+}
+
+type waitingDialer struct {
+	err error
+}
+
+func (d waitingDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	<-ctx.Done()
 	return nil, d.err
 }
 
