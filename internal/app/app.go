@@ -11,8 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/bridge"
@@ -38,6 +38,12 @@ var (
 	ErrShutdownTimeout = errors.New("优雅退出超时")
 	// ErrLoopStopped 表示常驻运行循环在未取消时意外结束。
 	ErrLoopStopped = errors.New("运行循环意外结束")
+
+	// 超时返回时运行循环可能仍持有网络资源，因此必须继续持有文件锁，避免同一进程内
+	// 的 finalizer 或 GC 间接解锁并允许第二个实例启动。该集合只接管超时锁；循环永久
+	// 卡住时持有至进程退出，全部退出后再安全释放。
+	retainedLocksMu sync.Mutex
+	retainedLocks   []*retainedProcessLock
 )
 
 // Options 是启动 Herdr Pal 所需的外部选项。
@@ -58,6 +64,10 @@ type Options struct {
 
 type processLock interface {
 	Release() error
+}
+
+type retainedProcessLock struct {
+	lock processLock
 }
 
 type weComRuntime interface {
@@ -167,7 +177,12 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("获取进程锁: %w", err)
 	}
+	var timedOutComponentsDone <-chan struct{}
 	defer func() {
+		if errors.Is(runErr, ErrShutdownTimeout) {
+			retainProcessLockUntilDone(lock, timedOutComponentsDone)
+			return
+		}
 		if err := lock.Release(); err != nil {
 			releaseErr := fmt.Errorf("释放进程锁: %w", err)
 			if runErr == nil {
@@ -191,7 +206,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	}
 
 	logger.Info("Herdr Pal 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "user_hash", shortHash(loaded.WeCom.AllowedUserID))
-	runErr = runRuntime(ctx, runtime, dependencies.shutdownTimeout)
+	outcome := runRuntime(ctx, runtime, dependencies.shutdownTimeout)
+	runErr = outcome.err
+	timedOutComponentsDone = outcome.componentsDone
 	if runErr != nil {
 		logger.Error("Herdr Pal 停止", "error_type", safeErrorType(runErr))
 	} else {
@@ -269,11 +286,20 @@ func assembleRuntime(loaded config.Config, socketPath string, _ *slog.Logger, de
 }
 
 type componentResult struct {
-	name string
-	err  error
+	name            string
+	err             error
+	shutdownDerived bool
 }
 
-func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTimeout time.Duration) error {
+type runtimeOutcome struct {
+	err            error
+	componentsDone <-chan struct{}
+}
+
+func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTimeout time.Duration) runtimeOutcome {
+	if parent.Err() != nil {
+		return runtimeOutcome{}
+	}
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = defaultShutdownTimeout
 	}
@@ -284,29 +310,19 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 	defer stopMessages()
 	results := make(chan componentResult, 3)
 	start := func(name string, run func(context.Context) error) {
-		go func() { results <- componentResult{name: name, err: run(componentContext)} }()
+		go runComponent(componentContext, name, run, results)
 	}
 	start("wecom", runtime.wecom.Run)
 	start("herdr", runtime.supervisor.Run)
-	go func() {
-		results <- componentResult{name: "messages", err: consumeMessages(messageContext, runtime.wecom.Events(), runtime.handler)}
-	}()
+	go runComponent(messageContext, "messages", func(ctx context.Context) error {
+		return consumeMessages(ctx, runtime.wecom.Events(), runtime.handler)
+	}, results)
 
-	completed := 0
-	var firstErr error
-	normalCancellation := false
+	collected := make([]componentResult, 0, 3)
 	select {
 	case <-parent.Done():
-		normalCancellation = true
 	case result := <-results:
-		completed++
-		if parent.Err() != nil {
-			normalCancellation = true
-		} else if result.err == nil {
-			firstErr = fmt.Errorf("%w: %s", ErrLoopStopped, result.name)
-		} else {
-			firstErr = fmt.Errorf("%s 运行失败: %w", result.name, result.err)
-		}
+		collected = append(collected, result)
 	}
 	// 先停止业务消息消费，再取消两侧连接和未完成请求。
 	stopMessages()
@@ -314,21 +330,62 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 
 	timer := time.NewTimer(shutdownTimeout)
 	defer timer.Stop()
-	for completed < 3 {
+	for len(collected) < 3 {
 		select {
-		case <-results:
-			completed++
+		case result := <-results:
+			collected = append(collected, result)
 		case <-timer.C:
-			if firstErr != nil {
-				return errors.Join(firstErr, ErrShutdownTimeout)
+			componentsDone := collectRemainingComponents(results, 3-len(collected))
+			if rootErr := runtimeRootError(parent, collected); rootErr != nil {
+				return runtimeOutcome{err: errors.Join(rootErr, ErrShutdownTimeout), componentsDone: componentsDone}
 			}
-			return ErrShutdownTimeout
+			return runtimeOutcome{err: ErrShutdownTimeout, componentsDone: componentsDone}
 		}
 	}
-	if normalCancellation {
+	return runtimeOutcome{err: runtimeRootError(parent, collected)}
+}
+
+func runComponent(ctx context.Context, name string, run func(context.Context) error, results chan<- componentResult) {
+	err := run(ctx)
+	contextErr := ctx.Err()
+	results <- componentResult{
+		name: name, err: err,
+		shutdownDerived: contextErr != nil && errors.Is(err, contextErr),
+	}
+}
+
+func runtimeRootError(parent context.Context, results []componentResult) error {
+	if parent.Err() != nil {
 		return nil
 	}
-	return firstErr
+	for _, result := range results {
+		if (result.name != "wecom" && result.name != "herdr") || result.err == nil || result.shutdownDerived {
+			continue
+		}
+		return fmt.Errorf("%s 运行失败: %w", result.name, result.err)
+	}
+	for _, result := range results {
+		if result.err == nil {
+			return fmt.Errorf("%w: %s", ErrLoopStopped, result.name)
+		}
+	}
+	for _, result := range results {
+		if result.err != nil && !result.shutdownDerived {
+			return fmt.Errorf("%s 运行失败: %w", result.name, result.err)
+		}
+	}
+	return ErrLoopStopped
+}
+
+func collectRemainingComponents(results <-chan componentResult, remaining int) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range remaining {
+			<-results
+		}
+	}()
+	return done
 }
 
 func consumeMessages(ctx context.Context, events <-chan wecom.IncomingText, handler messageHandler) error {
@@ -376,8 +433,51 @@ func shortHash(value string) string {
 }
 
 func safeErrorType(err error) string {
-	if err == nil {
-		return "<nil>"
+	switch {
+	case errors.Is(err, ErrShutdownTimeout):
+		return "shutdown_timeout"
+	case errors.Is(err, ErrLoopStopped):
+		return "loop_stopped"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "context"
+	case errors.Is(err, bridge.ErrNotificationQueueFull):
+		return "notification_queue_full"
+	case errors.Is(err, herdr.ErrProtocol), errors.Is(err, herdr.ErrProtocolMismatch):
+		return "herdr_protocol"
+	case errors.Is(err, herdr.ErrUnavailable):
+		return "herdr_unavailable"
+	case errors.Is(err, wecom.ErrProtocol):
+		return "wecom_protocol"
+	case errors.Is(err, wecom.ErrUnavailable):
+		return "wecom_unavailable"
+	default:
+		return "runtime_error"
 	}
-	return reflect.TypeOf(err).String()
+}
+
+func retainProcessLockUntilDone(lock processLock, componentsDone <-chan struct{}) {
+	retained := &retainedProcessLock{lock: lock}
+	retainedLocksMu.Lock()
+	retainedLocks = append(retainedLocks, retained)
+	retainedLocksMu.Unlock()
+	if componentsDone == nil {
+		return
+	}
+	go func() {
+		<-componentsDone
+		if err := retained.lock.Release(); err != nil {
+			return
+		}
+		retainedLocksMu.Lock()
+		for index, candidate := range retainedLocks {
+			if candidate == retained {
+				copy(retainedLocks[index:], retainedLocks[index+1:])
+				last := len(retainedLocks) - 1
+				retainedLocks[last] = nil
+				retainedLocks = retainedLocks[:last]
+				break
+			}
+		}
+		retainedLocksMu.Unlock()
+	}()
 }

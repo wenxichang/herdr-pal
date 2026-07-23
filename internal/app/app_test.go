@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -183,12 +185,41 @@ func TestRunStartsAllLoopsAndConsumesMessages(t *testing.T) {
 	}
 }
 
+func TestRunDoesNotStartLoopsWhenContextIsAlreadyCanceled(t *testing.T) {
+	im := newFakeWeCom()
+	supervisor := newFakeRunner()
+	lock := &fakeLock{}
+	options := testOptions(t)
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
+	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := Run(ctx, options); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for name, started := range map[string]<-chan struct{}{"WeCom": im.started, "Supervisor": supervisor.started} {
+		select {
+		case <-started:
+			t.Fatalf("%s loop started with an already canceled context", name)
+		default:
+		}
+	}
+	if got := lock.releases.Load(); got != 1 {
+		t.Fatalf("lock releases = %d, want 1 without live components", got)
+	}
+}
+
 func TestRunCancelsOtherLoopsAfterFatalError(t *testing.T) {
 	fatal := errors.New("supervisor fatal")
 	im := newFakeWeCom()
 	supervisor := newFakeRunner()
 	supervisor.result = fatal
+	lock := &fakeLock{}
 	options := testOptions(t)
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
 		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
@@ -198,6 +229,61 @@ func TestRunCancelsOtherLoopsAfterFatalError(t *testing.T) {
 		t.Fatalf("Run() error = %v, want fatal supervisor error", err)
 	}
 	waitClosed(t, im.stopped, "WeCom cancellation")
+	if got := lock.releases.Load(); got != 1 {
+		t.Fatalf("lock releases = %d, want 1 after fatal shutdown", got)
+	}
+}
+
+func TestRunPreservesWeComFatalRegardlessOfResultOrder(t *testing.T) {
+	fatal := errors.New("wecom fatal")
+	tests := []struct {
+		name        string
+		closeEvents bool
+		waitForStop bool
+	}{
+		{name: "WeCom 错误先到"},
+		{name: "Events 关闭先到", closeEvents: true, waitForStop: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			supervisor := newFakeRunner()
+			im := newOrderedResultWeCom(fatal)
+			im.closeEvents = test.closeEvents
+			if test.waitForStop {
+				im.returnAfter = supervisor.stopped
+			}
+			options := testOptions(t)
+			options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+				return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+			}
+
+			err := Run(context.Background(), options)
+			if !errors.Is(err, fatal) {
+				t.Fatalf("Run() error = %v, want WeCom fatal", err)
+			}
+			waitClosed(t, supervisor.stopped, "Supervisor cancellation")
+		})
+	}
+}
+
+func TestRunTreatsIndependentEventsClosureAsUnexpectedLoopStop(t *testing.T) {
+	supervisor := newFakeRunner()
+	im := newOrderedResultWeCom(nil)
+	im.closeEvents = true
+	options := testOptions(t)
+	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+	}
+
+	err := Run(context.Background(), options)
+	if !errors.Is(err, ErrLoopStopped) {
+		t.Fatalf("Run() error = %v, want ErrLoopStopped", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, cancellation must not replace ErrLoopStopped", err)
+	}
+	waitClosed(t, supervisor.stopped, "Supervisor cancellation")
 }
 
 func TestRunStopsConsumptionAndConnectionsBeforeReleasingLock(t *testing.T) {
@@ -244,24 +330,41 @@ func TestRunStopsConsumptionAndConnectionsBeforeReleasingLock(t *testing.T) {
 
 func TestRunBoundsGracefulShutdown(t *testing.T) {
 	unblock := make(chan struct{})
-	t.Cleanup(func() { close(unblock) })
+	var unblockOnce sync.Once
+	releaseRunners := func() { unblockOnce.Do(func() { close(unblock) }) }
+	t.Cleanup(releaseRunners)
 	stuck := &blockingRunner{started: make(chan struct{}), unblock: unblock}
+	supervisor := &blockingRunner{started: make(chan struct{}), unblock: unblock}
+	lock := &fakeLock{}
 	options := testOptions(t)
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
 	options.dependencies.shutdownTimeout = 20 * time.Millisecond
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
 		return &applicationRuntime{
 			wecom:      &blockingWeCom{blockingRunner: stuck, events: make(chan wecom.IncomingText)},
-			supervisor: &blockingRunner{started: make(chan struct{}), unblock: unblock},
+			supervisor: supervisor,
 			handler:    &fakeHandler{},
 		}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, stuck.started, "stuck WeCom Run")
+	waitClosed(t, supervisor.started, "stuck Supervisor Run")
 	cancel()
 
-	err := Run(ctx, options)
+	err := waitResult(t, result)
 	if !errors.Is(err, ErrShutdownTimeout) {
 		t.Fatalf("Run() error = %v, want ErrShutdownTimeout", err)
 	}
+	if got := lock.releases.Load(); got != 0 {
+		t.Fatalf("lock releases = %d, want 0 while timed-out components may still run", got)
+	}
+	if !retainsFakeLock(lock) {
+		t.Fatal("timed-out lock is not strongly retained")
+	}
+	releaseRunners()
+	waitLockReleasedAndUnretained(t, lock)
 }
 
 func TestRunLogsOnlySafeIdentifiers(t *testing.T) {
@@ -287,6 +390,31 @@ func TestRunLogsOnlySafeIdentifiers(t *testing.T) {
 	}
 	if !strings.Contains(output, "bot_hash=") || !strings.Contains(output, "user_hash=") {
 		t.Fatalf("safe identifier hashes missing from log: %s", output)
+	}
+}
+
+func TestSafeErrorTypeUsesFixedSemanticCategories(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "退出超时", err: errors.Join(errors.New("secret"), ErrShutdownTimeout), want: "shutdown_timeout"},
+		{name: "循环停止", err: fmt.Errorf("wrapped: %w", ErrLoopStopped), want: "loop_stopped"},
+		{name: "上下文", err: context.Canceled, want: "context"},
+		{name: "通知队列", err: bridge.ErrNotificationQueueFull, want: "notification_queue_full"},
+		{name: "Herdr 协议", err: herdr.ErrProtocolMismatch, want: "herdr_protocol"},
+		{name: "Herdr 不可用", err: herdr.ErrUnavailable, want: "herdr_unavailable"},
+		{name: "企业微信协议", err: wecom.ErrProtocol, want: "wecom_protocol"},
+		{name: "企业微信不可用", err: wecom.ErrUnavailable, want: "wecom_unavailable"},
+		{name: "其它错误", err: errors.New("secret"), want: "runtime_error"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := safeErrorType(test.err); got != test.want {
+				t.Fatalf("safeErrorType() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -336,9 +464,11 @@ func (fakeCommandRunner) Output(context.Context, string, ...string) ([]byte, err
 
 type fakeLock struct {
 	onRelease func()
+	releases  atomic.Int32
 }
 
 func (l *fakeLock) Release() error {
+	l.releases.Add(1)
 	if l.onRelease != nil {
 		l.onRelease()
 	}
@@ -424,6 +554,41 @@ func (w *blockingWeCom) Events() <-chan wecom.IncomingText { return w.events }
 func (w *blockingWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
 
 func (w *blockingWeCom) SendMarkdown(context.Context, string) error { return nil }
+
+type orderedResultWeCom struct {
+	events      chan wecom.IncomingText
+	fatal       error
+	closeEvents bool
+	returnAfter <-chan struct{}
+}
+
+func newOrderedResultWeCom(fatal error) *orderedResultWeCom {
+	return &orderedResultWeCom{events: make(chan wecom.IncomingText), fatal: fatal}
+}
+
+func (w *orderedResultWeCom) Run(ctx context.Context) error {
+	if w.closeEvents {
+		close(w.events)
+	}
+	if w.returnAfter != nil {
+		select {
+		case <-w.returnAfter:
+		case <-ctx.Done():
+			// 结果顺序测试仍需返回预设错误，不能让派生取消覆盖根因。
+		}
+	}
+	if w.fatal != nil {
+		return w.fatal
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (w *orderedResultWeCom) Events() <-chan wecom.IncomingText { return w.events }
+
+func (w *orderedResultWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
+
+func (w *orderedResultWeCom) SendMarkdown(context.Context, string) error { return nil }
 
 type fakeManagedHerdr struct {
 	mu       sync.Mutex
@@ -516,4 +681,28 @@ func waitResult(t *testing.T, result <-chan error) error {
 		t.Fatal("timed out waiting for Run")
 		return nil
 	}
+}
+
+func waitLockReleasedAndUnretained(t *testing.T, lock *fakeLock) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if lock.releases.Load() == 1 && !retainsFakeLock(lock) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("lock releases = %d, retained = %v, want released and removed", lock.releases.Load(), retainsFakeLock(lock))
+}
+
+func retainsFakeLock(lock *fakeLock) bool {
+	retainedLocksMu.Lock()
+	defer retainedLocksMu.Unlock()
+	for _, retained := range retainedLocks {
+		candidate, ok := retained.lock.(*fakeLock)
+		if ok && candidate == lock {
+			return true
+		}
+	}
+	return false
 }
