@@ -245,7 +245,10 @@ func defaultAssemblyDependencies() assemblyDependencies {
 	}
 }
 
-func assembleRuntime(loaded config.Config, socketPath string, _ *slog.Logger, dependencies assemblyDependencies) (*applicationRuntime, error) {
+func assembleRuntime(loaded config.Config, socketPath string, logger *slog.Logger, dependencies assemblyDependencies) (*applicationRuntime, error) {
+	if logger == nil {
+		return nil, errors.New("结构化日志器无效")
+	}
 	client := dependencies.newHerdr(socketPath)
 	if client == nil {
 		return nil, errors.New("Herdr Client 无效")
@@ -273,7 +276,7 @@ func assembleRuntime(loaded config.Config, socketPath string, _ *slog.Logger, de
 	if err != nil {
 		return nil, fmt.Errorf("创建消息幂等器: %w", err)
 	}
-	service, err := bridge.NewService(registry, buffer, guard, deduper, im)
+	service, err := bridge.NewService(registry, buffer, guard, deduper, im, newSlogKeyAuditSink(logger))
 	if err != nil {
 		return nil, fmt.Errorf("创建 BridgeService: %w", err)
 	}
@@ -290,6 +293,40 @@ func assembleRuntime(loaded config.Config, socketPath string, _ *slog.Logger, de
 		wecom: im, supervisor: supervisor, handler: service,
 		herdr: client, factory: factory, service: service, notifier: notifier,
 	}, nil
+}
+
+type slogKeyAuditSink struct {
+	logger *slog.Logger
+}
+
+func newSlogKeyAuditSink(logger *slog.Logger) slogKeyAuditSink {
+	return slogKeyAuditSink{logger: slog.New(auditLogHandler{Handler: logger.Handler()})}
+}
+
+func (s slogKeyAuditSink) RecordKeyAudit(audit policy.KeyAudit) {
+	s.logger.Info("显式按键审计",
+		slog.String("user_id", audit.UserID()),
+		slog.String("pane_id", audit.PaneID()),
+		slog.String("occupant_hash", audit.OccupantHash()),
+		slog.String("key", audit.Key()),
+		slog.Time("at", audit.At()),
+		slog.String("result", string(audit.Result())),
+	)
+}
+
+// auditLogHandler 复用应用日志格式和目的地，但不让普通日志级别过滤安全审计。
+type auditLogHandler struct {
+	slog.Handler
+}
+
+func (h auditLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h auditLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return auditLogHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h auditLogHandler) WithGroup(name string) slog.Handler {
+	return auditLogHandler{Handler: h.Handler.WithGroup(name)}
 }
 
 type componentResult struct {

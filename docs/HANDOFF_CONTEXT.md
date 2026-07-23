@@ -144,6 +144,9 @@ HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
 - 不暴露原始 Herdr Socket 到网络。
 - 不记录完整 Secret、Cookie、prompt 或终端快照。
 - 未授权用户、群聊、未知 pane、失效 terminal/occupant 和 degraded 状态都不能产生输入。
+- 白名单按键在取得当前选择后同步记录结构化审计；成功、occupant 拒绝、Herdr 查询或
+  发送失败分别记录 `sent`、`rejected`、`failed`。审计只含用户、pane、occupant SHA-256
+  摘要、规范化按键、时间和结果，且不受普通日志级别过滤。
 - 没有 `server.stop`、`pane.close`、`pane.send_text`、`pane.send_input` 或自动审批入口。
 
 ## 9. 后续工作

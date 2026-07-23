@@ -1117,7 +1117,7 @@ func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisor
 		t.Fatal(err)
 	}
 	im := &notifierIM{}
-	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im)
+	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, &fakeKeyAuditSink{})
 	if err != nil {
 		t.Fatal(err)
 	}

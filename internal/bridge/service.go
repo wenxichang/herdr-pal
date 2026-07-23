@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/wenxichang/herdr-pal/internal/command"
@@ -41,6 +42,12 @@ type IMAdapter interface {
 	SendMarkdown(ctx context.Context, content string) error
 }
 
+// KeyAuditSink 同步接收已经过安全字段校验的显式按键审计记录。
+type KeyAuditSink interface {
+	// RecordKeyAudit 记录一次按键处理结果。
+	RecordKeyAudit(audit policy.KeyAudit)
+}
+
 type clientHolder struct{ client HerdrAPI }
 
 // Service 处理企业微信单聊文本命令。
@@ -54,6 +61,7 @@ type Service struct {
 	guard    *policy.Guard
 	deduper  *policy.Deduper
 	im       IMAdapter
+	keyAudit KeyAuditSink
 
 	client atomic.Pointer[clientHolder]
 
@@ -76,11 +84,11 @@ type Service struct {
 }
 
 // NewService 创建入站命令服务并校验全部依赖。
-func NewService(registry *session.Registry, buffer *panel.Buffer, guard *policy.Guard, deduper *policy.Deduper, im IMAdapter) (*Service, error) {
-	if registry == nil || buffer == nil || guard == nil || deduper == nil || im == nil {
+func NewService(registry *session.Registry, buffer *panel.Buffer, guard *policy.Guard, deduper *policy.Deduper, im IMAdapter, keyAudit KeyAuditSink) (*Service, error) {
+	if registry == nil || buffer == nil || guard == nil || deduper == nil || im == nil || keyAudit == nil {
 		return nil, ErrInvalidServiceDependency
 	}
-	service := &Service{registry: registry, panel: buffer, guard: guard, deduper: deduper, im: im}
+	service := &Service{registry: registry, panel: buffer, guard: guard, deduper: deduper, im: im, keyAudit: keyAudit}
 	service.opCond = sync.NewCond(&service.opMu)
 	return service, nil
 }
@@ -286,8 +294,15 @@ func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, 
 }
 
 func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key string) {
-	client, release, ok := s.beginOperation(true)
-	if !ok {
+	if err := s.guard.ValidateKey(key); err != nil {
+		s.reply(ctx, message.RequestID, "按键不受支持。")
+		return
+	}
+	client, release, availability := s.beginOperationDetailed(true)
+	if availability != operationReady {
+		if availability == operationUnavailable {
+			s.auditUnavailableKey(message.UserID, key)
+		}
 		s.reply(ctx, message.RequestID, unavailableMessage)
 		return
 	}
@@ -297,30 +312,69 @@ func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
+	audits, err := prepareKeyAudits(message.UserID, target, key, time.Now().UTC())
+	if err != nil {
+		release()
+		s.reply(ctx, message.RequestID, "按键请求无效，未执行任何操作。")
+		return
+	}
 	current, err := client.GetAgent(ctx, target.TerminalID)
 	if err != nil {
+		s.keyAudit.RecordKeyAudit(audits.failed)
 		release()
 		s.reply(ctx, message.RequestID, unavailableMessage)
 		return
 	}
 	if !session.MatchesAgent(target, current) {
+		s.keyAudit.RecordKeyAudit(audits.rejected)
 		release()
 		s.invalidateExpected(target)
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	if err := s.guard.ValidateKey(key); err != nil {
-		release()
-		s.reply(ctx, message.RequestID, "按键不受支持。")
-		return
-	}
 	err = client.SendKey(ctx, target.TerminalID, key)
+	if err != nil {
+		s.keyAudit.RecordKeyAudit(audits.failed)
+	} else {
+		s.keyAudit.RecordKeyAudit(audits.sent)
+	}
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, "按键发送失败，请稍后重试。")
 		return
 	}
 	s.reply(ctx, message.RequestID, "按键已发送。")
+}
+
+func (s *Service) auditUnavailableKey(userID, key string) {
+	target, err := s.selectedTarget()
+	if err != nil {
+		return
+	}
+	audits, err := prepareKeyAudits(userID, target, key, time.Now().UTC())
+	if err != nil {
+		return
+	}
+	s.keyAudit.RecordKeyAudit(audits.failed)
+}
+
+type preparedKeyAudits struct {
+	sent     policy.KeyAudit
+	rejected policy.KeyAudit
+	failed   policy.KeyAudit
+}
+
+func prepareKeyAudits(userID string, target session.Target, key string, at time.Time) (preparedKeyAudits, error) {
+	results := []policy.AuditResult{policy.AuditResultSent, policy.AuditResultRejected, policy.AuditResultFailed}
+	audits := make([]policy.KeyAudit, len(results))
+	for index, result := range results {
+		audit, err := policy.NewKeyAudit(userID, target.PaneID, target.OccupantKey, key, at, result)
+		if err != nil {
+			return preparedKeyAudits{}, err
+		}
+		audits[index] = audit
+	}
+	return preparedKeyAudits{sent: audits[0], rejected: audits[1], failed: audits[2]}, nil
 }
 
 func (s *Service) handleContent(ctx context.Context, message wecom.IncomingText) {
@@ -499,17 +553,33 @@ func (s *Service) applyExpand(expected session.Target, generation uint64, normal
 }
 
 func (s *Service) beginOperation(input bool) (HerdrAPI, func(), bool) {
+	client, release, availability := s.beginOperationDetailed(input)
+	return client, release, availability == operationReady
+}
+
+type operationAvailability uint8
+
+const (
+	operationReady operationAvailability = iota
+	operationUnavailable
+	operationTransitioning
+)
+
+func (s *Service) beginOperationDetailed(input bool) (HerdrAPI, func(), operationAvailability) {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	holder := s.client.Load()
-	if s.opsBlocked > 0 || (input && s.inputBlocked > 0) || holder == nil || holder.client == nil {
-		return nil, nil, false
+	if input && s.inputBlocked > 0 {
+		return nil, nil, operationTransitioning
+	}
+	if s.opsBlocked > 0 || holder == nil || holder.client == nil {
+		return nil, nil, operationUnavailable
 	}
 	s.activeOps++
 	if input {
 		s.activeInputs++
 	}
-	return holder.client, func() { s.endOperation(input) }, true
+	return holder.client, func() { s.endOperation(input) }, operationReady
 }
 
 func (s *Service) endOperation(input bool) {

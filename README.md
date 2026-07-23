@@ -175,6 +175,9 @@ HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
 - 默认拒绝未知用户、群聊、未知 pane 和失效 occupant。
 - 企业微信 `msgid` 使用有容量和 TTL 上限的内存集合去重。
 - 每次 prompt 或按键前重新校验 pane、terminal 和 Agent occupant。
+- 每次已选目标的白名单按键尝试都会写入结构化审计，只包含用户、pane、occupant 摘要、
+  规范化按键、时间和 `sent`/`rejected`/`failed` 结果；重复消息、未授权输入和原始非法
+  命令不产生按键审计。
 - 日志只记录连接状态、安全错误类别、长度或摘要，不记录 Secret、完整 prompt、Cookie
   或完整终端快照。
 - 没有 `server.stop`、`pane.close`、`pane.send_text`、`pane.send_input` 或自动审批入口。

@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -154,6 +155,47 @@ func TestAssembleRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testing.T) {
 	}
 	if gotGet, gotRead := managed.getCount()-getsBeforeNotification, managed.readCount(); gotGet != 2 || gotRead != 1 {
 		t.Fatalf("shared notifier get/read calls = %d/%d, want 2/1", gotGet, gotRead)
+	}
+}
+
+func TestAssembleRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) {
+	managed := newFakeManagedHerdr()
+	im := newFakeWeCom()
+	dependencies := defaultAssemblyDependencies()
+	dependencies.newHerdr = func(string) bridge.ManagedHerdr { return managed }
+	dependencies.newWeCom = func(wecom.ClientConfig) (weComRuntime, error) { return im, nil }
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger.Info("普通信息应被过滤", slog.String("content", "private ordinary log"))
+	runtime, err := assembleRuntime(testConfig(), "/tmp/audit.sock", logger, dependencies)
+	if err != nil {
+		t.Fatalf("assembleRuntime() error = %v", err)
+	}
+	runtime.service.SetHerdr(managed)
+	runtime.service.ReplaceSnapshot(managed.snapshot, false)
+	for index, content := range []string{"/ls", "/sel 1", "/enter"} {
+		runtime.service.HandleMessage(context.Background(), incoming(fmt.Sprintf("audit-%d", index), content))
+	}
+
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
+		t.Fatalf("audit log is not one JSON record: %v; output=%q", err, output.String())
+	}
+	if record["msg"] != "显式按键审计" || record["user_id"] != "user-sensitive" ||
+		record["pane_id"] != "pane-1" || record["key"] != "enter" || record["result"] != "sent" {
+		t.Fatalf("audit log fields = %#v", record)
+	}
+	occupantHash, ok := record["occupant_hash"].(string)
+	if !ok || len(occupantHash) != 64 || record["at"] == nil {
+		t.Fatalf("audit log occupant/time = %#v/%#v", record["occupant_hash"], record["at"])
+	}
+	for _, sensitive := range []string{"secret-sensitive", "bot-sensitive", "recent terminal"} {
+		if strings.Contains(output.String(), sensitive) {
+			t.Fatalf("audit log leaked %q: %q", sensitive, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "普通信息应被过滤") || strings.Contains(output.String(), "private ordinary log") {
+		t.Fatalf("audit handler changed ordinary logger filtering: %q", output.String())
 	}
 }
 

@@ -162,6 +162,90 @@ func TestServiceKeyAliasesSendOnceWithoutConfirmation(t *testing.T) {
 	}
 }
 
+func TestServiceKeyAuditsEveryAttemptAfterSelection(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(*fakeHerdr)
+		wantResult policy.AuditResult
+		wantKeys   int
+	}{
+		{name: "sent", wantResult: policy.AuditResultSent, wantKeys: 1},
+		{name: "get failed", prepare: func(fake *fakeHerdr) { fake.getErr = errors.New("private get failure") }, wantResult: policy.AuditResultFailed},
+		{name: "occupant rejected", prepare: func(fake *fakeHerdr) { fake.setAgent(agentInfo("pane-1", "terminal-1", "other")) }, wantResult: policy.AuditResultRejected},
+		{name: "send failed", prepare: func(fake *fakeHerdr) { fake.keyErr = errors.New("private send failure") }, wantResult: policy.AuditResultFailed, wantKeys: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, fake := newTestService(t)
+			selectTarget(t, service)
+			target, err := service.registry.ValidateSelected()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.prepare != nil {
+				test.prepare(fake)
+			}
+
+			service.HandleMessage(context.Background(), incoming("key-audit-"+test.name, "/key enter"))
+
+			audits := fakeAuditFromService(t, service).records()
+			if len(audits) != 1 {
+				t.Fatalf("audit records = %#v, want exactly one", audits)
+			}
+			audit := audits[0]
+			if audit.UserID() != "user-1" || audit.PaneID() != target.PaneID ||
+				audit.OccupantHash() != target.OccupantKey || audit.Key() != "enter" ||
+				audit.At().IsZero() || audit.Result() != test.wantResult {
+				t.Fatalf("audit = %#v, want safe selected-target fields and result %q", audit, test.wantResult)
+			}
+			if got := len(fake.keys()); got != test.wantKeys {
+				t.Fatalf("SendKey calls = %d, want %d", got, test.wantKeys)
+			}
+		})
+	}
+}
+
+func TestServiceKeyAuditIgnoresDuplicateUnauthorizedAndInvalidCommands(t *testing.T) {
+	service, _ := newTestService(t)
+	selectTarget(t, service)
+	message := incoming("key-audit-once", "/enter")
+	service.HandleMessage(context.Background(), message)
+	service.HandleMessage(context.Background(), message)
+	service.HandleMessage(context.Background(), wecom.IncomingText{
+		RequestID: "request-key-unauthorized", MessageID: "key-unauthorized", UserID: "other", ChatType: "single", Content: "/enter",
+	})
+	service.HandleMessage(context.Background(), wecom.IncomingText{
+		RequestID: "request-key-group", MessageID: "key-group", UserID: "user-1", ChatType: "group", Content: "/enter",
+	})
+	service.HandleMessage(context.Background(), incoming("key-invalid", "/key ctrl+c private-command"))
+
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultSent {
+		t.Fatalf("audit records = %#v, want only the first authorized unique key", audits)
+	}
+}
+
+func TestServiceKeyAuditRecordsDegradedAttemptOnlyWithValidSelection(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	service.SetHerdr(nil)
+	service.HandleMessage(context.Background(), incoming("key-degraded-selected", "/enter"))
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultFailed || audits[0].PaneID() != "pane-1" {
+		t.Fatalf("selected degraded audits = %#v, want one failed pane-1 audit", audits)
+	}
+	if len(fake.keys()) != 0 {
+		t.Fatalf("degraded key reached Herdr: %#v", fake.keys())
+	}
+
+	service, _ = newTestService(t)
+	service.SetHerdr(nil)
+	service.HandleMessage(context.Background(), incoming("key-degraded-unselected", "/enter"))
+	if audits := fakeAuditFromService(t, service).records(); len(audits) != 0 {
+		t.Fatalf("unselected degraded audits = %#v, want none", audits)
+	}
+}
+
 func TestServiceKeyMismatchClearsSelectionWithoutSending(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
@@ -592,11 +676,15 @@ func TestNewServiceRejectsMissingDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewService(nil, &panel.Buffer{}, guard, deduper, &fakeIM{}); !errors.Is(err, ErrInvalidServiceDependency) {
+	audit := &fakeKeyAuditSink{}
+	if _, err := NewService(nil, &panel.Buffer{}, guard, deduper, &fakeIM{}, audit); !errors.Is(err, ErrInvalidServiceDependency) {
 		t.Fatalf("nil registry error = %v", err)
 	}
-	if _, err := NewService(registry, nil, guard, deduper, &fakeIM{}); !errors.Is(err, ErrInvalidServiceDependency) {
+	if _, err := NewService(registry, nil, guard, deduper, &fakeIM{}, audit); !errors.Is(err, ErrInvalidServiceDependency) {
 		t.Fatalf("nil panel error = %v", err)
+	}
+	if _, err := NewService(registry, &panel.Buffer{}, guard, deduper, &fakeIM{}, nil); !errors.Is(err, ErrInvalidServiceDependency) {
+		t.Fatalf("nil audit sink error = %v", err)
 	}
 }
 
@@ -902,12 +990,22 @@ func newTestService(t *testing.T) (*Service, *fakeHerdr) {
 	}
 	fake := &fakeHerdr{agent: agentInfo("pane-1", "terminal-1", "codex")}
 	im := &fakeIM{}
-	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im)
+	audit := &fakeKeyAuditSink{}
+	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, audit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	service.SetHerdr(fake)
 	return service, fake
+}
+
+func fakeAuditFromService(t *testing.T, service *Service) *fakeKeyAuditSink {
+	t.Helper()
+	audit, ok := service.keyAudit.(*fakeKeyAuditSink)
+	if !ok {
+		t.Fatalf("service key audit sink = %T, want *fakeKeyAuditSink", service.keyAudit)
+	}
+	return audit
 }
 
 func selectTarget(t *testing.T, service *Service) {
@@ -995,6 +1093,23 @@ type fakeHerdr struct {
 	readStarted   chan struct{}
 	promptStarted chan struct{}
 	keyStarted    chan struct{}
+}
+
+type fakeKeyAuditSink struct {
+	mu     sync.Mutex
+	audits []policy.KeyAudit
+}
+
+func (s *fakeKeyAuditSink) RecordKeyAudit(audit policy.KeyAudit) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.audits = append(s.audits, audit)
+}
+
+func (s *fakeKeyAuditSink) records() []policy.KeyAudit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]policy.KeyAudit(nil), s.audits...)
 }
 
 func (f *fakeHerdr) GetAgent(_ context.Context, target string) (herdr.AgentInfo, error) {
