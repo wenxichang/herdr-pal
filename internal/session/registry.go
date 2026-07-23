@@ -4,11 +4,29 @@ package session
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+)
+
+var (
+	// ErrNoListSnapshot 表示尚未生成可选择的 Agent 列表。
+	ErrNoListSnapshot = errors.New("尚无 Agent 列表")
+	// ErrSelectionIndexOutOfRange 表示选择编号不在列表范围内。
+	ErrSelectionIndexOutOfRange = errors.New("选择编号超出列表范围")
+	// ErrListSnapshotExpired 表示列表对应的目标已经变化。
+	ErrListSnapshotExpired = errors.New("Agent 列表快照已过期")
+	// ErrNoSelection 表示当前没有已选择的 Agent。
+	ErrNoSelection = errors.New("尚未选择 Agent")
+	// ErrSelectionInvalid 表示先前选择的 Agent 已失效。
+	ErrSelectionInvalid = errors.New("已选择的 Agent 已失效")
+	// ErrUnknownPane 表示状态事件引用了不在当前快照中的 pane。
+	ErrUnknownPane = errors.New("未知 Agent 面板")
+	// ErrStaleAgentEvent 表示状态事件不能确认属于当前 pane occupant。
+	ErrStaleAgentEvent = errors.New("过期或无法确认归属的 Agent 状态事件")
 )
 
 // Target 表示可被企业微信用户选择的 Agent 面板。
@@ -59,12 +77,13 @@ type Transition struct {
 //
 // Registry 的零值可以直接使用。
 type Registry struct {
-	mu           sync.RWMutex
-	targets      map[string]Target
-	orders       map[string]targetOrder
-	listSnapshot []listEntry
-	selectedKey  string
-	selectedPane string
+	mu               sync.RWMutex
+	targets          map[string]Target
+	orders           map[string]targetOrder
+	listSnapshot     []listEntry
+	selectedKey      string
+	selectedPane     string
+	selectionInvalid bool
 }
 
 type targetOrder struct {
@@ -107,18 +126,12 @@ func (r *Registry) Replace(snapshot herdr.Snapshot, reconnect bool) ChangeSet {
 	r.targets = nextTargets
 	r.orders = nextOrders
 	if reconnect {
-		if r.selectedKey != "" {
-			changes.SelectionInvalidated = true
-		}
-		r.selectedKey = ""
-		r.selectedPane = ""
+		changes.SelectionInvalidated = r.invalidateSelection()
 		r.listSnapshot = nil
 	} else if r.selectedKey != "" {
 		selected, exists := r.targets[r.selectedPane]
 		if !exists || selected.OccupantKey != r.selectedKey {
-			changes.SelectionInvalidated = true
-			r.selectedKey = ""
-			r.selectedPane = ""
+			changes.SelectionInvalidated = r.invalidateSelection()
 		}
 	}
 	sortTargetsByOrder(changes.RemovedTargets, previousOrders)
@@ -145,18 +158,19 @@ func (r *Registry) Select(index int) (Target, error) {
 	defer r.mu.Unlock()
 
 	if len(r.listSnapshot) == 0 {
-		return Target{}, fmt.Errorf("尚无 Agent 列表，请先执行 /ls")
+		return Target{}, fmt.Errorf("%w，请先执行 /ls", ErrNoListSnapshot)
 	}
 	if index < 1 || index > len(r.listSnapshot) {
-		return Target{}, fmt.Errorf("选择编号超出列表范围：1 到 %d", len(r.listSnapshot))
+		return Target{}, fmt.Errorf("%w：1 到 %d", ErrSelectionIndexOutOfRange, len(r.listSnapshot))
 	}
 	entry := r.listSnapshot[index-1]
 	target, found := r.targets[entry.paneID]
 	if !found || target.OccupantKey != entry.occupantKey {
-		return Target{}, fmt.Errorf("列表快照已过期，请重新执行 /ls")
+		return Target{}, fmt.Errorf("%w，请重新执行 /ls", ErrListSnapshotExpired)
 	}
 	r.selectedKey = target.OccupantKey
 	r.selectedPane = target.PaneID
+	r.selectionInvalid = false
 	return target, nil
 }
 
@@ -165,26 +179,35 @@ func (r *Registry) ValidateSelected() (Target, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.selectionInvalid {
+		r.selectionInvalid = false
+		return Target{}, fmt.Errorf("%w，请重新执行 /ls 和 /sel", ErrSelectionInvalid)
+	}
 	if r.selectedKey == "" {
-		return Target{}, fmt.Errorf("尚未选择 Agent，请先执行 /ls 和 /sel")
+		return Target{}, fmt.Errorf("%w，请先执行 /ls 和 /sel", ErrNoSelection)
 	}
 	target, found := r.targets[r.selectedPane]
 	if !found || target.OccupantKey != r.selectedKey {
-		r.selectedKey = ""
-		r.selectedPane = ""
-		return Target{}, fmt.Errorf("已选择的 Agent 已失效，请重新执行 /ls 和 /sel")
+		r.invalidateSelection()
+		return Target{}, fmt.Errorf("%w，请重新执行 /ls 和 /sel", ErrSelectionInvalid)
 	}
 	return target, nil
 }
 
 // ApplyStatus 将状态事件应用到已存在的 Agent 面板。
+//
+// 公开事件中的 Agent 字段虽然可选，但缺失时无法确认归属，必须拒绝以避免旧 occupant
+// 的重放事件污染当前目标；事件本身不携带会话标识，无法在此区分同 Agent 的不同会话。
 func (r *Registry) ApplyStatus(event herdr.AgentStatusEvent) (Transition, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	target, found := r.targets[event.PaneID]
 	if !found {
-		return Transition{}, fmt.Errorf("未知 Agent 面板：%s", event.PaneID)
+		return Transition{}, fmt.Errorf("%w：%s", ErrUnknownPane, event.PaneID)
+	}
+	if event.Agent == nil || *event.Agent != target.Agent {
+		return Transition{}, fmt.Errorf("%w：pane %s 的当前 Agent 与事件不一致", ErrStaleAgentEvent, event.PaneID)
 	}
 	previous := target.Status
 	target.Status = event.AgentStatus
@@ -227,7 +250,18 @@ func (r *Registry) ClearSelection() {
 	defer r.mu.Unlock()
 	r.selectedKey = ""
 	r.selectedPane = ""
+	r.selectionInvalid = false
 	r.listSnapshot = nil
+}
+
+func (r *Registry) invalidateSelection() bool {
+	if r.selectedKey == "" {
+		return false
+	}
+	r.selectedKey = ""
+	r.selectedPane = ""
+	r.selectionInvalid = true
+	return true
 }
 
 func targetsFromSnapshot(snapshot herdr.Snapshot) (map[string]Target, map[string]targetOrder) {

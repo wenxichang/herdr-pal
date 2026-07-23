@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -149,11 +150,11 @@ func TestStatusChangeKeepsSelectionAndApplyStatusDoesNotCreateTargets(t *testing
 		t.Fatalf("ValidateSelected() = %#v, %v", selected, err)
 	}
 
-	transition, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", AgentStatus: herdr.AgentStatusDone})
+	transition, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", Agent: stringPtr("codex"), AgentStatus: herdr.AgentStatusDone})
 	if err != nil || transition.Previous != herdr.AgentStatusWorking || transition.Current != herdr.AgentStatusDone {
 		t.Fatalf("ApplyStatus() = %#v, %v", transition, err)
 	}
-	if _, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", AgentStatus: herdr.AgentStatusDone}); err != nil {
+	if _, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", Agent: stringPtr("codex"), AgentStatus: herdr.AgentStatusDone}); err != nil {
 		t.Fatalf("repeated ApplyStatus() error = %v", err)
 	}
 	if _, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "unknown", AgentStatus: herdr.AgentStatusIdle}); err == nil {
@@ -161,6 +162,59 @@ func TestStatusChangeKeepsSelectionAndApplyStatusDoesNotCreateTargets(t *testing
 	}
 	if len(registry.AgentPaneIDs()) != 1 {
 		t.Fatalf("unknown event created a target: %v", registry.AgentPaneIDs())
+	}
+}
+
+func TestApplyStatusRejectsStaleAgentEventAfterOccupantReplacement(t *testing.T) {
+	registry := &Registry{}
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)
+	replacement := testAgentPane("pane-1", "terminal-2", "claude", nil)
+	replacement.AgentStatus = herdr.AgentStatusWorking
+	registry.Replace(testSnapshot(replacement), false)
+
+	if _, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", Agent: stringPtr("codex"), AgentStatus: herdr.AgentStatusDone}); !errors.Is(err, ErrStaleAgentEvent) {
+		t.Fatalf("ApplyStatus() stale event error = %v, want ErrStaleAgentEvent", err)
+	}
+	current := registry.CreateListSnapshot()[0]
+	if current.Status != herdr.AgentStatusWorking {
+		t.Fatalf("stale event updated replacement status to %q", current.Status)
+	}
+	transition, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", Agent: stringPtr("claude"), AgentStatus: herdr.AgentStatusDone})
+	if err != nil || transition.Previous != herdr.AgentStatusWorking || transition.Current != herdr.AgentStatusDone {
+		t.Fatalf("ApplyStatus() matching event = %#v, %v", transition, err)
+	}
+	if _, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "pane-1", AgentStatus: herdr.AgentStatusIdle}); !errors.Is(err, ErrStaleAgentEvent) {
+		t.Fatalf("ApplyStatus() event without Agent error = %v, want ErrStaleAgentEvent", err)
+	}
+}
+
+func TestRegistryErrorsAreClassifiable(t *testing.T) {
+	registry := &Registry{}
+	if _, err := registry.Select(1); !errors.Is(err, ErrNoListSnapshot) {
+		t.Fatalf("Select() without snapshot error = %v", err)
+	}
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)
+	registry.CreateListSnapshot()
+	if _, err := registry.Select(2); !errors.Is(err, ErrSelectionIndexOutOfRange) {
+		t.Fatalf("Select() out of range error = %v", err)
+	}
+	if _, err := registry.ValidateSelected(); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("ValidateSelected() without selection error = %v", err)
+	}
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-2", "claude", nil)), false)
+	if _, err := registry.Select(1); !errors.Is(err, ErrListSnapshotExpired) {
+		t.Fatalf("Select() expired snapshot error = %v", err)
+	}
+	registry.CreateListSnapshot()
+	if _, err := registry.Select(1); err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	registry.Replace(testSnapshot(), false)
+	if _, err := registry.ValidateSelected(); !errors.Is(err, ErrSelectionInvalid) {
+		t.Fatalf("ValidateSelected() invalid selection error = %v", err)
+	}
+	if _, err := registry.ApplyStatus(herdr.AgentStatusEvent{PaneID: "missing", Agent: stringPtr("codex")}); !errors.Is(err, ErrUnknownPane) {
+		t.Fatalf("ApplyStatus() unknown pane error = %v", err)
 	}
 }
 
