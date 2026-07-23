@@ -18,19 +18,26 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
+// ErrInvalidServiceDependency 表示 BridgeService 缺少必需依赖。
 var ErrInvalidServiceDependency = errors.New("BridgeService 依赖无效")
 
 // HerdrAPI 是入站命令所需的最小 Herdr 公共 API。
 type HerdrAPI interface {
+	// GetAgent 查询目标当前的 Agent occupant。
 	GetAgent(ctx context.Context, target string) (herdr.AgentInfo, error)
+	// ReadRecent 读取目标的 recent_unwrapped 终端快照。
 	ReadRecent(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
+	// Prompt 向目标发送普通文本输入。
 	Prompt(ctx context.Context, target, text string) error
+	// SendKey 向目标发送一个已校验的 UI 按键。
 	SendKey(ctx context.Context, target, key string) error
 }
 
 // IMAdapter 是入站命令回复所需的最小企业微信能力。
 type IMAdapter interface {
+	// RespondMarkdown 使用回调 req_id 发送首段 Markdown 回复。
 	RespondMarkdown(ctx context.Context, callbackRequestID, content string) error
+	// SendMarkdown 发送后续 Markdown 分段。
 	SendMarkdown(ctx context.Context, content string) error
 }
 
