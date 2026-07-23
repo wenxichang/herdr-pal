@@ -1,0 +1,942 @@
+package bridge
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"reflect"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/panel"
+	"github.com/wenxichang/herdr-pal/internal/policy"
+	"github.com/wenxichang/herdr-pal/internal/session"
+)
+
+func TestSupervisorConnectsChecksSnapshotsAndBuildsBaselineSubscriptions(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(
+		supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusDone),
+		supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
+	))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+
+	first := awaitSupervisorSubscribe(t, client)
+	second := awaitSupervisorSubscribe(t, client)
+	if !reflect.DeepEqual(first, herdr.LifecycleSubscriptions()) {
+		t.Fatalf("lifecycle specs = %#v", first)
+	}
+	wantStatus := herdr.StatusSubscriptions([]string{"pane-1", "pane-2"})
+	if !reflect.DeepEqual(second, wantStatus) {
+		t.Fatalf("status specs = %#v，期望 %#v", second, wantStatus)
+	}
+	if got, want := harness.log.Entries(), []string{"connect", "compatible", "snapshot", "subscribe:lifecycle", "subscribe:status"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("启动调用顺序 = %#v，期望 %#v", got, want)
+	}
+	if messages := harness.im.Messages(); len(messages) != 0 {
+		t.Fatalf("初始 snapshot 发送历史通知：%#v", messages)
+	}
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusDone))
+	status.Emit(supervisorStatusEvent("pane-2", "workspace-1", "claude", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "基线重放抑制", func() bool { return len(harness.im.Messages()) == 1 })
+	if message := harness.im.Messages()[0]; !strings.Contains(message, "开始工作") || strings.Contains(message, "已完成") {
+		t.Fatalf("基线重放通知 = %q", message)
+	}
+	if !serviceAvailable(harness.service) {
+		t.Fatal("订阅建立后 Service 未接管 Herdr client")
+	}
+}
+
+func TestSupervisorStatusEventAppliesThenNotifiesAndSuppressesReplay(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking)))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	harness.reader.result = herdr.ReadResult{PaneID: "pane-1", Text: "需要确认"}
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusBlocked))
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusBlocked))
+	awaitSupervisorCondition(t, "状态通知", func() bool { return len(harness.im.Messages()) >= 2 })
+
+	targets := harness.registry.CreateListSnapshot()
+	if len(targets) != 1 || targets[0].Status != herdr.AgentStatusBlocked {
+		t.Fatalf("Registry 状态 = %#v", targets)
+	}
+	if calls := harness.reader.Calls(); len(calls) != 1 || calls[0].lines != 100 {
+		t.Fatalf("重复状态事件读取 = %#v", calls)
+	}
+	if messages := harness.im.Messages(); len(messages) != 2 || !strings.Contains(messages[0], "已阻塞") {
+		t.Fatalf("重复状态事件通知 = %#v", messages)
+	}
+}
+
+func TestSupervisorLifecycleEventsDebounceSnapshotAndRebuildStatusStream(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	oldStatus := newSupervisorStream()
+	newStatus := newSupervisorStream()
+	client := newSupervisorClient(
+		supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking)),
+		supervisorSnapshot(
+			supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking),
+			supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
+		),
+	)
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{oldStatus, newStatus}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+
+	lifecycle.Emit(supervisorLifecycleEvent("pane.created"))
+	firstDebounce := awaitSupervisorWait(t, harness.waiter)
+	if firstDebounce.delay != 100*time.Millisecond {
+		t.Fatalf("首次 debounce = %v", firstDebounce.delay)
+	}
+	lifecycle.Emit(supervisorLifecycleEvent("pane.updated"))
+	secondDebounce := awaitSupervisorWait(t, harness.waiter)
+	if secondDebounce.delay != 100*time.Millisecond {
+		t.Fatalf("第二次 debounce = %v", secondDebounce.delay)
+	}
+	if err := awaitSupervisorWaitDone(t, firstDebounce); !errors.Is(err, context.Canceled) {
+		t.Fatalf("旧 debounce 结果 = %v，期望 context.Canceled", err)
+	}
+	secondDebounce.Release()
+
+	rebuilt := awaitSupervisorSubscribe(t, client)
+	want := herdr.StatusSubscriptions([]string{"pane-1", "pane-2"})
+	if !reflect.DeepEqual(rebuilt, want) {
+		t.Fatalf("重建 status specs = %#v，期望 %#v", rebuilt, want)
+	}
+	awaitSupervisorCondition(t, "关闭旧 status stream", func() bool { return oldStatus.CloseCount() == 1 })
+	if got := harness.factory.ConnectCount(); got != 1 {
+		t.Fatalf("主动关闭旧 status stream 被误判为断线，Connect 次数 = %d", got)
+	}
+	if got := client.SnapshotCount(); got != 2 {
+		t.Fatalf("合并后的 snapshot 次数 = %d，期望 2（初始加一次 debounce）", got)
+	}
+}
+
+func TestSupervisorAllLifecycleKindsTriggerSnapshot(t *testing.T) {
+	for _, kind := range []string{"pane.created", "pane.closed", "pane.updated", "pane.exited", "pane.agent_detected"} {
+		t.Run(kind, func(t *testing.T) {
+			lifecycle := newSupervisorStream()
+			status := newSupervisorStream()
+			client := newSupervisorClient(
+				supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking)),
+				supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking)),
+			)
+			client.lifecycleStreams = []*supervisorStream{lifecycle}
+			client.statusStreams = []*supervisorStream{status}
+			harness := newSupervisorHarness(t, []*supervisorClient{client})
+			cancel, result := runSupervisor(t, harness.supervisor)
+			defer cancelAndAwaitSupervisor(t, cancel, result)
+			awaitSupervisorSubscribe(t, client)
+			awaitSupervisorSubscribe(t, client)
+
+			lifecycle.Emit(supervisorLifecycleEvent(kind))
+			wait := awaitSupervisorWait(t, harness.waiter)
+			wait.Release()
+			awaitSupervisorCondition(t, "lifecycle snapshot", func() bool { return client.SnapshotCount() == 2 })
+		})
+	}
+}
+
+func TestSupervisorLifecycleReplacementInvalidatesOnlyAffectedSelectionAndNotifiesOldTargets(t *testing.T) {
+	tests := []struct {
+		name              string
+		selectedIndex     int
+		wantSelection     string
+		wantPanelRetained bool
+	}{
+		{name: "affected selection", selectedIndex: 2, wantPanelRetained: false},
+		{name: "unaffected selection", selectedIndex: 3, wantSelection: "pane-3", wantPanelRetained: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			initial := supervisorSnapshot(
+				supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking),
+				supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
+				supervisorPane("pane-3", "terminal-3", "gemini", herdr.AgentStatusIdle),
+			)
+			next := supervisorSnapshot(
+				supervisorPane("pane-2", "terminal-replaced", "codex", herdr.AgentStatusWorking),
+				supervisorPane("pane-3", "terminal-3", "gemini", herdr.AgentStatusIdle),
+			)
+			lifecycle := newSupervisorStream()
+			oldStatus := newSupervisorStream()
+			newStatus := newSupervisorStream()
+			client := newSupervisorClient(initial, next)
+			client.lifecycleStreams = []*supervisorStream{lifecycle}
+			client.statusStreams = []*supervisorStream{oldStatus, newStatus}
+			harness := newSupervisorHarness(t, []*supervisorClient{client})
+			cancel, result := runSupervisor(t, harness.supervisor)
+			defer cancelAndAwaitSupervisor(t, cancel, result)
+			awaitSupervisorSubscribe(t, client)
+			awaitSupervisorSubscribe(t, client)
+
+			harness.registry.CreateListSnapshot()
+			selected, err := harness.registry.Select(test.selectedIndex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			harness.service.stateMu.Lock()
+			harness.service.panel.Refresh(selected.OccupantKey, []string{"手工分页缓存"})
+			harness.service.panelReady = true
+			harness.service.page = 0
+			harness.service.stateMu.Unlock()
+
+			lifecycle.Emit(supervisorLifecycleEvent("pane.closed"))
+			wait := awaitSupervisorWait(t, harness.waiter)
+			wait.Release()
+			awaitSupervisorSubscribe(t, client)
+			awaitSupervisorCondition(t, "目标失效通知", func() bool { return len(harness.im.Messages()) == 2 })
+
+			current, selectionErr := harness.registry.ValidateSelected()
+			if test.wantSelection == "" {
+				if selectionErr == nil {
+					t.Fatalf("受影响选择仍然有效：%#v", current)
+				}
+			} else if selectionErr != nil || current.PaneID != test.wantSelection {
+				t.Fatalf("未受影响选择被清理：target=%#v err=%v", current, selectionErr)
+			}
+			harness.service.stateMu.Lock()
+			panelReady := harness.service.panelReady
+			harness.service.stateMu.Unlock()
+			if panelReady != test.wantPanelRetained {
+				t.Fatalf("panelReady = %v，期望 %v", panelReady, test.wantPanelRetained)
+			}
+			messages := strings.Join(harness.im.Messages(), "\n")
+			if !strings.Contains(messages, "pane-1") || !strings.Contains(messages, "pane-2") || strings.Contains(messages, "pane-3") {
+				t.Fatalf("Removed/Replaced 失效通知 = %q", messages)
+			}
+		})
+	}
+}
+
+func TestSupervisorCurrentStreamEndDegradesAndReconnectsFromFreshBaseline(t *testing.T) {
+	firstLifecycle := newSupervisorStream()
+	firstStatus := newSupervisorStream()
+	secondLifecycle := newSupervisorStream()
+	secondStatus := newSupervisorStream()
+	first := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
+	first.lifecycleStreams = []*supervisorStream{firstLifecycle}
+	first.statusStreams = []*supervisorStream{firstStatus}
+	second := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
+	second.lifecycleStreams = []*supervisorStream{secondLifecycle}
+	second.statusStreams = []*supervisorStream{secondStatus}
+	harness := newSupervisorHarness(t, []*supervisorClient{first, second})
+	harness.backoff.delays = []time.Duration{3 * time.Second}
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, first)
+	awaitSupervisorSubscribe(t, first)
+	firstStatus.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "首次 working 通知", func() bool { return len(harness.im.Messages()) == 1 })
+	harness.registry.CreateListSnapshot()
+	selected, err := harness.registry.Select(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.service.stateMu.Lock()
+	harness.service.panel.Refresh(selected.OccupantKey, []string{"旧分页"})
+	harness.service.panelReady = true
+	harness.service.stateMu.Unlock()
+
+	firstStatus.End(io.EOF)
+	retry := awaitSupervisorWait(t, harness.waiter)
+	if retry.delay != 3*time.Second {
+		t.Fatalf("重连退避 = %v，期望 3s", retry.delay)
+	}
+	awaitSupervisorCondition(t, "关闭两个失效 stream", func() bool {
+		return firstLifecycle.CloseCount() == 1 && firstStatus.CloseCount() == 1
+	})
+	if serviceAvailable(harness.service) {
+		t.Fatal("stream 结束后 Service 仍允许 Herdr 操作")
+	}
+	if _, err := harness.registry.ValidateSelected(); err == nil {
+		t.Fatal("stream 结束后选择未清空")
+	}
+	harness.service.stateMu.Lock()
+	panelReady := harness.service.panelReady
+	harness.service.stateMu.Unlock()
+	if panelReady {
+		t.Fatal("stream 结束后手工分页缓存未清空")
+	}
+
+	retry.Release()
+	awaitSupervisorSubscribe(t, second)
+	awaitSupervisorSubscribe(t, second)
+	if !serviceAvailable(harness.service) {
+		t.Fatal("重连后 Service 未接管新 client")
+	}
+	if messages := harness.im.Messages(); len(messages) != 1 {
+		t.Fatalf("重连 snapshot 重放历史通知：%#v", messages)
+	}
+	secondStatus.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "重连后的新状态通知", func() bool { return len(harness.im.Messages()) == 2 })
+	if got := harness.factory.ConnectCount(); got != 2 {
+		t.Fatalf("Connect 次数 = %d，期望 2", got)
+	}
+}
+
+func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
+	client := newSupervisorClient()
+	client.checkErr = herdr.ErrProtocolMismatch
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	wait := awaitSupervisorWait(t, harness.waiter)
+	if wait.delay != 30*time.Second {
+		t.Fatalf("协议不匹配探测间隔 = %v，期望 30s", wait.delay)
+	}
+	if client.SnapshotCount() != 0 || client.SubscribeCount() != 0 {
+		t.Fatalf("协议不匹配后仍调用业务 API：snapshot=%d subscribe=%d", client.SnapshotCount(), client.SubscribeCount())
+	}
+	if serviceAvailable(harness.service) {
+		t.Fatal("协议不匹配时 Service 允许输入")
+	}
+	if harness.backoff.NextCount() != 0 {
+		t.Fatalf("协议不匹配使用了普通退避：Next=%d", harness.backoff.NextCount())
+	}
+	cancel()
+	if err := awaitSupervisorResult(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestSupervisorOrdinaryFailuresUseBackoffAndStopAtFailedStep(t *testing.T) {
+	tests := []struct {
+		name    string
+		clients func() []*supervisorClient
+		wantLog []string
+	}{
+		{
+			name:    "connect",
+			clients: func() []*supervisorClient { return nil },
+			wantLog: []string{"connect"},
+		},
+		{
+			name: "compatible",
+			clients: func() []*supervisorClient {
+				client := newSupervisorClient()
+				client.checkErr = errors.New("check failed")
+				return []*supervisorClient{client}
+			},
+			wantLog: []string{"connect", "compatible"},
+		},
+		{
+			name: "snapshot",
+			clients: func() []*supervisorClient {
+				client := newSupervisorClient()
+				client.snapshots = []supervisorSnapshotResult{{err: errors.New("snapshot failed")}}
+				return []*supervisorClient{client}
+			},
+			wantLog: []string{"connect", "compatible", "snapshot"},
+		},
+		{
+			name: "lifecycle subscribe",
+			clients: func() []*supervisorClient {
+				client := newSupervisorClient(supervisorSnapshot())
+				return []*supervisorClient{client}
+			},
+			wantLog: []string{"connect", "compatible", "snapshot", "subscribe:lifecycle"},
+		},
+		{
+			name: "status subscribe",
+			clients: func() []*supervisorClient {
+				client := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
+				client.lifecycleStreams = []*supervisorStream{newSupervisorStream()}
+				return []*supervisorClient{client}
+			},
+			wantLog: []string{"connect", "compatible", "snapshot", "subscribe:lifecycle", "subscribe:status"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newSupervisorHarness(t, test.clients())
+			harness.backoff.delays = []time.Duration{4 * time.Second}
+			cancel, result := runSupervisor(t, harness.supervisor)
+			wait := awaitSupervisorWait(t, harness.waiter)
+			if wait.delay != 4*time.Second {
+				t.Fatalf("普通失败退避 = %v，期望 4s", wait.delay)
+			}
+			if got := harness.log.Entries(); !reflect.DeepEqual(got, test.wantLog) {
+				t.Fatalf("失败调用顺序 = %#v，期望 %#v", got, test.wantLog)
+			}
+			if serviceAvailable(harness.service) {
+				t.Fatal("普通失败后 Service 未 degraded")
+			}
+			cancel()
+			if err := awaitSupervisorResult(t, result); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+			}
+		})
+	}
+}
+
+func TestSupervisorZeroAgentSnapshotDoesNotSubscribeEmptyStatusStream(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot())
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	if specs := awaitSupervisorSubscribe(t, client); !reflect.DeepEqual(specs, herdr.LifecycleSubscriptions()) {
+		t.Fatalf("唯一订阅 = %#v", specs)
+	}
+	awaitSupervisorCondition(t, "零 Agent 启动完成", func() bool { return serviceAvailable(harness.service) })
+	if got := client.SubscribeCount(); got != 1 {
+		t.Fatalf("零 Agent 时 Subscribe 次数 = %d，期望仅 lifecycle 一次", got)
+	}
+}
+
+func TestSupervisorLifecycleRemovalToZeroDoesNotSubscribeEmptyStatusStream(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(
+		supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)),
+		supervisorSnapshot(),
+	)
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	lifecycle.Emit(supervisorLifecycleEvent("pane.closed"))
+	wait := awaitSupervisorWait(t, harness.waiter)
+	wait.Release()
+	awaitSupervisorCondition(t, "移除最后一个 Agent", func() bool {
+		return client.SnapshotCount() == 2 && status.CloseCount() == 1
+	})
+	if got := client.SubscribeCount(); got != 2 {
+		t.Fatalf("移除到零 Agent 后 Subscribe 次数 = %d，期望不新增空 status 订阅", got)
+	}
+}
+
+func TestSupervisorContextCancellationClosesBothStreams(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	cancel()
+	if err := awaitSupervisorResult(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+	if lifecycle.CloseCount() != 1 || status.CloseCount() != 1 {
+		t.Fatalf("context 取消后的 Close 次数：lifecycle=%d status=%d", lifecycle.CloseCount(), status.CloseCount())
+	}
+}
+
+func TestDefaultSupervisorRetryGrowsCapsAndResets(t *testing.T) {
+	retry := newDefaultSupervisorRetry(time.Second, 3*time.Second, func() float64 { return 0.5 })
+	if got := []time.Duration{retry.Next(), retry.Next(), retry.Next(), retry.Next()}; !reflect.DeepEqual(got, []time.Duration{time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}) {
+		t.Fatalf("默认退避 = %#v", got)
+	}
+	retry.Reset()
+	if got := retry.Next(); got != time.Second {
+		t.Fatalf("Reset 后退避 = %v", got)
+	}
+}
+
+func TestWaitSupervisorDelayStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitSupervisorDelay(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitSupervisorDelay() error = %v", err)
+	}
+}
+
+func TestSupervisorMalformedStatusEndsHealthyCycle(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking)))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	harness.backoff.delays = []time.Duration{time.Second}
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	status.Emit(herdr.Event{Kind: "pane.agent_status_changed", Data: json.RawMessage(`{"pane_id":"pane-1"}`)})
+
+	wait := awaitSupervisorWait(t, harness.waiter)
+	if wait.delay != time.Second {
+		t.Fatalf("严格解码失败后的退避 = %v", wait.delay)
+	}
+	if serviceAvailable(harness.service) {
+		t.Fatal("严格解码失败后 Service 未 degraded")
+	}
+}
+
+func TestSupervisorLifecycleStreamEndAlsoClosesStatusStream(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusWorking)))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	harness.backoff.delays = []time.Duration{2 * time.Second}
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	lifecycle.End(io.EOF)
+	awaitSupervisorWait(t, harness.waiter)
+	awaitSupervisorCondition(t, "关闭 status stream", func() bool { return status.CloseCount() == 1 })
+}
+
+type supervisorHarness struct {
+	supervisor *Supervisor
+	registry   *session.Registry
+	service    *Service
+	im         *notifierIM
+	reader     *notifierReader
+	factory    *supervisorFactory
+	waiter     *supervisorWaiter
+	backoff    *supervisorBackoff
+	log        *supervisorCallLog
+}
+
+func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisorHarness {
+	t.Helper()
+	registry := &session.Registry{}
+	guard, err := policy.NewGuard("user-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	im := &notifierIM{}
+	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &notifierReader{}
+	notifier := mustNotifier(t, im, reader.ReadRecent)
+	log := &supervisorCallLog{}
+	for _, client := range clients {
+		client.log = log
+	}
+	factory := &supervisorFactory{clients: clients, connected: make(chan struct{}, 16), log: log}
+	waiter := newSupervisorWaiter()
+	backoff := &supervisorBackoff{delays: []time.Duration{time.Second}}
+	supervisor, err := NewSupervisor(factory, registry, service, notifier, SupervisorOptions{
+		Backoff:               backoff,
+		Wait:                  waiter.Wait,
+		DebounceDelay:         100 * time.Millisecond,
+		ProtocolProbeInterval: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor() 返回错误：%v", err)
+	}
+	return &supervisorHarness{supervisor: supervisor, registry: registry, service: service, im: im, reader: reader, factory: factory, waiter: waiter, backoff: backoff, log: log}
+}
+
+func runSupervisor(t *testing.T, supervisor *Supervisor) (context.CancelFunc, <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(ctx) }()
+	return cancel, result
+}
+
+func cancelAndAwaitSupervisor(t *testing.T, cancel context.CancelFunc, result <-chan error) {
+	t.Helper()
+	cancel()
+	if err := awaitSupervisorResult(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func awaitSupervisorResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 Supervisor 退出超时")
+		return nil
+	}
+}
+
+func awaitSupervisorSubscribe(t *testing.T, client *supervisorClient) []herdr.SubscriptionSpec {
+	t.Helper()
+	select {
+	case specs := <-client.subscribed:
+		return specs
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 Subscribe 调用超时")
+		return nil
+	}
+}
+
+func awaitSupervisorCondition(t *testing.T, name string, condition func() bool) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for !condition() {
+		select {
+		case <-deadline:
+			t.Fatalf("等待%s超时", name)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+func serviceAvailable(service *Service) bool {
+	client, release, ok := service.beginOperation(false)
+	if ok {
+		release()
+	}
+	return ok && client != nil
+}
+
+func supervisorSnapshot(panes ...herdr.Pane) herdr.Snapshot {
+	return herdr.Snapshot{
+		Version:    "0.1.0",
+		Protocol:   herdr.RequiredProtocol,
+		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-1", Number: 1, Label: "workspace-1"}},
+		Tabs:       []herdr.Tab{{TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "tab-1"}},
+		Panes:      panes,
+	}
+}
+
+func supervisorPane(paneID, terminalID, agent string, status herdr.AgentStatus) herdr.Pane {
+	display := strings.ToUpper(agent[:1]) + agent[1:]
+	return herdr.Pane{PaneID: paneID, TerminalID: terminalID, WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef(agent), DisplayAgent: stringRef(display), AgentStatus: status}
+}
+
+func supervisorStatusEvent(paneID, workspaceID, agent string, status herdr.AgentStatus) herdr.Event {
+	data, _ := json.Marshal(map[string]any{
+		"pane_id": paneID, "workspace_id": workspaceID, "agent_status": status, "agent": agent,
+	})
+	return herdr.Event{Kind: "pane.agent_status_changed", Data: data}
+}
+
+func supervisorLifecycleEvent(kind string) herdr.Event {
+	return herdr.Event{Kind: kind, Data: json.RawMessage(`{"pane_id":"pane-1"}`)}
+}
+
+type supervisorCallLog struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *supervisorCallLog) Add(entry string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, entry)
+}
+
+func (l *supervisorCallLog) Entries() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.entries...)
+}
+
+type supervisorFactory struct {
+	mu        sync.Mutex
+	clients   []*supervisorClient
+	index     int
+	calls     int
+	connected chan struct{}
+	log       *supervisorCallLog
+}
+
+func (f *supervisorFactory) Connect(context.Context) (ManagedHerdr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.log.Add("connect")
+	select {
+	case f.connected <- struct{}{}:
+	default:
+	}
+	if f.index >= len(f.clients) {
+		return nil, errors.New("没有更多 fake client")
+	}
+	client := f.clients[f.index]
+	f.index++
+	return client, nil
+}
+
+func (f *supervisorFactory) ConnectCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+type supervisorSnapshotResult struct {
+	snapshot herdr.Snapshot
+	err      error
+}
+
+type supervisorClient struct {
+	mu               sync.Mutex
+	log              *supervisorCallLog
+	checkErr         error
+	snapshots        []supervisorSnapshotResult
+	snapshotIndex    int
+	snapshotCalls    int
+	lifecycleStreams []*supervisorStream
+	lifecycleIndex   int
+	statusStreams    []*supervisorStream
+	statusIndex      int
+	subscribeCalls   int
+	subscribed       chan []herdr.SubscriptionSpec
+}
+
+func newSupervisorClient(snapshots ...herdr.Snapshot) *supervisorClient {
+	results := make([]supervisorSnapshotResult, len(snapshots))
+	for index, snapshot := range snapshots {
+		results[index] = supervisorSnapshotResult{snapshot: snapshot}
+	}
+	return &supervisorClient{snapshots: results, subscribed: make(chan []herdr.SubscriptionSpec, 16)}
+}
+
+func (c *supervisorClient) CheckCompatible(context.Context) error {
+	c.log.Add("compatible")
+	return c.checkErr
+}
+
+func (c *supervisorClient) Snapshot(context.Context) (herdr.Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.log.Add("snapshot")
+	c.snapshotCalls++
+	if c.snapshotIndex >= len(c.snapshots) {
+		return herdr.Snapshot{}, errors.New("没有更多 snapshot")
+	}
+	result := c.snapshots[c.snapshotIndex]
+	c.snapshotIndex++
+	return result.snapshot, result.err
+}
+
+func (c *supervisorClient) Subscribe(_ context.Context, specs []herdr.SubscriptionSpec) (herdr.SubscriptionStream, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscribeCalls++
+	copySpecs := append([]herdr.SubscriptionSpec(nil), specs...)
+	c.subscribed <- copySpecs
+	if len(specs) > 0 && specs[0].Type == "pane.agent_status_changed" {
+		c.log.Add("subscribe:status")
+		if c.statusIndex >= len(c.statusStreams) {
+			return nil, errors.New("没有更多 status stream")
+		}
+		stream := c.statusStreams[c.statusIndex]
+		c.statusIndex++
+		return stream, nil
+	}
+	c.log.Add("subscribe:lifecycle")
+	if c.lifecycleIndex >= len(c.lifecycleStreams) {
+		return nil, errors.New("没有更多 lifecycle stream")
+	}
+	stream := c.lifecycleStreams[c.lifecycleIndex]
+	c.lifecycleIndex++
+	return stream, nil
+}
+
+func (c *supervisorClient) GetAgent(context.Context, string) (herdr.AgentInfo, error) {
+	return herdr.AgentInfo{}, nil
+}
+
+func (c *supervisorClient) ReadRecent(context.Context, string, int) (herdr.ReadResult, error) {
+	return herdr.ReadResult{}, nil
+}
+
+func (c *supervisorClient) Prompt(context.Context, string, string) error { return nil }
+
+func (c *supervisorClient) SendKey(context.Context, string, string) error { return nil }
+
+func (c *supervisorClient) SnapshotCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.snapshotCalls
+}
+
+func (c *supervisorClient) SubscribeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.subscribeCalls
+}
+
+type supervisorStreamItem struct {
+	event herdr.Event
+	err   error
+}
+
+type supervisorStream struct {
+	items     chan supervisorStreamItem
+	closed    chan struct{}
+	closeOnce sync.Once
+	mu        sync.Mutex
+	closes    int
+}
+
+func newSupervisorStream() *supervisorStream {
+	return &supervisorStream{items: make(chan supervisorStreamItem, 32), closed: make(chan struct{})}
+}
+
+func (s *supervisorStream) Recv(ctx context.Context) (herdr.Event, error) {
+	select {
+	case <-ctx.Done():
+		return herdr.Event{}, ctx.Err()
+	case <-s.closed:
+		return herdr.Event{}, io.ErrClosedPipe
+	case item := <-s.items:
+		return item.event, item.err
+	}
+}
+
+func (s *supervisorStream) Close() error {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closes++
+		s.mu.Unlock()
+		close(s.closed)
+	})
+	return nil
+}
+
+func (s *supervisorStream) Emit(event herdr.Event) {
+	s.items <- supervisorStreamItem{event: event}
+}
+
+func (s *supervisorStream) End(err error) {
+	s.items <- supervisorStreamItem{err: err}
+}
+
+func (s *supervisorStream) CloseCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
+}
+
+type supervisorWaitRequest struct {
+	delay   time.Duration
+	release chan struct{}
+	done    chan error
+	once    sync.Once
+}
+
+func (r *supervisorWaitRequest) Release() {
+	r.once.Do(func() { close(r.release) })
+}
+
+type supervisorWaiter struct {
+	requests chan *supervisorWaitRequest
+}
+
+func newSupervisorWaiter() *supervisorWaiter {
+	return &supervisorWaiter{requests: make(chan *supervisorWaitRequest, 64)}
+}
+
+func (w *supervisorWaiter) Wait(ctx context.Context, delay time.Duration) error {
+	request := &supervisorWaitRequest{delay: delay, release: make(chan struct{}), done: make(chan error, 1)}
+	select {
+	case w.requests <- request:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	var err error
+	select {
+	case <-request.release:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	request.done <- err
+	return err
+}
+
+func awaitSupervisorWait(t *testing.T, waiter *supervisorWaiter) *supervisorWaitRequest {
+	t.Helper()
+	select {
+	case request := <-waiter.requests:
+		return request
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待可控 Wait 调用超时")
+		return nil
+	}
+}
+
+func awaitSupervisorWaitDone(t *testing.T, request *supervisorWaitRequest) error {
+	t.Helper()
+	select {
+	case err := <-request.done:
+		return err
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待可控 Wait 结束超时")
+		return nil
+	}
+}
+
+type supervisorBackoff struct {
+	mu       sync.Mutex
+	delays   []time.Duration
+	next     int
+	resets   int
+	nextCall int
+}
+
+func (b *supervisorBackoff) Next() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.nextCall++
+	if b.next >= len(b.delays) {
+		return time.Second
+	}
+	delay := b.delays[b.next]
+	b.next++
+	return delay
+}
+
+func (b *supervisorBackoff) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.resets++
+}
+
+func (b *supervisorBackoff) NextCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nextCall
+}

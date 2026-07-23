@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/panel"
@@ -155,6 +157,21 @@ func TestNotifierReadFailureStillSendsStatusTitleAndCanRetryWithSnapshot(t *test
 	}
 }
 
+func TestNotifierDoesNotModifyManualPanelBuffer(t *testing.T) {
+	buffer := &panel.Buffer{}
+	buffer.Refresh("occupant-1", []string{"manual-1", "manual-2"})
+	before := buffer.Render()
+	reader := &notifierReader{result: herdr.ReadResult{PaneID: "pane-1", Text: "automatic"}}
+	notifier := mustNotifier(t, &notifierIM{}, reader.ReadRecent)
+
+	if err := notifier.HandleTransition(context.Background(), notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked)); err != nil {
+		t.Fatalf("HandleTransition() 返回错误：%v", err)
+	}
+	if after := buffer.Render(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("自动通知修改手工 PanelBuffer：before=%#v after=%#v", before, after)
+	}
+}
+
 func TestNotifierRejectsMismatchedReadResultWithoutForwardingTerminalContent(t *testing.T) {
 	reader := &notifierReader{result: herdr.ReadResult{PaneID: "other-pane", Text: "不应发送的内容"}}
 	im := &notifierIM{}
@@ -206,6 +223,29 @@ func TestNotifierSnapshotSplittingIsUTF8AndCodeFenceSafe(t *testing.T) {
 	}
 }
 
+func TestNotifierStatusTitleIsSplitWithinMarkdownLimit(t *testing.T) {
+	im := &notifierIM{}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	transition := notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)
+	transition.Target.Title = strings.Repeat("中", panel.WeComContentLimit)
+
+	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
+		t.Fatalf("HandleTransition() 返回错误：%v", err)
+	}
+	messages := im.Messages()
+	if len(messages) < 2 {
+		t.Fatalf("超长状态标题未分段：%#v", messages)
+	}
+	for index, message := range messages {
+		if len(message) > panel.WeComContentLimit || !utf8.ValidString(message) {
+			t.Fatalf("状态标题分段 %d 不安全：bytes=%d", index, len(message))
+		}
+	}
+	if !strings.Contains(strings.Join(messages, ""), "中") {
+		t.Fatal("状态标题分段丢失 UTF-8 内容")
+	}
+}
+
 func TestNotifierTargetInvalidatedIsDeduplicatedByOccupant(t *testing.T) {
 	im := &notifierIM{}
 	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
@@ -223,6 +263,27 @@ func TestNotifierTargetInvalidatedIsDeduplicatedByOccupant(t *testing.T) {
 	}
 	if messages := im.Messages(); len(messages) != 2 || !strings.Contains(messages[0], "目标已失效") {
 		t.Fatalf("目标失效通知 = %#v", messages)
+	}
+}
+
+func TestNotifierResetDoesNotLetOldInflightDeliveryRestoreDedupe(t *testing.T) {
+	im := &blockingNotifierIM{started: make(chan struct{}), release: make(chan struct{})}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	transition := notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)
+	result := make(chan error, 1)
+	go func() { result <- notifier.HandleTransition(context.Background(), transition) }()
+	<-im.started
+
+	notifier.Reset()
+	close(im.release)
+	if err := <-result; err != nil {
+		t.Fatalf("旧周期 HandleTransition() 返回错误：%v", err)
+	}
+	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
+		t.Fatalf("新周期 HandleTransition() 返回错误：%v", err)
+	}
+	if got := im.Count(); got != 2 {
+		t.Fatalf("Reset 后同一状态通知次数 = %d，期望新周期重新发送", got)
 	}
 }
 
@@ -291,6 +352,36 @@ type notifierIM struct {
 	messages []string
 	failAt   int
 	calls    int
+}
+
+type blockingNotifierIM struct {
+	mu      sync.Mutex
+	count   int
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (i *blockingNotifierIM) RespondMarkdown(context.Context, string, string) error {
+	return errors.New("Notifier 不应回复入站回调")
+}
+
+func (i *blockingNotifierIM) SendMarkdown(context.Context, string) error {
+	i.mu.Lock()
+	i.count++
+	count := i.count
+	i.mu.Unlock()
+	if count == 1 {
+		i.once.Do(func() { close(i.started) })
+		<-i.release
+	}
+	return nil
+}
+
+func (i *blockingNotifierIM) Count() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.count
 }
 
 func (i *notifierIM) RespondMarkdown(context.Context, string, string) error {

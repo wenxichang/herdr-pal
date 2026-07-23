@@ -39,6 +39,7 @@ type Notifier struct {
 	mu       sync.Mutex
 	recent   map[string]notificationKey
 	inflight map[string]chan struct{}
+	epoch    uint64
 }
 
 // NewNotifier 创建状态通知器并校验必需依赖。
@@ -52,6 +53,17 @@ func NewNotifier(im IMAdapter, read ReadRecentFunc) (*Notifier, error) {
 		recent:   make(map[string]notificationKey),
 		inflight: make(map[string]chan struct{}),
 	}, nil
+}
+
+// Reset 清空当前进程内的通知去重基线，供 Herdr 重连后的新健康周期使用。
+func (n *Notifier) Reset() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.epoch++
+	n.recent = make(map[string]notificationKey)
+	n.mu.Unlock()
 }
 
 // HandleTransition 根据状态迁移发送主动通知。
@@ -70,7 +82,7 @@ func (n *Notifier) HandleTransition(ctx context.Context, transition session.Tran
 		kind:        "status",
 		status:      transition.Current,
 	}
-	parts := []string{renderStatusTitle(title, transition.Target)}
+	parts := renderStatusTitleParts(title, transition.Target)
 	if includeSnapshot {
 		result, err := n.read(ctx, transition.Target.TerminalID, panel.PageSize)
 		if err == nil && result.PaneID == transition.Target.PaneID {
@@ -89,7 +101,7 @@ func (n *Notifier) TargetInvalidated(ctx context.Context, target session.Target)
 		return ErrInvalidNotifierDependency
 	}
 	key := notificationKey{paneID: target.PaneID, occupantKey: target.OccupantKey, kind: "invalidated"}
-	return n.deliverOnce(ctx, target.PaneID, key, []string{renderStatusTitle("Agent 目标已失效，请重新执行 /ls 和 /sel。", target)})
+	return n.deliverOnce(ctx, target.PaneID, key, renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target))
 }
 
 func notificationPolicy(transition session.Transition) (title string, includeSnapshot, notify bool) {
@@ -133,12 +145,13 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 		}
 		completed := make(chan struct{})
 		n.inflight[paneID] = completed
+		deliveryEpoch := n.epoch
 		n.mu.Unlock()
 
 		err := n.sendParts(ctx, parts)
 
 		n.mu.Lock()
-		if err == nil {
+		if err == nil && n.epoch == deliveryEpoch {
 			n.recent[paneID] = key
 		}
 		delete(n.inflight, paneID)
@@ -170,6 +183,14 @@ func renderStatusTitle(title string, target session.Target) string {
 		content += "\n标题：" + safeLabel(target.Title)
 	}
 	return content
+}
+
+func renderStatusTitleParts(title string, target session.Target) []string {
+	content := renderStatusTitle(title, target)
+	if len(content) <= panel.WeComContentLimit {
+		return []string{content}
+	}
+	return panel.SplitMarkdown(content, panel.WeComContentLimit)
 }
 
 func renderNotificationSnapshot(target session.Target, lines []string) []string {
