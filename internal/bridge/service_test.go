@@ -94,6 +94,30 @@ func TestServiceListAndSelectionResetPanel(t *testing.T) {
 	}
 }
 
+func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T) {
+	service, _ := newTestService(t)
+	service.registry.Replace(herdr.Snapshot{
+		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-2", Number: 2, Label: "工作区二"}, {WorkspaceID: "workspace-1", Number: 1, Label: "工作区一"}},
+		Tabs:       []herdr.Tab{{TabID: "tab-2", WorkspaceID: "workspace-2", Number: 2, Label: "标签二"}, {TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "标签一"}},
+		Panes: []herdr.Pane{
+			{PaneID: "pane-z", TerminalID: "terminal-z", WorkspaceID: "workspace-2", TabID: "tab-2", Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"), Title: stringRef("第二项"), AgentStatus: herdr.AgentStatusDone},
+			{PaneID: "pane-a", TerminalID: "terminal-a", WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude"), Title: stringRef("第一项\n```注入"), AgentStatus: herdr.AgentStatusBlocked},
+		},
+	}, false)
+	service.HandleMessage(context.Background(), incoming("list-details", "/ls"))
+	list := fakeIMFromService(t, service).lastReply()
+	for _, want := range []string{"1. Claude", "标题：第一项 ``\u200b`注入", "工作区一 / 标签一", "状态：blocked", "面板：pane-a", "2. Codex", "标题：第二项", "工作区二 / 标签二", "状态：done", "面板：pane-z"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("list missing %q: %q", want, list)
+		}
+	}
+	service.HandleMessage(context.Background(), incoming("list-select", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("list-current", "/ls"))
+	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "1. Claude（当前选择）") {
+		t.Fatalf("current marker missing: %q", fakeIMFromService(t, service).lastReply())
+	}
+}
+
 func TestServicePromptPreservesBytesAndChecksLiveAgent(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
@@ -127,10 +151,23 @@ func TestServiceKeyAliasesSendOnceWithoutConfirmation(t *testing.T) {
 			if got := fake.keys(); len(got) != 1 || got[0].key != test.key {
 				t.Fatalf("key calls = %#v", got)
 			}
+			if got := strings.Join(fake.callOrder(), ","); got != "get,key" {
+				t.Fatalf("key call order = %q, want get,key", got)
+			}
 			if strings.Contains(fakeIMFromService(t, service).lastReply(), "确认") {
 				t.Fatalf("key reply asks confirmation: %q", fakeIMFromService(t, service).lastReply())
 			}
 		})
+	}
+}
+
+func TestServiceKeyMismatchClearsSelectionWithoutSending(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.setAgent(agentInfo("pane-1", "terminal-1", "other"))
+	service.HandleMessage(context.Background(), incoming("key-mismatch", "/key enter"))
+	if len(fake.keys()) != 0 || !strings.Contains(fakeIMFromService(t, service).lastReply(), "/sel") {
+		t.Fatalf("mismatch keys=%#v reply=%q", fake.keys(), fakeIMFromService(t, service).lastReply())
 	}
 }
 
@@ -176,6 +213,35 @@ func TestServiceContentAndPaging(t *testing.T) {
 	}
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "第 0 页") {
 		t.Fatalf("pagedown reply = %q", fakeIMFromService(t, service).lastReply())
+	}
+}
+
+func TestServiceSelectResetsExistingPanelCache(t *testing.T) {
+	service, fake := newTestService(t)
+	service.registry.Replace(twoTargetSnapshot(), false)
+	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
+	service.HandleMessage(context.Background(), incoming("select-one", "/sel 1"))
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(100, 200)}
+	service.HandleMessage(context.Background(), incoming("select-content", "/con"))
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(0, 200)}
+	service.HandleMessage(context.Background(), incoming("select-pageup", "/pageup"))
+	service.HandleMessage(context.Background(), incoming("select-list-again", "/ls"))
+	service.HandleMessage(context.Background(), incoming("select-two", "/sel 2"))
+	beforeReads := len(fake.reads())
+	service.HandleMessage(context.Background(), incoming("select-pagedown", "/pagedn"))
+	if len(fake.reads()) != beforeReads || !strings.Contains(fakeIMFromService(t, service).lastReply(), "/con") {
+		t.Fatalf("selection retained old panel: reads=%#v reply=%q", fake.reads(), fakeIMFromService(t, service).lastReply())
+	}
+}
+
+func TestServiceContentNormalizesTerminalControls(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: "\x1b]0;title\a\x1b[31mred\x1b[0m\rfinal\x00  \n"}
+	service.HandleMessage(context.Background(), incoming("normalize", "/con"))
+	reply := fakeIMFromService(t, service).lastReply()
+	if strings.Contains(reply, "\x1b") || strings.Contains(reply, "red") || !strings.Contains(reply, "final") {
+		t.Fatalf("terminal normalization reply = %q", reply)
 	}
 }
 
@@ -280,6 +346,147 @@ func TestServiceSplitsTerminalReplyAndStopsAfterIMFailure(t *testing.T) {
 	}
 }
 
+func TestServiceStopsAfterFirstPushFailure(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: strings.Repeat("终端行\n", 9000)}
+	im := fakeIMFromService(t, service)
+	im.sendErr = errors.New("network")
+	_, beforePushes := im.deliveryCounts()
+	service.HandleMessage(context.Background(), incoming("push-fail", "/con"))
+	if got := im.pushCount() - beforePushes; got != 1 {
+		t.Fatalf("push attempts = %d, want 1", got)
+	}
+}
+
+func TestServiceInvalidateDoesNotWaitForBlockingIMReply(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	im := fakeIMFromService(t, service)
+	im.blockRespond = make(chan struct{})
+	im.respondStarted = make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("blocking-reply", "prompt"))
+		close(done)
+	}()
+	awaitSignal(t, im.respondStarted, "RespondMarkdown")
+	invalidated := make(chan struct{})
+	go func() { service.InvalidateSelection(); close(invalidated) }()
+	awaitSignal(t, invalidated, "InvalidateSelection")
+	close(im.blockRespond)
+	awaitSignal(t, done, "HandleMessage")
+	if len(fake.prompts()) != 1 {
+		t.Fatalf("prompt calls = %#v", fake.prompts())
+	}
+}
+
+func TestServiceSetNilWaitsForHerdrOperationAndThenBlocksNewOperations(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.blockPrompt = make(chan struct{})
+	fake.promptStarted = make(chan struct{}, 1)
+	promptDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("blocked-prompt", "prompt"))
+		close(promptDone)
+	}()
+	awaitSignal(t, fake.promptStarted, "Prompt")
+	setDone := make(chan struct{})
+	go func() { service.SetHerdr(nil); close(setDone) }()
+	assertNotClosed(t, setDone, "SetHerdr(nil) returned before Prompt")
+	close(fake.blockPrompt)
+	awaitSignal(t, promptDone, "prompt HandleMessage")
+	awaitSignal(t, setDone, "SetHerdr(nil)")
+	before := fake.callCount()
+	service.HandleMessage(context.Background(), incoming("after-nil", "prompt"))
+	service.HandleMessage(context.Background(), incoming("after-nil-key", "/key enter"))
+	service.HandleMessage(context.Background(), incoming("after-nil-read", "/con"))
+	if fake.callCount() != before {
+		t.Fatalf("new operation called old client after nil: %#v", fake)
+	}
+}
+
+func TestServiceConcurrentInvalidationsDoNotLetInputThrough(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.blockPrompt = make(chan struct{})
+	fake.promptStarted = make(chan struct{}, 1)
+	promptDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("multi-invalidate-prompt", "prompt"))
+		close(promptDone)
+	}()
+	awaitSignal(t, fake.promptStarted, "Prompt")
+	firstDone, secondDone := make(chan struct{}), make(chan struct{})
+	go func() { service.InvalidateSelection(); close(firstDone) }()
+	go func() { service.InvalidateSelection(); close(secondDone) }()
+	assertNotClosed(t, firstDone, "first InvalidateSelection returned before Prompt")
+	assertNotClosed(t, secondDone, "second InvalidateSelection returned before Prompt")
+	close(fake.blockPrompt)
+	awaitSignal(t, promptDone, "prompt")
+	awaitSignal(t, firstDone, "first InvalidateSelection")
+	awaitSignal(t, secondDone, "second InvalidateSelection")
+	before := fake.callCount()
+	service.HandleMessage(context.Background(), incoming("multi-invalidate-after", "prompt"))
+	if fake.callCount() != before {
+		t.Fatalf("input passed after invalidations: %#v", fake)
+	}
+}
+
+func TestServiceInvalidateAndSetNilWaitForBlockingGetAgent(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.blockGet = make(chan struct{})
+	fake.getStarted = make(chan struct{}, 1)
+	inputDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("blocked-get", "prompt"))
+		close(inputDone)
+	}()
+	awaitSignal(t, fake.getStarted, "GetAgent")
+	invalidated := make(chan struct{})
+	setDone := make(chan struct{})
+	go func() { service.InvalidateSelection(); close(invalidated) }()
+	go func() { service.SetHerdr(nil); close(setDone) }()
+	assertNotClosed(t, invalidated, "InvalidateSelection returned before GetAgent")
+	assertNotClosed(t, setDone, "SetHerdr(nil) returned before GetAgent")
+	close(fake.blockGet)
+	awaitSignal(t, inputDone, "input")
+	awaitSignal(t, invalidated, "InvalidateSelection")
+	awaitSignal(t, setDone, "SetHerdr(nil)")
+}
+
+func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
+	service, fake := newTestService(t)
+	service.registry.Replace(twoTargetSnapshot(), false)
+	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
+	service.HandleMessage(context.Background(), incoming("select-one", "/sel 1"))
+	fake.blockPrompt = make(chan struct{})
+	fake.promptStarted = make(chan struct{}, 1)
+	promptDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("select-blocked", "prompt"))
+		close(promptDone)
+	}()
+	awaitSignal(t, fake.promptStarted, "Prompt")
+	selectDone := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), incoming("select-two", "/sel 2"))
+		close(selectDone)
+	}()
+	assertNotClosed(t, selectDone, "/sel returned before Prompt")
+	close(fake.blockPrompt)
+	awaitSignal(t, promptDone, "prompt")
+	awaitSignal(t, selectDone, "/sel")
+	fake.setAgent(herdr.AgentInfo{PaneID: "pane-2", TerminalID: "terminal-2", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude")})
+	service.HandleMessage(context.Background(), incoming("select-two-prompt", "prompt"))
+	got := fake.prompts()
+	if len(got) != 2 || got[1].target != "terminal-2" {
+		t.Fatalf("selection target calls = %#v", got)
+	}
+}
+
 func TestServiceConcurrentDuplicateAndStateChangesAreRaceSafe(t *testing.T) {
 	service, fake := newTestService(t)
 	selectTarget(t, service)
@@ -344,6 +551,12 @@ func testSnapshot() herdr.Snapshot {
 	}
 }
 
+func twoTargetSnapshot() herdr.Snapshot {
+	snapshot := testSnapshot()
+	snapshot.Panes = append(snapshot.Panes, herdr.Pane{PaneID: "pane-2", TerminalID: "terminal-2", WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude"), Title: stringRef("second"), AgentStatus: herdr.AgentStatusIdle})
+	return snapshot
+}
+
 func agentInfo(paneID, terminalID, agent string) herdr.AgentInfo {
 	return herdr.AgentInfo{PaneID: paneID, TerminalID: terminalID, Agent: stringRef(agent), DisplayAgent: stringRef("Codex")}
 }
@@ -366,47 +579,80 @@ type readCall struct {
 }
 
 type fakeHerdr struct {
-	mu          sync.Mutex
-	agent       herdr.AgentInfo
-	getErr      error
-	read        herdr.ReadResult
-	readErr     error
-	promptErr   error
-	keyErr      error
-	getCalls    []string
-	readCalls   []readCall
-	promptCalls []promptCall
-	keyCalls    []keyCall
-	order       []string
+	mu            sync.Mutex
+	agent         herdr.AgentInfo
+	getErr        error
+	read          herdr.ReadResult
+	readErr       error
+	promptErr     error
+	keyErr        error
+	getCalls      []string
+	readCalls     []readCall
+	promptCalls   []promptCall
+	keyCalls      []keyCall
+	order         []string
+	blockGet      chan struct{}
+	blockRead     chan struct{}
+	blockPrompt   chan struct{}
+	blockKey      chan struct{}
+	getStarted    chan struct{}
+	readStarted   chan struct{}
+	promptStarted chan struct{}
+	keyStarted    chan struct{}
 }
 
 func (f *fakeHerdr) GetAgent(_ context.Context, target string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.getCalls = append(f.getCalls, target)
 	f.order = append(f.order, "get")
-	return f.agent, f.getErr
+	agent, err, block, started := f.agent, f.getErr, f.blockGet, f.getStarted
+	f.mu.Unlock()
+	signal(started)
+	if block != nil {
+		<-block
+	}
+	return agent, err
 }
 func (f *fakeHerdr) ReadRecent(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.readCalls = append(f.readCalls, readCall{target, lines})
 	f.order = append(f.order, "read")
-	return f.read, f.readErr
+	result, err, block, started := f.read, f.readErr, f.blockRead, f.readStarted
+	f.mu.Unlock()
+	signal(started)
+	if block != nil {
+		<-block
+	}
+	return result, err
 }
 func (f *fakeHerdr) Prompt(_ context.Context, target, text string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.promptCalls = append(f.promptCalls, promptCall{target, text})
 	f.order = append(f.order, "prompt")
-	return f.promptErr
+	err, block, started := f.promptErr, f.blockPrompt, f.promptStarted
+	f.mu.Unlock()
+	signal(started)
+	if block != nil {
+		<-block
+	}
+	return err
 }
 func (f *fakeHerdr) SendKey(_ context.Context, target, key string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.keyCalls = append(f.keyCalls, keyCall{target, key})
 	f.order = append(f.order, "key")
-	return f.keyErr
+	err, block, started := f.keyErr, f.blockKey, f.keyStarted
+	f.mu.Unlock()
+	signal(started)
+	if block != nil {
+		<-block
+	}
+	return err
+}
+func (f *fakeHerdr) setAgent(agent herdr.AgentInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agent = agent
 }
 func (f *fakeHerdr) prompts() []promptCall {
 	f.mu.Lock()
@@ -440,18 +686,25 @@ func (f *fakeHerdr) callCount() int {
 }
 
 type fakeIM struct {
-	mu         sync.Mutex
-	replies    []string
-	pushes     []string
-	respondErr error
-	sendErr    error
+	mu             sync.Mutex
+	replies        []string
+	pushes         []string
+	respondErr     error
+	sendErr        error
+	blockRespond   chan struct{}
+	respondStarted chan struct{}
 }
 
 func (f *fakeIM) RespondMarkdown(_ context.Context, _ string, content string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.replies = append(f.replies, content)
-	return f.respondErr
+	err, block, started := f.respondErr, f.blockRespond, f.respondStarted
+	f.mu.Unlock()
+	signal(started)
+	if block != nil {
+		<-block
+	}
+	return err
 }
 func (f *fakeIM) SendMarkdown(_ context.Context, content string) error {
 	f.mu.Lock()
@@ -482,4 +735,28 @@ func fakeIMFromService(t *testing.T, service *Service) *fakeIM {
 		t.Fatalf("service IM = %T, want *fakeIM", service.im)
 	}
 	return im
+}
+
+func signal(channel chan<- struct{}) {
+	if channel != nil {
+		channel <- struct{}{}
+	}
+}
+
+func awaitSignal(t *testing.T, channel <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-channel:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func assertNotClosed(t *testing.T, channel <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-channel:
+		t.Fatal(name)
+	case <-time.After(30 * time.Millisecond):
+	}
 }
