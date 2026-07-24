@@ -1396,7 +1396,13 @@ func (c *supervisorClient) ReadRecent(context.Context, string, int) (herdr.ReadR
 	return herdr.ReadResult{}, nil
 }
 
-func (c *supervisorClient) Prompt(context.Context, string, string) error { return nil }
+func (c *supervisorClient) PromptUntilStateChange(context.Context, string, string) (herdr.AgentInfo, error) {
+	return herdr.AgentInfo{}, nil
+}
+
+func (c *supervisorClient) WaitForStateChange(context.Context, string, uint64, time.Duration) (herdr.AgentInfo, error) {
+	return herdr.AgentInfo{}, nil
+}
 
 func (c *supervisorClient) SendKey(context.Context, string, string) error { return nil }
 

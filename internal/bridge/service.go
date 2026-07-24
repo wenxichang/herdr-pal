@@ -22,14 +22,18 @@ import (
 // ErrInvalidServiceDependency 表示 BridgeService 缺少必需依赖。
 var ErrInvalidServiceDependency = errors.New("BridgeService 依赖无效")
 
+const promptRecoveryTimeout = 5 * time.Second
+
 // HerdrAPI 是入站命令所需的最小 Herdr 公共 API。
 type HerdrAPI interface {
 	// GetAgent 查询目标当前的 Agent occupant。
 	GetAgent(ctx context.Context, target string) (herdr.AgentInfo, error)
 	// ReadRecent 读取目标的 recent_unwrapped 终端快照。
 	ReadRecent(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
-	// Prompt 向目标发送普通文本输入。
-	Prompt(ctx context.Context, target, text string) error
+	// PromptUntilStateChange 向目标发送普通文本并等待首次状态变化。
+	PromptUntilStateChange(ctx context.Context, target, text string) (herdr.AgentInfo, error)
+	// WaitForStateChange 等待目标的状态变化序列离开 baseline。
+	WaitForStateChange(ctx context.Context, target string, baseline uint64, timeout time.Duration) (herdr.AgentInfo, error)
 	// SendKey 向目标发送一个已校验的 UI 按键。
 	SendKey(ctx context.Context, target, key string) error
 }
@@ -284,13 +288,103 @@ func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, 
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	err = client.Prompt(ctx, target.PaneID, text)
-	release()
-	if err != nil {
+	if !canAcceptPrompt(current.AgentStatus) {
+		release()
+		s.reply(ctx, message.RequestID, fmt.Sprintf("Agent 当前状态为 %s，暂不接受普通文本。", safeLabel(string(current.AgentStatus))))
+		return
+	}
+	changed, err := client.PromptUntilStateChange(ctx, target.PaneID, text)
+	if err == nil && !session.MatchesAgent(target, changed) {
+		release()
+		s.invalidateExpected(target)
+		s.reply(ctx, message.RequestID, targetChangedMessage)
+		return
+	}
+	if err != nil && !isPromptStalled(err) {
+		release()
 		s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
 		return
 	}
-	s.reply(ctx, message.RequestID, "已发送。")
+	if err != nil {
+		audits, auditErr := prepareKeyAudits(message.UserID, target, "enter", time.Now().UTC())
+		if auditErr != nil {
+			release()
+			s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
+			return
+		}
+		rechecked, getErr := client.GetAgent(ctx, target.PaneID)
+		if getErr != nil {
+			s.keyAudit.RecordKeyAudit(audits.failed)
+			release()
+			s.reply(ctx, message.RequestID, unavailableMessage)
+			return
+		}
+		if !session.MatchesAgent(target, rechecked) {
+			s.keyAudit.RecordKeyAudit(audits.rejected)
+			release()
+			s.invalidateExpected(target)
+			s.reply(ctx, message.RequestID, targetChangedMessage)
+			return
+		}
+		if promptStateChanged(current, rechecked) {
+			s.keyAudit.RecordKeyAudit(audits.rejected)
+			release()
+			s.replyPromptSuccess(ctx, message.RequestID, rechecked.AgentStatus)
+			return
+		}
+		if !canAcceptPrompt(rechecked.AgentStatus) {
+			s.keyAudit.RecordKeyAudit(audits.rejected)
+			release()
+			s.reply(ctx, message.RequestID, fmt.Sprintf("Agent 当前状态为 %s，未补发 Enter。", safeLabel(string(rechecked.AgentStatus))))
+			return
+		}
+		if sendErr := client.SendKey(ctx, target.PaneID, "enter"); sendErr != nil {
+			s.keyAudit.RecordKeyAudit(audits.failed)
+			release()
+			s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
+			return
+		}
+		s.keyAudit.RecordKeyAudit(audits.sent)
+		changed, err = client.WaitForStateChange(ctx, target.PaneID, current.StateChangeSeq, promptRecoveryTimeout)
+		if err != nil {
+			release()
+			if errors.Is(err, herdr.ErrAgentStateChangeTimeout) {
+				s.reply(ctx, message.RequestID, "发送未生效，请检查 Agent 界面。")
+			} else {
+				s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
+			}
+			return
+		}
+		if !session.MatchesAgent(target, changed) {
+			release()
+			s.invalidateExpected(target)
+			s.reply(ctx, message.RequestID, targetChangedMessage)
+			return
+		}
+	}
+	release()
+	if !promptStateChanged(current, changed) {
+		s.reply(ctx, message.RequestID, "发送未生效，请检查 Agent 界面。")
+		return
+	}
+	s.replyPromptSuccess(ctx, message.RequestID, changed.AgentStatus)
+}
+
+func canAcceptPrompt(status herdr.AgentStatus) bool {
+	return status == herdr.AgentStatusIdle || status == herdr.AgentStatusDone
+}
+
+func promptStateChanged(before, after herdr.AgentInfo) bool {
+	return before.AgentStatus != after.AgentStatus || before.StateChangeSeq != after.StateChangeSeq
+}
+
+func isPromptStalled(err error) bool {
+	var apiErr *herdr.APIError
+	return errors.As(err, &apiErr) && apiErr.Code == "agent_prompt_stalled"
+}
+
+func (s *Service) replyPromptSuccess(ctx context.Context, requestID string, status herdr.AgentStatus) {
+	s.reply(ctx, requestID, fmt.Sprintf("已发送，Agent 状态已变为 %s。", safeLabel(string(status))))
 }
 
 func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key string) {

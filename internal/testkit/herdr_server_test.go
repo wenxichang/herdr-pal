@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -116,6 +117,57 @@ func TestHerdrServerAgentTargetsRequirePaneIDOrUniqueName(t *testing.T) {
 		"id": "duplicate-name", "method": "agent.get", "params": map[string]any{"target": "unique-agent"},
 	}); response.Error == nil || response.Error.Code != "agent_not_found" {
 		t.Fatalf("duplicate name response = %#v, want agent_not_found", response)
+	}
+}
+
+func TestHerdrServerPromptWaitTransitionsAgentAndReturnsStateChange(t *testing.T) {
+	snapshot := testkitSnapshot()
+	snapshot.Panes[0].AgentStatus = herdr.AgentStatusIdle
+	snapshot.Agents[0].AgentStatus = herdr.AgentStatusIdle
+	snapshot.Agents[0].StateChangeSeq = 7
+	server := NewHerdrServer(t, snapshot)
+	client := herdr.NewClient(server.SocketPath(), nil, time.Second)
+
+	changed, err := client.PromptUntilStateChange(context.Background(), "pane-1", "continue")
+	if err != nil {
+		t.Fatalf("PromptUntilStateChange() error = %v", err)
+	}
+	if changed.AgentStatus != herdr.AgentStatusWorking || changed.StateChangeSeq != 8 {
+		t.Fatalf("changed agent = %+v", changed)
+	}
+	current, err := client.GetAgent(context.Background(), "pane-1")
+	if err != nil {
+		t.Fatalf("GetAgent() error = %v", err)
+	}
+	if current.AgentStatus != herdr.AgentStatusWorking || current.StateChangeSeq != 8 {
+		t.Fatalf("current agent = %+v", current)
+	}
+}
+
+func TestHerdrServerPromptStallCanRecoverOnEnter(t *testing.T) {
+	snapshot := testkitSnapshot()
+	snapshot.Panes[0].AgentStatus = herdr.AgentStatusIdle
+	snapshot.Agents[0].AgentStatus = herdr.AgentStatusIdle
+	snapshot.Agents[0].StateChangeSeq = 7
+	server := NewHerdrServer(t, snapshot)
+	server.SetPromptWaitStalls(1)
+	server.SetEnterTransition(herdr.AgentStatusWorking)
+	client := herdr.NewClient(server.SocketPath(), nil, time.Second)
+
+	_, err := client.PromptUntilStateChange(context.Background(), "pane-1", "continue")
+	var apiError *herdr.APIError
+	if !errors.As(err, &apiError) || apiError.Code != "agent_prompt_stalled" {
+		t.Fatalf("PromptUntilStateChange() error = %v, want agent_prompt_stalled", err)
+	}
+	if err := client.SendKey(context.Background(), "pane-1", "enter"); err != nil {
+		t.Fatalf("SendKey() error = %v", err)
+	}
+	changed, err := client.WaitForStateChange(context.Background(), "pane-1", 7, time.Second)
+	if err != nil {
+		t.Fatalf("WaitForStateChange() error = %v", err)
+	}
+	if changed.AgentStatus != herdr.AgentStatusWorking || changed.StateChangeSeq != 8 {
+		t.Fatalf("changed agent = %+v", changed)
 	}
 }
 

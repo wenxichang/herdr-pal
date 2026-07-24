@@ -134,8 +134,207 @@ func TestServicePromptPreservesBytesAndChecksLiveAgent(t *testing.T) {
 		t.Fatalf("call order = %#v, want get,prompt", got)
 	}
 	reply := fakeIMFromService(t, service).lastReply()
-	if !strings.Contains(reply, "已发送") || strings.Contains(reply, "keep") {
+	if !strings.Contains(reply, "已发送") || !strings.Contains(reply, "working") || strings.Contains(reply, "keep") {
 		t.Fatalf("prompt reply = %q", reply)
+	}
+}
+
+func TestServicePromptOnlyAcceptsIdleAndDone(t *testing.T) {
+	tests := []struct {
+		status herdr.AgentStatus
+		sent   bool
+	}{
+		{status: herdr.AgentStatusIdle, sent: true},
+		{status: herdr.AgentStatusDone, sent: true},
+		{status: herdr.AgentStatusWorking, sent: false},
+		{status: herdr.AgentStatusBlocked, sent: false},
+		{status: herdr.AgentStatusUnknown, sent: false},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			service, fake := newTestService(t)
+			selectTarget(t, service)
+			current := agentInfo("pane-1", "terminal-1", "codex")
+			current.AgentStatus = test.status
+			fake.setAgent(current)
+			fake.promptResult = changedAgent(current, herdr.AgentStatusWorking)
+
+			service.HandleMessage(context.Background(), incoming("prompt-status-"+string(test.status), "prompt"))
+
+			if got := len(fake.prompts()); (got == 1) != test.sent {
+				t.Fatalf("prompt calls = %d, sent = %v", got, test.sent)
+			}
+			reply := fakeIMFromService(t, service).lastReply()
+			if test.sent {
+				if !strings.Contains(reply, "working") {
+					t.Fatalf("success reply = %q", reply)
+				}
+			} else if !strings.Contains(reply, string(test.status)) {
+				t.Fatalf("rejected reply = %q, want status %s", reply, test.status)
+			}
+		})
+	}
+}
+
+func TestServicePromptStallSendsOneEnterAndWaitsForChange(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	current := fake.currentAgent()
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+	fake.waitResult = changedAgent(current, herdr.AgentStatusWorking)
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-recover", "prompt"))
+
+	if got := strings.Join(fake.callOrder(), ","); got != "get,prompt,get,key,wait" {
+		t.Fatalf("call order = %q", got)
+	}
+	if keys := fake.keys(); len(keys) != 1 || keys[0].key != "enter" {
+		t.Fatalf("keys = %#v", keys)
+	}
+	waits := fake.waits()
+	if len(waits) != 1 || waits[0].baseline != current.StateChangeSeq || waits[0].timeout != 5*time.Second {
+		t.Fatalf("waits = %#v", waits)
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "working") {
+		t.Fatalf("reply = %q", reply)
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Key() != "enter" || audits[0].Result() != policy.AuditResultSent {
+		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+func TestServicePromptStallSkipsEnterWhenRecheckAlreadyChanged(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	current := fake.currentAgent()
+	changed := changedAgent(current, herdr.AgentStatusWorking)
+	fake.setGetResults(agentGetResult{agent: current}, agentGetResult{agent: changed})
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-late-change", "prompt"))
+
+	if len(fake.keys()) != 0 || len(fake.waits()) != 0 {
+		t.Fatalf("unexpected recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "working") {
+		t.Fatalf("reply = %q", reply)
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultRejected {
+		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+func TestServicePromptStallTimesOutAfterOneEnter(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+	fake.waitErr = herdr.ErrAgentStateChangeTimeout
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-timeout", "prompt"))
+
+	if len(fake.keys()) != 1 || len(fake.waits()) != 1 {
+		t.Fatalf("recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "未生效") || strings.Contains(reply, "已发送") {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestServicePromptStallDoesNotRetryOtherErrors(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.promptErr = errors.New("private prompt failure")
+
+	service.HandleMessage(context.Background(), incoming("prompt-other-error", "prompt"))
+
+	if len(fake.keys()) != 0 || len(fake.waits()) != 0 || len(fakeAuditFromService(t, service).records()) != 0 {
+		t.Fatalf("unexpected recovery: keys=%#v waits=%#v audits=%#v", fake.keys(), fake.waits(), fakeAuditFromService(t, service).records())
+	}
+}
+
+func TestServicePromptStallInvalidatesReplacedOccupant(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	current := fake.currentAgent()
+	replacement := agentInfo("pane-1", "terminal-replaced", "claude")
+	fake.setGetResults(agentGetResult{agent: current}, agentGetResult{agent: replacement})
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-replaced", "prompt"))
+
+	if len(fake.keys()) != 0 || len(fake.waits()) != 0 {
+		t.Fatalf("replacement reached recovery: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	if _, err := service.registry.ValidateSelected(); err == nil {
+		t.Fatal("replacement did not invalidate selection")
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultRejected {
+		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+func TestServicePromptStallInvalidatesReplacementObservedAfterEnter(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+	fake.waitResult = agentInfo("pane-1", "terminal-replaced", "claude")
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-replaced-after-enter", "prompt"))
+
+	if len(fake.keys()) != 1 || len(fake.waits()) != 1 {
+		t.Fatalf("recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	if _, err := service.registry.ValidateSelected(); err == nil {
+		t.Fatal("replacement did not invalidate selection")
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/sel") {
+		t.Fatalf("replacement reply = %q", reply)
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultSent {
+		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+func TestServicePromptStallAuditsFailedRecheck(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	current := fake.currentAgent()
+	fake.setGetResults(agentGetResult{agent: current}, agentGetResult{err: errors.New("private get failure")})
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-recheck-failed", "prompt"))
+
+	if len(fake.keys()) != 0 || len(fake.waits()) != 0 {
+		t.Fatalf("unexpected recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultFailed {
+		t.Fatalf("audits = %#v", audits)
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "暂不可用") {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestServicePromptStallAuditsFailedEnter(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+	fake.keyErr = errors.New("private key failure")
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-key-failed", "prompt"))
+
+	if len(fake.keys()) != 1 || len(fake.waits()) != 0 {
+		t.Fatalf("recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 1 || audits[0].Result() != policy.AuditResultFailed {
+		t.Fatalf("audits = %#v", audits)
 	}
 }
 
@@ -922,7 +1121,10 @@ func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 	close(fake.blockPrompt)
 	awaitSignal(t, promptDone, "prompt")
 	awaitSignal(t, selectDone, "/sel")
-	fake.setAgent(herdr.AgentInfo{PaneID: "pane-2", TerminalID: "terminal-2", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude")})
+	second := agentInfo("pane-2", "terminal-2", "claude")
+	second.DisplayAgent = stringRef("Claude")
+	fake.setAgent(second)
+	fake.promptResult = changedAgent(second, herdr.AgentStatusWorking)
 	service.HandleMessage(context.Background(), incoming("select-two-prompt", "prompt"))
 	got := fake.prompts()
 	if len(got) != 2 || got[1].target != "pane-2" {
@@ -1003,7 +1205,8 @@ func newTestService(t *testing.T) (*Service, *fakeHerdr) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fake := &fakeHerdr{agent: agentInfo("pane-1", "terminal-1", "codex")}
+	current := agentInfo("pane-1", "terminal-1", "codex")
+	fake := &fakeHerdr{agent: current, promptResult: changedAgent(current, herdr.AgentStatusWorking)}
 	im := &fakeIM{}
 	audit := &fakeKeyAuditSink{}
 	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, audit)
@@ -1048,7 +1251,13 @@ func twoTargetSnapshot() herdr.Snapshot {
 }
 
 func agentInfo(paneID, terminalID, agent string) herdr.AgentInfo {
-	return herdr.AgentInfo{PaneID: paneID, TerminalID: terminalID, Agent: stringRef(agent), DisplayAgent: stringRef("Codex")}
+	return herdr.AgentInfo{PaneID: paneID, TerminalID: terminalID, Agent: stringRef(agent), DisplayAgent: stringRef("Codex"), AgentStatus: herdr.AgentStatusIdle, StateChangeSeq: 1}
+}
+
+func changedAgent(agent herdr.AgentInfo, status herdr.AgentStatus) herdr.AgentInfo {
+	agent.AgentStatus = status
+	agent.StateChangeSeq++
+	return agent
 }
 
 func stringRef(value string) *string { return &value }
@@ -1082,6 +1291,16 @@ func replacedSnapshot() herdr.Snapshot {
 
 type promptCall struct{ target, text string }
 type keyCall struct{ target, key string }
+type waitCall struct {
+	target   string
+	baseline uint64
+	timeout  time.Duration
+}
+
+type agentGetResult struct {
+	agent herdr.AgentInfo
+	err   error
+}
 type readCall struct {
 	target string
 	lines  int
@@ -1091,13 +1310,18 @@ type fakeHerdr struct {
 	mu            sync.Mutex
 	agent         herdr.AgentInfo
 	getErr        error
+	getResults    []agentGetResult
 	read          herdr.ReadResult
 	readErr       error
 	promptErr     error
+	promptResult  herdr.AgentInfo
+	waitErr       error
+	waitResult    herdr.AgentInfo
 	keyErr        error
 	getCalls      []string
 	readCalls     []readCall
 	promptCalls   []promptCall
+	waitCalls     []waitCall
 	keyCalls      []keyCall
 	order         []string
 	blockGet      chan struct{}
@@ -1132,6 +1356,10 @@ func (f *fakeHerdr) GetAgent(_ context.Context, target string) (herdr.AgentInfo,
 	f.getCalls = append(f.getCalls, target)
 	f.order = append(f.order, "get")
 	agent, err, block, started := f.agent, f.getErr, f.blockGet, f.getStarted
+	if len(f.getResults) > 0 {
+		agent, err = f.getResults[0].agent, f.getResults[0].err
+		f.getResults = f.getResults[1:]
+	}
 	f.mu.Unlock()
 	signal(started)
 	if block != nil {
@@ -1151,17 +1379,25 @@ func (f *fakeHerdr) ReadRecent(_ context.Context, target string, lines int) (her
 	}
 	return result, err
 }
-func (f *fakeHerdr) Prompt(_ context.Context, target, text string) error {
+func (f *fakeHerdr) PromptUntilStateChange(_ context.Context, target, text string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
 	f.promptCalls = append(f.promptCalls, promptCall{target, text})
 	f.order = append(f.order, "prompt")
-	err, block, started := f.promptErr, f.blockPrompt, f.promptStarted
+	result, err, block, started := f.promptResult, f.promptErr, f.blockPrompt, f.promptStarted
 	f.mu.Unlock()
 	signal(started)
 	if block != nil {
 		<-block
 	}
-	return err
+	return result, err
+}
+func (f *fakeHerdr) WaitForStateChange(_ context.Context, target string, baseline uint64, timeout time.Duration) (herdr.AgentInfo, error) {
+	f.mu.Lock()
+	f.waitCalls = append(f.waitCalls, waitCall{target: target, baseline: baseline, timeout: timeout})
+	f.order = append(f.order, "wait")
+	result, err := f.waitResult, f.waitErr
+	f.mu.Unlock()
+	return result, err
 }
 func (f *fakeHerdr) SendKey(_ context.Context, target, key string) error {
 	f.mu.Lock()
@@ -1180,6 +1416,16 @@ func (f *fakeHerdr) setAgent(agent herdr.AgentInfo) {
 	defer f.mu.Unlock()
 	f.agent = agent
 }
+func (f *fakeHerdr) currentAgent() herdr.AgentInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.agent
+}
+func (f *fakeHerdr) setGetResults(results ...agentGetResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getResults = append([]agentGetResult(nil), results...)
+}
 func (f *fakeHerdr) setRead(result herdr.ReadResult, block chan struct{}) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1195,6 +1441,11 @@ func (f *fakeHerdr) keys() []keyCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]keyCall(nil), f.keyCalls...)
+}
+func (f *fakeHerdr) waits() []waitCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]waitCall(nil), f.waitCalls...)
 }
 func (f *fakeHerdr) reads() []readCall {
 	f.mu.Lock()
@@ -1214,7 +1465,7 @@ func (f *fakeHerdr) callOrder() []string {
 func (f *fakeHerdr) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.getCalls) + len(f.readCalls) + len(f.promptCalls) + len(f.keyCalls)
+	return len(f.getCalls) + len(f.readCalls) + len(f.promptCalls) + len(f.waitCalls) + len(f.keyCalls)
 }
 
 type fakeIM struct {

@@ -743,6 +743,36 @@ func TestClientWaitForStateChangePropagatesGetAgentError(t *testing.T) {
 	}
 }
 
+func TestClientWaitForStateChangeReturnsCallerCancellation(t *testing.T) {
+	agent := validAgentInfo(t)
+	agent["state_change_seq"] = float64(1)
+	agentPayload := mustJSON(t, agent)
+	requestSeen := make(chan struct{}, 1)
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
+		select {
+		case requestSeen <- struct{}{}:
+		default:
+		}
+		id, _ := request["id"].(string)
+		_, err := io.WriteString(conn, `{"id":"`+id+`","result":{"type":"agent_info","agent":`+agentPayload+`}}`+"\n")
+		return err
+	}}
+	t.Cleanup(func() { dialer.assertNoHandlerError(t) })
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.WaitForStateChange(ctx, "p1", 1, time.Second)
+		result <- err
+	}()
+
+	<-requestSeen
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitForStateChange() 错误 = %v，期望 context.Canceled", err)
+	}
+}
+
 func TestClientPromptRejectsEmptyTargetAndInvalidResult(t *testing.T) {
 	dialer := &pipeDialer{}
 	client := NewClient("/tmp/herdr.sock", dialer, time.Second)

@@ -33,16 +33,18 @@ type HerdrServer struct {
 	listener net.Listener
 	path     string
 
-	mu             sync.Mutex
-	snapshot       herdr.Snapshot
-	output         []string
-	calls          []HerdrCall
-	subscriptions  map[*herdrSubscription]struct{}
-	subscribeCount map[string]int
-	connections    map[net.Conn]struct{}
-	closed         bool
-	available      bool
-	changed        chan struct{}
+	mu               sync.Mutex
+	snapshot         herdr.Snapshot
+	output           []string
+	calls            []HerdrCall
+	subscriptions    map[*herdrSubscription]struct{}
+	subscribeCount   map[string]int
+	connections      map[net.Conn]struct{}
+	promptWaitStalls int
+	enterTransition  *herdr.AgentStatus
+	closed           bool
+	available        bool
+	changed          chan struct{}
 }
 
 type herdrSubscription struct {
@@ -125,6 +127,25 @@ func (s *HerdrServer) SetSnapshot(snapshot herdr.Snapshot) {
 func (s *HerdrServer) SetOutput(lines []string) {
 	s.mu.Lock()
 	s.output = append([]string(nil), lines...)
+	s.mu.Unlock()
+	s.signal()
+}
+
+// SetPromptWaitStalls 设置后续带 wait 的 agent.prompt 返回 stalled 的次数。
+func (s *HerdrServer) SetPromptWaitStalls(count int) {
+	if count < 0 {
+		panic("prompt stalled 次数不能为负数")
+	}
+	s.mu.Lock()
+	s.promptWaitStalls = count
+	s.mu.Unlock()
+	s.signal()
+}
+
+// SetEnterTransition 设置收到 enter 后 Agent 应迁移到的状态。
+func (s *HerdrServer) SetEnterTransition(status herdr.AgentStatus) {
+	s.mu.Lock()
+	s.enterTransition = &status
 	s.mu.Unlock()
 	s.signal()
 }
@@ -372,6 +393,9 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		var params struct {
 			Target string  `json:"target"`
 			Text   *string `json:"text"`
+			Wait   *struct {
+				Until []herdr.AgentStatus `json:"until"`
+			} `json:"wait"`
 		}
 		if json.Unmarshal(request.Params, &params) != nil || strings.TrimSpace(params.Target) == "" || params.Text == nil {
 			s.writeError(connection, request.ID, "invalid_params", "invalid prompt")
@@ -382,7 +406,32 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 			s.writeError(connection, request.ID, "agent_not_found", "agent not found")
 			return
 		}
-		result = map[string]any{"type": "agent_prompted", "agent": agentWire(agent)}
+		if params.Wait == nil {
+			result = map[string]any{"type": "agent_prompted", "agent": agentWire(agent)}
+			break
+		}
+		wantStatuses := []herdr.AgentStatus{
+			herdr.AgentStatusIdle,
+			herdr.AgentStatusWorking,
+			herdr.AgentStatusBlocked,
+			herdr.AgentStatusDone,
+			herdr.AgentStatusUnknown,
+		}
+		if !reflect.DeepEqual(params.Wait.Until, wantStatuses) {
+			s.writeError(connection, request.ID, "invalid_params", "invalid prompt wait")
+			return
+		}
+		s.mu.Lock()
+		if s.promptWaitStalls > 0 {
+			s.promptWaitStalls--
+			s.mu.Unlock()
+			s.writeError(connection, request.ID, "agent_prompt_stalled", "agent status did not change")
+			return
+		}
+		agent, _ = s.transitionAgentLocked(agent.PaneID, herdr.AgentStatusWorking)
+		s.mu.Unlock()
+		s.signal()
+		result = map[string]any{"type": "agent_info", "agent": agentWire(agent)}
 	case "agent.send_keys":
 		var params struct {
 			Target string   `json:"target"`
@@ -393,9 +442,18 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 			s.writeError(connection, request.ID, "invalid_params", "invalid keys")
 			return
 		}
-		if _, ok := findAgent(snapshot, params.Target); !ok {
+		agent, ok := findAgent(snapshot, params.Target)
+		if !ok {
 			s.writeError(connection, request.ID, "agent_not_found", "agent not found")
 			return
+		}
+		if params.Keys[0] == "enter" {
+			s.mu.Lock()
+			if s.enterTransition != nil {
+				s.transitionAgentLocked(agent.PaneID, *s.enterTransition)
+			}
+			s.mu.Unlock()
+			s.signal()
 		}
 		result = map[string]any{"type": "ok"}
 	default:
@@ -403,6 +461,25 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		return
 	}
 	_ = writeHerdrJSON(connection, map[string]any{"id": request.ID, "result": result})
+}
+
+func (s *HerdrServer) transitionAgentLocked(paneID string, status herdr.AgentStatus) (herdr.AgentInfo, bool) {
+	for index := range s.snapshot.Agents {
+		if s.snapshot.Agents[index].PaneID != paneID {
+			continue
+		}
+		s.snapshot.Agents[index].AgentStatus = status
+		s.snapshot.Agents[index].StateChangeSeq++
+		agent := s.snapshot.Agents[index]
+		for paneIndex := range s.snapshot.Panes {
+			if s.snapshot.Panes[paneIndex].PaneID == paneID {
+				s.snapshot.Panes[paneIndex].AgentStatus = status
+				break
+			}
+		}
+		return agent, true
+	}
+	return herdr.AgentInfo{}, false
 }
 
 func (s *HerdrServer) writeError(connection net.Conn, requestID, code, message string) {

@@ -22,7 +22,7 @@ const interactivePrompt = "interactive-sensitive-prompt"
 
 func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	cacheRoot, cacheDir := isolateUserCache(t)
-	herdrServer := testkit.NewHerdrServer(t, integrationSnapshot("interactive-session", herdr.AgentStatusWorking))
+	herdrServer := testkit.NewHerdrServer(t, integrationSnapshot("interactive-session", herdr.AgentStatusIdle))
 	configPath := writeInteractiveConfig(t, herdrServer.SocketPath())
 	application := startInteractiveApplication(t, configPath)
 
@@ -62,7 +62,13 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 		t.Fatalf("普通 prompt 回复 = %q, want 已发送", promptReply)
 	}
 	promptCalls := herdrServer.WaitCallCount(t, "agent.prompt", 1)
-	assertCallParams(t, promptCalls[0], map[string]any{"target": "pane-1", "text": interactivePrompt})
+	assertCallParams(t, promptCalls[0], map[string]any{
+		"target": "pane-1",
+		"text":   interactivePrompt,
+		"wait": map[string]any{
+			"until": []any{"idle", "working", "blocked", "done", "unknown"},
+		},
+	})
 
 	keyReply := sendInteractiveLine(t, application, "/space")
 	assertReplyBlock(t, keyReply)

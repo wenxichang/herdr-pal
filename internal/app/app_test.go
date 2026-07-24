@@ -2394,11 +2394,11 @@ func newFakeManagedHerdr() *fakeManagedHerdr {
 		Version: "test", Protocol: herdr.RequiredProtocol,
 		Panes: []herdr.Pane{{
 			PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1",
-			Agent: &agent, Title: &title, AgentStatus: herdr.AgentStatusWorking,
+			Agent: &agent, Title: &title, AgentStatus: herdr.AgentStatusIdle,
 		}},
 		Agents: []herdr.AgentInfo{{
 			PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1",
-			Agent: &agent, Title: &title, AgentStatus: herdr.AgentStatusWorking,
+			Agent: &agent, Title: &title, AgentStatus: herdr.AgentStatusIdle, StateChangeSeq: 1,
 		}},
 	}}
 }
@@ -2425,11 +2425,18 @@ func (f *fakeManagedHerdr) ReadRecent(context.Context, string, int) (herdr.ReadR
 	return herdr.ReadResult{PaneID: "pane-1", Text: "recent terminal"}, nil
 }
 
-func (f *fakeManagedHerdr) Prompt(context.Context, string, string) error {
+func (f *fakeManagedHerdr) PromptUntilStateChange(context.Context, string, string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.prompts++
-	f.mu.Unlock()
-	return nil
+	agent := f.snapshot.Agents[0]
+	agent.AgentStatus = herdr.AgentStatusWorking
+	agent.StateChangeSeq++
+	return agent, nil
+}
+
+func (f *fakeManagedHerdr) WaitForStateChange(context.Context, string, uint64, time.Duration) (herdr.AgentInfo, error) {
+	return herdr.AgentInfo{}, errors.New("not used")
 }
 
 func (f *fakeManagedHerdr) SendKey(context.Context, string, string) error { return nil }

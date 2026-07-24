@@ -43,7 +43,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	})
 
 	t.Run("列表选择与普通文本仅发送一次 prompt", func(t *testing.T) {
-		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
+		harness := newBridgeHarness(t, herdr.AgentStatusIdle)
 		defer harness.stop(t)
 
 		harness.send(t, "message-list", testUserID, "single", "/ls")
@@ -51,10 +51,50 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.send(t, "message-prompt", testUserID, "single", "继续实现端到端测试")
 
 		calls := harness.herdr.WaitCallCount(t, "agent.prompt", 1)
-		assertCallParams(t, calls[0], map[string]any{"target": "pane-1", "text": "继续实现端到端测试"})
+		assertCallParams(t, calls[0], map[string]any{
+			"target": "pane-1",
+			"text":   "继续实现端到端测试",
+			"wait": map[string]any{
+				"until": []any{"idle", "working", "blocked", "done", "unknown"},
+			},
+		})
 		getCalls := harness.herdr.WaitCallCount(t, "agent.get", 1)
 		assertCallParams(t, getCalls[0], map[string]any{"target": "pane-1"})
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
+	})
+
+	t.Run("prompt 未触发状态变化时补发一次 enter", func(t *testing.T) {
+		harness := newBridgeHarness(t, herdr.AgentStatusIdle)
+		defer harness.stop(t)
+		harness.herdr.SetPromptWaitStalls(1)
+		harness.herdr.SetEnterTransition(herdr.AgentStatusWorking)
+		harness.selectFirst(t)
+
+		reply := harness.send(t, "message-prompt-recovery", testUserID, "single", "继续执行")
+		if !strings.Contains(reply.Content, "working") {
+			t.Fatalf("prompt 恢复回复 = %q", reply.Content)
+		}
+		promptCalls := harness.herdr.WaitCallCount(t, "agent.prompt", 1)
+		assertCallParams(t, promptCalls[0], map[string]any{
+			"target": "pane-1",
+			"text":   "继续执行",
+		})
+		keyCalls := harness.herdr.WaitCallCount(t, "agent.send_keys", 1)
+		assertCallParams(t, keyCalls[0], map[string]any{"target": "pane-1", "keys": []any{"enter"}})
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.send_keys")) }, 1)
+	})
+
+	t.Run("working 状态拒绝普通文本", func(t *testing.T) {
+		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
+		defer harness.stop(t)
+		harness.selectFirst(t)
+
+		reply := harness.send(t, "message-working-prompt", testUserID, "single", "不得发送")
+		if !strings.Contains(reply.Content, "working") {
+			t.Fatalf("working 拒绝回复 = %q", reply.Content)
+		}
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 0)
 	})
 
 	t.Run("显式 enter 与 space 各发送一次受限按键", func(t *testing.T) {
@@ -129,7 +169,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	})
 
 	t.Run("重复 msgid 不重复 prompt 或按键", func(t *testing.T) {
-		harness := newBridgeHarness(t, herdr.AgentStatusBlocked)
+		harness := newBridgeHarness(t, herdr.AgentStatusIdle)
 		defer harness.stop(t)
 		harness.selectFirst(t)
 
@@ -177,7 +217,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	})
 
 	t.Run("Herdr 断线期间暂停输入且重连后必须重新选择", func(t *testing.T) {
-		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
+		harness := newBridgeHarness(t, herdr.AgentStatusIdle)
 		defer harness.stop(t)
 		harness.selectFirst(t)
 
@@ -224,7 +264,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	})
 
 	t.Run("企业微信重连不重放旧消息或通知", func(t *testing.T) {
-		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
+		harness := newBridgeHarness(t, herdr.AgentStatusIdle)
 		defer harness.stop(t)
 		harness.selectFirst(t)
 		harness.send(t, "message-before-wecom-disconnect", testUserID, "single", "重连前消息")
@@ -244,6 +284,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
 		assertStableCount(t, func() int { return len(harness.wecom.Requests("aibot_send_msg")) }, sentBeforeDisconnect)
 
+		harness.herdr.SetSnapshot(integrationSnapshot("session-1", herdr.AgentStatusIdle))
 		harness.send(t, "message-after-wecom-reconnect", testUserID, "single", "重连后新消息")
 		harness.herdr.WaitCallCount(t, "agent.prompt", 2)
 	})
