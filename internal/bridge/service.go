@@ -151,6 +151,34 @@ func (s *Service) InvalidateSelection() {
 	s.transitionMu.Unlock()
 }
 
+// CurrentTargets 返回当前可上报给 Relay Server 的稳定排序目标副本。
+func (s *Service) CurrentTargets() []session.Target {
+	if s == nil {
+		return nil
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.registry.CurrentTargets()
+}
+
+// SelectTarget 按 pane 和 occupant 稳定身份选择本机目标。
+func (s *Service) SelectTarget(paneID, occupantKey string) error {
+	if s == nil {
+		return session.ErrListSnapshotExpired
+	}
+	s.transitionMu.Lock()
+	s.beginInputBarrierLocked()
+	s.stateMu.Lock()
+	_, err := s.registry.SelectTarget(paneID, occupantKey)
+	if err == nil {
+		s.resetPanelLocked()
+	}
+	s.stateMu.Unlock()
+	s.endInputBarrierLocked()
+	s.transitionMu.Unlock()
+	return err
+}
+
 // ReplaceSnapshot 用新的 Herdr 会话快照原子替换目标索引。
 //
 // reconnect 为 true 或当前选择因 occupant 变化失效时，会同时清空手工终端分页缓存。

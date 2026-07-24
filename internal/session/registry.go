@@ -175,6 +175,27 @@ func (r *Registry) CreateListSnapshot() []Target {
 	return targets
 }
 
+// CurrentTargets 返回当前稳定排序的目标副本，不修改最近一次本地列表编号。
+func (r *Registry) CurrentTargets() []Target {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return sortedTargets(r.targets, r.orders)
+}
+
+// SelectTarget 按 pane 和 occupant 稳定身份选择当前目标。
+func (r *Registry) SelectTarget(paneID, occupantKey string) (Target, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	target, found := r.targets[paneID]
+	if !found || target.OccupantKey != occupantKey {
+		return Target{}, fmt.Errorf("%w，请刷新会话列表", ErrListSnapshotExpired)
+	}
+	r.selectedKey = target.OccupantKey
+	r.selectedPane = target.PaneID
+	r.selectionInvalid = false
+	return target, nil
+}
+
 // Select 从最近一次列表快照按一开始的编号选择目标。
 func (r *Registry) Select(index int) (Target, error) {
 	r.mu.Lock()

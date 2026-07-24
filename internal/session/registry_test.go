@@ -58,6 +58,32 @@ func TestCreateListSnapshotSortsByWorkspaceAndTabNumbers(t *testing.T) {
 	}
 }
 
+func TestCurrentTargetsDoesNotReplaceLocalListSnapshot(t *testing.T) {
+	registry := &Registry{}
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)
+	listed := registry.CreateListSnapshot()
+	current := registry.CurrentTargets()
+	if len(current) != 1 || current[0] != listed[0] {
+		t.Fatalf("CurrentTargets() = %#v, listed %#v", current, listed)
+	}
+	if _, err := registry.Select(1); err != nil {
+		t.Fatalf("CurrentTargets() changed list snapshot: %v", err)
+	}
+}
+
+func TestSelectTargetRequiresMatchingPaneAndOccupant(t *testing.T) {
+	registry := &Registry{}
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)
+	target := registry.CurrentTargets()[0]
+	selected, err := registry.SelectTarget(target.PaneID, target.OccupantKey)
+	if err != nil || selected != target {
+		t.Fatalf("SelectTarget() = %#v, %v", selected, err)
+	}
+	if _, err := registry.SelectTarget(target.PaneID, "stale"); !errors.Is(err, ErrListSnapshotExpired) {
+		t.Fatalf("SelectTarget(stale) error = %v", err)
+	}
+}
+
 func TestSelectUsesMostRecentListSnapshot(t *testing.T) {
 	registry := &Registry{}
 	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)

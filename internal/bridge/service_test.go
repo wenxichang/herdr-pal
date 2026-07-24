@@ -36,6 +36,23 @@ func TestServiceRejectsUnauthorizedAndGroupBeforeParsing(t *testing.T) {
 	}
 }
 
+func TestServiceSelectTargetUsesStableIdentity(t *testing.T) {
+	service, _ := newTestService(t)
+	targets := service.CurrentTargets()
+	if len(targets) != 1 {
+		t.Fatalf("CurrentTargets() = %#v", targets)
+	}
+	if err := service.SelectTarget(targets[0].PaneID, targets[0].OccupantKey); err != nil {
+		t.Fatalf("SelectTarget() error = %v", err)
+	}
+	if selected, err := service.registry.ValidateSelected(); err != nil || selected != targets[0] {
+		t.Fatalf("ValidateSelected() = %#v, %v", selected, err)
+	}
+	if err := service.SelectTarget(targets[0].PaneID, "stale"); !errors.Is(err, session.ErrListSnapshotExpired) {
+		t.Fatalf("SelectTarget(stale) error = %v", err)
+	}
+}
+
 func TestServiceLogsRejectedAndDuplicateMessagesWithoutSensitiveValues(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
