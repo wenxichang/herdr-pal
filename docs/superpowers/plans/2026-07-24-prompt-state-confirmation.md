@@ -107,7 +107,7 @@ func TestClientPromptUntilStateChangeSendsWaitAndDecodesAgent(t *testing.T) {
     agent["agent_status"] = "working"
     agent["state_change_seq"] = float64(8)
     client := newBusinessTestClient(t,
-        `{"type":"agent_info","agent":`+mustJSON(t, agent)+`}`,
+        `{"type":"agent_prompted","agent":`+mustJSON(t, agent)+`}`,
         businessRequestCheck("agent.prompt", map[string]any{
             "target": "p1",
             "text":   "运行测试",
@@ -158,7 +158,7 @@ type agentPromptParams struct {
 func (c *Client) PromptUntilStateChange(ctx context.Context, target, text string) (AgentInfo, error)
 ```
 
-成功 result type 必须为 `agent_info`；原有 `Prompt` 继续接受 `agent_prompted`，供显式实时联调使用。
+成功 result type 必须为 `agent_prompted`；返回 payload 中的完整 AgentInfo 用于确认状态变化。
 
 - [ ] **Step 4: 编写 `WaitForStateChange` 失败测试**
 
@@ -444,7 +444,7 @@ git commit -m "fix: 确认 prompt 状态变化并恢复 Enter"
 验证 `agent.prompt` 带 wait 时：
 
 - 参数 `until` 必须是完整状态集合。
-- 成功返回 `agent_info`，并将 fake Agent 从 `idle` 切换为 `working`、递增
+- 成功返回 `agent_prompted`，并将 fake Agent 从 `idle` 切换为 `working`、递增
   `state_change_seq`。
 - 无 wait 的既有路径仍返回 `agent_prompted`。
 
@@ -477,7 +477,7 @@ agent.AgentStatus = herdr.AgentStatusWorking
 agent.StateChangeSeq++
 ```
 
-随后返回 `{"type":"agent_info","agent":...}`。不模拟 PTY、私有 AppState 或真实事件
+随后返回 `{"type":"agent_prompted","agent":...}`。不模拟 PTY、私有 AppState 或真实事件
 检测。
 
 - [ ] **Step 4: 更新端到端失败测试**

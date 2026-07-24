@@ -431,7 +431,7 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		agent, _ = s.transitionAgentLocked(agent.PaneID, herdr.AgentStatusWorking)
 		s.mu.Unlock()
 		s.signal()
-		result = map[string]any{"type": "agent_info", "agent": agentWire(agent)}
+		result = map[string]any{"type": "agent_prompted", "agent": agentWire(agent)}
 	case "agent.send_keys":
 		var params struct {
 			Target string   `json:"target"`

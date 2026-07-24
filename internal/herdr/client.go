@@ -224,7 +224,7 @@ func (c *Client) PromptUntilStateChange(ctx context.Context, target, text string
 	if err := c.call(ctx, "agent.prompt", params, &result); err != nil {
 		return AgentInfo{}, err
 	}
-	if err := validateResultType(result.Type, "agent_info"); err != nil {
+	if err := validateResultType(result.Type, "agent_prompted"); err != nil {
 		return AgentInfo{}, err
 	}
 	var wire wireAgentInfo

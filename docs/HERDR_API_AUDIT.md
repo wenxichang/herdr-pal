@@ -276,9 +276,9 @@ pane ID 和 Agent name；允许 terminal ID 的 `resolve_terminal_target` 是另
 ```
 
 Herdr Pal 不显式传 `timeout_ms`，使用 Herdr prompt effect 固定的约 5 秒窗口。成功响应
-必须是包含完整 `AgentInfo` 的 `agent_info`，其中 protocol 17 的 `state_change_seq` 用于
-确认请求提交后确实发生了 Agent 生命周期变化；无变化时 Herdr 返回
-`agent_prompt_stalled`。
+必须是包含完整 `AgentInfo` 的 `agent_prompted`，其中 protocol 17 的
+`state_change_seq` 用于确认请求提交后确实发生了 Agent 生命周期变化；无变化时 Herdr
+返回 `agent_prompt_stalled`。
 
 bridge 只在初始实时状态为 `idle` 或 `done` 时提交普通文本。收到 stalled 后先重新调用
 `agent.get`：occupant、序列或状态不符合预期时不发送按键；仍为原 occupant、原序列且

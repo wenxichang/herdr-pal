@@ -669,7 +669,7 @@ func TestClientPromptUntilStateChangeSendsWaitAndDecodesAgent(t *testing.T) {
 	agent := validAgentInfo(t)
 	agent["agent_status"] = "working"
 	agent["state_change_seq"] = float64(8)
-	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+mustJSON(t, agent)+`}`, businessRequestCheck("agent.prompt", map[string]any{
+	client := newBusinessTestClient(t, `{"type":"agent_prompted","agent":`+mustJSON(t, agent)+`}`, businessRequestCheck("agent.prompt", map[string]any{
 		"target": "p1",
 		"text":   "运行测试",
 		"wait": map[string]any{
@@ -683,6 +683,14 @@ func TestClientPromptUntilStateChangeSendsWaitAndDecodesAgent(t *testing.T) {
 	}
 	if got.AgentStatus != AgentStatusWorking || got.StateChangeSeq != 8 {
 		t.Fatalf("PromptUntilStateChange() = %+v", got)
+	}
+}
+
+func TestClientPromptUntilStateChangeRejectsAgentInfoResult(t *testing.T) {
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+validAgentInfoJSON(t)+`}`, nil)
+
+	if _, err := client.PromptUntilStateChange(context.Background(), "p1", "运行测试"); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("PromptUntilStateChange() 错误 = %v，期望 ErrProtocol", err)
 	}
 }
 

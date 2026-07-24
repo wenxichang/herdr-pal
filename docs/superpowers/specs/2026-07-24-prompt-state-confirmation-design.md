@@ -68,7 +68,7 @@ PromptUntilStateChange(ctx context.Context, target, text string) (AgentInfo, err
 }
 ```
 
-成功响应必须是 `agent_info`，方法返回发生变化后的 `AgentInfo`。Herdr 返回
+成功响应必须是 `agent_prompted`，方法返回发生变化后的 `AgentInfo`。Herdr 返回
 `agent_prompt_stalled` 时保留为可通过 `errors.As` 检查的 `APIError`，由业务层决定是否
 补发 Enter。其他 API、协议和连接错误不进入恢复流程。
 
@@ -149,7 +149,7 @@ Agent 当前状态为 working，暂不接受普通文本。
 ### 8.1 HerdrClient 单元测试
 
 - 请求包含完整 `wait.until`，且不发送 `timeout_ms`。
-- 成功解析 `agent_info` 和 `state_change_seq`。
+- 成功解析 `agent_prompted` 和 `state_change_seq`。
 - 拒绝缺失或非法 `state_change_seq` 的 protocol 17 响应。
 - 保留 `agent_prompt_stalled` 的 `APIError.Code`。
 - 拒绝错误 result type 和不完整 Agent 信息。
