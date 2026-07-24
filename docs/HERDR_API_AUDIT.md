@@ -215,7 +215,26 @@ Herdr 提供本地 Socket API：
 
 ## 6. 输入能力
 
-### 6.1 普通 IM 文本
+### 6.1 Agent target 语义
+
+最新源码与真实 Herdr 0.7.5/protocol 17 联调确认，Agent API 的 `target` 支持：
+
+- 当前 session 中的公共 pane ID。
+- 能唯一匹配一个 Agent pane 的 Agent name。
+
+Agent name 出现多个匹配时会返回歧义错误。terminal ID 虽然出现在 snapshot 和
+`AgentInfo` 中，但不是 Agent API target；把 terminal ID 传给 `agent.get`、
+`agent.read`、`agent.prompt` 或 `agent.send_keys` 会返回 `agent_not_found`。
+
+因此 Herdr Pal 对上述四个 Agent API 一律传递 pane ID。terminal ID 仍与 Agent name、
+display name 和 agent session reference 一起构成 occupant 身份，只用于在输入或输出
+前后判断 pane 中的 Agent 是否已被替换，不能替代 pane ID 发起调用。
+
+解析逻辑位于 `src/app/terminal_targets.rs:75`。其中 `resolve_agent_target` 只尝试公共
+pane ID 和 Agent name；允许 terminal ID 的 `resolve_terminal_target` 是另一套目标解析
+逻辑，不能据此推断 Agent API 接受 terminal ID。
+
+### 6.2 普通 IM 文本
 
 推荐映射到：
 
@@ -257,7 +276,7 @@ Herdr 提供本地 Socket API：
 }
 ```
 
-### 6.2 交互式 UI 按键
+### 6.3 交互式 UI 按键
 
 ```json
 {
@@ -279,7 +298,7 @@ Herdr 提供本地 Socket API：
 安全要求：不能把 `blocked` 自动等同于“发送 Enter”。不同 Agent 和不同页面的
 默认选项可能具有完全不同的风险。
 
-### 6.3 原始 Pane 输入
+### 6.4 原始 Pane 输入
 
 - `pane.send_text`：发送原始文本，不追加 Enter。
 - `pane.send_keys`：发送按键序列。
@@ -372,7 +391,10 @@ truncated: false
 - `src/app/api/agents.rs:127`
 - `src/app/api/panes.rs:1189`
 
-因此 bridge 必须保存上一次规范化后的文本，自行做后缀差分、hash 去重和 checkpoint。
+因此不能用服务端 revision 做输出 checkpoint 或断点续传。Herdr Pal 当前也不实现可靠
+增量差分：主动通知只规范化最近 100 行，并对整份规范化快照做 hash 去重。未来若需要
+增量输出，可以在本地保存上一份规范化快照并进行保守差分，但差分结果不能伪装成
+Herdr 提供的精确增量游标。
 
 ### 7.5 输出匹配
 
@@ -395,8 +417,9 @@ truncated: false
 ```text
 状态变化事件
     → 读取 recent_unwrapped 快照
-    → 清理并和上次输出做差分
-    → 发送新增内容到 IM
+    → 取最近 100 行并规范化
+    → 对整份快照做 hash 去重、分段和安全截断
+    → 发送终端近期快照到消息入口
 
 IM 普通文本
     → 校验用户和会话绑定
@@ -440,12 +463,33 @@ Herdr Pal 客户端固定 `RequiredProtocol = 17`，每次启动和重连都先�
 可选真实测试命令：
 
 ```sh
-HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
+PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
+HERDR_PAL_INTEGRATION=1 \
+go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 ```
 
 测试先执行公共 CLI `herdr status server --json`。只有运行中服务精确返回 protocol 17
-才继续调用真实 `ping` 和 `session.snapshot`；企业微信侧始终使用本地 fake。
+才继续调用真实 `ping`、`session.snapshot`、`agent.get` 和 `agent.read`，并覆盖
+`herdr-pal -i` 的 `/ls`、`/sel`、`/con` 只读路径；企业微信侧不参与，也不需要 Secret。
 
-截至 2026-07-24，当前开发机安装的 Herdr 0.7.1 返回 protocol 14，因此该测试明确
-`Skip`。这只说明本机二进制尚未达到审计协议，不代表 protocol 17 fake 测试失败，也
-不能表述为真实 Herdr 联调成功。
+实时 prompt 另有三重显式门禁：
+
+```sh
+PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
+HERDR_PAL_INTEGRATION=1 \
+HERDR_PAL_LIVE_INPUT=1 \
+HERDR_PAL_LIVE_PANE_ID='<必须替换为当前 pane ID>' \
+go test ./internal/integration -run '^TestRealHerdrLivePrompt$' -count=1 -v
+```
+
+必须先从最新公共 `session.snapshot` 取得目标 pane ID 并替换占位符，禁止原样执行；未
+替换或目标不存在时，测试应在 `agent.prompt` 前失败。测试只对通过校验的 pane ID 发送
+一次固定 prompt，并通过最近 100 行快照等待新增 marker。
+
+截至 2026-07-24，源码 debug Herdr 0.7.5/protocol 17 已完成上述只读与实时 prompt
+联调。它位于 `/Users/wxc/Code/herdr/target/debug/herdr`，使用
+`~/.config/herdr-dev`；Homebrew Herdr 0.7.1 位于 `/opt/homebrew/bin/herdr`，使用
+`~/.config/herdr`。两套 CLI 的配置目录和 Socket 不同，真实测试必须通过 `PATH` 明确
+选择 debug 二进制。所有测试和运行时仍保持 protocol 精确等于 17 的门禁，不接受“17
+或更高”；输出侧也仍按本文既有结论处理：`revision` 固定为 0，且没有公共
+`pane.output_changed` 输出流。

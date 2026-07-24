@@ -2,32 +2,34 @@
 
 ## 1. 架构目标
 
-Herdr Pal 作为独立常驻进程运行。它不修改 Herdr，也不要求 IM 平台理解 Herdr
-协议。bridge 在本机连接 Herdr Socket，在网络侧连接一个或多个 IM API。
+Herdr Pal 作为独立进程运行。它不修改 Herdr，也不要求消息入口理解 Herdr 协议。
+bridge 在本机连接 Herdr Socket，消息侧既可以连接企业微信，也可以使用本机控制台。
 
 ```text
-┌─────────────────────┐
-│ Herdr Server        │
-│ local Socket / NDJSON│
-└──────────┬──────────┘
-           │ snapshot / events / read / prompt
+┌──────────────────────┐
+│ Herdr Server         │
+│ Local Socket / NDJSON│
+└──────────┬───────────┘
+           │ snapshot / events / read / prompt / send_keys
            ▼
-┌──────────────────────────────────────────────┐
-│ Herdr Pal                                    │
-│                                              │
-│ HerdrClient ─ SessionRegistry ─ EventSupervisor
-│      │               │              │         │
-│      └──── OutputExtractor ─ ConversationRouter
-│                            │          │         │
-│                       PolicyGuard ─ StateStore │
-│                                   │            │
-│                               IMAdapter        │
-└───────────────────────────────────┬────────────┘
-                                    │ HTTPS/Webhook
-                                    ▼
-                              ┌────────────┐
-                              │ IM Platform│
-                              └────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ Herdr Pal 共享 Bridge                                   │
+│                                                         │
+│ HerdrClient ─ SessionRegistry ─ EventSupervisor         │
+│      │               │              │                    │
+│      └──── OutputExtractor ─ Service / Notifier         │
+│                            │                             │
+│           PolicyGuard / Deduper / 内存运行时状态        │
+│                            │                             │
+│                         IMAdapter                       │
+└────────────────────────────┬────────────────────────────┘
+                             │
+                 ┌───────────┴───────────┐
+                 ▼                       ▼
+       ┌──────────────────┐    ┌──────────────────┐
+       │ WeComClient      │    │ ConsoleAdapter   │
+       │ WebSocket 长连接 │    │ stdin / stdout   │
+       └──────────────────┘    └──────────────────┘
 ```
 
 ## 2. 模块边界
@@ -77,24 +79,22 @@ Herdr Pal 作为独立常驻进程运行。它不修改 Herdr，也不要求 IM 
 
 ### 2.4 OutputExtractor
 
-职责：
+这是输出处理的逻辑边界；当前实现由 `Notifier`、`panel` 和消息分段函数共同完成，而非
+一个独立的持久化模块。当前职责和边界是：
 
-- 在 `blocked`、`done`、`idle` 等状态边界调用 `agent.read`。
-- 默认读取 `recent_unwrapped` 文本快照。
-- 规范化换行和 ANSI/TUI 噪音。
-- 与上次 checkpoint 做差分。
-- 限制 IM 消息长度并安全截断。
-- 生成可审计的输出摘要元数据。
+- 在 `blocked`、`done`，以及从 `working`/`blocked` 转入 `idle` 的状态边界调用
+  `agent.read(recent_unwrapped, 100)`。
+- 只保留最近 100 行，规范化换行与 ANSI/TUI 噪音。
+- 对整份规范化快照计算 hash，参与相同状态通知的内存去重。
+- 按消息大小做 UTF-8 安全分段和截断。
+- 对 alternate-screen Agent 明确标记内容只是当前可见或近期终端快照。
 
-初始策略建议：
+当前没有 revision checkpoint，也没有可靠的增量差分；主动通知发送的是受限的近期
+快照，不能表述为“自上次以来的新增 assistant 内容”。`/pageup` 使用连续重叠锚点扩展
+手工分页缓存，是另一条内存分页路径，不等同于通知增量提取。
 
-1. 每个 pane 保留最近一次规范化快照和 hash。
-2. 先尝试最长公共前缀或稳定后缀差分。
-3. 差分不可信时发送带说明的短快照，而不是伪造新增内容。
-4. 对完全相同的快照不重复通知。
-5. 对 alternate-screen Agent 明确标记“终端仅保留当前可见/近期内容”。
-
-输出提取规则必须按 Agent 类型可配置，但通用逻辑不能硬编码到 IM Adapter。
+未来可以把 Agent 特定清理规则、上一快照 checkpoint、最长公共前缀或稳定后缀差分演进
+为独立模块。差分不可信时仍应回退为带说明的短快照，不能伪造精确增量。
 
 ### 2.5 ConversationRouter
 
@@ -105,7 +105,11 @@ Herdr Pal 作为独立常驻进程运行。它不修改 Herdr，也不要求 IM 
 - 将 IM 回复解析为普通 prompt 或显式控制动作。
 - 防止旧 IM thread 向已经被替换的 Agent occupant 发送输入。
 
-建议使用稳定的内部绑定记录：
+当前版本只有一个授权企业微信用户或固定的 `interactive-local` 身份，并在内存中保存
+当前 `/ls` 编号快照、`/sel` 选择和分页缓存。Herdr 断线、pane/occupant 变化或进程重启
+都会清空相关状态，不存在可跨重启恢复的持久 Binding。
+
+未来需要多会话或持久恢复时，可以引入稳定的内部绑定记录：
 
 ```text
 Binding
@@ -128,50 +132,57 @@ pane 中的 Agent 是否已经被替换。
 
 职责：
 
-- 校验 IM 用户和会话是否被授权。
-- 限制哪些绑定可以接收输入。
-- 区分普通文本、导航按键、终止操作和审批操作。
-- 对高风险动作要求明确按钮、二次确认或管理员权限。
+- 校验企业微信用户或固定本地身份是否被授权，并且消息类型为单聊。
+- 区分普通文本、导航按键和不受支持的命令。
+- 只允许预定义的按键白名单。
 - 生成不包含密钥的审计记录。
+
+目标选择与 occupant 实时校验由 `Service`、`SessionRegistry` 和 `HerdrClient` 共同完成，
+但属于同一条输入策略边界，适配器不能绕过。
 
 默认策略：
 
 - 普通文本允许映射到 `agent.prompt`。
-- 导航按键只允许预定义动作，不接受任意按键字符串。
-- `ctrl+c`、退出、关闭 pane 等动作默认需要额外确认。
+- 白名单按键命令本身就是用户的显式操作，不二次确认。
+- `ctrl+c`、组合键、退出、关闭 pane 等动作当前不提供入口。
 - Agent 权限审批永不自动执行。
 
 ### 2.7 IMAdapter
 
 职责：
 
-- 验证 webhook 或长连接来源。
-- 接收消息、按钮和交互事件。
-- 发送、更新、分段和撤回平台消息。
-- 将平台对象转换为统一内部事件。
+- 按各自信任边界接收文本消息。
+- 将来源对象转换为统一内部文本事件。
+- 发送首段回复和后续通知分段。
 
-推荐抽象接口：
+当前共享能力可以概括为：
 
 ```text
 receive() -> IMEvent
-send_message(target, message) -> MessageRef
-update_message(message_ref, message)
-send_actions(target, message, actions) -> MessageRef
+respond(callback_ref, message)
+send_message(target, message)
 ```
 
-第一版只实现一个 IM Adapter，接口保持可扩展但不提前实现多平台公共最小公倍数。
+当前有两个并列适配器：
 
-### 2.8 StateStore
+- `WeComClient` 负责企业微信智能机器人 WebSocket 长连接、回调接收和消息发送。
+- `ConsoleAdapter` 把 stdin 的逐行输入转换为本地单聊事件，把回复和通知串行写入 stdout；
+  它不是 TUI，也不解析 Herdr 协议。
 
-职责：
+两种适配器进入同一套 Bridge 装配。交互模式不会绕过 `PolicyGuard`、`Deduper`、
+`Service`、`Notifier` 或 `EventSupervisor`，因此身份检查、消息幂等、occupant 校验、状态
+订阅、输出限制和按键审计与企业微信模式保持一致。接口保持可扩展，但不为尚未接入的
+平台提前设计公共最小公倍数；消息更新、撤回或交互按钮属于未来适配能力。
 
-- 保存 IM 与 pane 的绑定。
-- 保存输出 checkpoint 和去重 hash。
-- 保存 webhook 幂等键。
-- 保存最近状态及通知记录。
-- 支持进程重启后的恢复。
+### 2.8 StateStore（未来模块）
 
-Herdr 会话快照不应原样永久保存；只存恢复 bridge 所需的最小数据。
+当前没有 StateStore。会话选择、分页缓存、状态通知 hash、occupant 路由状态和有容量、
+TTL 上限的 `msgid` 幂等键全部只保存在进程内存中；进程重启后不会恢复，也不会补发旧
+通知。
+
+未来若需要跨重启恢复，StateStore 可以保存 IM 与 pane 的最小绑定、通知去重元数据、
+输出 checkpoint 和消息幂等键。Herdr 会话快照不应原样永久保存，并且恢复出的绑定仍须
+用最新 `session.snapshot` 和 occupant 信息重新验证。
 
 ## 3. 数据流
 
@@ -181,11 +192,11 @@ Herdr 会话快照不应原样永久保存；只存恢复 bridge 所需的最小
 启动 bridge
   → ping / session.snapshot
   → 重建 SessionRegistry
-  → 恢复本地 Binding
-  → 校验 binding 的 pane 和 occupant
   → 建立生命周期订阅
   → 建立当前 pane 状态订阅
-  → 启动 IM Adapter
+  → 用订阅后的权威 snapshot 收敛当前基线
+  → 启动 WeComClient 或 ConsoleAdapter
+  → 等待用户重新 /ls、/sel，不恢复上次选择或分页
 ```
 
 如果 Herdr 未运行，bridge 可以等待并重试，但不应未经明确产品决定自动启动或停止
@@ -198,10 +209,10 @@ pane.agent_status_changed
   → 校验当前 pane/occupant
   → 和最近状态比较
   → 应用通知策略
-  → 必要时 agent.read
-  → OutputExtractor 差分
-  → IMAdapter 发送或更新消息
-  → 保存状态和 checkpoint
+  → 必要时 agent.read(recent_unwrapped, 100)
+  → 规范化最近 100 行并计算整快照 hash
+  → 内存去重、分段和安全截断
+  → IMAdapter 发送通知
 ```
 
 推荐状态策略：
@@ -210,17 +221,21 @@ pane.agent_status_changed
 | --- | --- |
 | `working` | 更新状态，默认不发送大段输出 |
 | `blocked` | 立即通知，读取近期输出，提供安全交互入口 |
-| `done` | 通知完成，读取并发送新增输出 |
+| `done` | 通知完成，读取并发送最近 100 行快照 |
 | `idle` | 仅在从 working/blocked 转入时读取输出 |
 | `unknown` | 标记状态不确定，不宣称任务成功 |
 
 ### 3.3 IM 普通回复
 
 ```text
-IM message
-  → webhook/connection 验证
-  → 查找 Binding
-  → PolicyGuard 校验用户和 occupant
+WeComClient：已认证并订阅的 WebSocket → 解码企业微信文本回调 ┐
+ConsoleAdapter：进程 stdin → 固定 interactive-local 单聊身份   ├→ 共享 Bridge
+                                                              ┘
+共享 Bridge
+  → PolicyGuard 校验身份和单聊类型
+  → Deduper 登记 msgid
+  → 解析普通 prompt
+  → 校验当前选择和 Agent occupant
   → agent.prompt
   → 返回“已送达”或错误
   → 等待后续状态事件
@@ -229,18 +244,28 @@ IM message
 正常聊天消息不要调用 `pane.send_text`，因为该接口不会验证当前 pane 中是否仍为原
 Agent。
 
-### 3.4 IM 控制按钮
+### 3.4 显式控制动作
 
 ```text
-IM action
-  → 验证签名和幂等键
-  → 查找预定义动作
-  → 风险和权限检查
+WeComClient
+  → 只接收已认证、已订阅 WebSocket 上通过协议校验的企业微信回调
+
+ConsoleAdapter
+  → 只接收当前进程 stdin
+  → 写入固定 user_id=interactive-local、chat_type=single
+
+两种入口汇合到共享 Bridge
+  → PolicyGuard 校验身份和单聊类型
+  → Deduper 登记 msgid，拒绝重复投递
+  → command.Parse 识别显式按键命令
+  → PolicyGuard.ValidateKey 校验按键白名单
+  → Service 校验当前选择、pane 和 Agent occupant
   → agent.send_keys
-  → 记录操作人、pane、动作和结果
+  → 同步记录用户、pane、occupant 摘要、动作和结果
 ```
 
-IM 前端传来的值只能是项目定义的 action id，不能直接成为任意 Herdr key string。
+ConsoleAdapter 不验证平台签名；它的信任边界是本机进程 stdin 和固定本地身份。任一消息
+入口都不能把外部字符串直接当作任意 Herdr key string。
 
 ## 4. 重连和一致性
 
@@ -251,18 +276,20 @@ IM 前端传来的值只能是项目定义的 action id，不能直接成为任�
 3. 使用有上限的指数退避重连。
 4. 重连后执行 `ping` 和 `session.snapshot`。
 5. 用新快照替换 SessionRegistry。
-6. 验证现有 Binding 的 pane、terminal 和 Agent occupant。
-7. 重建订阅。
-8. 仅发送必要的恢复通知，避免重放旧状态。
+6. 清空当前选择和分页缓存。
+7. 重建订阅并用订阅后的 snapshot 收敛基线。
+8. 不恢复旧选择，不重放断线期间的旧状态通知。
 
 ### 4.2 幂等和去重
 
-当前 Herdr 事件没有对外 cursor，IM webhook 也可能重复投递。因此至少需要：
+当前 Herdr 事件没有对外 cursor，企业微信回调也可能重复投递。当前内存去重包括：
 
-- IM 入站 event id 去重。
-- 状态通知 key：binding + pane + occupant + status + presentation hash。
-- 输出通知 key：binding + normalized output hash。
-- 控制动作 key：IM action event id。
+- 入站 `msgid`：容量和 TTL 有上限，prompt 与按键只接受第一次投递。
+- 状态通知 key：pane + occupant + status + 最近 100 行规范化快照 hash。
+- pane 失效通知 key：pane + occupant。
+
+进程重启后这些键不会恢复。未来 webhook adapter 或持久化 StateStore 需要另行定义签名
+验证、事件 ID 和跨重启幂等策略。
 
 exactly-once 不作为第一版承诺；目标是 at-least-once 输入接收配合业务幂等，以及
 best-effort 去重通知。
@@ -277,7 +304,7 @@ best-effort 去重通知。
 - `OccupantChanged`：pane 仍存在但 Agent 已替换。
 - `InputRejected`：Herdr 拒绝 prompt 或按键。
 - `Unauthorized`：IM 用户或会话没有权限。
-- `OutputUnavailable`：终端快照为空、丢失或无法可靠差分。
+- `OutputUnavailable`：终端近期快照为空、丢失或无法安全处理。
 - `IMDeliveryFailed`：平台限流、网络错误或消息格式错误。
 
 面向用户的错误消息应可操作，例如“Agent 已被替换，请重新绑定”，而不是只展示底层
@@ -286,9 +313,10 @@ Socket 错误。
 ## 6. 安全边界
 
 - Herdr Socket 只在本机访问。
-- IM token 存放在受限配置或系统密钥存储中。
-- Webhook 必须验证平台签名和时间戳。
-- 默认使用用户、群组、channel allowlist。
+- 企业微信当前使用客户端主动建立的 WebSocket 长连接，并通过 Bot ID 与 Secret 完成订阅；
+  Secret 只从 `HERDR_PAL_WECOM_SECRET` 环境变量读取，配置文件拒绝 Secret 字段。
+- 当前没有 webhook 入口。未来若新增 webhook adapter，必须验证平台签名和时间戳。
+- 企业微信模式只允许配置中的一个用户和单聊；交互模式只允许固定的本地身份。
 - 终端输出可能包含源码、密钥和日志，转发前要支持内容过滤和最大长度限制。
 - 日志默认只记录 hash、长度和目标标识，不记录完整 prompt 和输出。
 - 不允许 IM 用户选择任意本地 Socket 路径。
@@ -301,10 +329,10 @@ Socket 错误。
 - NDJSON framing 和部分读取。
 - Herdr success/error/event 数据解析。
 - 状态迁移通知规则。
-- 输出差分、重复文本、重绘和截断。
+- 输出规范化、整快照 hash 去重、分页重叠和截断。
 - Binding occupant 校验。
 - PolicyGuard 动作矩阵。
-- IM webhook 幂等。
+- 企业微信回调 `msgid` 内存幂等。
 
 ### 7.2 集成测试
 
@@ -312,7 +340,7 @@ Socket 错误。
 - 使用 fake IM Adapter 验证发送、更新和失败重试。
 - 测试 pane 创建后状态订阅重建。
 - 测试 Herdr 重启后 pane id/terminal id 改变。
-- 测试相同事件或 webhook 重放不会产生重复危险输入。
+- 测试相同事件或企业微信回调重放不会产生重复危险输入。
 
 ### 7.3 手工联调
 
@@ -324,22 +352,24 @@ Socket 错误。
 
 ## 8. 分阶段交付
 
-### 阶段一：单平台 MVP
+### 阶段一：首版 MVP
 
-- 单个 IM Adapter。
+- 一个网络 IM Adapter 和一个共享核心的本地 ConsoleAdapter。
 - 手工建立一个 IM 会话到 pane 的绑定。
 - snapshot + pane 生命周期 + Agent 状态订阅。
 - blocked/done 时读取 recent_unwrapped 并通知。
 - 普通 IM 文本通过 agent.prompt 发送。
-- 内存去重和基础日志。
+- Herdr 重连、订阅自动重建和断线后重新选择。
+- `msgid`、状态通知和失效通知的内存幂等。
+- 白名单按键、occupant 校验、结构化审计和安全日志。
 
 ### 阶段二：可靠性
 
 - 本地 StateStore。
-- 重连、绑定验证和订阅自动重建。
-- webhook 幂等。
-- 输出差分质量和 Agent 特定清理规则。
-- 显式交互按钮和权限策略。
+- 跨重启绑定、选择和幂等恢复。
+- 上一快照 checkpoint、保守增量差分和 Agent 特定清理规则。
+- 未来 webhook adapter 的验签与持久事件幂等。
+- 更丰富的显式交互按钮和权限策略。
 
 ### 阶段三：产品化
 
@@ -347,7 +377,7 @@ Socket 错误。
 - 管理命令和绑定生命周期。
 - 消息更新、线程化展示和通知聚合。
 - 可观测性、审计和配置迁移。
-- 根据实际需求评估第二个 IM Adapter。
+- 根据实际需求评估第二个网络 IM 平台 Adapter。
 
 整个路线都不要求修改 Herdr。若未来需要实时结构化输出，应作为独立的 Herdr
 公共 API 提案处理，而不是让 Herdr Pal 依赖私有内部实现。

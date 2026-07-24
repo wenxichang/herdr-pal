@@ -3,8 +3,8 @@
 ## 1. 当前状态
 
 Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与自己的企业微信智能机器人
-单聊连接起来。程序手工启动，使用 `CGO_ENABLED=0` 构建为 `dist/herdr-pal` 单文件，
-运行状态只保存在内存中。
+单聊连接起来，也可以用 `herdr-pal -i` 在本机控制台运行同一套 Bridge。程序手工启动，
+使用 `CGO_ENABLED=0` 构建为 `dist/herdr-pal` 单文件，运行状态只保存在内存中。
 
 当前实现包括：
 
@@ -14,6 +14,7 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 - 单聊命令、100 行分页、普通 prompt、受限按键和 `msgid` 幂等。
 - 状态通知异步队列、失败重试、合并、去重和 pane 失效通知。
 - 本机进程锁、结构化安全日志、SIGINT/SIGTERM 和 10 秒优雅退出。
+- 无 TUI 的 ConsoleAdapter：stdin 接收聊天输入，stdout 输出回复与通知，Ctrl+D 正常退出。
 - fake Herdr、fake 企业微信和十个核心端到端场景。
 
 ## 2. 固定产品决策
@@ -25,6 +26,8 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 - Herdr 集成：只使用公共 Local Socket API、公共 CLI 和审计过的 JSON 模型。
 - 协议：只接受精确 protocol 17，不能按“17 或更高”处理。
 - 状态恢复：进程重启和 Herdr 重连后以最新 `session.snapshot` 接管，不恢复旧选择或分页。
+- 持久化：当前没有 StateStore；选择、分页、通知 hash 和带 TTL 的 `msgid` 幂等键均只
+  存内存，进程重启后不恢复。
 - 输出：只称为终端近期快照，不承诺完整对话、结构化 assistant 消息或 LLM transcript。
 - 审批：不自动批准权限请求；只有用户明确输入白名单按键命令时才发送按键。
 
@@ -102,6 +105,7 @@ spinner、状态栏、权限界面和 TUI 重绘。`PaneReadResult.revision` 在
 
 - `internal/herdr`：公共 NDJSON 请求、严格响应模型、订阅和 Socket 解析。
 - `internal/wecom`：WebSocket 协议、请求关联、心跳和重连。
+- `internal/interactive`：把 stdin/stdout 适配为单用户本地聊天会话。
 - `internal/session`：快照索引、列表编号、选择和 occupant 身份。
 - `internal/command`：纯命令解析。
 - `internal/panel`：终端规范化、100 行分页和 UTF-8 安全分段。
@@ -128,14 +132,34 @@ go test ./internal/integration -run TestBridgeEndToEnd
 可选真实 Herdr 测试：
 
 ```sh
-HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
+PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
+HERDR_PAL_INTEGRATION=1 \
+go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 ```
 
-该测试先运行 `herdr status server --json`，只有 protocol 17 才继续读取真实 snapshot；
-企业微信始终使用 fake，不需要外网或真实 Secret。
+该只读测试先运行 `herdr status server --json`，只有 protocol 17 才继续执行真实
+`ping`、`session.snapshot`、`agent.get`、`agent.read` 和交互模式 `/ls`、`/sel`、`/con`；
+不访问企业微信外网，也不需要真实 Secret。
 
-截至 2026-07-24，本机 `/opt/homebrew/bin/herdr` 为 0.7.1，运行服务 protocol 14，真实
-测试按设计 `Skip`。这不是成功的真实 Herdr 联调记录。
+实时 prompt 测试必须显式指定目标 pane，并额外打开写入门禁：
+
+```sh
+PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
+HERDR_PAL_INTEGRATION=1 \
+HERDR_PAL_LIVE_INPUT=1 \
+HERDR_PAL_LIVE_PANE_ID='<必须替换为当前 pane ID>' \
+go test ./internal/integration -run '^TestRealHerdrLivePrompt$' -count=1 -v
+```
+
+必须先从最新公共 `session.snapshot` 取得目标 pane ID 并替换占位符，禁止原样执行；未
+替换或目标不存在时，测试应在调用 `agent.prompt` 前失败。门禁通过后只发送一次固定
+marker prompt，并通过 `agent.read(recent_unwrapped, 100)` 等待新增 marker，不发送按键。
+
+截至 2026-07-24，真实联调基线为源码 debug Herdr 0.7.5/protocol 17，二进制位于
+`/Users/wxc/Code/herdr/target/debug/herdr`，配置目录为 `~/.config/herdr-dev`。默认
+`PATH` 中的 Homebrew `/opt/homebrew/bin/herdr` 仍为 0.7.1，使用 `~/.config/herdr`；
+两者解析到不同 Socket，因此运行测试或 `herdr-pal -i` 时必须显式使用 debug PATH。
+只读测试和显式门禁的实时 prompt 测试均已在该 protocol 17 服务上完成联调。
 
 ## 8. 安全边界
 
@@ -151,6 +175,6 @@ HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
 
 ## 9. 后续工作
 
-首版范围完成后再独立评估：真实 protocol 17 联调、多用户/群聊、持久化恢复、模板卡片、
-更多安全按键、`launchd`、多媒体输入，以及官方 Go SDK 出现后的替换策略。任何需要
-实时结构化输出的需求都应先形成 Herdr 公共 API 提案，不能依赖私有内部状态。
+首版范围完成后再独立评估：多用户/群聊、持久化恢复、模板卡片、更多安全按键、
+`launchd`、多媒体输入，以及官方 Go SDK 出现后的替换策略。任何需要实时结构化输出的
+需求都应先形成 Herdr 公共 API 提案，不能依赖私有内部状态。

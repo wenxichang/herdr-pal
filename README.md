@@ -1,8 +1,8 @@
 # Herdr Pal
 
 Herdr Pal 是运行在本机的独立 IM bridge。首个版本使用 Go 编译为单文件，通过 Herdr
-公共 Local Socket API 与企业微信智能机器人长连接，把 Agent 状态通知、终端近期快照
-和受限输入带到自己的企业微信单聊中。
+公共 Local Socket API 与企业微信智能机器人长连接，或在本机进入纯控制台交互模式，
+把 Agent 状态通知、终端近期快照和受限输入带到聊天会话中。
 
 它不修改 Herdr，不使用 MCP、plugin startup hook、私有 TUI socket 或内部 Rust 模块。
 普通文本只调用 `agent.prompt`，明确的 UI 操作只调用 `agent.send_keys`。
@@ -40,8 +40,16 @@ herdr status server --json
 herdr session list --json
 ```
 
-当前开发机安装的 Herdr 0.7.1 返回 `protocol: 14`，因此仓库中的真实 Herdr 集成测试
-会跳过；fake 端到端测试完整使用 protocol 17。不能据此宣称已在本机完成真实联调。
+当前开发机同时存在两套 Herdr：
+
+- Homebrew 的 `/opt/homebrew/bin/herdr` 为 0.7.1，使用 `~/.config/herdr`。
+- 源码构建的 `/Users/wxc/Code/herdr/target/debug/herdr` 为 0.7.5，使用
+  `~/.config/herdr-dev`；当前真实联调基线是该版本及其 protocol 17 服务。
+
+`PATH` 决定 Herdr Pal 通过公共 CLI 解析哪套配置和 Socket。两套二进制不会自动共享
+配置目录，排查服务状态时必须使用与启动 Herdr Pal 相同的 `PATH`。Herdr Pal 调用
+`agent.get`、`agent.read`、`agent.prompt` 和 `agent.send_keys` 时一律使用 pane ID；
+terminal ID 只用于确认 Agent occupant 是否仍然相同。
 
 ## 企业微信配置
 
@@ -107,10 +115,36 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 ./dist/herdr-pal -config /绝对路径/config.json
 ```
 
-按 `Ctrl+C` 停止，也可以发送 `SIGTERM`。程序会停止接收新消息、取消 Herdr 请求、
-关闭两侧连接并释放同 Bot 的本机进程锁；优雅退出上限为 10 秒。
+不连接企业微信、直接把控制台模拟成聊天框：
 
-## 单聊命令
+```sh
+./dist/herdr-pal -i
+./dist/herdr-pal -i -config /绝对路径/interactive.json
+PATH=/Users/wxc/Code/herdr/target/debug:$PATH ./dist/herdr-pal -i
+```
+
+交互模式可以完全不提供配置文件；需要覆盖 Herdr session、Socket 或日志级别时，配置
+文件只保留 `herdr` 和 `log` 即可，不需要 `wecom` 字段，也不读取
+`HERDR_PAL_WECOM_SECRET`。例如：
+
+```json
+{
+  "herdr": {
+    "session": "",
+    "socket_path": ""
+  },
+  "log": {
+    "level": "info"
+  }
+}
+```
+
+交互模式把提示符、`[回复]` 和 `[通知]` 写到 stdout；结构化运行日志与显式按键审计写到
+stderr，便于独立重定向。按 `Ctrl+C` 或发送 `SIGTERM` 可停止两种模式，交互模式还可按
+`Ctrl+D` 关闭 stdin 并正常退出。程序会停止接收新消息、取消 Herdr 请求、关闭连接并
+释放对应的本机进程锁；优雅退出上限为 10 秒。
+
+## 聊天命令
 
 | 输入 | 行为 |
 | --- | --- |
@@ -161,14 +195,17 @@ fake Herdr + fake 企业微信端到端测试：
 go test ./internal/integration -run TestBridgeEndToEnd
 ```
 
-可选真实 Herdr 测试仍使用 fake 企业微信，不访问企业微信外网，也不需要真实 Secret：
+可选真实 Herdr 只读测试不访问企业微信外网，也不需要真实 Secret：
 
 ```sh
-HERDR_PAL_INTEGRATION=1 go test ./internal/integration -run TestRealHerdr -v
+PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
+HERDR_PAL_INTEGRATION=1 \
+go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 ```
 
 该测试首先执行 `herdr status server --json`。服务未运行、CLI 不可用或协议不是 17 时
-会明确 `Skip`；只有通过门禁后才读取真实 `session.snapshot`。
+会明确 `Skip`；只有通过门禁后才读取真实 `session.snapshot` 和 Agent 近期快照，并验证
+交互模式的 `/ls`、`/sel`、`/con` 只读路径。
 
 ## 安全模型
 
