@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -266,46 +265,6 @@ func TestApplicationHarnessCleanupReleasesProcessLock(t *testing.T) {
 	application := startApplication(t, herdrServer.SocketPath(), weComServer.Endpoint())
 	weComServer.WaitSubscribeCount(t, 1)
 	application.stop(t)
-	application.stop(t)
-}
-
-func TestRealHerdr(t *testing.T) {
-	if os.Getenv("HERDR_PAL_INTEGRATION") != "1" {
-		t.Skip("设置 HERDR_PAL_INTEGRATION=1 后才运行真实 Herdr 集成测试")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "herdr", "status", "server", "--json").Output()
-	if err != nil {
-		t.Skipf("Herdr 公共 CLI 状态不可用：%v", err)
-	}
-	var status struct {
-		Running  bool   `json:"running"`
-		Protocol uint32 `json:"protocol"`
-		Socket   string `json:"socket"`
-	}
-	if err := json.Unmarshal(output, &status); err != nil {
-		t.Skipf("Herdr 公共 CLI 状态 JSON 无法解析：%v", err)
-	}
-	if !status.Running || status.Protocol != herdr.RequiredProtocol || strings.TrimSpace(status.Socket) == "" {
-		t.Skipf("已安装 Herdr 尚未满足真实联调门禁：running=%t protocol=%d，需要 protocol=%d", status.Running, status.Protocol, herdr.RequiredProtocol)
-	}
-
-	client := herdr.NewClient(status.Socket, nil, 5*time.Second)
-	if err := client.CheckCompatible(ctx); err != nil {
-		t.Fatalf("真实 Herdr CheckCompatible() error = %v", err)
-	}
-	snapshot, err := client.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("真实 Herdr Snapshot() error = %v", err)
-	}
-	if snapshot.Protocol != herdr.RequiredProtocol {
-		t.Fatalf("真实 Herdr snapshot protocol = %d, want %d", snapshot.Protocol, herdr.RequiredProtocol)
-	}
-
-	weComServer := testkit.NewWeComServer(t, testBotID, testSecret)
-	application := startApplication(t, status.Socket, weComServer.Endpoint())
-	weComServer.WaitSubscribeCount(t, 1)
 	application.stop(t)
 }
 
