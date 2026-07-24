@@ -40,6 +40,7 @@ bridge 在本机连接 Herdr Socket，消息侧既可以连接企业微信，也
 
 - 解析 Herdr Socket 路径和 session。
 - 编码、发送和解析 NDJSON 请求。
+- 解析 protocol 17 的 `state_change_seq`，执行原子 prompt wait 和状态序列轮询。
 - 维护 `events.subscribe` 长连接。
 - 区分请求响应、订阅确认和事件行。
 - 将协议错误转换为稳定的项目内部错误类型。
@@ -142,8 +143,10 @@ pane 中的 Agent 是否已经被替换。
 
 默认策略：
 
-- 普通文本允许映射到 `agent.prompt`。
+- 普通文本仅在实时状态为 `idle` 或 `done` 时映射到带 wait 的 `agent.prompt`。
 - 白名单按键命令本身就是用户的显式操作，不二次确认。
+- `agent_prompt_stalled` 只允许在 occupant、状态和序列复核后补发一次受审计的 Enter；
+  `blocked` 永不触发自动 Enter。
 - `ctrl+c`、组合键、退出、关闭 pane 等动作当前不提供入口。
 - Agent 权限审批永不自动执行。
 
@@ -235,9 +238,11 @@ ConsoleAdapter：进程 stdin → 固定 interactive-local 单聊身份   ├→
   → PolicyGuard 校验身份和单聊类型
   → Deduper 登记 msgid
   → 解析普通 prompt
-  → 校验当前选择和 Agent occupant
-  → agent.prompt
-  → 返回“已送达”或错误
+  → agent.get 校验当前选择、occupant 和 idle/done 状态
+  → 带 wait 的 agent.prompt 等待状态或 state_change_seq 变化
+  → stalled 时复核 occupant、状态和序列
+  → 必要时只补发一次受审计的 Enter，再轮询 state_change_seq
+  → 仅在观察到变化后返回实际状态，否则报告未生效
   → 等待后续状态事件
 ```
 
@@ -328,6 +333,8 @@ Socket 错误。
 
 - NDJSON framing 和部分读取。
 - Herdr success/error/event 数据解析。
+- prompt wait、`agent_prompt_stalled`、状态序列轮询和调用方取消。
+- 普通文本状态门禁、occupant 复核、单次 Enter 恢复及三态审计。
 - 状态迁移通知规则。
 - 输出规范化、整快照 hash 去重、分页重叠和截断。
 - Binding occupant 校验。
@@ -341,6 +348,7 @@ Socket 错误。
 - 测试 pane 创建后状态订阅重建。
 - 测试 Herdr 重启后 pane id/terminal id 改变。
 - 测试相同事件或企业微信回调重放不会产生重复危险输入。
+- 测试 working 状态拒绝普通文本，以及 stalled 后只补发一次 Enter 并确认状态变化。
 
 ### 7.3 手工联调
 
@@ -358,7 +366,7 @@ Socket 错误。
 - 手工建立一个 IM 会话到 pane 的绑定。
 - snapshot + pane 生命周期 + Agent 状态订阅。
 - blocked/done 时读取 recent_unwrapped 并通知。
-- 普通 IM 文本通过 agent.prompt 发送。
+- 普通 IM 文本通过 agent.prompt wait 发送，确认状态变化后才报告成功。
 - Herdr 重连、订阅自动重建和断线后重新选择。
 - `msgid`、状态通知和失效通知的内存幂等。
 - 白名单按键、occupant 校验、结构化审计和安全日志。

@@ -24,7 +24,7 @@ Herdr 已接受输入字节，不表示 Agent 已经开始处理。Claude Code �
 
 采用“原子 prompt 等待 + Enter 后序列轮询”方案。
 
-首次发送使用 `agent.prompt.wait`。Herdr 在处理同一请求时记录提交前的
+首次发送使用带 wait 的 `agent.prompt`。Herdr 在处理同一请求时记录提交前的
 `state_change_seq`，因此不会漏掉紧随 prompt 发生的快速状态变化。`wait.until` 包含协议
 定义的全部 Agent 状态，使请求在首次可观察状态变化后立即返回，而不是继续等待任务完成。
 不显式设置 `timeout_ms`，使用 Herdr 对 prompt effect 固定的 5 秒检测窗口；无变化时返回
@@ -171,7 +171,7 @@ Agent 当前状态为 working，暂不接受普通文本。
 
 ### 8.3 集成测试
 
-扩展 fake Herdr，使 `agent.prompt.wait` 可以返回状态变化或
+扩展 fake Herdr，使带 wait 的 `agent.prompt` 可以返回状态变化或
 `agent_prompt_stalled`，并允许测试在 `agent.send_keys` 后更新 `state_change_seq`。覆盖：
 
 - 普通 prompt 首次确认成功。

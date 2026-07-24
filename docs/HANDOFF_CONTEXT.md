@@ -11,11 +11,12 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 - 企业微信智能机器人 API 模式 WebSocket 长连接、订阅、心跳、`req_id` 响应关联和重连。
 - Herdr 公共 Unix Socket NDJSON 客户端、精确 protocol 17 门禁、快照和两类事件订阅。
 - 全部 Agent pane 的动态索引、occupant 身份校验和重连后最新状态接管。
-- 单聊命令、100 行分页、普通 prompt、受限按键和 `msgid` 幂等。
+- 单聊命令、100 行分页、带状态确认和一次性 Enter 恢复的普通 prompt、受限按键与
+  `msgid` 幂等。
 - 状态通知异步队列、失败重试、合并、去重和 pane 失效通知。
 - 本机进程锁、结构化安全日志、SIGINT/SIGTERM 和 10 秒优雅退出。
 - 无 TUI 的 ConsoleAdapter：stdin 接收聊天输入，stdout 输出回复与通知，Ctrl+D 正常退出。
-- fake Herdr、fake 企业微信和十个核心端到端场景。
+- fake Herdr、fake 企业微信和核心端到端场景。
 
 ## 2. 固定产品决策
 
@@ -29,7 +30,9 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 - 持久化：当前没有 StateStore；选择、分页、通知 hash 和带 TTL 的 `msgid` 幂等键均只
   存内存，进程重启后不恢复。
 - 输出：只称为终端近期快照，不承诺完整对话、结构化 assistant 消息或 LLM transcript。
-- 审批：不自动批准权限请求；只有用户明确输入白名单按键命令时才发送按键。
+- 审批：不自动批准权限请求；用户可以显式发送白名单按键。唯一自动按键是普通 prompt
+  已从 `idle`/`done` 提交但 5 秒无状态变化时，在 occupant、状态和序列复核后补发的一次
+  `enter`；`blocked` 永不触发该恢复。
 
 ## 3. 已实现命令
 
@@ -49,6 +52,11 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 
 `X` 只允许单个 ASCII 字母或数字。其他不以 `/` 开头的文本通过 `agent.prompt` 发送；
 未知 `/` 命令不会降级为 prompt。按键命令不二次确认。
+
+普通文本发送前实时调用 `agent.get`，仅允许 `idle`、`done`。首次发送使用带 wait 的
+`agent.prompt`，并以 `state_change_seq` 确认状态确实变化；收到
+`agent_prompt_stalled` 后只允许一次受审计的 Enter 恢复，再轮询最多 5 秒。未观察到
+变化时回复“发送未生效”，不会宣称已经开始执行。
 
 分页固定 100 行一页。`/con` 读取最后 100 行并重置页码，`/pageup` 逐步扩大到最多
 1000 行，`/pagedn` 只访问缓存。`blocked`、`done` 和需要输出的 `idle` 主动通知每次也
@@ -83,7 +91,18 @@ Herdr 断线时立即进入 degraded，暂停 prompt/按键、清空选择和分
 外部协议没有可持久化 cursor。重连仍必须依靠权威 snapshot 和业务幂等，而不是假定
 事件 exactly-once 或可断点续传。
 
-### 4.3 输出限制
+### 4.3 Prompt 确认语义
+
+- protocol 17 的完整 `AgentInfo` 必须包含 `state_change_seq`；缺失时按协议错误处理。
+- 普通文本初始状态只接受 `idle`、`done`，并使用带 wait 的 `agent.prompt` 覆盖全部
+  稳定状态。
+- Herdr 固定的 prompt effect 窗口内无变化会返回 `agent_prompt_stalled`。
+- 恢复前再次调用 `agent.get`。occupant 已替换、序列已变化或状态不再可输入时不发送
+  Enter。
+- 只有仍为原 occupant、原序列且状态仍为 `idle`/`done` 时补发一次 Enter；随后通过
+  `agent.get` 比较原序列，最多等待 5 秒。
+
+### 4.4 输出限制
 
 `agent.read(recent_unwrapped)` 返回终端快照，内容可能包含 prompt、Agent 回复、工具日志、
 spinner、状态栏、权限界面和 TUI 重绘。`PaneReadResult.revision` 在审计基线中固定为 0，
@@ -126,8 +145,9 @@ spinner、状态栏、权限界面和 TUI 重绘。`PaneReadResult.revision` 在
 go test ./internal/integration -run TestBridgeEndToEnd
 ```
 
-端到端覆盖：启动订阅、`/ls`/`/sel`/prompt、Enter/Space、分页读取次数、blocked/done
-100 行、`msgid` 去重、未授权与群聊、occupant 替换、Herdr 断线重选、企业微信断线不重放。
+端到端覆盖：启动订阅、`/ls`/`/sel`/prompt、stalled 后单次 Enter 恢复、working 状态
+拒绝文本、显式 Enter/Space、分页读取次数、blocked/done 100 行、`msgid` 去重、未授权
+与群聊、occupant 替换、Herdr 断线重选、企业微信断线不重放。
 
 可选真实 Herdr 测试：
 
@@ -168,9 +188,10 @@ marker prompt，并通过 `agent.read(recent_unwrapped, 100)` 等待新增 marke
 - 不暴露原始 Herdr Socket 到网络。
 - 不记录完整 Secret、Cookie、prompt 或终端快照。
 - 未授权用户、群聊、未知 pane、失效 terminal/occupant 和 degraded 状态都不能产生输入。
-- 白名单按键在取得当前选择后同步记录结构化审计；成功、occupant 拒绝、Herdr 查询或
-  发送失败分别记录 `sent`、`rejected`、`failed`。审计只含用户、pane、occupant SHA-256
-  摘要、规范化按键、时间和结果，且不受普通日志级别过滤。
+- 白名单按键和 stalled prompt 的恢复 Enter 在取得当前选择后同步记录结构化审计；
+  成功、occupant 拒绝、Herdr 查询或发送失败分别记录 `sent`、`rejected`、`failed`。
+  审计只含用户、pane、occupant SHA-256 摘要、规范化按键、时间和结果，且不受普通日志
+  级别过滤。
 - 没有 `server.stop`、`pane.close`、`pane.send_text`、`pane.send_input` 或自动审批入口。
 
 ## 9. 后续工作

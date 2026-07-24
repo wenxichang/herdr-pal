@@ -5,7 +5,7 @@ Herdr Pal 是运行在本机的独立 IM bridge。首个版本使用 Go 编译�
 把 Agent 状态通知、终端近期快照和受限输入带到聊天会话中。
 
 它不修改 Herdr，不使用 MCP、plugin startup hook、私有 TUI socket 或内部 Rust 模块。
-普通文本只调用 `agent.prompt`，明确的 UI 操作只调用 `agent.send_keys`。
+普通文本只调用带状态等待的 `agent.prompt`，明确的 UI 操作只调用 `agent.send_keys`。
 
 ## 能力与边界
 
@@ -159,11 +159,18 @@ stderr，便于独立重定向。按 `Ctrl+C` 或发送 `SIGTERM` 可停止两�
 | `/esc`、`/key esc` | 发送 `esc` |
 | `/space`、`/key space` | 发送 `space` |
 | `/key X` | 发送一个 ASCII 字母或数字，保留大小写 |
-| 其他不以 `/` 开头的文本 | 通过 `agent.prompt` 发送给当前 Agent |
+| 其他不以 `/` 开头的文本 | 在状态确认后通过 `agent.prompt` 发送给当前 Agent |
 
 `/key X` 只接受单个 `A-Z`、`a-z` 或 `0-9`；特殊键名只接受表中的小写形式。不支持
 组合键、控制键、任意 key name 或按键序列。命令本身就是用户的显式操作，不二次确认，
 但 `blocked` 状态永远不会自动发送 Enter 或空格。
+
+普通文本只允许发送给实时状态为 `idle` 或 `done` 的当前 occupant；`working`、`blocked`
+和 `unknown` 会直接拒绝。`agent.prompt` 在同一请求中等待最多约 5 秒的状态变化，只有
+观察到状态或 `state_change_seq` 改变才回复成功。若 Herdr 返回
+`agent_prompt_stalled`，bridge 会再次确认 occupant、状态和序列；仍为原 occupant 且仍
+处于 `idle`/`done` 时只补发一次 `enter`，再等待最多 5 秒。仍无变化时提示检查 Agent
+界面，不会继续重试。
 
 以 `/` 开头但无法识别的内容只返回命令错误，绝不会作为 prompt 转发。
 
@@ -212,9 +219,9 @@ go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 - 默认拒绝未知用户、群聊、未知 pane 和失效 occupant。
 - 企业微信 `msgid` 使用有容量和 TTL 上限的内存集合去重。
 - 每次 prompt 或按键前重新校验 pane、terminal 和 Agent occupant。
-- 每次已选目标的白名单按键尝试都会写入结构化审计，只包含用户、pane、occupant 摘要、
-  规范化按键、时间和 `sent`/`rejected`/`failed` 结果；重复消息、未授权输入和原始非法
-  命令不产生按键审计。
+- 每次已选目标的白名单按键尝试，以及 stalled prompt 的一次性恢复 Enter，都会写入
+  结构化审计，只包含用户、pane、occupant 摘要、规范化按键、时间和
+  `sent`/`rejected`/`failed` 结果；重复消息、未授权输入和原始非法命令不产生按键审计。
 - 日志只记录连接状态、安全错误类别、长度或摘要，不记录 Secret、完整 prompt、Cookie
   或完整终端快照。
 - 没有 `server.stop`、`pane.close`、`pane.send_text`、`pane.send_input` 或自动审批入口。
