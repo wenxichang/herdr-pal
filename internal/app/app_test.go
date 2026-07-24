@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,10 +139,14 @@ func TestRunInteractiveResolvesSocketBeforeSocketScopedLock(t *testing.T) {
 		}
 		return &fakeLock{}, nil
 	}
+	options.dependencies.prepareStableDialPath = func(canonicalEndpoint string) (*dialPathLease, error) {
+		order = append(order, "dial")
+		return prepareStableDialPath(canonicalEndpoint)
+	}
 	options.dependencies.assembleInteractive = func(_ config.Config, socketPath string, _ io.Reader, _ io.Writer, _ *slog.Logger) (*applicationRuntime, error) {
 		order = append(order, "assemble")
-		if socketPath != canonicalSocketPath {
-			t.Fatalf("assembled socket = %q, want stable canonical path %q", socketPath, canonicalSocketPath)
+		if identity := resolvedDialPath(t, socketPath); identity != canonicalSocketPath {
+			t.Fatalf("assembled socket identity = %q, want canonical endpoint %q", identity, canonicalSocketPath)
 		}
 		return canceledRuntime(), nil
 	}
@@ -151,7 +156,7 @@ func TestRunInteractiveResolvesSocketBeforeSocketScopedLock(t *testing.T) {
 	if err := Run(ctx, options); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	wantOrder := []string{"load", "resolve", "cache", "mkdir", "lock", "assemble"}
+	wantOrder := []string{"load", "resolve", "cache", "mkdir", "lock", "dial", "assemble"}
 	if fmt.Sprint(order) != fmt.Sprint(wantOrder) {
 		t.Fatalf("interactive startup order = %v, want %v", order, wantOrder)
 	}
@@ -175,7 +180,7 @@ func TestRunInteractiveCanonicalizesSocketAliasesForLockIdentity(t *testing.T) {
 		t.Helper()
 		firstPlan := captureInteractiveSocketPlan(t, first, nil)
 		secondPlan := captureInteractiveSocketPlan(t, second, nil)
-		if firstPlan.lockPath != secondPlan.lockPath || firstPlan.assembledSocket != secondPlan.assembledSocket {
+		if firstPlan.lockPath != secondPlan.lockPath || firstPlan.assembledIdentity != secondPlan.assembledIdentity {
 			t.Fatalf("%s plans = %#v/%#v, want same lock and connection path", name, firstPlan, secondPlan)
 		}
 	}
@@ -183,7 +188,7 @@ func TestRunInteractiveCanonicalizesSocketAliasesForLockIdentity(t *testing.T) {
 	assertSameSocketPlan("relative alias", target, relativeTarget)
 
 	other := filepath.Join(tempDir, "other.sock")
-	if first, second := captureInteractiveSocketPlan(t, target, nil), captureInteractiveSocketPlan(t, other, nil); first.lockPath == second.lockPath || first.assembledSocket == second.assembledSocket {
+	if first, second := captureInteractiveSocketPlan(t, target, nil), captureInteractiveSocketPlan(t, other, nil); first.lockPath == second.lockPath || first.assembledIdentity == second.assembledIdentity {
 		t.Fatalf("different sockets share plan %#v/%#v", first, second)
 	}
 
@@ -214,20 +219,21 @@ func TestRunInteractiveResolvesSymlinkParentWithMissingSocketLeaf(t *testing.T) 
 	aliasSocket := filepath.Join(aliasDir, "missing.sock")
 	realPlan := captureInteractiveSocketPlan(t, filepath.Join(realDir, "missing.sock"), nil)
 	aliasPlan := captureInteractiveSocketPlan(t, aliasSocket, nil)
-	if realPlan != aliasPlan {
+	if realPlan.lockPath != aliasPlan.lockPath || realPlan.assembledIdentity != aliasPlan.assembledIdentity {
 		t.Fatalf("missing-leaf plans = %#v/%#v, want same stable path", realPlan, aliasPlan)
 	}
-	if aliasPlan.assembledSocket != realSocket {
-		t.Fatalf("assembled socket = %q, want resolved parent path %q", aliasPlan.assembledSocket, realSocket)
+	if aliasPlan.assembledIdentity != realSocket {
+		t.Fatalf("assembled socket identity = %q, want resolved parent path %q", aliasPlan.assembledIdentity, realSocket)
 	}
 }
 
 func TestRunInteractiveFreezesCanonicalSocketAcrossSymlinkRetarget(t *testing.T) {
 	tempDir := t.TempDir()
-	dirA := filepath.Join(tempDir, "socket-a")
-	dirB := filepath.Join(tempDir, "socket-b")
+	longParent := filepath.Join(tempDir, strings.Repeat("long-parent-", 9))
+	dirA := filepath.Join(longParent, "socket-a")
+	dirB := filepath.Join(longParent, "socket-b")
 	for _, dir := range []string{dirA, dirB} {
-		if err := os.Mkdir(dir, 0o700); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatalf("create socket directory: %v", err)
 		}
 	}
@@ -238,6 +244,14 @@ func TestRunInteractiveFreezesCanonicalSocketAcrossSymlinkRetarget(t *testing.T)
 	aliasSocket := filepath.Join(aliasDir, "herdr.sock")
 	wantA := resolvedChildPath(t, dirA, "herdr.sock")
 	wantB := resolvedChildPath(t, dirB, "herdr.sock")
+	for _, endpoint := range []string{wantA, wantB} {
+		if err := os.WriteFile(endpoint, nil, 0o600); err != nil {
+			t.Fatalf("create socket endpoint marker: %v", err)
+		}
+		if len([]byte(endpoint)) < unixSocketPathByteLimit {
+			t.Fatalf("test endpoint length = %d, want at least %d", len([]byte(endpoint)), unixSocketPathByteLimit)
+		}
+	}
 
 	planA := captureInteractiveSocketPlan(t, aliasSocket, func() {
 		if err := os.Remove(aliasDir); err != nil {
@@ -247,16 +261,19 @@ func TestRunInteractiveFreezesCanonicalSocketAcrossSymlinkRetarget(t *testing.T)
 			t.Fatalf("retarget alias: %v", err)
 		}
 	})
-	if planA.assembledSocket != wantA {
-		t.Fatalf("first assembled socket = %q, want frozen %q", planA.assembledSocket, wantA)
+	if planA.assembledIdentity != wantA {
+		t.Fatalf("first assembled socket identity = %q, want frozen %q", planA.assembledIdentity, wantA)
+	}
+	if planA.assembledSocket == wantA || len([]byte(planA.assembledSocket)) >= unixSocketPathByteLimit {
+		t.Fatalf("first dial path length/path = %d/%q, want short private alias", len([]byte(planA.assembledSocket)), planA.assembledSocket)
 	}
 	wantLockA := filepath.Join("/cache", "herdr-pal", "interactive-"+shortHash(wantA)+".lock")
 	if planA.lockPath != wantLockA {
 		t.Fatalf("first lock path = %q, want frozen target lock %q", planA.lockPath, wantLockA)
 	}
 	planB := captureInteractiveSocketPlan(t, aliasSocket, nil)
-	if planB.assembledSocket != wantB {
-		t.Fatalf("second assembled socket = %q, want retargeted %q", planB.assembledSocket, wantB)
+	if planB.assembledIdentity != wantB {
+		t.Fatalf("second assembled socket identity = %q, want retargeted %q", planB.assembledIdentity, wantB)
 	}
 	wantLockB := filepath.Join("/cache", "herdr-pal", "interactive-"+shortHash(wantB)+".lock")
 	if planB.lockPath != wantLockB {
@@ -264,6 +281,111 @@ func TestRunInteractiveFreezesCanonicalSocketAcrossSymlinkRetarget(t *testing.T)
 	}
 	if planA.lockPath == planB.lockPath {
 		t.Fatalf("different retargeted endpoints share lock %q", planA.lockPath)
+	}
+}
+
+func TestPrepareStableDialPathKeepsShortCanonicalEndpoint(t *testing.T) {
+	canonicalEndpoint := "/tmp/herdr-short.sock"
+	lease, err := prepareStableDialPath(canonicalEndpoint)
+	if err != nil {
+		t.Fatalf("prepareStableDialPath() error = %v", err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	if lease.Path() != canonicalEndpoint {
+		t.Fatalf("stable dial path = %q, want canonical endpoint %q", lease.Path(), canonicalEndpoint)
+	}
+	if lease.aliasDir != "" {
+		t.Fatalf("short canonical endpoint created alias directory %q", lease.aliasDir)
+	}
+}
+
+func TestPrepareStableDialPathCreatesDialablePrivateAliasForLongEndpoint(t *testing.T) {
+	longDirectory := filepath.Join(t.TempDir(), strings.Repeat("long-directory-", 8))
+	if err := os.MkdirAll(longDirectory, 0o700); err != nil {
+		t.Fatalf("create long socket directory: %v", err)
+	}
+	canonicalEndpoint := resolvedChildPath(t, longDirectory, "herdr.sock")
+	if len([]byte(canonicalEndpoint)) < unixSocketPathByteLimit {
+		t.Fatalf("test endpoint length = %d, want at least %d", len([]byte(canonicalEndpoint)), unixSocketPathByteLimit)
+	}
+
+	listenerAliasDir, err := os.MkdirTemp("/tmp", "herdr-pal-listener-")
+	if err != nil {
+		t.Fatalf("create listener alias directory: %v", err)
+	}
+	listenerAlias := filepath.Join(listenerAliasDir, "s")
+	if err := os.Symlink(longDirectory, listenerAlias); err != nil {
+		_ = os.Remove(listenerAliasDir)
+		t.Skipf("platform does not support symlink: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(listenerAlias)
+		_ = os.Remove(listenerAliasDir)
+	})
+	listener, err := net.Listen("unix", filepath.Join(listenerAlias, filepath.Base(canonicalEndpoint)))
+	if err != nil {
+		t.Fatalf("listen through short alias: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	lease, err := prepareStableDialPath(canonicalEndpoint)
+	if err != nil {
+		t.Fatalf("prepareStableDialPath() error = %v", err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	if len([]byte(lease.Path())) >= unixSocketPathByteLimit {
+		t.Fatalf("stable dial path length = %d, want below %d", len([]byte(lease.Path())), unixSocketPathByteLimit)
+	}
+	info, err := os.Stat(lease.aliasDir)
+	if err != nil {
+		t.Fatalf("stat alias directory: %v", err)
+	}
+	if permissions := info.Mode().Perm(); permissions != 0o700 {
+		t.Fatalf("alias directory permissions = %o, want 700", permissions)
+	}
+	if identity := resolvedDialPath(t, lease.Path()); identity != canonicalEndpoint {
+		t.Fatalf("stable dial identity = %q, want %q", identity, canonicalEndpoint)
+	}
+	connection, err := net.DialTimeout("unix", lease.Path(), time.Second)
+	if err != nil {
+		t.Fatalf("dial stable path: %v", err)
+	}
+	_ = connection.Close()
+}
+
+func TestPrepareStableDialPathUsesByteLimitAndRejectsUnshortenableBasename(t *testing.T) {
+	withinLimit := "/" + strings.Repeat("a", unixSocketPathByteLimit-2)
+	if len([]byte(withinLimit)) != unixSocketPathByteLimit-1 {
+		t.Fatalf("within-limit fixture length = %d", len([]byte(withinLimit)))
+	}
+	direct, err := prepareStableDialPath(withinLimit)
+	if err != nil {
+		t.Fatalf("prepare within-limit path: %v", err)
+	}
+	if direct.Path() != withinLimit || direct.aliasDir != "" {
+		t.Fatalf("within-limit stable path = %q alias=%q, want direct", direct.Path(), direct.aliasDir)
+	}
+
+	atLimit := "/" + strings.Repeat("b", unixSocketPathByteLimit-3) + "/s"
+	if len([]byte(atLimit)) != unixSocketPathByteLimit {
+		t.Fatalf("at-limit fixture length = %d", len([]byte(atLimit)))
+	}
+	aliased, err := prepareStableDialPath(atLimit)
+	if err != nil {
+		t.Fatalf("prepare at-limit path: %v", err)
+	}
+	t.Cleanup(func() { _ = aliased.Close() })
+	if aliased.Path() == atLimit || len([]byte(aliased.Path())) >= unixSocketPathByteLimit {
+		t.Fatalf("at-limit stable path length/path = %d/%q", len([]byte(aliased.Path())), aliased.Path())
+	}
+
+	sensitiveEndpoint := "/" + strings.Repeat("socket-sensitive-", 10)
+	_, err = prepareStableDialPath(sensitiveEndpoint)
+	if !errors.Is(err, errStableDialPathTooLong) {
+		t.Fatalf("prepare unshortenable endpoint error = %v, want safe length error", err)
+	}
+	if strings.Contains(err.Error(), sensitiveEndpoint) {
+		t.Fatalf("stable path error leaked canonical endpoint: %v", err)
 	}
 }
 
@@ -872,6 +994,105 @@ func TestRunInteractiveTreatsInputEOFAsNormalAndReleasesLock(t *testing.T) {
 	if got := lock.releases.Load(); got != 1 {
 		t.Fatalf("lock releases = %d, want 1 after normal EOF", got)
 	}
+}
+
+func TestRunInteractiveCleansLongDialAliasAfterNormalExit(t *testing.T) {
+	canonicalEndpoint := longCanonicalEndpoint(t)
+	im := newOrderedResultWeCom(interactive.ErrInputClosed)
+	supervisor := newFakeRunner()
+	options := testInteractiveOptions(t)
+	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
+		return canonicalEndpoint, nil
+	}
+	var dialPath string
+	options.dependencies.assembleInteractive = func(_ config.Config, stableDialPath string, _ io.Reader, _ io.Writer, _ *slog.Logger) (*applicationRuntime, error) {
+		dialPath = stableDialPath
+		return &applicationRuntime{
+			im: im, supervisor: supervisor, handler: &fakeHandler{},
+			normalIMExit: func(err error) bool { return errors.Is(err, interactive.ErrInputClosed) },
+		}, nil
+	}
+
+	if err := Run(context.Background(), options); err != nil {
+		t.Fatalf("Run() error = %v, want normal EOF shutdown", err)
+	}
+	assertPrivateDialAliasRemoved(t, dialPath)
+}
+
+func TestRunInteractiveCleansLongDialAliasAfterAssemblyFailure(t *testing.T) {
+	canonicalEndpoint := longCanonicalEndpoint(t)
+	assemblyFailure := errors.New("assembly failure")
+	lock := &fakeLock{}
+	options := testInteractiveOptions(t)
+	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
+		return canonicalEndpoint, nil
+	}
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
+	var dialPath string
+	options.dependencies.assembleInteractive = func(_ config.Config, stableDialPath string, _ io.Reader, _ io.Writer, _ *slog.Logger) (*applicationRuntime, error) {
+		dialPath = stableDialPath
+		return nil, assemblyFailure
+	}
+
+	err := Run(context.Background(), options)
+	if !errors.Is(err, assemblyFailure) {
+		t.Fatalf("Run() error = %v, want assembly failure", err)
+	}
+	assertPrivateDialAliasRemoved(t, dialPath)
+	if got := lock.releases.Load(); got != 1 {
+		t.Fatalf("lock releases = %d, want 1 after assembly failure", got)
+	}
+}
+
+func TestRunInteractiveRetainsLongDialAliasUntilTimedOutComponentsFinish(t *testing.T) {
+	canonicalEndpoint := longCanonicalEndpoint(t)
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	releaseRunners := func() { unblockOnce.Do(func() { close(unblock) }) }
+	t.Cleanup(releaseRunners)
+	imRunner := &blockingRunner{started: make(chan struct{}), unblock: unblock}
+	supervisor := &blockingRunner{started: make(chan struct{}), unblock: unblock}
+	lock := &fakeLock{}
+	options := testInteractiveOptions(t)
+	options.dependencies.shutdownTimeout = 20 * time.Millisecond
+	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
+		return canonicalEndpoint, nil
+	}
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
+	var dialPath string
+	options.dependencies.assembleInteractive = func(_ config.Config, stableDialPath string, _ io.Reader, _ io.Writer, _ *slog.Logger) (*applicationRuntime, error) {
+		dialPath = stableDialPath
+		return &applicationRuntime{
+			im:         &blockingWeCom{blockingRunner: imRunner, events: make(chan wecom.IncomingText)},
+			supervisor: supervisor,
+			handler:    &fakeHandler{},
+		}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, imRunner.started, "interactive IM")
+	waitClosed(t, supervisor.started, "interactive Supervisor")
+	cancel()
+	err := waitResult(t, result)
+	if !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Run() error = %v, want ErrShutdownTimeout", err)
+	}
+	aliasDir := privateDialAliasDir(t, dialPath)
+	if _, statErr := os.Stat(aliasDir); statErr != nil {
+		t.Fatalf("timed-out dial alias was removed early: %v", statErr)
+	}
+	if identity := resolvedDialPath(t, dialPath); identity != canonicalEndpoint {
+		t.Fatalf("retained dial identity = %q, want %q", identity, canonicalEndpoint)
+	}
+	if got := lock.releases.Load(); got != 0 || !retainsFakeLock(lock) {
+		t.Fatalf("timed-out lock releases/retained = %d/%v, want 0/true", got, retainsFakeLock(lock))
+	}
+
+	releaseRunners()
+	waitPathRemoved(t, aliasDir)
+	waitLockReleasedAndUnretained(t, lock)
 }
 
 func TestRunInteractiveEOFPreservesSupervisorFatalDuringDrain(t *testing.T) {
@@ -1553,8 +1774,9 @@ func testInteractiveOptions(t *testing.T) Options {
 }
 
 type interactiveSocketPlan struct {
-	lockPath        string
-	assembledSocket string
+	lockPath          string
+	assembledSocket   string
+	assembledIdentity string
 }
 
 func resolvedChildPath(t *testing.T, parent, child string) string {
@@ -1564,6 +1786,60 @@ func resolvedChildPath(t *testing.T, parent, child string) string {
 		t.Fatalf("resolve existing parent %q: %v", parent, err)
 	}
 	return filepath.Join(resolvedParent, child)
+}
+
+func resolvedDialPath(t *testing.T, dialPath string) string {
+	t.Helper()
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(dialPath))
+	if err != nil {
+		t.Fatalf("resolve dial parent %q: %v", filepath.Dir(dialPath), err)
+	}
+	return filepath.Join(resolvedParent, filepath.Base(dialPath))
+}
+
+func longCanonicalEndpoint(t *testing.T) string {
+	t.Helper()
+	directory := filepath.Join(t.TempDir(), strings.Repeat("long-directory-", 8))
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatalf("create long canonical directory: %v", err)
+	}
+	endpoint := resolvedChildPath(t, directory, "herdr.sock")
+	if len([]byte(endpoint)) < unixSocketPathByteLimit {
+		t.Fatalf("canonical endpoint length = %d, want at least %d", len([]byte(endpoint)), unixSocketPathByteLimit)
+	}
+	return endpoint
+}
+
+func privateDialAliasDir(t *testing.T, dialPath string) string {
+	t.Helper()
+	if len([]byte(dialPath)) >= unixSocketPathByteLimit {
+		t.Fatalf("dial path length = %d, want below %d", len([]byte(dialPath)), unixSocketPathByteLimit)
+	}
+	aliasDir := filepath.Dir(filepath.Dir(dialPath))
+	if filepath.Dir(aliasDir) != "/tmp" || !strings.HasPrefix(filepath.Base(aliasDir), "herdr-pal-") {
+		t.Fatalf("dial alias directory = %q, want private /tmp/herdr-pal-* directory", aliasDir)
+	}
+	return aliasDir
+}
+
+func assertPrivateDialAliasRemoved(t *testing.T, dialPath string) {
+	t.Helper()
+	aliasDir := privateDialAliasDir(t, dialPath)
+	if _, err := os.Lstat(aliasDir); !os.IsNotExist(err) {
+		t.Fatalf("dial alias directory still exists: %v", err)
+	}
+}
+
+func waitPathRemoved(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("path was not removed before deadline: %q", path)
 }
 
 func assertInteractiveSocketRejectedBeforeLock(t *testing.T, socketPath string, sensitivePaths []string) {
@@ -1614,6 +1890,7 @@ func captureInteractiveSocketPlan(t *testing.T, socketPath string, onAcquire fun
 	}
 	options.dependencies.assembleInteractive = func(_ config.Config, assembledSocket string, _ io.Reader, _ io.Writer, _ *slog.Logger) (*applicationRuntime, error) {
 		plan.assembledSocket = assembledSocket
+		plan.assembledIdentity = resolvedDialPath(t, assembledSocket)
 		return canceledRuntime(), nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())

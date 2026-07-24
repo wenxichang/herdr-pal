@@ -31,6 +31,10 @@ const (
 	dedupeTTL              = 24 * time.Hour
 	dedupeCapacity         = 10000
 	maxPureErrorTreeDepth  = 64
+	// 预留 pathname 终止符并兼容地址空间更小的 Unix 实现。
+	unixSocketPathByteLimit = 96
+	stableDialAliasPattern  = "herdr-pal-"
+	stableDialAliasLinkName = "s"
 )
 
 var (
@@ -39,9 +43,12 @@ var (
 	// ErrShutdownTimeout 表示部分运行循环未能在退出上限内停止。
 	ErrShutdownTimeout = errors.New("优雅退出超时")
 	// ErrLoopStopped 表示常驻运行循环在未取消时意外结束。
-	ErrLoopStopped               = errors.New("运行循环意外结束")
-	errSocketPathUnresolvable    = errors.New("Herdr Socket 路径无法可靠规范化")
-	errSocketSymlinkUnresolvable = errors.New("Herdr Socket symlink 无法可靠解析")
+	ErrLoopStopped                = errors.New("运行循环意外结束")
+	errSocketPathUnresolvable     = errors.New("Herdr Socket 路径无法可靠规范化")
+	errSocketSymlinkUnresolvable  = errors.New("Herdr Socket symlink 无法可靠解析")
+	errStableDialAliasUnavailable = errors.New("Herdr Socket 短连接路径不可用")
+	errStableDialPathTooLong      = errors.New("Herdr Socket 连接路径超过安全长度")
+	errStableDialAliasCleanup     = errors.New("清理 Herdr Socket 短连接路径失败")
 
 	// 超时返回时运行循环可能仍持有网络资源，因此必须继续持有文件锁，避免同一进程内
 	// 的 finalizer 或 GC 间接解锁并允许第二个实例启动。该集合只接管超时锁；循环永久
@@ -80,6 +87,44 @@ type retainedProcessLock struct {
 	lock processLock
 }
 
+// dialPathLease 将短别名生命周期绑定到仍可能重连的运行组件。
+type dialPathLease struct {
+	path      string
+	aliasDir  string
+	aliasLink string
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (l *dialPathLease) Path() string {
+	if l == nil {
+		return ""
+	}
+	return l.path
+}
+
+func (l *dialPathLease) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.closeOnce.Do(func() {
+		if l.aliasDir == "" {
+			return
+		}
+		failed := false
+		if err := os.Remove(l.aliasLink); err != nil && !os.IsNotExist(err) {
+			failed = true
+		}
+		if err := os.Remove(l.aliasDir); err != nil && !os.IsNotExist(err) {
+			failed = true
+		}
+		if failed {
+			l.closeErr = errStableDialAliasCleanup
+		}
+	})
+	return l.closeErr
+}
+
 type imRuntime interface {
 	bridge.IMAdapter
 	Run(ctx context.Context) error
@@ -113,6 +158,7 @@ type appDependencies struct {
 	mkdirAll              func(string, os.FileMode) error
 	acquireLock           func(string) (processLock, error)
 	resolveSocket         func(context.Context, string, string, herdr.CommandRunner) (string, error)
+	prepareStableDialPath func(string) (*dialPathLease, error)
 	assemble              func(config.Config, string, *slog.Logger) (*applicationRuntime, error)
 	assembleInteractive   func(config.Config, string, io.Reader, io.Writer, *slog.Logger) (*applicationRuntime, error)
 	shutdownTimeout       time.Duration
@@ -265,11 +311,11 @@ func runInteractive(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("解析 Herdr Socket: %w", err)
 	}
-	stableSocketPath, err := canonicalSocketPath(socketPath)
+	canonicalEndpoint, err := canonicalSocketPath(socketPath)
 	if err != nil {
 		return fmt.Errorf("规范化 Herdr Socket: %w", err)
 	}
-	socketHash := shortHash(stableSocketPath)
+	socketHash := shortHash(canonicalEndpoint)
 	cacheDir, err := dependencies.userCacheDir()
 	if err != nil {
 		return fmt.Errorf("获取缓存目录: %w", err)
@@ -287,8 +333,15 @@ func runInteractive(ctx context.Context, options Options) (runErr error) {
 	defer func() {
 		finishProcessLock(lock, &runErr, timedOutComponentsDone)
 	}()
+	stableDialPath, err := dependencies.prepareStableDialPath(canonicalEndpoint)
+	if err != nil {
+		return fmt.Errorf("准备 Herdr Socket 连接路径: %w", err)
+	}
+	defer func() {
+		finishDialPathLease(stableDialPath, &runErr, timedOutComponentsDone)
+	}()
 
-	runtime, err := dependencies.assembleInteractive(loaded, stableSocketPath, stdin, stdout, logger)
+	runtime, err := dependencies.assembleInteractive(loaded, stableDialPath.Path(), stdin, stdout, logger)
 	if err != nil {
 		return fmt.Errorf("组装应用: %w", err)
 	}
@@ -308,7 +361,7 @@ func runInteractive(ctx context.Context, options Options) (runErr error) {
 	return runErr
 }
 
-// canonicalSocketPath 冻结交互锁、日志与连接共同使用的路径，避免 symlink 别名和重定向漂移。
+// canonicalSocketPath 冻结交互锁和日志使用的端点身份，避免 symlink 别名和重定向漂移。
 func canonicalSocketPath(socketPath string) (string, error) {
 	if strings.TrimSpace(socketPath) == "" {
 		return "", errors.New("Herdr Socket 路径不能为空")
@@ -349,6 +402,61 @@ func canonicalSocketPath(socketPath string) (string, error) {
 	}
 }
 
+// prepareStableDialPath 为过长端点创建进程私有短别名，同时保持 canonical endpoint 身份不变。
+func prepareStableDialPath(canonicalEndpoint string) (*dialPathLease, error) {
+	if len([]byte(canonicalEndpoint)) < unixSocketPathByteLimit {
+		return &dialPathLease{path: canonicalEndpoint}, nil
+	}
+
+	aliasDir, err := os.MkdirTemp("/tmp", stableDialAliasPattern)
+	if err != nil {
+		return nil, errStableDialAliasUnavailable
+	}
+	if err := os.Chmod(aliasDir, 0o700); err != nil {
+		_ = os.Remove(aliasDir)
+		return nil, errStableDialAliasUnavailable
+	}
+	aliasLink := filepath.Join(aliasDir, stableDialAliasLinkName)
+	if err := os.Symlink(filepath.Dir(canonicalEndpoint), aliasLink); err != nil {
+		_ = os.Remove(aliasDir)
+		return nil, errStableDialAliasUnavailable
+	}
+	lease := &dialPathLease{
+		path:      filepath.Join(aliasLink, filepath.Base(canonicalEndpoint)),
+		aliasDir:  aliasDir,
+		aliasLink: aliasLink,
+	}
+	if len([]byte(lease.path)) >= unixSocketPathByteLimit {
+		_ = lease.Close()
+		return nil, errStableDialPathTooLong
+	}
+	return lease, nil
+}
+
+func finishDialPathLease(lease *dialPathLease, runErr *error, timedOutComponentsDone <-chan struct{}) {
+	if errors.Is(*runErr, ErrShutdownTimeout) {
+		retainDialPathLeaseUntilDone(lease, timedOutComponentsDone)
+		return
+	}
+	if err := lease.Close(); err != nil {
+		if *runErr == nil {
+			*runErr = err
+		} else {
+			*runErr = errors.Join(*runErr, err)
+		}
+	}
+}
+
+func retainDialPathLeaseUntilDone(lease *dialPathLease, componentsDone <-chan struct{}) {
+	if lease == nil || componentsDone == nil {
+		return
+	}
+	go func() {
+		<-componentsDone
+		_ = lease.Close()
+	}()
+}
+
 func finishProcessLock(lock processLock, runErr *error, timedOutComponentsDone <-chan struct{}) {
 	if errors.Is(*runErr, ErrShutdownTimeout) {
 		retainProcessLockUntilDone(lock, timedOutComponentsDone)
@@ -372,6 +480,7 @@ func defaultAppDependencies() *appDependencies {
 		mkdirAll:              os.MkdirAll,
 		acquireLock:           func(path string) (processLock, error) { return processlock.Acquire(path) },
 		resolveSocket:         herdr.ResolveSocket,
+		prepareStableDialPath: prepareStableDialPath,
 		assemble: func(loaded config.Config, socketPath string, logger *slog.Logger) (*applicationRuntime, error) {
 			return assembleRuntime(loaded, socketPath, logger, defaultAssemblyDependencies())
 		},
