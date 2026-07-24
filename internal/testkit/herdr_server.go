@@ -616,7 +616,7 @@ func agentWire(agent herdr.AgentInfo) map[string]any {
 		"terminal_title": agent.TerminalTitle, "terminal_title_stripped": agent.TerminalTitleStripped,
 		"display_agent": agent.DisplayAgent, "agent_status": agent.AgentStatus, "agent_session": agent.AgentSession,
 		"workspace_id": agent.WorkspaceID, "tab_id": agent.TabID, "pane_id": agent.PaneID,
-		"focused": false, "revision": 0,
+		"focused": false, "revision": 0, "state_change_seq": agent.StateChangeSeq,
 	}
 }
 

@@ -15,6 +15,16 @@ import (
 
 const defaultRequestTimeout = 10 * time.Second
 
+const agentStatePollInterval = 100 * time.Millisecond
+
+var allAgentStatuses = []AgentStatus{
+	AgentStatusIdle,
+	AgentStatusWorking,
+	AgentStatusBlocked,
+	AgentStatusDone,
+	AgentStatusUnknown,
+}
+
 // Dialer 定义 Client 建立本地 Socket 连接所需的拨号能力。
 type Dialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
@@ -200,6 +210,82 @@ func (c *Client) Prompt(ctx context.Context, target, text string) error {
 	return err
 }
 
+// PromptUntilStateChange 向 target 发送普通文本，并等待首次可观察的 Agent 状态变化。
+func (c *Client) PromptUntilStateChange(ctx context.Context, target, text string) (AgentInfo, error) {
+	if err := validateTarget(target); err != nil {
+		return AgentInfo{}, err
+	}
+	params := agentPromptParams{
+		Target: target,
+		Text:   text,
+		Wait:   &agentPromptWaitOptions{Until: append([]AgentStatus(nil), allAgentStatuses...)},
+	}
+	var result agentResult
+	if err := c.call(ctx, "agent.prompt", params, &result); err != nil {
+		return AgentInfo{}, err
+	}
+	if err := validateResultType(result.Type, "agent_info"); err != nil {
+		return AgentInfo{}, err
+	}
+	var wire wireAgentInfo
+	if err := decodeRequiredPayload(result.Agent, "agent", &wire); err != nil {
+		return AgentInfo{}, err
+	}
+	return agentInfoFromWire(wire)
+}
+
+// WaitForStateChange 轮询 target，直到 state_change_seq 不再等于 baseline。
+func (c *Client) WaitForStateChange(ctx context.Context, target string, baseline uint64, timeout time.Duration) (AgentInfo, error) {
+	if err := validateTarget(target); err != nil {
+		return AgentInfo{}, err
+	}
+	if timeout <= 0 {
+		return AgentInfo{}, protocolError("等待 Agent 状态变化失败：timeout 必须大于零")
+	}
+	waitContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		agent, err := c.GetAgent(waitContext, target)
+		if err != nil {
+			if contextError := ctx.Err(); contextError != nil {
+				return AgentInfo{}, contextError
+			}
+			if waitContext.Err() != nil {
+				return AgentInfo{}, ErrAgentStateChangeTimeout
+			}
+			return AgentInfo{}, err
+		}
+		if agent.StateChangeSeq != baseline {
+			return agent, nil
+		}
+
+		timer := time.NewTimer(agentStatePollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return AgentInfo{}, ctx.Err()
+		case <-waitContext.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if contextError := ctx.Err(); contextError != nil {
+				return AgentInfo{}, contextError
+			}
+			return AgentInfo{}, ErrAgentStateChangeTimeout
+		case <-timer.C:
+		}
+	}
+}
+
 // SendKey 向 target 对应的 Agent 发送一个显式 UI 控制按键。
 func (c *Client) SendKey(ctx context.Context, target, key string) error {
 	if err := validateTarget(target); err != nil {
@@ -253,8 +339,13 @@ type agentReadParams struct {
 }
 
 type agentPromptParams struct {
-	Target string `json:"target"`
-	Text   string `json:"text"`
+	Target string                  `json:"target"`
+	Text   string                  `json:"text"`
+	Wait   *agentPromptWaitOptions `json:"wait,omitempty"`
+}
+
+type agentPromptWaitOptions struct {
+	Until []AgentStatus `json:"until"`
 }
 
 type agentSendKeysParams struct {

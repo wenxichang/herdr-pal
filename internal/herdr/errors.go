@@ -15,6 +15,8 @@ var (
 	ErrProtocol = errors.New("Herdr 协议错误")
 	// ErrProtocolMismatch 表示 Herdr 的协议版本与客户端不兼容。
 	ErrProtocolMismatch = errors.New("Herdr 协议版本不匹配")
+	// ErrAgentStateChangeTimeout 表示指定窗口内未观察到 Agent 生命周期变化。
+	ErrAgentStateChangeTimeout = errors.New("等待 Agent 状态变化超时")
 )
 
 // APIError 表示 Herdr API 返回的业务错误。

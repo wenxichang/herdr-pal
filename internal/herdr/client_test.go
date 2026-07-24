@@ -541,6 +541,20 @@ func TestClientGetAgentRejectsInvalidInputOrResult(t *testing.T) {
 	}
 }
 
+func TestClientGetAgentDecodesStateChangeSequence(t *testing.T) {
+	agent := validAgentInfo(t)
+	agent["state_change_seq"] = float64(27)
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+mustJSON(t, agent)+`}`, nil)
+
+	got, err := client.GetAgent(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("GetAgent() 返回错误：%v", err)
+	}
+	if got.StateChangeSeq != 27 {
+		t.Fatalf("StateChangeSeq = %d, want 27", got.StateChangeSeq)
+	}
+}
+
 func TestClientGetAgentAndPromptRejectInvalidAgentInfo(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -552,6 +566,7 @@ func TestClientGetAgentAndPromptRejectInvalidAgentInfo(t *testing.T) {
 		{name: "缺 pane_id", mutate: func(agent map[string]any) { delete(agent, "pane_id") }},
 		{name: "缺 focused", mutate: func(agent map[string]any) { delete(agent, "focused") }},
 		{name: "缺 revision", mutate: func(agent map[string]any) { delete(agent, "revision") }},
+		{name: "缺 state_change_seq", mutate: func(agent map[string]any) { delete(agent, "state_change_seq") }},
 		{name: "缺 agent_status", mutate: func(agent map[string]any) { delete(agent, "agent_status") }},
 		{name: "非法 agent_status", mutate: func(agent map[string]any) { agent["agent_status"] = "running" }},
 		{name: "会话缺 source", mutate: func(agent map[string]any) { delete(agent["agent_session"].(map[string]any), "source") }},
@@ -647,6 +662,84 @@ func TestClientPromptSendsExactParameters(t *testing.T) {
 
 	if err := client.Prompt(context.Background(), "p1", ""); err != nil {
 		t.Fatalf("Prompt() 返回错误：%v", err)
+	}
+}
+
+func TestClientPromptUntilStateChangeSendsWaitAndDecodesAgent(t *testing.T) {
+	agent := validAgentInfo(t)
+	agent["agent_status"] = "working"
+	agent["state_change_seq"] = float64(8)
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+mustJSON(t, agent)+`}`, businessRequestCheck("agent.prompt", map[string]any{
+		"target": "p1",
+		"text":   "运行测试",
+		"wait": map[string]any{
+			"until": []any{"idle", "working", "blocked", "done", "unknown"},
+		},
+	}))
+
+	got, err := client.PromptUntilStateChange(context.Background(), "p1", "运行测试")
+	if err != nil {
+		t.Fatalf("PromptUntilStateChange() 返回错误：%v", err)
+	}
+	if got.AgentStatus != AgentStatusWorking || got.StateChangeSeq != 8 {
+		t.Fatalf("PromptUntilStateChange() = %+v", got)
+	}
+}
+
+func TestClientPromptUntilStateChangePreservesStalledAPIError(t *testing.T) {
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
+		id, _ := request["id"].(string)
+		_, err := io.WriteString(conn, `{"id":"`+id+`","error":{"code":"agent_prompt_stalled","message":"no state change"}}`+"\n")
+		return err
+	}}
+	t.Cleanup(func() { dialer.assertNoHandlerError(t) })
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+
+	_, err := client.PromptUntilStateChange(context.Background(), "p1", "text")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "agent_prompt_stalled" {
+		t.Fatalf("PromptUntilStateChange() 错误 = %T %[1]v", err)
+	}
+}
+
+func TestClientWaitForStateChangeReturnsImmediatelyForNewSequence(t *testing.T) {
+	agent := validAgentInfo(t)
+	agent["state_change_seq"] = float64(2)
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+mustJSON(t, agent)+`}`, businessRequestCheck("agent.get", map[string]any{"target": "p1"}))
+
+	got, err := client.WaitForStateChange(context.Background(), "p1", 1, time.Second)
+	if err != nil {
+		t.Fatalf("WaitForStateChange() 返回错误：%v", err)
+	}
+	if got.StateChangeSeq != 2 {
+		t.Fatalf("WaitForStateChange() = %+v", got)
+	}
+}
+
+func TestClientWaitForStateChangeTimesOutWithoutNewSequence(t *testing.T) {
+	agent := validAgentInfo(t)
+	agent["state_change_seq"] = float64(1)
+	client := newBusinessTestClient(t, `{"type":"agent_info","agent":`+mustJSON(t, agent)+`}`, businessRequestCheck("agent.get", map[string]any{"target": "p1"}))
+
+	_, err := client.WaitForStateChange(context.Background(), "p1", 1, time.Millisecond)
+	if !errors.Is(err, ErrAgentStateChangeTimeout) {
+		t.Fatalf("WaitForStateChange() 错误 = %v，期望 ErrAgentStateChangeTimeout", err)
+	}
+}
+
+func TestClientWaitForStateChangePropagatesGetAgentError(t *testing.T) {
+	dialer := &pipeDialer{handler: func(conn net.Conn, request map[string]any) error {
+		id, _ := request["id"].(string)
+		_, err := io.WriteString(conn, `{"id":"`+id+`","error":{"code":"agent_not_found","message":"missing"}}`+"\n")
+		return err
+	}}
+	t.Cleanup(func() { dialer.assertNoHandlerError(t) })
+	client := NewClient("/tmp/herdr.sock", dialer, time.Second)
+
+	_, err := client.WaitForStateChange(context.Background(), "p1", 1, time.Second)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "agent_not_found" {
+		t.Fatalf("WaitForStateChange() 错误 = %T %[1]v", err)
 	}
 }
 
@@ -811,6 +904,7 @@ func validAgentInfo(t *testing.T) map[string]any {
 		"pane_id":                 "p1",
 		"focused":                 false,
 		"revision":                0,
+		"state_change_seq":        1,
 	}
 }
 

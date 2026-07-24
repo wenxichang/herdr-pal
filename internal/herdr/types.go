@@ -97,6 +97,8 @@ type AgentInfo struct {
 	DisplayAgent *string `json:"display_agent"`
 	// AgentStatus 是当前 Agent 生命周期状态。
 	AgentStatus AgentStatus `json:"agent_status"`
+	// StateChangeSeq 是 Herdr 为 Agent 生命周期变化维护的序列。
+	StateChangeSeq uint64 `json:"state_change_seq"`
 	// AgentSession 是可选的 Agent 恢复会话标识。
 	AgentSession *AgentSession `json:"agent_session"`
 	// WorkspaceID 是 Agent 所在工作区标识。
@@ -241,6 +243,7 @@ type wireAgentInfo struct {
 	PaneID                *string           `json:"pane_id"`
 	Focused               *bool             `json:"focused"`
 	Revision              *uint64           `json:"revision"`
+	StateChangeSeq        *uint64           `json:"state_change_seq"`
 }
 
 type wireAgentSession struct {
@@ -350,7 +353,7 @@ func paneFromWire(wire wirePane) (Pane, error) {
 }
 
 func agentInfoFromWire(wire wireAgentInfo) (AgentInfo, error) {
-	if wire.TerminalID == nil || strings.TrimSpace(*wire.TerminalID) == "" || wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.TabID == nil || strings.TrimSpace(*wire.TabID) == "" || wire.PaneID == nil || strings.TrimSpace(*wire.PaneID) == "" || wire.Focused == nil || wire.Revision == nil {
+	if wire.TerminalID == nil || strings.TrimSpace(*wire.TerminalID) == "" || wire.WorkspaceID == nil || strings.TrimSpace(*wire.WorkspaceID) == "" || wire.TabID == nil || strings.TrimSpace(*wire.TabID) == "" || wire.PaneID == nil || strings.TrimSpace(*wire.PaneID) == "" || wire.Focused == nil || wire.Revision == nil || wire.StateChangeSeq == nil {
 		return AgentInfo{}, protocolError("agent 信息缺少必填字段")
 	}
 	status, err := agentStatusFromWire(wire.AgentStatus)
@@ -361,7 +364,7 @@ func agentInfoFromWire(wire wireAgentInfo) (AgentInfo, error) {
 	if err != nil {
 		return AgentInfo{}, err
 	}
-	return AgentInfo{TerminalID: *wire.TerminalID, Name: wire.Name, Agent: wire.Agent, Title: wire.Title, TerminalTitle: wire.TerminalTitle, TerminalTitleStripped: wire.TerminalTitleStripped, DisplayAgent: wire.DisplayAgent, AgentStatus: status, AgentSession: session, WorkspaceID: *wire.WorkspaceID, TabID: *wire.TabID, PaneID: *wire.PaneID}, nil
+	return AgentInfo{TerminalID: *wire.TerminalID, Name: wire.Name, Agent: wire.Agent, Title: wire.Title, TerminalTitle: wire.TerminalTitle, TerminalTitleStripped: wire.TerminalTitleStripped, DisplayAgent: wire.DisplayAgent, AgentStatus: status, StateChangeSeq: *wire.StateChangeSeq, AgentSession: session, WorkspaceID: *wire.WorkspaceID, TabID: *wire.TabID, PaneID: *wire.PaneID}, nil
 }
 
 func agentStatusFromWire(status *string) (AgentStatus, error) {
