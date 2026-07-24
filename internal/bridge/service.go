@@ -28,6 +28,8 @@ const promptRecoveryTimeout = 5 * time.Second
 
 // HerdrAPI 是入站命令所需的最小 Herdr 公共 API。
 type HerdrAPI interface {
+	// Snapshot 读取当前 Herdr 会话的权威结构快照。
+	Snapshot(ctx context.Context) (herdr.Snapshot, error)
 	// GetAgent 查询目标当前的 Agent occupant。
 	GetAgent(ctx context.Context, target string) (herdr.AgentInfo, error)
 	// ReadRecent 读取目标的 recent_unwrapped 终端快照。
@@ -245,6 +247,16 @@ func bridgeShortHash(value string) string {
 }
 
 func (s *Service) handleList(ctx context.Context, message wecom.IncomingText) {
+	client, release, availability := s.beginOperationDetailed(false)
+	if availability == operationReady {
+		snapshot, err := client.Snapshot(ctx)
+		release()
+		if err != nil || snapshot.Protocol != herdr.RequiredProtocol {
+			s.reply(ctx, message.RequestID, unavailableMessage)
+			return
+		}
+		s.ReplaceSnapshotPreservingStatus(snapshot)
+	}
 	s.stateMu.Lock()
 	targets := s.registry.CreateListSnapshot()
 	selected, selectedErr := s.registry.ValidateSelected()
@@ -327,8 +339,12 @@ func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, 
 	changed, err := client.PromptUntilStateChange(ctx, target.PaneID, text)
 	if err == nil && !session.MatchesAgent(target, changed) {
 		release()
-		s.invalidateExpected(target)
-		s.reply(ctx, message.RequestID, targetChangedMessage)
+		if s.rebindExpected(target, changed) {
+			s.reply(ctx, message.RequestID, fmt.Sprintf("消息已发送，Agent 会话已切换并已自动选择新会话。当前状态：%s。", safeLabel(string(changed.AgentStatus))))
+		} else {
+			s.invalidateExpected(target)
+			s.reply(ctx, message.RequestID, targetChangedAfterPromptMessage)
+		}
 		return
 	}
 	if err != nil && !isPromptStalled(err) {
@@ -619,6 +635,20 @@ func (s *Service) invalidateExpected(expected session.Target) bool {
 	return invalidated
 }
 
+func (s *Service) rebindExpected(expected session.Target, current herdr.AgentInfo) bool {
+	s.transitionMu.Lock()
+	s.beginInputBarrierLocked()
+	s.stateMu.Lock()
+	_, err := s.registry.RebindSelected(expected, current)
+	if err == nil {
+		s.resetPanelLocked()
+	}
+	s.stateMu.Unlock()
+	s.endInputBarrierLocked()
+	s.transitionMu.Unlock()
+	return err == nil
+}
+
 func (s *Service) captureContentTarget() (session.Target, uint64, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
@@ -765,6 +795,7 @@ func (s *Service) reply(ctx context.Context, requestID, content string) {
 
 const unavailableMessage = "Herdr 暂不可用，操作未执行，请稍后重试。"
 const targetChangedMessage = "目标 Agent 已变化，请重新执行 /ls 和 /sel。"
+const targetChangedAfterPromptMessage = "消息已发送，但 Agent 会话在发送过程中发生变化。为避免后续消息投递到错误会话，请重新执行 /ls 和 /sel。"
 
 func safeCommandError(err error) string {
 	if errors.Is(err, command.ErrInvalidCommand) {

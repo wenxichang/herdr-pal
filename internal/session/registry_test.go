@@ -353,6 +353,61 @@ func TestMatchesAgentVerifiesCurrentOccupant(t *testing.T) {
 	}
 }
 
+func TestRebindSelectedAdoptsNewSessionForSamePhysicalAgent(t *testing.T) {
+	registry := &Registry{}
+	pane := testAgentPane("pane-1", "terminal-1", "codex", &herdr.AgentSession{Source: "cli", Kind: "id", Value: "session-old"})
+	registry.Replace(testSnapshot(pane), false)
+	registry.CreateListSnapshot()
+	expected, err := registry.Select(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := herdr.AgentInfo{
+		PaneID: "pane-1", TerminalID: "terminal-1", Agent: stringPtr("codex"), DisplayAgent: stringPtr("Codex"),
+		AgentStatus:  herdr.AgentStatusWorking,
+		AgentSession: &herdr.AgentSession{Source: "cli", Kind: "id", Value: "session-new"},
+	}
+
+	rebound, err := registry.RebindSelected(expected, current)
+	if err != nil {
+		t.Fatalf("RebindSelected() error = %v", err)
+	}
+	if rebound.OccupantKey == expected.OccupantKey || !MatchesAgent(rebound, current) {
+		t.Fatalf("RebindSelected() = %#v, 未采用新会话", rebound)
+	}
+	selected, err := registry.ValidateSelected()
+	if err != nil || selected.OccupantKey != rebound.OccupantKey {
+		t.Fatalf("ValidateSelected() = %#v, %v", selected, err)
+	}
+	selectedFromList, err := registry.Select(1)
+	if err != nil || selectedFromList.OccupantKey != rebound.OccupantKey {
+		t.Fatalf("Select(1) = %#v, %v", selectedFromList, err)
+	}
+}
+
+func TestRebindSelectedRejectsPhysicalReplacement(t *testing.T) {
+	registry := &Registry{}
+	pane := testAgentPane("pane-1", "terminal-1", "codex", &herdr.AgentSession{Source: "cli", Kind: "id", Value: "session-old"})
+	registry.Replace(testSnapshot(pane), false)
+	registry.CreateListSnapshot()
+	expected, err := registry.Select(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := herdr.AgentInfo{
+		PaneID: "pane-1", TerminalID: "terminal-2", Agent: stringPtr("codex"),
+		AgentSession: &herdr.AgentSession{Source: "cli", Kind: "id", Value: "session-new"},
+	}
+
+	if _, err := registry.RebindSelected(expected, replacement); !errors.Is(err, ErrSelectionInvalid) {
+		t.Fatalf("RebindSelected() error = %v, want ErrSelectionInvalid", err)
+	}
+	selected, err := registry.ValidateSelected()
+	if err != nil || selected.OccupantKey != expected.OccupantKey {
+		t.Fatalf("物理目标替换影响了旧选择：selected=%#v err=%v", selected, err)
+	}
+}
+
 func TestRegistryConcurrentSnapshotsAndReads(t *testing.T) {
 	registry := &Registry{}
 	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)

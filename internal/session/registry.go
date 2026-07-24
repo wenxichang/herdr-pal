@@ -217,6 +217,45 @@ func (r *Registry) ValidateSelected() (Target, error) {
 	return target, nil
 }
 
+// RebindSelected 将仍指向同一 pane、terminal 和 Agent 的当前选择更新为新的会话身份。
+//
+// 该方法只用于 prompt 已成功后才观察到 Agent 会话切换的场景；任何物理目标变化或并发
+// 选择变化都会被拒绝。
+func (r *Registry) RebindSelected(expected Target, current herdr.AgentInfo) (Target, error) {
+	if current.Agent == nil || current.AgentSession == nil || expected.PaneID != current.PaneID ||
+		expected.TerminalID != current.TerminalID || expected.Agent != *current.Agent {
+		return Target{}, fmt.Errorf("%w：Agent 物理目标已变化", ErrSelectionInvalid)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.selectionInvalid || r.selectedPane != expected.PaneID || r.selectedKey != expected.OccupantKey {
+		return Target{}, fmt.Errorf("%w：当前选择已变化", ErrSelectionInvalid)
+	}
+	target, found := r.targets[expected.PaneID]
+	if !found || target.OccupantKey != expected.OccupantKey {
+		return Target{}, fmt.Errorf("%w：当前 occupant 已变化", ErrSelectionInvalid)
+	}
+
+	previousKey := target.OccupantKey
+	target.OccupantKey = occupantKey(current.TerminalID, *current.Agent, stringValue(current.DisplayAgent), current.AgentSession)
+	if current.DisplayAgent != nil {
+		target.DisplayAgent = *current.DisplayAgent
+	}
+	if current.Title != nil {
+		target.Title = *current.Title
+	}
+	target.Status = current.AgentStatus
+	r.targets[target.PaneID] = target
+	r.selectedKey = target.OccupantKey
+	for index, entry := range r.listSnapshot {
+		if entry.paneID == target.PaneID && entry.occupantKey == previousKey {
+			r.listSnapshot[index].occupantKey = target.OccupantKey
+		}
+	}
+	return target, nil
+}
+
 // ApplyStatus 将状态事件应用到已存在的 Agent 面板。
 //
 // 公开事件中的 Agent 字段虽然可选，但缺失时无法确认归属，必须拒绝以避免旧 occupant

@@ -131,16 +131,45 @@ func TestServiceListAndSelectionResetPanel(t *testing.T) {
 	}
 }
 
+func TestServiceListRefreshesAgentSessionBeforeSelection(t *testing.T) {
+	service, fake := newTestService(t)
+	service.registry.Replace(testSnapshotWithSession("session-old"), false)
+	currentSnapshot := testSnapshotWithSession("session-new")
+	currentSnapshot.Panes[0].AgentStatus = herdr.AgentStatusIdle
+	fake.setSnapshot(currentSnapshot)
+	current := agentInfo("pane-1", "terminal-1", "codex")
+	current.AgentSession = &herdr.AgentSession{Source: "herdr:codex", Agent: "codex", Kind: "id", Value: "session-new"}
+	fake.setAgent(current)
+	fake.promptResult = changedAgent(current, herdr.AgentStatusWorking)
+
+	service.HandleMessage(context.Background(), incoming("session-refresh-list", "/ls"))
+	service.HandleMessage(context.Background(), incoming("session-refresh-select", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("session-refresh-prompt", "继续处理"))
+
+	if got := fake.snapshotCount(); got != 1 {
+		t.Fatalf("/ls snapshot calls = %d, want 1", got)
+	}
+	if got := fake.prompts(); len(got) != 1 || got[0].target != "pane-1" {
+		t.Fatalf("新会话选择后 prompt calls = %#v", got)
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "目标 Agent 已变化") {
+		t.Fatalf("新会话重新选择后仍被判定失效：%q", reply)
+	}
+}
+
 func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T) {
-	service, _ := newTestService(t)
-	service.registry.Replace(herdr.Snapshot{
+	service, fake := newTestService(t)
+	snapshot := herdr.Snapshot{
+		Protocol:   herdr.RequiredProtocol,
 		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-2", Number: 2, Label: "工作区二"}, {WorkspaceID: "workspace-1", Number: 1, Label: "工作区一"}},
 		Tabs:       []herdr.Tab{{TabID: "tab-2", WorkspaceID: "workspace-2", Number: 2, Label: "标签二"}, {TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "标签一"}},
 		Panes: []herdr.Pane{
 			{PaneID: "pane-z", TerminalID: "terminal-z", WorkspaceID: "workspace-2", TabID: "tab-2", Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"), Title: stringRef("第二项"), AgentStatus: herdr.AgentStatusDone},
 			{PaneID: "pane-a", TerminalID: "terminal-a", WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude"), Title: stringRef("第一项\n```注入"), AgentStatus: herdr.AgentStatusBlocked},
 		},
-	}, false)
+	}
+	service.registry.Replace(snapshot, false)
+	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("list-details", "/ls"))
 	list := fakeIMFromService(t, service).lastReply()
 	for _, want := range []string{"1. Claude", "标题：第一项 ``\u200b`注入", "工作区一 / 标签一", "状态：blocked", "面板：pane-a", "2. Codex", "标题：第二项", "工作区二 / 标签二", "状态：done", "面板：pane-z"} {
@@ -172,6 +201,49 @@ func TestServicePromptPreservesBytesAndChecksLiveAgent(t *testing.T) {
 	reply := fakeIMFromService(t, service).lastReply()
 	if !strings.Contains(reply, "已发送") || !strings.Contains(reply, "working") || strings.Contains(reply, "keep") {
 		t.Fatalf("prompt reply = %q", reply)
+	}
+}
+
+func TestServicePromptRebindsSessionChangedAfterSubmission(t *testing.T) {
+	service, fake := newTestService(t)
+	snapshot := testSnapshotWithSession("session-old")
+	snapshot.Panes[0].AgentStatus = herdr.AgentStatusIdle
+	service.registry.Replace(snapshot, false)
+	fake.setSnapshot(snapshot)
+	current := agentInfo("pane-1", "terminal-1", "codex")
+	current.AgentSession = &herdr.AgentSession{Source: "herdr:codex", Agent: "codex", Kind: "id", Value: "session-old"}
+	fake.setAgent(current)
+	changed := changedAgent(current, herdr.AgentStatusWorking)
+	changed.AgentSession = &herdr.AgentSession{Source: "herdr:codex", Agent: "codex", Kind: "id", Value: "session-new"}
+	fake.promptResult = changed
+	selectTarget(t, service)
+
+	service.HandleMessage(context.Background(), incoming("prompt-session-rollover", "继续处理"))
+
+	if got := fake.prompts(); len(got) != 1 || got[0].target != "pane-1" {
+		t.Fatalf("prompt calls = %#v", got)
+	}
+	reply := fakeIMFromService(t, service).lastReply()
+	for _, want := range []string{"已发送", "会话", "已自动选择"} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("发送后会话切换回复缺少 %q：%q", want, reply)
+		}
+	}
+	if strings.Contains(reply, "/ls") || strings.Contains(reply, "/sel") {
+		t.Fatalf("自动选择新会话后仍要求手工选择：%q", reply)
+	}
+	selected, err := service.registry.ValidateSelected()
+	if err != nil || !session.MatchesAgent(selected, changed) {
+		t.Fatalf("发送后未选中新会话：selected=%#v err=%v", selected, err)
+	}
+
+	currentNewSession := changed
+	currentNewSession.AgentStatus = herdr.AgentStatusIdle
+	fake.setAgent(currentNewSession)
+	fake.promptResult = changedAgent(currentNewSession, herdr.AgentStatusWorking)
+	service.HandleMessage(context.Background(), incoming("prompt-session-rollover-next", "继续下一步"))
+	if got := fake.prompts(); len(got) != 2 || got[1].target != "pane-1" {
+		t.Fatalf("新会话后续 prompt calls = %#v", got)
 	}
 }
 
@@ -510,7 +582,9 @@ func TestServiceInputMismatchDoesNotInvalidateNewSelection(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, fake := newTestService(t)
-			service.registry.Replace(twoTargetSnapshot(), false)
+			snapshot := twoTargetSnapshot()
+			service.registry.Replace(snapshot, false)
+			fake.setSnapshot(snapshot)
 			selectTarget(t, service)
 			fake.setAgent(agentInfo("pane-1", "terminal-1", "other"))
 			fake.blockGet = make(chan struct{})
@@ -567,7 +641,9 @@ func TestServiceReadMismatchDoesNotInvalidateNewSelectionOrPanel(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, fake := newTestService(t)
-			service.registry.Replace(twoTargetSnapshot(), false)
+			snapshot := twoTargetSnapshot()
+			service.registry.Replace(snapshot, false)
+			fake.setSnapshot(snapshot)
 			selectTarget(t, service)
 			test.prepareOld(service, fake)
 			oldReadBlock := make(chan struct{})
@@ -793,7 +869,9 @@ func TestServiceContentAndPaging(t *testing.T) {
 
 func TestServiceSelectResetsExistingPanelCache(t *testing.T) {
 	service, fake := newTestService(t)
-	service.registry.Replace(twoTargetSnapshot(), false)
+	snapshot := twoTargetSnapshot()
+	service.registry.Replace(snapshot, false)
+	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("select-one", "/sel 1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(100, 200)}
@@ -811,7 +889,9 @@ func TestServiceSelectResetsExistingPanelCache(t *testing.T) {
 
 func TestServiceBlockedReadCannotRestoreOldPanelAfterSelectionChanges(t *testing.T) {
 	service, fake := newTestService(t)
-	service.registry.Replace(twoTargetSnapshot(), false)
+	snapshot := twoTargetSnapshot()
+	service.registry.Replace(snapshot, false)
+	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("read-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("read-select-one", "/sel 1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: "OLD-TERMINAL-CONTENT"}
@@ -1140,7 +1220,9 @@ func TestServiceInvalidateAndSetNilWaitForBlockingGetAgent(t *testing.T) {
 
 func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 	service, fake := newTestService(t)
-	service.registry.Replace(twoTargetSnapshot(), false)
+	snapshot := twoTargetSnapshot()
+	service.registry.Replace(snapshot, false)
+	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("select-one", "/sel 1"))
 	fake.blockPrompt = make(chan struct{})
@@ -1173,7 +1255,9 @@ func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 
 func TestServiceConcurrentSelectAndPageDownNeverMixTargetAndPanel(t *testing.T) {
 	service, fake := newTestService(t)
-	service.registry.Replace(twoTargetSnapshot(), false)
+	snapshot := twoTargetSnapshot()
+	service.registry.Replace(snapshot, false)
+	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("mix-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("mix-select-one", "/sel 1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(100, 200)}
@@ -1253,7 +1337,7 @@ func newTestServiceWithLogger(t *testing.T, logger *slog.Logger) (*Service, *fak
 		t.Fatal(err)
 	}
 	current := agentInfo("pane-1", "terminal-1", "codex")
-	fake := &fakeHerdr{agent: current, promptResult: changedAgent(current, herdr.AgentStatusWorking)}
+	fake := &fakeHerdr{snapshot: testSnapshot(), agent: current, promptResult: changedAgent(current, herdr.AgentStatusWorking)}
 	im := &fakeIM{}
 	audit := &fakeKeyAuditSink{}
 	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, audit, logger)
@@ -1285,10 +1369,17 @@ func incoming(messageID, content string) wecom.IncomingText {
 
 func testSnapshot() herdr.Snapshot {
 	return herdr.Snapshot{
+		Protocol:   herdr.RequiredProtocol,
 		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-1", Number: 1, Label: "workspace-1"}},
 		Tabs:       []herdr.Tab{{TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "tab-1"}},
 		Panes:      []herdr.Pane{{PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"), AgentStatus: herdr.AgentStatusWorking}},
 	}
+}
+
+func testSnapshotWithSession(value string) herdr.Snapshot {
+	snapshot := testSnapshot()
+	snapshot.Panes[0].AgentSession = &herdr.AgentSession{Source: "herdr:codex", Agent: "codex", Kind: "id", Value: value}
+	return snapshot
 }
 
 func twoTargetSnapshot() herdr.Snapshot {
@@ -1355,6 +1446,9 @@ type readCall struct {
 
 type fakeHerdr struct {
 	mu            sync.Mutex
+	snapshot      herdr.Snapshot
+	snapshotErr   error
+	snapshotCalls int
 	agent         herdr.AgentInfo
 	getErr        error
 	getResults    []agentGetResult
@@ -1414,6 +1508,12 @@ func (f *fakeHerdr) GetAgent(_ context.Context, target string) (herdr.AgentInfo,
 	}
 	return agent, err
 }
+func (f *fakeHerdr) Snapshot(context.Context) (herdr.Snapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshotCalls++
+	return f.snapshot, f.snapshotErr
+}
 func (f *fakeHerdr) ReadRecent(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
 	f.mu.Lock()
 	f.readCalls = append(f.readCalls, readCall{target, lines})
@@ -1462,6 +1562,16 @@ func (f *fakeHerdr) setAgent(agent herdr.AgentInfo) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agent = agent
+}
+func (f *fakeHerdr) setSnapshot(snapshot herdr.Snapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshot = snapshot
+}
+func (f *fakeHerdr) snapshotCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapshotCalls
 }
 func (f *fakeHerdr) currentAgent() herdr.AgentInfo {
 	f.mu.Lock()

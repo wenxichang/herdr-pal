@@ -192,7 +192,8 @@ stderr，便于独立重定向。按 `Ctrl+C` 或发送 `SIGTERM` 可停止两�
 观察到状态或 `state_change_seq` 改变才回复成功。若 Herdr 返回
 `agent_prompt_stalled`，bridge 会再次确认 occupant、状态和序列；仍为原 occupant 且仍
 处于 `idle`/`done` 时只补发一次 `enter`，再等待最多 5 秒。仍无变化时提示检查 Agent
-界面，不会继续重试。
+界面，不会继续重试。若 prompt 已成功后才观察到 `agent_session` 切换，并且 pane、
+terminal 和 Agent 均未变化，bridge 会清空旧面板缓存并自动把当前选择迁移到新会话。
 
 以 `/` 开头但无法识别的内容只返回命令错误，绝不会作为 prompt 转发。
 
@@ -208,7 +209,8 @@ stderr，便于独立重定向。按 `Ctrl+C` 或发送 `SIGTERM` 可停止两�
   内容，也不改变用户的手工分页位置。
 
 pane 关闭、Agent occupant 替换或 Herdr 重连都会使旧选择失效；继续输入前必须重新执行
-`/ls` 和 `/sel N`。
+`/ls` 和 `/sel N`。唯一例外是上述成功 prompt 触发的同一物理 Agent 会话切换，此时会
+自动选中新会话。
 
 ## 测试
 
