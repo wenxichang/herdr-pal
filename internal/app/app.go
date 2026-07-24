@@ -338,7 +338,7 @@ func runInteractive(ctx context.Context, options Options) (runErr error) {
 		return fmt.Errorf("准备 Herdr Socket 连接路径: %w", err)
 	}
 	defer func() {
-		finishDialPathLease(stableDialPath, &runErr, timedOutComponentsDone)
+		finishDialPathLease(stableDialPath, &runErr, timedOutComponentsDone, logger)
 	}()
 
 	runtime, err := dependencies.assembleInteractive(loaded, stableDialPath.Path(), stdin, stdout, logger)
@@ -371,35 +371,33 @@ func canonicalSocketPath(socketPath string) (string, error) {
 		return "", errSocketPathUnresolvable
 	}
 
-	candidate := absolute
-	suffix := make([]string, 0, 4)
-	for {
-		resolved, resolveErr := filepath.EvalSymlinks(candidate)
-		if resolveErr == nil {
-			for index := len(suffix) - 1; index >= 0; index-- {
-				resolved = filepath.Join(resolved, suffix[index])
-			}
-			return filepath.Clean(resolved), nil
-		}
-
-		info, lstatErr := os.Lstat(candidate)
-		if lstatErr == nil {
-			if info.Mode()&os.ModeSymlink != 0 {
-				return "", errSocketSymlinkUnresolvable
-			}
-			return "", errSocketPathUnresolvable
-		}
-		if !os.IsNotExist(resolveErr) || !os.IsNotExist(lstatErr) {
-			return "", errSocketPathUnresolvable
-		}
-
-		parent := filepath.Dir(candidate)
-		if parent == candidate {
-			return "", errSocketPathUnresolvable
-		}
-		suffix = append(suffix, filepath.Base(candidate))
-		candidate = parent
+	resolved, resolveErr := filepath.EvalSymlinks(absolute)
+	if resolveErr == nil {
+		return filepath.Clean(resolved), nil
 	}
+
+	info, lstatErr := os.Lstat(absolute)
+	if lstatErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", errSocketSymlinkUnresolvable
+		}
+		return "", errSocketPathUnresolvable
+	}
+	if !os.IsNotExist(resolveErr) || !os.IsNotExist(lstatErr) {
+		return "", errSocketPathUnresolvable
+	}
+
+	// 仅允许 Socket leaf 尚未创建；父目录身份必须在加锁前完整冻结。
+	parent := filepath.Dir(absolute)
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", errSocketPathUnresolvable
+	}
+	parentInfo, err := os.Stat(resolvedParent)
+	if err != nil || !parentInfo.IsDir() {
+		return "", errSocketPathUnresolvable
+	}
+	return filepath.Join(resolvedParent, filepath.Base(absolute)), nil
 }
 
 // prepareStableDialPath 为过长端点创建进程私有短别名，同时保持 canonical endpoint 身份不变。
@@ -417,25 +415,32 @@ func prepareStableDialPath(canonicalEndpoint string) (*dialPathLease, error) {
 		return nil, errStableDialAliasUnavailable
 	}
 	aliasLink := filepath.Join(aliasDir, stableDialAliasLinkName)
-	if err := os.Symlink(filepath.Dir(canonicalEndpoint), aliasLink); err != nil {
+	if err := os.Symlink(canonicalEndpoint, aliasLink); err != nil {
 		_ = os.Remove(aliasDir)
 		return nil, errStableDialAliasUnavailable
 	}
 	lease := &dialPathLease{
-		path:      filepath.Join(aliasLink, filepath.Base(canonicalEndpoint)),
+		path:      aliasLink,
 		aliasDir:  aliasDir,
 		aliasLink: aliasLink,
 	}
-	if len([]byte(lease.path)) >= unixSocketPathByteLimit {
+	if err := validateUnixSocketDialPath(lease.path); err != nil {
 		_ = lease.Close()
-		return nil, errStableDialPathTooLong
+		return nil, err
 	}
 	return lease, nil
 }
 
-func finishDialPathLease(lease *dialPathLease, runErr *error, timedOutComponentsDone <-chan struct{}) {
+func validateUnixSocketDialPath(dialPath string) error {
+	if len([]byte(dialPath)) >= unixSocketPathByteLimit {
+		return errStableDialPathTooLong
+	}
+	return nil
+}
+
+func finishDialPathLease(lease *dialPathLease, runErr *error, timedOutComponentsDone <-chan struct{}, logger *slog.Logger) {
 	if errors.Is(*runErr, ErrShutdownTimeout) {
-		retainDialPathLeaseUntilDone(lease, timedOutComponentsDone)
+		retainDialPathLeaseUntilDone(lease, timedOutComponentsDone, logger)
 		return
 	}
 	if err := lease.Close(); err != nil {
@@ -447,13 +452,15 @@ func finishDialPathLease(lease *dialPathLease, runErr *error, timedOutComponents
 	}
 }
 
-func retainDialPathLeaseUntilDone(lease *dialPathLease, componentsDone <-chan struct{}) {
+func retainDialPathLeaseUntilDone(lease *dialPathLease, componentsDone <-chan struct{}, logger *slog.Logger) {
 	if lease == nil || componentsDone == nil {
 		return
 	}
 	go func() {
 		<-componentsDone
-		_ = lease.Close()
+		if err := lease.Close(); err != nil && logger != nil {
+			logger.Error("Herdr Socket 短连接路径清理失败", "error_type", safeErrorType(err))
+		}
 	}()
 }
 
@@ -875,6 +882,8 @@ func safeErrorType(err error) string {
 		return "shutdown_timeout"
 	case errors.Is(err, ErrLoopStopped):
 		return "loop_stopped"
+	case errors.Is(err, errStableDialAliasCleanup):
+		return "socket_path_cleanup"
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return "context"
 	case errors.Is(err, bridge.ErrNotificationQueueFull):

@@ -227,6 +227,66 @@ func TestRunInteractiveResolvesSymlinkParentWithMissingSocketLeaf(t *testing.T) 
 	}
 }
 
+func TestRunInteractiveRejectsMissingSocketParentBeforeLockAndAlias(t *testing.T) {
+	tempDir := t.TempDir()
+	missingParent := filepath.Join(tempDir, "future-parent")
+	aliasEndpoint := filepath.Join(missingParent, "herdr.sock")
+	options := testInteractiveOptions(t)
+	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
+		return aliasEndpoint, nil
+	}
+	lockCalls := 0
+	prepareCalls := 0
+	assembleCalls := 0
+	options.dependencies.acquireLock = func(string) (processLock, error) {
+		lockCalls++
+		return &fakeLock{}, nil
+	}
+	options.dependencies.prepareStableDialPath = func(string) (*dialPathLease, error) {
+		prepareCalls++
+		return &dialPathLease{path: "/tmp/must-not-run.sock"}, nil
+	}
+	options.dependencies.assembleInteractive = func(config.Config, string, io.Reader, io.Writer, *slog.Logger) (*applicationRuntime, error) {
+		assembleCalls++
+		return canceledRuntime(), nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := Run(ctx, options)
+	if err == nil || !strings.Contains(err.Error(), "无法可靠") {
+		t.Fatalf("Run() error = %v, want safe missing-parent rejection", err)
+	}
+	if lockCalls != 0 || prepareCalls != 0 || assembleCalls != 0 {
+		t.Fatalf("lock/prepare/assemble calls = %d/%d/%d, want 0/0/0", lockCalls, prepareCalls, assembleCalls)
+	}
+	if strings.Contains(err.Error(), aliasEndpoint) || strings.Contains(err.Error(), missingParent) {
+		t.Fatalf("Run() error leaked missing path: %v", err)
+	}
+
+	realParent := filepath.Join(tempDir, "real-parent")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatalf("create real parent: %v", err)
+	}
+	if err := os.Symlink(realParent, missingParent); err != nil {
+		t.Skipf("platform does not support symlink: %v", err)
+	}
+	aliasPlan := captureInteractiveSocketPlan(t, aliasEndpoint, nil)
+	realPlan := captureInteractiveSocketPlan(t, filepath.Join(realParent, "herdr.sock"), nil)
+	if aliasPlan.lockPath != realPlan.lockPath || aliasPlan.assembledIdentity != realPlan.assembledIdentity {
+		t.Fatalf("created-parent plans = %#v/%#v, want one canonical identity", aliasPlan, realPlan)
+	}
+}
+
+func TestRunInteractiveRejectsSocketParentThatIsNotDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	parentFile := filepath.Join(tempDir, "not-a-directory")
+	if err := os.WriteFile(parentFile, nil, 0o600); err != nil {
+		t.Fatalf("create parent file: %v", err)
+	}
+	assertInteractiveSocketRejectedBeforeLock(t, filepath.Join(parentFile, "herdr.sock"), []string{parentFile})
+}
+
 func TestRunInteractiveFreezesCanonicalSocketAcrossSymlinkRetarget(t *testing.T) {
 	tempDir := t.TempDir()
 	longParent := filepath.Join(tempDir, strings.Repeat("long-parent-", 9))
@@ -299,17 +359,22 @@ func TestPrepareStableDialPathKeepsShortCanonicalEndpoint(t *testing.T) {
 	}
 }
 
-func TestPrepareStableDialPathCreatesDialablePrivateAliasForLongEndpoint(t *testing.T) {
+func TestPrepareStableDialPathCreatesDialableLeafAliasForLongEndpointAndBasename(t *testing.T) {
 	longDirectory := filepath.Join(t.TempDir(), strings.Repeat("long-directory-", 8))
 	if err := os.MkdirAll(longDirectory, 0o700); err != nil {
 		t.Fatalf("create long socket directory: %v", err)
 	}
-	canonicalEndpoint := resolvedChildPath(t, longDirectory, "herdr.sock")
+	socketBasename := strings.Repeat("s", 78)
+	canonicalEndpoint := resolvedChildPath(t, longDirectory, socketBasename)
 	if len([]byte(canonicalEndpoint)) < unixSocketPathByteLimit {
 		t.Fatalf("test endpoint length = %d, want at least %d", len([]byte(canonicalEndpoint)), unixSocketPathByteLimit)
 	}
+	legacyAliasPath := filepath.Join("/tmp", stableDialAliasPattern, stableDialAliasLinkName, socketBasename)
+	if len([]byte(legacyAliasPath)) < unixSocketPathByteLimit {
+		t.Fatalf("legacy parent-alias fixture length = %d, want at least %d", len([]byte(legacyAliasPath)), unixSocketPathByteLimit)
+	}
 
-	listenerAliasDir, err := os.MkdirTemp("/tmp", "herdr-pal-listener-")
+	listenerAliasDir, err := os.MkdirTemp("/tmp", "h")
 	if err != nil {
 		t.Fatalf("create listener alias directory: %v", err)
 	}
@@ -343,6 +408,9 @@ func TestPrepareStableDialPathCreatesDialablePrivateAliasForLongEndpoint(t *test
 	if permissions := info.Mode().Perm(); permissions != 0o700 {
 		t.Fatalf("alias directory permissions = %o, want 700", permissions)
 	}
+	if filepath.Dir(lease.Path()) != lease.aliasDir {
+		t.Fatalf("stable dial path = %q, want direct leaf alias in %q", lease.Path(), lease.aliasDir)
+	}
 	if identity := resolvedDialPath(t, lease.Path()); identity != canonicalEndpoint {
 		t.Fatalf("stable dial identity = %q, want %q", identity, canonicalEndpoint)
 	}
@@ -353,7 +421,7 @@ func TestPrepareStableDialPathCreatesDialablePrivateAliasForLongEndpoint(t *test
 	_ = connection.Close()
 }
 
-func TestPrepareStableDialPathUsesByteLimitAndRejectsUnshortenableBasename(t *testing.T) {
+func TestPrepareStableDialPathUsesByteLimitAndShortensLongBasename(t *testing.T) {
 	withinLimit := "/" + strings.Repeat("a", unixSocketPathByteLimit-2)
 	if len([]byte(withinLimit)) != unixSocketPathByteLimit-1 {
 		t.Fatalf("within-limit fixture length = %d", len([]byte(withinLimit)))
@@ -380,12 +448,17 @@ func TestPrepareStableDialPathUsesByteLimitAndRejectsUnshortenableBasename(t *te
 	}
 
 	sensitiveEndpoint := "/" + strings.Repeat("socket-sensitive-", 10)
-	_, err = prepareStableDialPath(sensitiveEndpoint)
-	if !errors.Is(err, errStableDialPathTooLong) {
-		t.Fatalf("prepare unshortenable endpoint error = %v, want safe length error", err)
+	longBasename, err := prepareStableDialPath(sensitiveEndpoint)
+	if err != nil {
+		t.Fatalf("prepare long basename endpoint: %v", err)
 	}
-	if strings.Contains(err.Error(), sensitiveEndpoint) {
-		t.Fatalf("stable path error leaked canonical endpoint: %v", err)
+	t.Cleanup(func() { _ = longBasename.Close() })
+	if len([]byte(longBasename.Path())) >= unixSocketPathByteLimit || filepath.Dir(longBasename.Path()) != longBasename.aliasDir {
+		t.Fatalf("long-basename stable path length/path = %d/%q", len([]byte(longBasename.Path())), longBasename.Path())
+	}
+
+	if strings.Contains(errStableDialPathTooLong.Error(), sensitiveEndpoint) {
+		t.Fatalf("stable path length error leaked canonical endpoint: %v", errStableDialPathTooLong)
 	}
 }
 
@@ -1095,6 +1168,71 @@ func TestRunInteractiveRetainsLongDialAliasUntilTimedOutComponentsFinish(t *test
 	waitLockReleasedAndUnretained(t, lock)
 }
 
+func TestRunInteractiveLogsSafeDialAliasCleanupFailureAfterTimeout(t *testing.T) {
+	canonicalEndpoint := longCanonicalEndpoint(t)
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	releaseRunners := func() { unblockOnce.Do(func() { close(unblock) }) }
+	t.Cleanup(releaseRunners)
+	imRunner := &blockingRunner{started: make(chan struct{}), unblock: unblock}
+	supervisor := &blockingRunner{started: make(chan struct{}), unblock: unblock}
+	lock := &fakeLock{}
+	logs := &synchronizedBuffer{}
+	options := testInteractiveOptions(t)
+	options.Stderr = logs
+	options.dependencies.shutdownTimeout = 20 * time.Millisecond
+	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
+		return canonicalEndpoint, nil
+	}
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
+	var dialPath string
+	options.dependencies.assembleInteractive = func(_ config.Config, stableDialPath string, _ io.Reader, _ io.Writer, _ *slog.Logger) (*applicationRuntime, error) {
+		dialPath = stableDialPath
+		return &applicationRuntime{
+			im:         &blockingWeCom{blockingRunner: imRunner, events: make(chan wecom.IncomingText)},
+			supervisor: supervisor,
+			handler:    &fakeHandler{},
+		}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, imRunner.started, "interactive IM")
+	waitClosed(t, supervisor.started, "interactive Supervisor")
+	cancel()
+	if err := waitResult(t, result); !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Run() error = %v, want ErrShutdownTimeout", err)
+	}
+
+	aliasDir := privateDialAliasDir(t, dialPath)
+	if err := os.Remove(dialPath); err != nil {
+		t.Fatalf("replace dial symlink: %v", err)
+	}
+	if err := os.Mkdir(dialPath, 0o700); err != nil {
+		t.Fatalf("create blocking alias directory: %v", err)
+	}
+	blocker := filepath.Join(dialPath, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatalf("create alias cleanup blocker: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(blocker)
+		_ = os.Remove(dialPath)
+		_ = os.Remove(aliasDir)
+	})
+
+	releaseRunners()
+	waitLockReleasedAndUnretained(t, lock)
+	waitBufferContains(t, logs, "error_type=socket_path_cleanup")
+	output := logs.String()
+	for _, sensitivePath := range []string{canonicalEndpoint, dialPath, aliasDir} {
+		if strings.Contains(output, sensitivePath) {
+			t.Fatalf("cleanup log leaked path %q: %s", sensitivePath, output)
+		}
+	}
+}
+
 func TestRunInteractiveEOFPreservesSupervisorFatalDuringDrain(t *testing.T) {
 	fatal := errors.New("supervisor fatal after EOF")
 	im := newOrderedResultWeCom(interactive.ErrInputClosed)
@@ -1722,6 +1860,7 @@ func TestSafeErrorTypeUsesFixedSemanticCategories(t *testing.T) {
 	}{
 		{name: "退出超时", err: errors.Join(errors.New("secret"), ErrShutdownTimeout), want: "shutdown_timeout"},
 		{name: "循环停止", err: fmt.Errorf("wrapped: %w", ErrLoopStopped), want: "loop_stopped"},
+		{name: "连接路径清理", err: errStableDialAliasCleanup, want: "socket_path_cleanup"},
 		{name: "上下文", err: context.Canceled, want: "context"},
 		{name: "通知队列", err: bridge.ErrNotificationQueueFull, want: "notification_queue_full"},
 		{name: "Herdr 协议", err: herdr.ErrProtocolMismatch, want: "herdr_protocol"},
@@ -1779,6 +1918,23 @@ type interactiveSocketPlan struct {
 	assembledIdentity string
 }
 
+type synchronizedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(value)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
 func resolvedChildPath(t *testing.T, parent, child string) string {
 	t.Helper()
 	resolvedParent, err := filepath.EvalSymlinks(parent)
@@ -1790,6 +1946,19 @@ func resolvedChildPath(t *testing.T, parent, child string) string {
 
 func resolvedDialPath(t *testing.T, dialPath string) string {
 	t.Helper()
+	if resolved, err := filepath.EvalSymlinks(dialPath); err == nil {
+		return filepath.Clean(resolved)
+	}
+	if info, err := os.Lstat(dialPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(dialPath)
+		if err != nil {
+			t.Fatalf("read dial symlink %q: %v", dialPath, err)
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(dialPath), target)
+		}
+		return filepath.Clean(target)
+	}
 	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(dialPath))
 	if err != nil {
 		t.Fatalf("resolve dial parent %q: %v", filepath.Dir(dialPath), err)
@@ -1815,7 +1984,7 @@ func privateDialAliasDir(t *testing.T, dialPath string) string {
 	if len([]byte(dialPath)) >= unixSocketPathByteLimit {
 		t.Fatalf("dial path length = %d, want below %d", len([]byte(dialPath)), unixSocketPathByteLimit)
 	}
-	aliasDir := filepath.Dir(filepath.Dir(dialPath))
+	aliasDir := filepath.Dir(dialPath)
 	if filepath.Dir(aliasDir) != "/tmp" || !strings.HasPrefix(filepath.Base(aliasDir), "herdr-pal-") {
 		t.Fatalf("dial alias directory = %q, want private /tmp/herdr-pal-* directory", aliasDir)
 	}
@@ -1842,6 +2011,18 @@ func waitPathRemoved(t *testing.T, path string) {
 	t.Fatalf("path was not removed before deadline: %q", path)
 }
 
+func waitBufferContains(t *testing.T, buffer *synchronizedBuffer, fragment string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buffer.String(), fragment) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("buffer did not contain %q before deadline: %s", fragment, buffer.String())
+}
+
 func assertInteractiveSocketRejectedBeforeLock(t *testing.T, socketPath string, sensitivePaths []string) {
 	t.Helper()
 	options := testInteractiveOptions(t)
@@ -1849,10 +2030,15 @@ func assertInteractiveSocketRejectedBeforeLock(t *testing.T, socketPath string, 
 		return socketPath, nil
 	}
 	lockCalls := 0
+	prepareCalls := 0
 	assembleCalls := 0
 	options.dependencies.acquireLock = func(string) (processLock, error) {
 		lockCalls++
 		return &fakeLock{}, nil
+	}
+	options.dependencies.prepareStableDialPath = func(string) (*dialPathLease, error) {
+		prepareCalls++
+		return &dialPathLease{path: "/tmp/must-not-run.sock"}, nil
 	}
 	options.dependencies.assembleInteractive = func(config.Config, string, io.Reader, io.Writer, *slog.Logger) (*applicationRuntime, error) {
 		assembleCalls++
@@ -1864,8 +2050,8 @@ func assertInteractiveSocketRejectedBeforeLock(t *testing.T, socketPath string, 
 	if err == nil || !strings.Contains(err.Error(), "无法可靠") {
 		t.Fatalf("Run() error = %v, want safe canonicalization failure", err)
 	}
-	if lockCalls != 0 || assembleCalls != 0 {
-		t.Fatalf("lock/assemble calls = %d/%d, want 0/0", lockCalls, assembleCalls)
+	if lockCalls != 0 || prepareCalls != 0 || assembleCalls != 0 {
+		t.Fatalf("lock/prepare/assemble calls = %d/%d/%d, want 0/0/0", lockCalls, prepareCalls, assembleCalls)
 	}
 	for _, sensitivePath := range sensitivePaths {
 		if strings.Contains(err.Error(), sensitivePath) {
