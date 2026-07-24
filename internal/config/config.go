@@ -2,10 +2,7 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
-	"os"
 	"strings"
 )
 
@@ -98,25 +95,5 @@ func LoadInteractive(path string) (Config, error) {
 }
 
 func loadFile(path string) (Config, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("读取配置文件: %w", err)
-	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	decoder.DisallowUnknownFields()
-
-	var config Config
-	if err := decoder.Decode(&config); err != nil {
-		return Config{}, fmt.Errorf("解析配置文件: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return Config{}, fmt.Errorf("配置文件包含多个 JSON 值")
-		}
-		return Config{}, fmt.Errorf("配置文件包含尾随内容: %w", err)
-	}
-
-	return config, nil
+	return decodeFile[Config](path)
 }

@@ -1,0 +1,14 @@
+{
+  "wecom": {
+    "bot_id": ""
+  },
+  "server": {
+    "listen": "0.0.0.0:9443",
+    "cert_file": "",
+    "key_file": "",
+    "state_dir": ""
+  },
+  "log": {
+    "level": "info"
+  }
+}

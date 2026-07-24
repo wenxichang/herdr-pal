@@ -1,7 +1,9 @@
 {
-  "wecom": {
-    "bot_id": "",
-    "allowed_user_id": ""
+  "relay": {
+    "url": "wss://127.0.0.1:9443",
+    "userid": "",
+    "machine_id": "home-mac",
+    "skip_verify": true
   },
   "herdr": {
     "session": "",
