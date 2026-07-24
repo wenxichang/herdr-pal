@@ -80,6 +80,82 @@ func TestLoadRejectsUnknownAndTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestLoadInteractiveUsesDefaultsForEmptyPath(t *testing.T) {
+	config, err := LoadInteractive(" \t\n ")
+	if err != nil {
+		t.Fatalf("LoadInteractive() 返回错误：%v", err)
+	}
+	if config.Herdr.Session != "" || config.Herdr.SocketPath != "" {
+		t.Fatalf("Herdr 覆盖配置不应存在：%+v", config.Herdr)
+	}
+	if config.Log.Level != "info" {
+		t.Fatalf("Log 默认配置不正确：%+v", config.Log)
+	}
+}
+
+func TestLoadInteractiveLoadsHerdrAndLogWithoutWeCom(t *testing.T) {
+	path := writeConfig(t, `{
+  "herdr": {"session": "session-1", "socket_path": "/tmp/herdr.sock"},
+  "log": {"level": "debug"}
+}`)
+
+	config, err := LoadInteractive(path)
+	if err != nil {
+		t.Fatalf("LoadInteractive() 返回错误：%v", err)
+	}
+	if config.Herdr.Session != "session-1" || config.Herdr.SocketPath != "/tmp/herdr.sock" {
+		t.Fatalf("Herdr 配置不正确：%+v", config.Herdr)
+	}
+	if config.Log.Level != "debug" {
+		t.Fatalf("Log 配置不正确：%+v", config.Log)
+	}
+	if config.WeCom.Secret != "" {
+		t.Fatalf("交互配置不应包含企业微信 Secret：%q", config.WeCom.Secret)
+	}
+}
+
+func TestLoadInteractiveAllowsMissingOrEmptyWeCom(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+	}{
+		{name: "缺少企业微信配置", json: `{"herdr":{},"log":{}}`},
+		{name: "空白企业微信字段", json: `{"wecom":{"bot_id":" ","allowed_user_id":""},"herdr":{},"log":{"level":" \t "}}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := LoadInteractive(writeConfig(t, test.json))
+			if err != nil {
+				t.Fatalf("LoadInteractive() 返回错误：%v", err)
+			}
+			if config.Log.Level != "info" {
+				t.Fatalf("Log 默认配置不正确：%+v", config.Log)
+			}
+		})
+	}
+}
+
+func TestLoadInteractiveRejectsUnknownAndTrailingJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+	}{
+		{name: "未知字段", json: `{"herdr":{"unexpected":true},"log":{}}`},
+		{name: "第二个 JSON", json: `{"herdr":{},"log":{}} {}`},
+		{name: "尾随内容", json: `{"herdr":{},"log":{}} trailing`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadInteractive(writeConfig(t, test.json))
+			if err == nil {
+				t.Fatal("LoadInteractive() 未拒绝非法 JSON")
+			}
+		})
+	}
+}
+
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")

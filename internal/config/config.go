@@ -41,6 +41,45 @@ type LogConfig struct {
 
 // Load 从 path 读取严格的 JSON 配置，并从 getenv 获取企业微信机器人密钥。
 func Load(path string, getenv func(string) string) (Config, error) {
+	config, err := loadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+
+	config.WeCom.Secret = getenv(SecretEnvName)
+	if strings.TrimSpace(config.WeCom.BotID) == "" {
+		return Config{}, fmt.Errorf("缺少必填字段 bot_id")
+	}
+	if strings.TrimSpace(config.WeCom.AllowedUserID) == "" {
+		return Config{}, fmt.Errorf("缺少必填字段 allowed_user_id")
+	}
+	if strings.TrimSpace(config.WeCom.Secret) == "" {
+		return Config{}, fmt.Errorf("缺少必填字段 secret")
+	}
+
+	return config, nil
+}
+
+// LoadInteractive 加载交互模式配置。空 path 使用公共 CLI 自动发现 Herdr。
+// 该函数不读取企业微信 Secret，也不校验企业微信字段。
+func LoadInteractive(path string) (Config, error) {
+	if strings.TrimSpace(path) == "" {
+		return Config{Log: LogConfig{Level: "info"}}, nil
+	}
+
+	config, err := loadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if strings.TrimSpace(config.Log.Level) == "" {
+		config.Log.Level = "info"
+	}
+	config.WeCom.Secret = ""
+
+	return config, nil
+}
+
+func loadFile(path string) (Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("读取配置文件: %w", err)
@@ -59,17 +98,6 @@ func Load(path string, getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("配置文件包含多个 JSON 值")
 		}
 		return Config{}, fmt.Errorf("配置文件包含尾随内容: %w", err)
-	}
-
-	config.WeCom.Secret = getenv(SecretEnvName)
-	if strings.TrimSpace(config.WeCom.BotID) == "" {
-		return Config{}, fmt.Errorf("缺少必填字段 bot_id")
-	}
-	if strings.TrimSpace(config.WeCom.AllowedUserID) == "" {
-		return Config{}, fmt.Errorf("缺少必填字段 allowed_user_id")
-	}
-	if strings.TrimSpace(config.WeCom.Secret) == "" {
-		return Config{}, fmt.Errorf("缺少必填字段 secret")
 	}
 
 	return config, nil
