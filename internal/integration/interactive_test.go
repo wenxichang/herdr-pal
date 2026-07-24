@@ -70,13 +70,15 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 		},
 	})
 
-	keyReply := sendInteractiveLine(t, application, "/space")
+	keyReply := sendInteractiveLine(t, application, "/key sp")
 	assertReplyBlock(t, keyReply)
-	if !strings.Contains(keyReply, "按键已发送") {
-		t.Fatalf("/space 回复 = %q, want 按键已发送", keyReply)
+	if !strings.Contains(keyReply, "按键已发送") || !strings.Contains(keyReply, "line-250") {
+		t.Fatalf("/key sp 回复 = %q, want 按键结果和控制台内容", keyReply)
 	}
 	keyCalls := herdrServer.WaitCallCount(t, "agent.send_keys", 1)
 	assertCallParams(t, keyCalls[0], map[string]any{"target": "pane-1", "keys": []any{"space"}})
+	readCalls = herdrServer.WaitCallCount(t, "agent.read", 2)
+	assertCallParams(t, readCalls[1], map[string]any{"target": "pane-1", "lines": float64(100)})
 	waitForConsoleOutput(t, application.stderr, 0, "显式按键审计", func(output string) bool {
 		return strings.Contains(output, "user_id=interactive-local") &&
 			strings.Contains(output, "pane_id=pane-1") &&
@@ -92,8 +94,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	}); delivered != 1 {
 		t.Fatalf("blocked 事件写入订阅数 = %d, want 1", delivered)
 	}
-	readCalls = herdrServer.WaitCallCount(t, "agent.read", 2)
-	assertCallParams(t, readCalls[1], map[string]any{"target": "pane-1", "lines": float64(100)})
+	readCalls = herdrServer.WaitCallCount(t, "agent.read", 3)
+	assertCallParams(t, readCalls[2], map[string]any{"target": "pane-1", "lines": float64(100)})
 	notification := waitForConsoleOutput(t, application.stdout, notificationStart, "blocked 主动通知", func(output string) bool {
 		return strings.Count(output, "\n[通知]\n") == 2 &&
 			strings.Contains(output, "line-081") && strings.Contains(output, "line-180") &&
@@ -106,8 +108,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 
 	assertStableCount(t, func() int { return len(herdrServer.Calls("agent.prompt")) }, 1)
 	assertStableCount(t, func() int { return len(herdrServer.Calls("agent.send_keys")) }, 1)
-	if calls := herdrServer.Calls("agent.read"); len(calls) != 2 {
-		t.Fatalf("agent.read 调用数 = %d, want 2", len(calls))
+	if calls := herdrServer.Calls("agent.read"); len(calls) != 3 {
+		t.Fatalf("agent.read 调用数 = %d, want 3", len(calls))
 	}
 
 	stdout := application.stdout.String()

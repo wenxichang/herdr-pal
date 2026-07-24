@@ -47,7 +47,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 		defer harness.stop(t)
 
 		harness.send(t, "message-list", testUserID, "single", "/ls")
-		harness.send(t, "message-select", testUserID, "single", "/sel 1")
+		harness.send(t, "message-select", testUserID, "single", "/1")
 		harness.send(t, "message-prompt", testUserID, "single", "继续实现端到端测试")
 
 		calls := harness.herdr.WaitCallCount(t, "agent.prompt", 1)
@@ -97,20 +97,32 @@ func TestBridgeEndToEnd(t *testing.T) {
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 0)
 	})
 
-	t.Run("显式 enter 与 space 各发送一次受限按键", func(t *testing.T) {
+	t.Run("显式 enter 与连续按键逐键发送并各刷新一次控制台", func(t *testing.T) {
 		harness := newBridgeHarness(t, herdr.AgentStatusBlocked)
 		defer harness.stop(t)
 		harness.selectFirst(t)
+		harness.herdr.SetOutput([]string{"key-console"})
 
-		harness.send(t, "message-enter", testUserID, "single", "/key enter")
-		harness.send(t, "message-space", testUserID, "single", "/space")
+		enterReply := harness.send(t, "message-enter", testUserID, "single", "/key enter")
+		sequenceReply := harness.send(t, "message-sequence", testUserID, "single", "/key down,sp")
+		if !strings.Contains(enterReply.Content, "1/1") || !strings.Contains(enterReply.Content, "key-console") {
+			t.Fatalf("enter 回复 = %q", enterReply.Content)
+		}
+		if !strings.Contains(sequenceReply.Content, "2/2") || !strings.Contains(sequenceReply.Content, "key-console") {
+			t.Fatalf("连续按键回复 = %q", sequenceReply.Content)
+		}
 
-		calls := harness.herdr.WaitCallCount(t, "agent.send_keys", 2)
+		calls := harness.herdr.WaitCallCount(t, "agent.send_keys", 3)
 		assertCallParams(t, calls[0], map[string]any{"target": "pane-1", "keys": []any{"enter"}})
-		assertCallParams(t, calls[1], map[string]any{"target": "pane-1", "keys": []any{"space"}})
-		getCalls := harness.herdr.WaitCallCount(t, "agent.get", 2)
+		assertCallParams(t, calls[1], map[string]any{"target": "pane-1", "keys": []any{"down"}})
+		assertCallParams(t, calls[2], map[string]any{"target": "pane-1", "keys": []any{"space"}})
+		getCalls := harness.herdr.WaitCallCount(t, "agent.get", 3)
 		for _, call := range getCalls {
 			assertCallParams(t, call, map[string]any{"target": "pane-1"})
+		}
+		readCalls := harness.herdr.WaitCallCount(t, "agent.read", 2)
+		for _, call := range readCalls {
+			assertCallParams(t, call, map[string]any{"target": "pane-1", "lines": float64(100)})
 		}
 	})
 

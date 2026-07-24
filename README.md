@@ -171,21 +171,26 @@ stderr，便于独立重定向。按 `Ctrl+C` 或发送 `SIGTERM` 可停止两�
 | 输入 | 行为 |
 | --- | --- |
 | `/ls` | 列出当前 Agent，并建立本次编号快照 |
-| `/sel 1` | 从最近一次 `/ls` 选择编号 1 |
+| `/1`、`/sel 1` | 从最近一次 `/ls` 选择编号 1 |
+| `/help` | 显示输入帮助 |
 | `/con` | 读取当前 Agent 最新 100 行，并重置到第 0 页 |
 | `/pageup` | 向更早内容移动一页 |
 | `/pagedn` | 从缓存向更新内容移动一页，不读取 Herdr |
-| `/keyup`、`/key up` | 发送 `up` |
-| `/keydn`、`/key down` | 发送 `down` |
 | `/enter`、`/key enter` | 发送 `enter` |
-| `/esc`、`/key esc` | 发送 `esc` |
-| `/space`、`/key space` | 发送 `space` |
-| `/key X` | 发送一个 ASCII 字母或数字，保留大小写 |
+| `/key KEYS` | 发送一个或多个受限按键，结束后显示最新 100 行 |
+| `/slash clear` | 将 `/clear` 作为普通 prompt 发送给当前 Agent |
 | 其他不以 `/` 开头的文本 | 在状态确认后通过 `agent.prompt` 发送给当前 Agent |
 
-`/key X` 只接受单个 `A-Z`、`a-z` 或 `0-9`；特殊键名只接受表中的小写形式。不支持
-组合键、控制键、任意 key name 或按键序列。命令本身就是用户的显式操作，不二次确认，
-但 `blocked` 状态永远不会自动发送 Enter 或空格。
+`/key KEYS` 使用逗号或空白分隔，二者可以混用，末尾逗号会被忽略。每个按键只允许
+`up`、`down`、`enter`、`esc`、`space` 或单个 `A-Z`、`a-z`、`0-9`；`dn` 是
+`down` 的缩写，`sp` 是 `space` 的缩写。单条命令最多 32 个按键，相邻按键发送间隔
+100ms。`enter` 只能单独发送，多键队列中包含 `enter` 会整组拒绝。`/keyup`、
+`/keydn`、`/space` 和 `/esc` 不再作为快捷命令支持。
+
+按键命令本身就是用户的显式操作，不二次确认。每个按键发送前都会重新确认当前 occupant，
+失败时停止剩余队列；命令结束后只执行一次等价 `/con` 的最近 100 行读取并重置页码。
+发送部分成功时会报告完成数量，控制台读取失败不会误报成按键发送失败。`blocked` 状态永远
+不会自动发送 Enter 或空格。
 
 普通文本只允许发送给实时状态为 `idle` 或 `done` 的当前 occupant；`working`、`blocked`
 和 `unknown` 会直接拒绝。`agent.prompt` 在同一请求中等待最多约 5 秒的状态变化，只有
@@ -195,7 +200,8 @@ stderr，便于独立重定向。按 `Ctrl+C` 或发送 `SIGTERM` 可停止两�
 界面，不会继续重试。若 prompt 已成功后才观察到 `agent_session` 切换，并且 pane、
 terminal 和 Agent 均未变化，bridge 会清空旧面板缓存并自动把当前选择迁移到新会话。
 
-以 `/` 开头但无法识别的内容只返回命令错误，绝不会作为 prompt 转发。
+以 `/` 开头但无法识别的内容只返回命令错误，绝不会作为 prompt 转发。需要向 Agent 发送
+斜杠命令时必须使用 `/slash TEXT`，它仍然走普通 prompt 的状态确认和会话安全流程。
 
 ## 分页与状态通知
 

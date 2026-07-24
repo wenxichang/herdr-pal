@@ -38,20 +38,26 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 
 ```text
 /ls
+/N
 /sel N
+/help
 /con
 /pageup
 /pagedn
-/keyup       /key up
-/keydn       /key down
 /enter       /key enter
-/esc         /key esc
-/space       /key space
-/key X
+/key KEYS
+/slash TEXT
 ```
 
-`X` 只允许单个 ASCII 字母或数字。其他不以 `/` 开头的文本通过 `agent.prompt` 发送；
-未知 `/` 命令不会降级为 prompt。按键命令不二次确认。
+`/<NUM>` 等同于 `/sel <NUM>`。`/key KEYS` 支持逗号或空白混合分隔，允许 `up`、
+`down`、`enter`、`esc`、`space`、单个 ASCII 字母或数字，并支持 `dn -> down`、
+`sp -> space`。每条命令最多 32 个按键，相邻按键间隔 100ms；`enter` 只能单独发送。
+`/keyup`、`/keydn`、`/space` 和 `/esc` 快捷命令已移除。
+
+每个按键发送前重新校验 occupant，队列中途失败立即停止。按键命令结束后只执行一次等价
+`/con` 的最近 100 行读取并重置页码。`/slash TEXT` 将 `/TEXT` 交给普通 prompt 流程。
+其他不以 `/` 开头的文本通过 `agent.prompt` 发送；未知 `/` 命令不会降级为 prompt。
+按键命令不二次确认。
 
 普通文本发送前实时调用 `agent.get`，仅允许 `idle`、`done`。首次发送使用带 wait 的
 `agent.prompt`，并以 `state_change_seq` 确认状态确实变化；收到

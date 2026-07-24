@@ -99,6 +99,51 @@ func TestServiceUnknownCommandShowsUsageWithoutHerdr(t *testing.T) {
 	}
 }
 
+func TestServiceHelpDoesNotCallHerdr(t *testing.T) {
+	service, fake := newTestService(t)
+
+	service.HandleMessage(context.Background(), incoming("help", "/help"))
+
+	if fake.callCount() != 0 {
+		t.Fatalf("/help called Herdr: %#v", fake.callOrder())
+	}
+	reply := fakeIMFromService(t, service).lastReply()
+	for _, want := range []string{"/help", "/N", "/key", "/slash"} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("/help reply = %q, want %q", reply, want)
+		}
+	}
+}
+
+func TestServiceSelectShorthandUsesListSnapshot(t *testing.T) {
+	service, _ := newTestService(t)
+	service.HandleMessage(context.Background(), incoming("short-list", "/ls"))
+
+	service.HandleMessage(context.Background(), incoming("short-select", "/1"))
+
+	selected, err := service.registry.ValidateSelected()
+	if err != nil || selected.PaneID != "pane-1" {
+		t.Fatalf("/<NUM> selection = %#v, %v, want pane-1", selected, err)
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "已选择") {
+		t.Fatalf("/<NUM> reply = %q, want 已选择", reply)
+	}
+}
+
+func TestServiceSlashPromptUsesNormalPromptFlow(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+
+	service.HandleMessage(context.Background(), incoming("slash-prompt", "/slash clear"))
+
+	if got := fake.prompts(); len(got) != 1 || got[0].target != "pane-1" || got[0].text != "/clear" {
+		t.Fatalf("/slash prompt calls = %#v, want pane-1 /clear", got)
+	}
+	if got := strings.Join(fake.callOrder(), ","); got != "get,prompt" {
+		t.Fatalf("/slash call order = %q, want get,prompt", got)
+	}
+}
+
 func TestServiceDegradedAllowsListButPausesHerdrActions(t *testing.T) {
 	service, fake := newTestService(t)
 	service.SetHerdr(nil)
@@ -446,18 +491,18 @@ func TestServicePromptStallAuditsFailedEnter(t *testing.T) {
 	}
 }
 
-func TestServiceKeyAliasesSendOnceWithoutConfirmation(t *testing.T) {
+func TestServiceSingleKeyCommandsSendOnceWithoutConfirmation(t *testing.T) {
 	for _, test := range []struct {
 		content string
 		key     string
 	}{
-		{"/keyup", "up"}, {"/key up", "up"}, {"/keydn", "down"}, {"/key down", "down"},
-		{"/enter", "enter"}, {"/key enter", "enter"}, {"/esc", "esc"}, {"/key esc", "esc"},
-		{"/space", "space"}, {"/key space", "space"}, {"/key A", "A"},
+		{"/key up", "up"}, {"/key down", "down"}, {"/enter", "enter"}, {"/key enter", "enter"},
+		{"/key esc", "esc"}, {"/key space", "space"}, {"/key A", "A"},
 	} {
 		t.Run(test.content, func(t *testing.T) {
 			service, fake := newTestService(t)
 			selectTarget(t, service)
+			fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: "single-key-console"}, nil)
 			service.HandleMessage(context.Background(), incoming("key-"+test.key, test.content))
 			if got := fake.keys(); len(got) != 1 || got[0].key != test.key {
 				t.Fatalf("key calls = %#v", got)
@@ -468,13 +513,145 @@ func TestServiceKeyAliasesSendOnceWithoutConfirmation(t *testing.T) {
 			if got := fake.gets(); len(got) != 1 || got[0] != "pane-1" {
 				t.Fatalf("GetAgent targets = %#v, want pane-1", got)
 			}
-			if got := strings.Join(fake.callOrder(), ","); got != "get,key" {
-				t.Fatalf("key call order = %q, want get,key", got)
+			if got := strings.Join(fake.callOrder(), ","); got != "get,key,read" {
+				t.Fatalf("key call order = %q, want get,key,read", got)
 			}
-			if strings.Contains(fakeIMFromService(t, service).lastReply(), "确认") {
-				t.Fatalf("key reply asks confirmation: %q", fakeIMFromService(t, service).lastReply())
+			if got := fake.reads(); len(got) != 1 || got[0] != (readCall{target: "pane-1", lines: panel.PageSize}) {
+				t.Fatalf("key read calls = %#v", got)
+			}
+			reply := fakeIMFromService(t, service).lastReply()
+			if strings.Contains(reply, "确认") || !strings.Contains(reply, "single-key-console") {
+				t.Fatalf("key reply = %q, want console without confirmation", reply)
 			}
 		})
+	}
+}
+
+func TestServiceKeySequenceSendsInOrderWithIntervalsAndRefreshesContent(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: "console-after-keys"}, nil)
+	var intervals []time.Duration
+	service.waitKeyInterval = func(_ context.Context, duration time.Duration) error {
+		intervals = append(intervals, duration)
+		return nil
+	}
+
+	service.HandleMessage(context.Background(), incoming("key-sequence", "/key down,sp dn space,"))
+
+	keys := fake.keys()
+	if len(keys) != 4 {
+		t.Fatalf("key calls = %#v, want 4", keys)
+	}
+	for index, want := range []string{"down", "space", "down", "space"} {
+		if keys[index] != (keyCall{target: "pane-1", key: want}) {
+			t.Fatalf("key call %d = %#v, want %q", index, keys[index], want)
+		}
+	}
+	if got := fake.gets(); len(got) != 4 {
+		t.Fatalf("GetAgent calls = %#v, want 4", got)
+	}
+	if got := strings.Join(fake.callOrder(), ","); got != "get,key,get,key,get,key,get,key,read" {
+		t.Fatalf("call order = %q", got)
+	}
+	if len(intervals) != 3 {
+		t.Fatalf("intervals = %#v, want 3", intervals)
+	}
+	for _, interval := range intervals {
+		if interval != 100*time.Millisecond {
+			t.Fatalf("interval = %s, want 100ms", interval)
+		}
+	}
+	if got := fake.reads(); len(got) != 1 || got[0] != (readCall{target: "pane-1", lines: panel.PageSize}) {
+		t.Fatalf("read calls = %#v", got)
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 4 {
+		t.Fatalf("audits = %#v, want 4", audits)
+	}
+	for index, audit := range audits {
+		if audit.Key() != []string{"down", "space", "down", "space"}[index] || audit.Result() != policy.AuditResultSent {
+			t.Fatalf("audit %d = %#v", index, audit)
+		}
+	}
+	reply := fakeIMFromService(t, service).lastReply()
+	if !strings.Contains(reply, "4/4") || !strings.Contains(reply, "console-after-keys") {
+		t.Fatalf("key sequence reply = %q", reply)
+	}
+}
+
+func TestServiceKeySequenceStopsOnSendFailureAndStillRefreshes(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.keyErrors = []error{nil, errors.New("private second key failure")}
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: "console-after-partial"}, nil)
+	var intervals []time.Duration
+	service.waitKeyInterval = func(_ context.Context, duration time.Duration) error {
+		intervals = append(intervals, duration)
+		return nil
+	}
+
+	service.HandleMessage(context.Background(), incoming("key-partial", "/key up down space"))
+
+	if got := fake.keys(); len(got) != 2 || got[0].key != "up" || got[1].key != "down" {
+		t.Fatalf("partial key calls = %#v", got)
+	}
+	if len(intervals) != 1 || intervals[0] != 100*time.Millisecond {
+		t.Fatalf("partial intervals = %#v", intervals)
+	}
+	if got := strings.Join(fake.callOrder(), ","); got != "get,key,get,key,read" {
+		t.Fatalf("partial call order = %q", got)
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 2 || audits[0].Result() != policy.AuditResultSent || audits[1].Result() != policy.AuditResultFailed {
+		t.Fatalf("partial audits = %#v", audits)
+	}
+	reply := fakeIMFromService(t, service).lastReply()
+	if !strings.Contains(reply, "1/3") || !strings.Contains(reply, "console-after-partial") || !strings.Contains(reply, "后续未执行") {
+		t.Fatalf("partial reply = %q", reply)
+	}
+}
+
+func TestServiceKeySequenceStopsWhenOccupantChanges(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.setGetResults(
+		agentGetResult{agent: agentInfo("pane-1", "terminal-1", "codex")},
+		agentGetResult{agent: agentInfo("pane-1", "terminal-1", "claude")},
+	)
+	service.waitKeyInterval = func(context.Context, time.Duration) error { return nil }
+
+	service.HandleMessage(context.Background(), incoming("key-occupant-change", "/key up down space"))
+
+	if got := fake.keys(); len(got) != 1 || got[0].key != "up" {
+		t.Fatalf("occupant change key calls = %#v", got)
+	}
+	if got := fake.reads(); len(got) != 0 {
+		t.Fatalf("occupant change read calls = %#v, want none", got)
+	}
+	audits := fakeAuditFromService(t, service).records()
+	if len(audits) != 2 || audits[0].Result() != policy.AuditResultSent || audits[1].Result() != policy.AuditResultRejected {
+		t.Fatalf("occupant change audits = %#v", audits)
+	}
+	if _, err := service.registry.ValidateSelected(); err == nil {
+		t.Fatal("occupant change did not invalidate selection")
+	}
+	reply := fakeIMFromService(t, service).lastReply()
+	if !strings.Contains(reply, "1/3") || !strings.Contains(reply, "目标 Agent 已变化") {
+		t.Fatalf("occupant change reply = %q", reply)
+	}
+}
+
+func TestServiceKeyReadFailureDoesNotMisreportSendFailure(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.readErr = errors.New("private read failure")
+
+	service.HandleMessage(context.Background(), incoming("key-read-failure", "/key space"))
+
+	reply := fakeIMFromService(t, service).lastReply()
+	if !strings.Contains(reply, "按键已发送") || !strings.Contains(reply, "控制台读取失败") || strings.Contains(reply, "按键发送失败") {
+		t.Fatalf("read failure reply = %q", reply)
 	}
 }
 
@@ -1337,7 +1514,10 @@ func newTestServiceWithLogger(t *testing.T, logger *slog.Logger) (*Service, *fak
 		t.Fatal(err)
 	}
 	current := agentInfo("pane-1", "terminal-1", "codex")
-	fake := &fakeHerdr{snapshot: testSnapshot(), agent: current, promptResult: changedAgent(current, herdr.AgentStatusWorking)}
+	fake := &fakeHerdr{
+		snapshot: testSnapshot(), agent: current, promptResult: changedAgent(current, herdr.AgentStatusWorking),
+		read: herdr.ReadResult{PaneID: "pane-1"},
+	}
 	im := &fakeIM{}
 	audit := &fakeKeyAuditSink{}
 	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, audit, logger)
@@ -1459,6 +1639,7 @@ type fakeHerdr struct {
 	waitErr       error
 	waitResult    herdr.AgentInfo
 	keyErr        error
+	keyErrors     []error
 	getCalls      []string
 	readCalls     []readCall
 	promptCalls   []promptCall
@@ -1551,6 +1732,10 @@ func (f *fakeHerdr) SendKey(_ context.Context, target, key string) error {
 	f.keyCalls = append(f.keyCalls, keyCall{target, key})
 	f.order = append(f.order, "key")
 	err, block, started := f.keyErr, f.blockKey, f.keyStarted
+	if len(f.keyErrors) > 0 {
+		err = f.keyErrors[0]
+		f.keyErrors = f.keyErrors[1:]
+	}
 	f.mu.Unlock()
 	signal(started)
 	if block != nil {

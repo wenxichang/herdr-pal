@@ -24,7 +24,12 @@ import (
 // ErrInvalidServiceDependency 表示 BridgeService 缺少必需依赖。
 var ErrInvalidServiceDependency = errors.New("BridgeService 依赖无效")
 
-const promptRecoveryTimeout = 5 * time.Second
+const (
+	promptRecoveryTimeout = 5 * time.Second
+	keySequenceInterval   = 100 * time.Millisecond
+)
+
+type keyIntervalWaiter func(context.Context, time.Duration) error
 
 // HerdrAPI 是入站命令所需的最小 Herdr 公共 API。
 type HerdrAPI interface {
@@ -72,6 +77,8 @@ type Service struct {
 	keyAudit KeyAuditSink
 	logger   *slog.Logger
 
+	waitKeyInterval keyIntervalWaiter
+
 	client atomic.Pointer[clientHolder]
 
 	transitionMu sync.Mutex
@@ -97,7 +104,10 @@ func NewService(registry *session.Registry, buffer *panel.Buffer, guard *policy.
 	if registry == nil || buffer == nil || guard == nil || deduper == nil || im == nil || keyAudit == nil || logger == nil {
 		return nil, ErrInvalidServiceDependency
 	}
-	service := &Service{registry: registry, panel: buffer, guard: guard, deduper: deduper, im: im, keyAudit: keyAudit, logger: logger}
+	service := &Service{
+		registry: registry, panel: buffer, guard: guard, deduper: deduper,
+		im: im, keyAudit: keyAudit, logger: logger, waitKeyInterval: waitKeyInterval,
+	}
 	service.opCond = sync.NewCond(&service.opMu)
 	return service, nil
 }
@@ -232,10 +242,12 @@ func (s *Service) HandleMessage(ctx context.Context, message wecom.IncomingText)
 		s.handlePageUp(ctx, message)
 	case command.KindPageDown:
 		s.handlePageDown(ctx, message)
+	case command.KindHelp:
+		s.reply(ctx, message.RequestID, command.HelpText())
 	case command.KindPrompt:
 		s.handlePrompt(ctx, message, action.Text)
 	case command.KindKey:
-		s.handleKey(ctx, message, action.Key)
+		s.handleKeys(ctx, message, action.Keys)
 	default:
 		s.reply(ctx, message.RequestID, "命令暂不支持。")
 	}
@@ -278,7 +290,7 @@ func (s *Service) handleList(ctx context.Context, message wecom.IncomingText) {
 		}
 		fmt.Fprintf(&content, "\n%d. %s%s\n   标题：%s\n   工作区：%s / %s\n   状态：%s\n   面板：%s", index+1, safeLabel(name), marker, safeLabel(target.Title), safeLabel(target.Workspace), safeLabel(target.Tab), safeLabel(string(target.Status)), safeLabel(target.PaneID))
 	}
-	content.WriteString("\n使用 /sel N 选择目标。")
+	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	s.reply(ctx, message.RequestID, content.String())
 }
 
@@ -434,15 +446,21 @@ func (s *Service) replyPromptSuccess(ctx context.Context, requestID string, stat
 	s.reply(ctx, requestID, fmt.Sprintf("已发送，Agent 状态已变为 %s。", safeLabel(string(status))))
 }
 
-func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key string) {
-	if err := s.guard.ValidateKey(key); err != nil {
-		s.reply(ctx, message.RequestID, "按键不受支持。")
+func (s *Service) handleKeys(ctx context.Context, message wecom.IncomingText, keys []string) {
+	if len(keys) == 0 {
+		s.reply(ctx, message.RequestID, "按键请求无效，未执行任何操作。")
 		return
+	}
+	for _, key := range keys {
+		if err := s.guard.ValidateKey(key); err != nil {
+			s.reply(ctx, message.RequestID, "按键不受支持。")
+			return
+		}
 	}
 	client, release, availability := s.beginOperationDetailed(true)
 	if availability != operationReady {
 		if availability == operationUnavailable {
-			s.auditUnavailableKey(message.UserID, key)
+			s.auditUnavailableKeys(message.UserID, keys)
 		}
 		s.reply(ctx, message.RequestID, unavailableMessage)
 		return
@@ -453,50 +471,105 @@ func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
-	audits, err := prepareKeyAudits(message.UserID, target, key, time.Now().UTC())
-	if err != nil {
+
+	prepared := make([]preparedKeyAudits, len(keys))
+	for index, key := range keys {
+		prepared[index], err = prepareKeyAudits(message.UserID, target, key, time.Now().UTC())
+		if err != nil {
+			release()
+			s.reply(ctx, message.RequestID, "按键请求无效，未执行任何操作。")
+			return
+		}
+	}
+
+	sent := 0
+	failureMessage := ""
+	for index, key := range keys {
+		current, getErr := client.GetAgent(ctx, target.PaneID)
+		if getErr != nil {
+			s.keyAudit.RecordKeyAudit(prepared[index].failed)
+			release()
+			s.reply(ctx, message.RequestID, keySequenceSummary(sent, len(keys), fmt.Sprintf("第 %d 个按键执行前无法确认 Agent，后续未执行。", index+1)))
+			return
+		}
+		if !session.MatchesAgent(target, current) {
+			s.keyAudit.RecordKeyAudit(prepared[index].rejected)
+			release()
+			s.invalidateExpected(target)
+			s.reply(ctx, message.RequestID, keySequenceSummary(sent, len(keys), targetChangedMessage))
+			return
+		}
+		if sendErr := client.SendKey(ctx, target.PaneID, key); sendErr != nil {
+			s.keyAudit.RecordKeyAudit(prepared[index].failed)
+			failureMessage = fmt.Sprintf("第 %d 个按键发送失败，后续未执行。", index+1)
+			break
+		}
+		s.keyAudit.RecordKeyAudit(prepared[index].sent)
+		sent++
+		if index+1 < len(keys) {
+			if waitErr := s.waitKeyInterval(ctx, keySequenceInterval); waitErr != nil {
+				failureMessage = "按键序列已取消，后续未执行。"
+				break
+			}
+		}
+	}
+
+	refreshTarget, generation, err := s.captureContentTarget()
+	if err != nil || !sameTarget(refreshTarget, target) {
 		release()
-		s.reply(ctx, message.RequestID, "按键请求无效，未执行任何操作。")
+		s.reply(ctx, message.RequestID, keySequenceSummary(sent, len(keys), failureMessage)+"\n\n控制台刷新失败，请重新执行 /con。")
 		return
 	}
-	current, err := client.GetAgent(ctx, target.PaneID)
-	if err != nil {
-		s.keyAudit.RecordKeyAudit(audits.failed)
-		release()
-		s.reply(ctx, message.RequestID, unavailableMessage)
-		return
-	}
-	if !session.MatchesAgent(target, current) {
-		s.keyAudit.RecordKeyAudit(audits.rejected)
-		release()
-		s.invalidateExpected(target)
-		s.reply(ctx, message.RequestID, targetChangedMessage)
-		return
-	}
-	err = client.SendKey(ctx, target.PaneID, key)
-	if err != nil {
-		s.keyAudit.RecordKeyAudit(audits.failed)
-	} else {
-		s.keyAudit.RecordKeyAudit(audits.sent)
-	}
+	result, readErr := client.ReadRecent(ctx, target.PaneID, panel.PageSize)
 	release()
-	if err != nil {
-		s.reply(ctx, message.RequestID, "按键发送失败，请稍后重试。")
+	summary := keySequenceSummary(sent, len(keys), failureMessage)
+	if readErr != nil {
+		s.reply(ctx, message.RequestID, summary+"\n\n控制台读取失败，请执行 /con 重试。")
 		return
 	}
-	s.reply(ctx, message.RequestID, "按键已发送。")
+	if result.PaneID != target.PaneID {
+		s.invalidateExpected(target)
+		s.reply(ctx, message.RequestID, summary+"\n\n控制台目标已变化，请重新执行 /ls 和 /sel。")
+		return
+	}
+	lines, page, applyErr := s.applyRefresh(target, generation, panel.Normalize(result.Text))
+	if applyErr != nil {
+		s.reply(ctx, message.RequestID, summary+"\n\n控制台刷新失败："+readApplyErrorMessage(applyErr))
+		return
+	}
+	s.reply(ctx, message.RequestID, summary+"\n\n"+panel.RenderPage(target, page, lines))
 }
 
-func (s *Service) auditUnavailableKey(userID, key string) {
+func keySequenceSummary(sent, total int, failureMessage string) string {
+	if failureMessage == "" {
+		return fmt.Sprintf("按键已发送（%d/%d）。", sent, total)
+	}
+	return fmt.Sprintf("已发送 %d/%d 个按键；%s", sent, total, failureMessage)
+}
+
+func waitKeyInterval(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) auditUnavailableKeys(userID string, keys []string) {
 	target, err := s.selectedTarget()
 	if err != nil {
 		return
 	}
-	audits, err := prepareKeyAudits(userID, target, key, time.Now().UTC())
-	if err != nil {
-		return
+	for _, key := range keys {
+		audits, auditErr := prepareKeyAudits(userID, target, key, time.Now().UTC())
+		if auditErr != nil {
+			return
+		}
+		s.keyAudit.RecordKeyAudit(audits.failed)
 	}
-	s.keyAudit.RecordKeyAudit(audits.failed)
 }
 
 type preparedKeyAudits struct {
