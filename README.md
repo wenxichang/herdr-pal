@@ -56,8 +56,8 @@ terminal ID 只用于确认 Agent occupant 是否仍然相同。
 1. 在企业微信创建智能机器人，选择 API 模式的长连接接入，取得 Bot ID 和 Secret。
 2. 用自己的企业微信帐号向机器人发送过至少一条消息。企业微信要求满足这一前置条件
    后，机器人才能向该单聊主动推送状态通知。
-3. 从真实消息回调确认 `userid`，把同一个标识写入 `allowed_user_id`。若平台返回加密
-   userid，就使用对应的加密值。
+3. 从真实消息回调确认 `userid`，把同一个标识写入 `allowed_user_id`。若管理后台没有
+   展示账号，或平台返回加密 userid，可使用下文的一次性用户发现模式。
 4. Secret 只放入环境变量，不写入 JSON、日志或仓库。
 
 企业微信长连接协议文档：
@@ -92,6 +92,18 @@ terminal ID 只用于确认 Agent occupant 是否仍然相同。
 export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 ```
 
+不知道真实 `userid` 时，先确保没有其他 Herdr Pal 或 SDK 连接同一机器人；
+`allowed_user_id` 可以留空，发现模式也不会使用已有值过滤消息。运行：
+
+```sh
+./dist/herdr-pal -discover-user -config /绝对路径/config.json
+```
+
+随后在企业微信中向机器人单聊发送任意文本。程序只连接企业微信，不连接 Herdr，不执行
+收到的命令；首条单聊文本回调到达后会在 stdout 输出 `userid=...` 并退出。把该值原样填入
+`allowed_user_id` 后再启动正常模式。完整 userid 只在显式发现模式的 stdout 输出一次，
+普通运行日志仍只记录摘要。
+
 ## 构建与运行
 
 项目使用 Go 1.26：
@@ -114,6 +126,16 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 ```sh
 ./dist/herdr-pal -config /绝对路径/config.json
 ```
+
+需要同时保留本机日志时：
+
+```sh
+./dist/herdr-pal -config /绝对路径/config.json 2>&1 | tee herdr-pal.log
+```
+
+企业微信连接、订阅、断线重连、不支持的消息类型、用户或会话策略拒绝以及重复消息都会写入
+stderr。日志只包含错误类别、会话类型和稳定摘要，不记录 Secret、完整未授权 userid 或消息
+正文。
 
 不连接企业微信、直接把控制台模拟成聊天框：
 

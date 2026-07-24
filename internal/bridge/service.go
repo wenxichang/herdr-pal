@@ -3,8 +3,10 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +68,7 @@ type Service struct {
 	deduper  *policy.Deduper
 	im       IMAdapter
 	keyAudit KeyAuditSink
+	logger   *slog.Logger
 
 	client atomic.Pointer[clientHolder]
 
@@ -88,11 +91,11 @@ type Service struct {
 }
 
 // NewService 创建入站命令服务并校验全部依赖。
-func NewService(registry *session.Registry, buffer *panel.Buffer, guard *policy.Guard, deduper *policy.Deduper, im IMAdapter, keyAudit KeyAuditSink) (*Service, error) {
-	if registry == nil || buffer == nil || guard == nil || deduper == nil || im == nil || keyAudit == nil {
+func NewService(registry *session.Registry, buffer *panel.Buffer, guard *policy.Guard, deduper *policy.Deduper, im IMAdapter, keyAudit KeyAuditSink, logger *slog.Logger) (*Service, error) {
+	if registry == nil || buffer == nil || guard == nil || deduper == nil || im == nil || keyAudit == nil || logger == nil {
 		return nil, ErrInvalidServiceDependency
 	}
-	service := &Service{registry: registry, panel: buffer, guard: guard, deduper: deduper, im: im, keyAudit: keyAudit}
+	service := &Service{registry: registry, panel: buffer, guard: guard, deduper: deduper, im: im, keyAudit: keyAudit, logger: logger}
 	service.opCond = sync.NewCond(&service.opMu)
 	return service, nil
 }
@@ -178,16 +181,39 @@ func (s *Service) replaceSnapshot(snapshot herdr.Snapshot, reconnect, preserveSt
 
 // HandleMessage 处理一条已完成企业微信协议校验的文本回调。
 func (s *Service) HandleMessage(ctx context.Context, message wecom.IncomingText) {
-	if s == nil || s.guard.Authorize(policy.Identity{UserID: message.UserID, ChatType: message.ChatType}) != nil {
+	if s == nil {
+		return
+	}
+	if s.guard.Authorize(policy.Identity{UserID: message.UserID, ChatType: message.ChatType}) != nil {
+		reason := "user_mismatch"
+		if message.ChatType != "single" {
+			reason = "chat_type"
+		} else if message.UserID == "" {
+			reason = "user_missing"
+		}
+		s.logger.Warn("企业微信消息被策略拒绝",
+			"reason", reason,
+			"user_hash", bridgeShortHash(message.UserID),
+			"chat_type", message.ChatType,
+		)
 		return
 	}
 	if strings.TrimSpace(message.MessageID) == "" {
+		s.logger.Warn("企业微信消息标识缺失", "user_hash", bridgeShortHash(message.UserID))
 		s.reply(ctx, message.RequestID, "消息标识缺失，未执行任何操作。")
 		return
 	}
 	if !s.deduper.AddIfNew(message.MessageID) {
+		s.logger.Info("企业微信重复消息已忽略",
+			"user_hash", bridgeShortHash(message.UserID),
+			"message_hash", bridgeShortHash(message.MessageID),
+		)
 		return
 	}
+	s.logger.Info("企业微信消息已接收",
+		"user_hash", bridgeShortHash(message.UserID),
+		"message_hash", bridgeShortHash(message.MessageID),
+	)
 	action, err := command.Parse(message.Content)
 	if err != nil {
 		s.reply(ctx, message.RequestID, safeCommandError(err))
@@ -211,6 +237,11 @@ func (s *Service) HandleMessage(ctx context.Context, message wecom.IncomingText)
 	default:
 		s.reply(ctx, message.RequestID, "命令暂不支持。")
 	}
+}
+
+func bridgeShortHash(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:8])
 }
 
 func (s *Service) handleList(ctx context.Context, message wecom.IncomingText) {

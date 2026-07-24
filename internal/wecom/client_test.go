@@ -1,10 +1,12 @@
 package wecom
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -367,6 +369,127 @@ func TestClientRejectsInvalidEndpointAndPermanentSubscribeError(t *testing.T) {
 	}
 }
 
+func TestClientAllowsReceiveOnlyDiscoveryWithoutAllowedUser(t *testing.T) {
+	socket := newFakeSocket()
+	client, err := NewClient(ClientConfig{
+		Endpoint: "ws://fake", BotID: "bot-1", Secret: "secret",
+		Dial:      func(context.Context, string) (Socket, error) { return socket, nil },
+		RequestID: sequentialIDs(), HeartbeatInterval: time.Hour, RequestTimeout: 100 * time.Millisecond,
+		EventsCapacity: 4, Wait: func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if err := client.SendMarkdown(context.Background(), "content"); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("SendMarkdown() = %v, want protocol error for missing target", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, socket)
+	socket.push(textCallbackJSON("discovery-callback"))
+	select {
+	case event := <-client.Events():
+		if event.UserID != "user-1" {
+			t.Fatalf("event user = %q", event.UserID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("发现模式未收到回调")
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientLogsConnectionLifecycleAndUnsupportedCallbacksWithoutSensitiveValues(t *testing.T) {
+	var logs lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	socket := newFakeSocket()
+	ctx, cancel := context.WithCancel(context.Background())
+	client, err := NewClient(ClientConfig{
+		Endpoint: "ws://fake", BotID: "bot-sensitive", Secret: "secret-sensitive", AllowedUserID: "user-1",
+		Dial: func(context.Context, string) (Socket, error) { return socket, nil }, Logger: logger,
+		RequestID: sequentialIDs(), HeartbeatInterval: time.Hour, RequestTimeout: 100 * time.Millisecond,
+		EventsCapacity: 4, Wait: func(context.Context, time.Duration) error {
+			cancel()
+			return context.Canceled
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, socket)
+	socket.push([]byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":"unsupported-1"},"body":{"msgid":"message-sensitive","aibotid":"bot-sensitive","chattype":"single","from":{"userid":"raw-user-sensitive"},"msgtype":"image"}}`))
+	waitForLog(t, &logs, "企业微信不支持的消息类型已忽略")
+	socket.push([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-1"},"body":{"msgid":"event-message-1","create_time":1720000000,"aibotid":"bot-sensitive","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`))
+	awaitDone(t, done)
+
+	output := logs.String()
+	for _, want := range []string{"企业微信连接中", "企业微信订阅成功", "企业微信不支持的消息类型已忽略", "企业微信连接已断开"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("日志缺少 %q：%q", want, output)
+		}
+	}
+	for _, forbidden := range []string{"secret-sensitive", "raw-user-sensitive", "message-sensitive"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("日志泄露敏感值 %q：%q", forbidden, output)
+		}
+	}
+}
+
+func TestClientLogsSafeHandshakeFailureDetails(t *testing.T) {
+	var logs lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	client, err := NewClient(ClientConfig{
+		Endpoint: "ws://fake", BotID: "bot-1", Secret: "secret-sensitive", AllowedUserID: "user-1",
+		Dial: func(context.Context, string) (Socket, error) {
+			return nil, &weComDialError{kind: "handshake", statusCode: http.StatusNotFound}
+		},
+		Logger: logger,
+		Wait:   func(ctx context.Context, _ time.Duration) error { return context.Canceled },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context canceled", err)
+	}
+	output := logs.String()
+	for _, want := range []string{"企业微信连接失败", "error_type=handshake", "http_status=404"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("日志缺少 %q：%q", want, output)
+		}
+	}
+	if strings.Contains(output, "secret-sensitive") {
+		t.Fatalf("日志泄露订阅密钥：%q", output)
+	}
+}
+
+func TestClientCancellationDoesNotLogReconnect(t *testing.T) {
+	var logs lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	socket := newFakeSocket()
+	client, err := NewClient(ClientConfig{
+		Endpoint: "ws://fake", BotID: "bot-1", Secret: "secret", AllowedUserID: "user-1",
+		Dial: func(context.Context, string) (Socket, error) { return socket, nil }, Logger: logger,
+		RequestID: sequentialIDs(), HeartbeatInterval: time.Hour, RequestTimeout: 100 * time.Millisecond,
+		EventsCapacity: 4, Wait: func(ctx context.Context, _ time.Duration) error { return ctx.Err() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, socket)
+	cancel()
+	awaitDone(t, done)
+	if output := logs.String(); strings.Contains(output, "企业微信准备重连") {
+		t.Fatalf("正常取消记录了重连日志：%q", output)
+	}
+}
+
 func TestClientFormattingNeverLeaksSecret(t *testing.T) {
 	secret := "format-secret"
 	config := ClientConfig{Endpoint: "ws://example.test", BotID: "bot", Secret: secret, AllowedUserID: "user"}
@@ -378,6 +501,32 @@ func TestClientFormattingNeverLeaksSecret(t *testing.T) {
 		if strings.Contains(value, secret) {
 			t.Fatalf("formatted value leaked secret: %s", value)
 		}
+	}
+}
+
+func TestWeComWebSocketTransportUsesGatewayCompatibleHeaderSpelling(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "https://openws.work.weixin.qq.com", nil)
+	request.Header["Sec-Websocket-Key"] = []string{"test-key"}
+	request.Header["Sec-Websocket-Version"] = []string{"13"}
+
+	base := roundTripperFunc(func(got *http.Request) (*http.Response, error) {
+		if _, ok := got.Header["Sec-WebSocket-Key"]; !ok {
+			t.Fatal("缺少企微网关兼容的 Sec-WebSocket-Key 头名")
+		}
+		if _, ok := got.Header["Sec-WebSocket-Version"]; !ok {
+			t.Fatal("缺少企微网关兼容的 Sec-WebSocket-Version 头名")
+		}
+		if _, ok := got.Header["Sec-Websocket-Key"]; ok {
+			t.Fatal("仍保留 Go 规范化后的 Sec-Websocket-Key 头名")
+		}
+		if _, ok := got.Header["Sec-Websocket-Version"]; ok {
+			t.Fatal("仍保留 Go 规范化后的 Sec-Websocket-Version 头名")
+		}
+		return &http.Response{StatusCode: http.StatusSwitchingProtocols, Body: http.NoBody}, nil
+	})
+
+	if _, err := (weComWebSocketTransport{base: base}).RoundTrip(request); err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
 	}
 }
 
@@ -618,6 +767,12 @@ type fakeRead struct {
 	err  error
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
 func newFakeSocket() *fakeSocket {
 	return &fakeSocket{reads: make(chan fakeRead, 16), writes: make(chan []byte, 32), closed: make(chan struct{})}
 }
@@ -728,6 +883,38 @@ func waitForCurrent(t *testing.T, ctx context.Context, client *Client) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func waitForLog(t *testing.T, logs *lockedBuffer, fragment string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if strings.Contains(logs.String(), fragment) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("日志未出现 %q：%q", fragment, logs.String())
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(value)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
 }
 func completeSubscribe(t *testing.T, client *Client, socket *fakeSocket) {
 	t.Helper()

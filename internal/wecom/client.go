@@ -3,9 +3,12 @@ package wecom
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -47,6 +50,7 @@ type ClientConfig struct {
 	EventsCapacity    int
 	Backoff           *Backoff
 	Wait              func(context.Context, time.Duration) error
+	Logger            *slog.Logger
 }
 
 // String 返回不包含订阅密钥的配置摘要。
@@ -73,6 +77,7 @@ type Client struct {
 	backoff           *Backoff
 	wait              func(context.Context, time.Duration) error
 	events            chan IncomingText
+	logger            *slog.Logger
 
 	mu         sync.Mutex
 	current    *session
@@ -95,7 +100,7 @@ func (c *Client) GoString() string { return c.String() }
 //
 // 校验错误不会包含订阅密钥或待发送内容。
 func NewClient(config ClientConfig) (*Client, error) {
-	if strings.TrimSpace(config.Endpoint) == "" || strings.TrimSpace(config.BotID) == "" || strings.TrimSpace(config.Secret) == "" || strings.TrimSpace(config.AllowedUserID) == "" {
+	if strings.TrimSpace(config.Endpoint) == "" || strings.TrimSpace(config.BotID) == "" || strings.TrimSpace(config.Secret) == "" {
 		return nil, newProtocolError("", 0, "连接配置缺失")
 	}
 	endpoint, err := url.Parse(config.Endpoint)
@@ -127,7 +132,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		endpoint: config.Endpoint, botID: config.BotID, secret: config.Secret, allowedUserID: config.AllowedUserID,
 		dial: config.Dial, requestID: config.RequestID, heartbeatInterval: config.HeartbeatInterval,
 		requestTimeout: config.RequestTimeout, events: make(chan IncomingText, config.EventsCapacity),
-		backoff: config.Backoff, wait: config.Wait,
+		backoff: config.Backoff, wait: config.Wait, logger: config.Logger,
 	}, nil
 }
 
@@ -150,21 +155,28 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		c.logInfo("企业微信连接中")
 		socket, err := c.dial(ctx, c.endpoint)
 		if err != nil {
-			if err := c.wait(ctx, c.backoff.Next()); err != nil {
+			delay := c.backoff.Next()
+			fields := append(weComDialLogFields(err), "retry_delay", delay)
+			c.logWarn("企业微信连接失败", fields...)
+			if err := c.wait(ctx, delay); err != nil {
 				return err
 			}
 			continue
 		}
-		session := newSession(ctx, socket, c.events)
+		session := newSession(ctx, socket, c.events, c.logger)
 		if err := c.subscribe(ctx, session); err != nil {
 			session.finish(ErrUnavailable)
 			session.wait()
 			if errors.Is(err, ErrProtocol) || errors.Is(err, ErrEventQueueFull) {
+				c.logError("企业微信订阅失败", "error_type", wecomErrorType(err))
 				return err
 			}
-			if err := c.wait(ctx, c.backoff.Next()); err != nil {
+			delay := c.backoff.Next()
+			c.logWarn("企业微信订阅暂时失败", "error_type", wecomErrorType(err), "retry_delay", delay)
+			if err := c.wait(ctx, delay); err != nil {
 				return err
 			}
 			continue
@@ -177,25 +189,67 @@ func (c *Client) Run(ctx context.Context) error {
 			if flushErr := session.flushQueued(ctx); flushErr != nil {
 				return flushErr
 			}
-			if err := c.wait(ctx, c.backoff.Next()); err != nil {
+			delay := c.backoff.Next()
+			c.logWarn("企业微信会话激活失败", "error_type", "event_queue_full", "retry_delay", delay)
+			if err := c.wait(ctx, delay); err != nil {
 				return err
 			}
 			continue
 		}
 		c.backoff.Reset()
+		c.logInfo("企业微信订阅成功")
 		session.startHeartbeat(c)
 		<-session.done
 		session.wait()
 		c.clearIfCurrent(session)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.logWarn("企业微信连接已断开", "error_type", wecomErrorType(session.reason()))
 		if errors.Is(session.reason(), ErrProtocol) {
 			return session.reason()
 		}
 		if err := session.flushQueued(ctx); err != nil {
 			return err
 		}
-		if err := c.wait(ctx, c.backoff.Next()); err != nil {
+		delay := c.backoff.Next()
+		c.logInfo("企业微信准备重连", "retry_delay", delay)
+		if err := c.wait(ctx, delay); err != nil {
 			return err
 		}
+	}
+}
+
+func (c *Client) logInfo(message string, args ...any) {
+	if c != nil && c.logger != nil {
+		c.logger.Info(message, args...)
+	}
+}
+
+func (c *Client) logWarn(message string, args ...any) {
+	if c != nil && c.logger != nil {
+		c.logger.Warn(message, args...)
+	}
+}
+
+func (c *Client) logError(message string, args ...any) {
+	if c != nil && c.logger != nil {
+		c.logger.Error(message, args...)
+	}
+}
+
+func wecomErrorType(err error) string {
+	switch {
+	case errors.Is(err, ErrEventQueueFull):
+		return "event_queue_full"
+	case errors.Is(err, ErrProtocol):
+		return "protocol"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "context"
+	case errors.Is(err, ErrUnavailable):
+		return "unavailable"
+	default:
+		return "transport"
 	}
 }
 
@@ -317,11 +371,83 @@ func (c *Client) clearCurrentAndClose() {
 func (c *Client) closeEvents() { c.closeOnce.Do(func() { close(c.events) }) }
 
 func productionDial(ctx context.Context, endpoint string) (Socket, error) {
-	connection, _, err := websocket.Dial(ctx, endpoint, nil)
+	connection, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: weComWebSocketTransport{base: http.DefaultTransport}},
+	})
 	if err != nil {
-		return nil, err
+		return nil, newWeComDialError(err, response)
 	}
 	return connection, nil
+}
+
+type weComDialError struct {
+	kind       string
+	statusCode int
+	cause      error
+}
+
+func (err *weComDialError) Error() string {
+	if err == nil {
+		return "企业微信连接失败"
+	}
+	return "企业微信连接失败: " + err.kind
+}
+
+func (err *weComDialError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
+}
+
+func newWeComDialError(cause error, response *http.Response) error {
+	if response != nil {
+		return &weComDialError{kind: "handshake", statusCode: response.StatusCode, cause: cause}
+	}
+	kind := "transport"
+	if errors.Is(cause, context.Canceled) {
+		kind = "context_canceled"
+	} else if errors.Is(cause, context.DeadlineExceeded) {
+		kind = "timeout"
+	}
+	return &weComDialError{kind: kind, cause: cause}
+}
+
+func weComDialLogFields(err error) []any {
+	var dialErr *weComDialError
+	if !errors.As(err, &dialErr) {
+		return []any{"error_type", "transport"}
+	}
+	fields := []any{"error_type", dialErr.kind}
+	if dialErr.statusCode > 0 {
+		fields = append(fields, "http_status", dialErr.statusCode)
+	}
+	return fields
+}
+
+type weComWebSocketTransport struct {
+	base http.RoundTripper
+}
+
+func (transport weComWebSocketTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	rewriteHeaderSpelling(clone.Header, "Sec-Websocket-Key", "Sec-WebSocket-Key")
+	rewriteHeaderSpelling(clone.Header, "Sec-Websocket-Version", "Sec-WebSocket-Version")
+	base := transport.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(clone)
+}
+
+func rewriteHeaderSpelling(header http.Header, source, target string) {
+	values, ok := header[source]
+	if !ok {
+		return
+	}
+	header[target] = values
+	delete(header, source)
 }
 
 func randomRequestID() string {
@@ -355,11 +481,16 @@ type session struct {
 	ready      bool
 	overflowed bool
 	queued     []IncomingText
+	logger     *slog.Logger
 }
 
-func newSession(parent context.Context, socket Socket, events chan<- IncomingText) *session {
+func newSession(parent context.Context, socket Socket, events chan<- IncomingText, loggers ...*slog.Logger) *session {
 	ctx, cancel := context.WithCancel(parent)
-	session := &session{ctx: ctx, cancel: cancel, socket: socket, events: events, done: make(chan struct{})}
+	var logger *slog.Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
+	session := &session{ctx: ctx, cancel: cancel, socket: socket, events: events, done: make(chan struct{}), logger: logger}
 	session.wg.Add(1)
 	go func() { defer session.wg.Done(); session.readLoop() }()
 	return session
@@ -459,11 +590,25 @@ func (s *session) readLoop() {
 				s.finish(err)
 				return
 			}
+		case FrameUnsupportedCallback:
+			if s.logger != nil && frame.Unsupported != nil {
+				s.logger.Warn("企业微信不支持的消息类型已忽略",
+					"message_type", frame.Unsupported.MessageType,
+					"chat_type", frame.Unsupported.ChatType,
+					"user_hash", wecomShortHash(frame.Unsupported.UserID),
+					"message_hash", wecomShortHash(frame.Unsupported.MessageID),
+				)
+			}
 		case FrameDisconnected:
 			s.finish(ErrUnavailable)
 			return
 		}
 	}
+}
+
+func wecomShortHash(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:8])
 }
 
 func (s *session) enqueue(event IncomingText) error {

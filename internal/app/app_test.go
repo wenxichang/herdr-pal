@@ -74,6 +74,90 @@ func TestRunReportsLockConflictWithoutResolvingSocket(t *testing.T) {
 	}
 }
 
+func TestRunDiscoveryPrintsFirstSingleUserWithoutStartingHerdr(t *testing.T) {
+	options := testOptions(t)
+	options.DiscoverUser = true
+	var stdout, stderr bytes.Buffer
+	options.Stdout = &stdout
+	options.Stderr = &stderr
+	loaded := testConfig()
+	loaded.WeCom.AllowedUserID = ""
+	options.dependencies.loadDiscoveryConfig = func(path string, getenv func(string) string) (config.Config, error) {
+		if path != options.ConfigPath || getenv(config.SecretEnvName) != "secret-sensitive" {
+			t.Fatalf("发现模式配置参数错误：path=%q", path)
+		}
+		return loaded, nil
+	}
+	options.dependencies.loadConfig = func(string, func(string) string) (config.Config, error) {
+		t.Fatal("发现模式不应调用普通配置加载器")
+		return config.Config{}, nil
+	}
+	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
+		t.Fatal("发现模式不应解析 Herdr Socket")
+		return "", nil
+	}
+	im := newFakeWeCom()
+	options.dependencies.assembleDiscovery = func(got config.Config, logger *slog.Logger) (imRuntime, error) {
+		if got.WeCom.BotID != loaded.WeCom.BotID || got.WeCom.Secret != loaded.WeCom.Secret || logger == nil {
+			t.Fatalf("发现模式装配参数错误：%+v", got.WeCom)
+		}
+		return im, nil
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- Run(context.Background(), options) }()
+	waitClosed(t, im.started, "发现模式企业微信连接")
+	im.events <- wecom.IncomingText{UserID: "group-user", ChatType: "group", Content: "/ls"}
+	im.events <- wecom.IncomingText{UserID: "encrypted-user-id", ChatType: "single", Content: "/ls"}
+
+	if err := waitResult(t, result); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := stdout.String(); got != "userid=encrypted-user-id\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if strings.Contains(stderr.String(), "encrypted-user-id") || strings.Contains(stderr.String(), "secret-sensitive") {
+		t.Fatalf("发现模式日志泄露敏感值：%q", stderr.String())
+	}
+}
+
+func TestRunDiscoveryWaitsForConnectionShutdownBeforeReleasingLock(t *testing.T) {
+	options := testOptions(t)
+	options.DiscoverUser = true
+	options.dependencies.loadDiscoveryConfig = func(string, func(string) string) (config.Config, error) {
+		loaded := testConfig()
+		loaded.WeCom.AllowedUserID = ""
+		return loaded, nil
+	}
+	release := make(chan struct{})
+	im := newDelayedCancelWeCom(release)
+	options.dependencies.assembleDiscovery = func(config.Config, *slog.Logger) (imRuntime, error) { return im, nil }
+	lock := &fakeLock{}
+	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- Run(ctx, options) }()
+	waitClosed(t, im.started, "发现模式企业微信连接")
+	cancel()
+	waitClosed(t, im.canceled, "发现模式取消")
+	select {
+	case err := <-result:
+		t.Fatalf("连接退出前 Run 已返回：%v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if lock.releases.Load() != 0 {
+		t.Fatal("连接退出前进程锁已释放")
+	}
+	close(release)
+	if err := waitResult(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	if lock.releases.Load() != 1 {
+		t.Fatalf("进程锁释放次数 = %d", lock.releases.Load())
+	}
+}
+
 func TestRunInteractiveLoadsOptionalConfigWithoutWeComDependencies(t *testing.T) {
 	options := testInteractiveOptions(t)
 	options.ConfigPath = ""
@@ -925,15 +1009,42 @@ func TestAssembleBridgeRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) 
 func TestAssembleRuntimeUsesOfficialWeComEndpointByDefault(t *testing.T) {
 	dependencies := defaultAssemblyDependencies()
 	dependencies.newHerdr = func(string) bridge.ManagedHerdr { return newFakeManagedHerdr() }
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (imRuntime, error) {
 		if clientConfig.Endpoint != wecom.DefaultEndpoint {
 			t.Fatalf("WeCom endpoint = %q, want %q", clientConfig.Endpoint, wecom.DefaultEndpoint)
 		}
+		if clientConfig.Logger != logger {
+			t.Fatal("WeCom client 未复用应用结构化日志器")
+		}
 		return newFakeWeCom(), nil
 	}
 
-	if _, err := assembleRuntime(testConfig(), "/tmp/shared.sock", slog.New(slog.NewTextHandler(io.Discard, nil)), dependencies); err != nil {
+	if _, err := assembleRuntime(testConfig(), "/tmp/shared.sock", logger, dependencies); err != nil {
 		t.Fatalf("assembleRuntime() error = %v", err)
+	}
+}
+
+func TestAssembleDiscoveryRuntimeCreatesReceiveOnlyWeComClient(t *testing.T) {
+	dependencies := defaultAssemblyDependencies()
+	dependencies.newHerdr = func(string) bridge.ManagedHerdr {
+		t.Fatal("用户发现模式不应创建 Herdr Client")
+		return nil
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (imRuntime, error) {
+		if clientConfig.Endpoint != wecom.DefaultEndpoint || clientConfig.BotID != "bot-sensitive" ||
+			clientConfig.Secret != "secret-sensitive" || clientConfig.AllowedUserID != "" || clientConfig.Logger != logger {
+			t.Fatalf("发现模式企业微信配置错误：%+v", clientConfig)
+		}
+		return newFakeWeCom(), nil
+	}
+	loaded := testConfig()
+	loaded.WeCom.AllowedUserID = ""
+
+	im, err := assembleDiscoveryRuntime(loaded, logger, dependencies)
+	if err != nil || im == nil {
+		t.Fatalf("assembleDiscoveryRuntime() = %v, %v", im, err)
 	}
 }
 
@@ -2300,6 +2411,34 @@ func (w *cancelClosingWeCom) Events() <-chan wecom.IncomingText { return w.event
 func (w *cancelClosingWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
 
 func (w *cancelClosingWeCom) SendMarkdown(context.Context, string) error { return nil }
+
+type delayedCancelWeCom struct {
+	events   chan wecom.IncomingText
+	started  chan struct{}
+	canceled chan struct{}
+	release  <-chan struct{}
+}
+
+func newDelayedCancelWeCom(release <-chan struct{}) *delayedCancelWeCom {
+	return &delayedCancelWeCom{
+		events: make(chan wecom.IncomingText), started: make(chan struct{}),
+		canceled: make(chan struct{}), release: release,
+	}
+}
+
+func (w *delayedCancelWeCom) Run(ctx context.Context) error {
+	close(w.started)
+	<-ctx.Done()
+	close(w.canceled)
+	<-w.release
+	return ctx.Err()
+}
+
+func (w *delayedCancelWeCom) Events() <-chan wecom.IncomingText { return w.events }
+
+func (w *delayedCancelWeCom) RespondMarkdown(context.Context, string, string) error { return nil }
+
+func (w *delayedCancelWeCom) SendMarkdown(context.Context, string) error { return nil }
 
 type gatedResultIM struct {
 	events  chan wecom.IncomingText

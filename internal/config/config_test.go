@@ -80,6 +80,54 @@ func TestLoadRejectsUnknownAndTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestLoadDiscoveryRequiresOnlyBotIDAndSecret(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom": {"bot_id": "bot-1", "allowed_user_id": ""},
+  "herdr": {},
+  "log": {"level": "debug"}
+}`)
+
+	config, err := LoadDiscovery(path, func(name string) string {
+		if name != SecretEnvName {
+			t.Fatalf("getenv 收到意外变量名：%s", name)
+		}
+		return "secret-value"
+	})
+	if err != nil {
+		t.Fatalf("LoadDiscovery() 返回错误：%v", err)
+	}
+	if config.WeCom.BotID != "bot-1" || config.WeCom.AllowedUserID != "" || config.WeCom.Secret != "secret-value" {
+		t.Fatalf("发现模式企业微信配置不正确：%+v", config.WeCom)
+	}
+	if config.Log.Level != "debug" {
+		t.Fatalf("发现模式日志配置不正确：%+v", config.Log)
+	}
+}
+
+func TestLoadDiscoveryRejectsMissingCredentials(t *testing.T) {
+	tests := []struct {
+		name   string
+		json   string
+		secret string
+		field  string
+	}{
+		{name: "缺少 bot_id", json: `{"wecom":{},"herdr":{},"log":{}}`, secret: "secret-value", field: "bot_id"},
+		{name: "缺少 Secret", json: `{"wecom":{"bot_id":"bot"},"herdr":{},"log":{}}`, secret: "\n\t", field: "secret"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadDiscovery(writeConfig(t, test.json), func(string) string { return test.secret })
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("LoadDiscovery() 错误 = %v，期望包含字段名 %q", err, test.field)
+			}
+			if strings.Contains(err.Error(), test.secret) {
+				t.Fatalf("LoadDiscovery() 错误泄露 Secret：%v", err)
+			}
+		})
+	}
+}
+
 func TestLoadInteractiveUsesDefaultsForEmptyPath(t *testing.T) {
 	config, err := LoadInteractive(" \t\n ")
 	if err != nil {

@@ -1,9 +1,12 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -30,6 +33,39 @@ func TestServiceRejectsUnauthorizedAndGroupBeforeParsing(t *testing.T) {
 	}
 	if got := fakeIMFromService(t, service).replyCount(); got != 0 {
 		t.Fatalf("unauthorized input replied %d times", got)
+	}
+}
+
+func TestServiceLogsRejectedAndDuplicateMessagesWithoutSensitiveValues(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	service, fake := newTestServiceWithLogger(t, logger)
+
+	service.HandleMessage(context.Background(), wecom.IncomingText{
+		RequestID: "request-rejected", MessageID: "message-rejected", UserID: "unknown-user-sensitive",
+		ChatType: "single", Content: "prompt-sensitive",
+	})
+	service.HandleMessage(context.Background(), wecom.IncomingText{
+		RequestID: "request-group", MessageID: "message-group", UserID: "user-1",
+		ChatType: "group", Content: "group-sensitive",
+	})
+	message := incoming("duplicate-sensitive-id", "/ls")
+	service.HandleMessage(context.Background(), message)
+	service.HandleMessage(context.Background(), message)
+
+	if fake.callCount() != 0 {
+		t.Fatalf("日志场景不应调用 Herdr：%#v", fake)
+	}
+	output := logs.String()
+	for _, want := range []string{"企业微信消息被策略拒绝", "reason=user_mismatch", "reason=chat_type", "企业微信重复消息已忽略"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("日志缺少 %q：%q", want, output)
+		}
+	}
+	for _, forbidden := range []string{"unknown-user-sensitive", "prompt-sensitive", "group-sensitive", "duplicate-sensitive-id"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("日志泄露敏感值 %q：%q", forbidden, output)
+		}
 	}
 }
 
@@ -891,14 +927,17 @@ func TestNewServiceRejectsMissingDependencies(t *testing.T) {
 		t.Fatal(err)
 	}
 	audit := &fakeKeyAuditSink{}
-	if _, err := NewService(nil, &panel.Buffer{}, guard, deduper, &fakeIM{}, audit); !errors.Is(err, ErrInvalidServiceDependency) {
+	if _, err := NewService(nil, &panel.Buffer{}, guard, deduper, &fakeIM{}, audit, discardTestLogger()); !errors.Is(err, ErrInvalidServiceDependency) {
 		t.Fatalf("nil registry error = %v", err)
 	}
-	if _, err := NewService(registry, nil, guard, deduper, &fakeIM{}, audit); !errors.Is(err, ErrInvalidServiceDependency) {
+	if _, err := NewService(registry, nil, guard, deduper, &fakeIM{}, audit, discardTestLogger()); !errors.Is(err, ErrInvalidServiceDependency) {
 		t.Fatalf("nil panel error = %v", err)
 	}
-	if _, err := NewService(registry, &panel.Buffer{}, guard, deduper, &fakeIM{}, nil); !errors.Is(err, ErrInvalidServiceDependency) {
+	if _, err := NewService(registry, &panel.Buffer{}, guard, deduper, &fakeIM{}, nil, discardTestLogger()); !errors.Is(err, ErrInvalidServiceDependency) {
 		t.Fatalf("nil audit sink error = %v", err)
+	}
+	if _, err := NewService(registry, &panel.Buffer{}, guard, deduper, &fakeIM{}, audit, nil); !errors.Is(err, ErrInvalidServiceDependency) {
+		t.Fatalf("nil logger error = %v", err)
 	}
 }
 
@@ -1194,6 +1233,14 @@ func TestServiceConcurrentDuplicateAndStateChangesAreRaceSafe(t *testing.T) {
 }
 
 func newTestService(t *testing.T) (*Service, *fakeHerdr) {
+	return newTestServiceWithLogger(t, discardTestLogger())
+}
+
+func discardTestLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func newTestServiceWithLogger(t *testing.T, logger *slog.Logger) (*Service, *fakeHerdr) {
 	t.Helper()
 	registry := &session.Registry{}
 	registry.Replace(testSnapshot(), false)
@@ -1209,7 +1256,7 @@ func newTestService(t *testing.T) (*Service, *fakeHerdr) {
 	fake := &fakeHerdr{agent: current, promptResult: changedAgent(current, herdr.AgentStatusWorking)}
 	im := &fakeIM{}
 	audit := &fakeKeyAuditSink{}
-	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, audit)
+	service, err := NewService(registry, &panel.Buffer{}, guard, deduper, im, audit, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
