@@ -134,6 +134,13 @@ func runServerComponents(ctx context.Context, weCom weComRuntime, router *server
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownContext)
+	for remaining := 2; remaining > 0; remaining-- {
+		select {
+		case <-results:
+		case <-shutdownContext.Done():
+			remaining = 0
+		}
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

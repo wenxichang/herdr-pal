@@ -187,6 +187,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 	}
 	connection := newClientConnection(parent, connectionID, key, socket, hub.config.SendQueueCapacity, hub.config.MaxInflight)
 	hub.install(connection)
+	hub.logger.Info("Relay 客户端已连接", "user_hash", routerHash(key.UserID), "machine_id", key.MachineID, "connection_id", connectionID)
 	go connection.runWriter()
 	defer connection.close(websocket.StatusNormalClosure, "connection ended")
 	defer hub.remove(connection)
@@ -211,6 +212,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 		return
 	}
 	connection.ready.Store(true)
+	hub.logger.Info("Relay 客户端已就绪", "user_hash", routerHash(key.UserID), "machine_id", key.MachineID, "session_count", len(firstSnapshot.Sessions))
 
 	heartbeatDone := make(chan struct{})
 	go hub.runOutbound(connection)
@@ -355,6 +357,7 @@ func (hub *ClientHub) remove(connection *clientConnection) {
 	}
 	hub.mu.Unlock()
 	hub.catalog.Detach(connection.id)
+	hub.logger.Info("Relay 客户端已移除", "user_hash", routerHash(connection.key.UserID), "machine_id", connection.key.MachineID, "connection_id", connection.id)
 }
 
 func (hub *ClientHub) writeProtocolError(socket *websocket.Conn, code relayproto.ErrorCode, message string, closeConnection bool) {

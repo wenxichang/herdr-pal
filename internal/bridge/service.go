@@ -156,6 +156,10 @@ func (s *Service) CurrentTargets() []session.Target {
 	if s == nil {
 		return nil
 	}
+	holder := s.client.Load()
+	if holder == nil || holder.client == nil {
+		return nil
+	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.registry.CurrentTargets()

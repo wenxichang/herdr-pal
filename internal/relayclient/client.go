@@ -128,7 +128,8 @@ func (client *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := client.runSession(ctx)
+		client.logger.Info("Relay 连接中", "machine_id", client.config.MachineID)
+		err := client.runSession(ctx, backoff.Reset)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -175,7 +176,7 @@ func (client *Client) SendNotification(ctx context.Context, target im.Notificati
 	return client.writeCurrent(ctx, relayproto.TypeNotification, "", relayproto.Notification{Target: ref, Content: content})
 }
 
-func (client *Client) runSession(parent context.Context) error {
+func (client *Client) runSession(parent context.Context, onReady func()) error {
 	connection, response, err := websocket.Dial(parent, client.config.URL, &websocket.DialOptions{HTTPClient: client.httpClient()})
 	if err != nil && response != nil && response.Body != nil {
 		_ = response.Body.Close()
@@ -213,6 +214,10 @@ func (client *Client) runSession(parent context.Context) error {
 		return err
 	}
 	fingerprint := SnapshotFingerprint(initial)
+	if onReady != nil {
+		onReady()
+	}
+	client.logger.Info("Relay 连接成功", "machine_id", client.config.MachineID, "session_count", len(initial.Sessions))
 
 	readResult := make(chan error, 1)
 	go func() { readResult <- client.readLoop(current) }()

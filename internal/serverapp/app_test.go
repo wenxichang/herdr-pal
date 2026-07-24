@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/im"
 )
@@ -23,7 +22,7 @@ func TestRunServerComponentsStopsHTTPAndWeComOnContextCancellation(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	weCom := &fakeWeComRuntime{events: make(chan im.IncomingText)}
+	weCom := &fakeWeComRuntime{events: make(chan im.IncomingText), stopped: make(chan struct{})}
 	httpServer := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -33,8 +32,8 @@ func TestRunServerComponentsStopsHTTPAndWeComOnContextCancellation(t *testing.T)
 	}
 	select {
 	case <-weCom.stopped:
-	case <-time.After(time.Second):
-		t.Fatal("WeCom runtime did not stop")
+	default:
+		t.Fatal("runServerComponents returned before WeCom runtime stopped")
 	}
 }
 
@@ -44,9 +43,6 @@ type fakeWeComRuntime struct {
 }
 
 func (runtime *fakeWeComRuntime) Run(ctx context.Context) error {
-	if runtime.stopped == nil {
-		runtime.stopped = make(chan struct{})
-	}
 	<-ctx.Done()
 	close(runtime.stopped)
 	return ctx.Err()

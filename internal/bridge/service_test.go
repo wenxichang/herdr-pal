@@ -53,6 +53,17 @@ func TestServiceSelectTargetUsesStableIdentity(t *testing.T) {
 	}
 }
 
+func TestServiceCurrentTargetsEmptyWhenHerdrUnavailable(t *testing.T) {
+	service, _ := newTestService(t)
+	if len(service.CurrentTargets()) != 1 {
+		t.Fatal("healthy service should expose current target")
+	}
+	service.SetHerdr(nil)
+	if targets := service.CurrentTargets(); len(targets) != 0 {
+		t.Fatalf("degraded CurrentTargets() = %#v", targets)
+	}
+}
+
 func TestServiceLogsRejectedAndDuplicateMessagesWithoutSensitiveValues(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
