@@ -2,41 +2,89 @@
 
 ## 1. 当前状态
 
-Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与自己的企业微信智能机器人
-单聊连接起来，也可以用 `herdr-pal -i` 在本机控制台运行同一套 Bridge。程序手工启动，
-使用 `CGO_ENABLED=0` 构建为 `dist/herdr-pal` 单文件，运行状态只保存在内存中。
+Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用户、多机器 Relay 架构：
+
+- `herdr-pal-server` 独占一个企业微信智能机器人长连接，并监听 WSS Relay。
+- 每台运行 Herdr 的机器启动一个 `herdr-pal`，连接本机 Herdr 公共 Socket，并向服务端
+  上报 `(userid, machine_id)` 及全部 Agent 会话。
+- 用户在企业微信单聊中执行 `/ls`，获得自己所有在线机器的聚合列表；选择后，服务端使用
+  稳定的机器、pane 和 occupant 身份路由请求。
+- `herdr-pal -i` 继续提供不经过网络的本机控制台模式。
+
+`build.sh` 使用 `CGO_ENABLED=0` 生成 `dist/herdr-pal` 和
+`dist/herdr-pal-server` 两个单文件。所有运行状态保存在内存中。
 
 当前实现包括：
 
-- 企业微信智能机器人 API 模式 WebSocket 长连接、订阅、心跳、`req_id` 响应关联和重连。
-- Herdr 公共 Unix Socket NDJSON 客户端、精确 protocol 17 门禁、快照和两类事件订阅。
-- 全部 Agent pane 的动态索引、occupant 身份校验和重连后最新状态接管。
-- 单聊命令、100 行分页、带状态确认和一次性 Enter 恢复的普通 prompt、受限按键与
-  `msgid` 幂等。
-- 状态通知异步队列、失败重试、合并、去重和 pane 失效通知。
-- 本机进程锁、结构化安全日志、SIGINT/SIGTERM 和 10 秒优雅退出。
-- 无 TUI 的 ConsoleAdapter：stdin 接收聊天输入，stdout 输出回复与通知，Ctrl+D 正常退出。
-- fake Herdr、fake 企业微信和核心端到端场景。
+- 企业微信智能机器人 API 模式 WebSocket 长连接、订阅、心跳、响应关联和重连。
+- Relay 严格版本化 JSON 协议、WSS 连接中心、自签名证书持久化和有界请求队列。
+- 多用户会话目录、按用户串行执行器、全局编号快照、稳定目标选择和跨机器通知。
+- Relay 客户端自动重连、变化时即时快照、30 秒校准快照和本地 Bridge 执行。
+- Herdr protocol 17 门禁、快照、生命周期订阅、pane 级状态订阅和重连恢复。
+- 100 行分页、状态确认 prompt、一次性 Enter 恢复、受限按键、通知和消息幂等。
+- 结构化安全日志、进程锁、SIGINT/SIGTERM 和有界优雅退出。
+- fake Herdr、fake 企业微信、Relay 协议测试和多用户多机器端到端测试。
 
 ## 2. 固定产品决策
 
-- IM 平台：企业微信智能机器人长连接。
-- 用户范围：一个配置指定的企业微信帐号，只支持单聊。
-- 技术栈：Go 1.26，单文件分发。
-- 运行方式：手工启动和停止，不安装常驻服务。
+- IM 平台：企业微信智能机器人长连接，由服务端唯一持有 Bot ID 和 Secret。
+- 用户范围：不在 Herdr Pal 中配置用户白名单；企业微信应用可见范围是入口边界，只处理
+  单聊。
+- 客户端身份：用户把机器人 `/userid` 返回的完整值原样写入客户端配置。
+- 机器唯一性：`(userid, machine_id)` 是在线唯一键；后来建立的重复连接被拒绝。
+- 多用户命名：不同用户可以使用相同 `machine_id`。
+- 在线目录：客户端断线或心跳超时后立即移除机器和全部会话，不保留离线目录。
+- 技术栈：Go 1.26、`CGO_ENABLED=0`、单文件分发、手工启动。
+- Relay 安全：只支持 WSS；客户端 `skip_verify` 默认 `true`，适用范围限定为受信任内网。
 - Herdr 集成：只使用公共 Local Socket API、公共 CLI 和审计过的 JSON 模型。
 - 协议：只接受精确 protocol 17，不能按“17 或更高”处理。
-- 状态恢复：进程重启和 Herdr 重连后以最新 `session.snapshot` 接管，不恢复旧选择或分页。
-- 持久化：当前没有 StateStore；选择、分页、通知 hash 和带 TTL 的 `msgid` 幂等键均只
-  存内存，进程重启后不恢复。
-- 输出：只称为终端近期快照，不承诺完整对话、结构化 assistant 消息或 LLM transcript。
-- 审批：不自动批准权限请求；用户可以显式发送白名单按键。唯一自动按键是普通 prompt
-  已从 `idle`/`done` 提交但 5 秒无状态变化时，在 occupant、状态和序列复核后补发的一次
-  `enter`；`blocked` 永不触发该恢复。
+- 持久化：选择、目录、通知 hash、分页、幂等键和断线消息均不持久化或重放。
+- 输出：只称为终端近期快照，不承诺完整对话或结构化 LLM transcript。
+- 审批：不自动批准权限请求；用户只能显式发送白名单按键。
 
-## 3. 已实现命令
+## 3. 网络模式数据流
+
+### 3.1 服务端启动
+
+1. `config.LoadServer` 读取 Bot ID、监听地址和 TLS 路径，从
+   `HERDR_PAL_WECOM_SECRET` 读取 Secret。
+2. `EnsureTLS` 加载外部证书；若未配置则在状态目录生成并复用自签名证书，私钥 `0600`。
+3. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
+4. 启动唯一企业微信连接和 TLS HTTP/WebSocket 监听。
+5. 用户发送 `/userid` 时，直接返回企业微信回调中的 userid，不要求已有客户端在线。
+
+### 3.2 客户端启动
+
+1. `config.LoadClient` 严格校验 `wss://`、userid 和 machine_id。
+2. 解析本机 Herdr Socket，获取对应 Socket 的进程锁。
+3. 启动 `EventSupervisor`，按最新 `session.snapshot` 接管本机会话。
+4. 建立 Relay WSS，发送 `client_hello` 和首个完整 `session_snapshot`。
+5. 会话变化后最多约 250ms 上报新快照，并按服务端协商间隔发送校准快照。
+6. Relay 断线时不缓存 prompt、按键或通知，指数退避重连。
+
+### 3.3 企业微信输入
+
+- `/userid`、`/ls`、`/N`/`/sel N`、`/help` 由服务端处理。
+- 其余内容要求已有稳定选择，然后作为 `execute_request` 发给目标机器。
+- 客户端先用稳定引用选择本地目标，再进入原有 `Bridge Service`。
+- 服务端等待首段 `execute_response`；后续分段通过 `execute_push` 主动发送。
+- 超时时服务端不自动重试，避免可能已经提交的 prompt 或按键重复执行。
+
+### 3.4 状态通知
+
+本地 `Notifier` 仍只读取最近 100 行，通过 Relay 发送结构化目标和内容。服务端复核该
+目标仍存在于最新目录，再补充：
 
 ```text
+[machine_id/local_index] DisplayAgent — panel title
+```
+
+然后向该连接所属 userid 主动推送。客户端断线时通知直接失败，不进入离线队列。
+
+## 4. 已实现命令
+
+```text
+/userid
 /ls
 /N
 /sel N
@@ -49,113 +97,96 @@ Herdr Pal 第一版已经按 Go 单进程架构实现，目标是把 Herdr 与�
 /slash TEXT
 ```
 
-`/<NUM>` 等同于 `/sel <NUM>`。`/key KEYS` 支持逗号或空白混合分隔，允许 `up`、
-`down`、`enter`、`esc`、`space`、单个 ASCII 字母或数字，并支持 `dn -> down`、
-`sp -> space`。每条命令最多 32 个按键，相邻按键间隔 100ms；`enter` 只能单独发送。
-`/keyup`、`/keydn`、`/space` 和 `/esc` 快捷命令已移除。
+`/userid` 只在企业微信服务端模式有意义。`/<NUM>` 等同 `/sel <NUM>`。全局 `/ls` 条目
+使用 `[machine_id/local_index]` 并包含 Agent、panel 标题、workspace、tab 和状态。
 
-每个按键发送前重新校验 occupant，队列中途失败立即停止。按键命令结束后只执行一次等价
-`/con` 的最近 100 行读取并重置页码。`/slash TEXT` 将 `/TEXT` 交给普通 prompt 流程。
-其他不以 `/` 开头的文本通过 `agent.prompt` 发送；未知 `/` 命令不会降级为 prompt。
-按键命令不二次确认。
+`/key KEYS` 支持逗号或空白混合分隔，允许 `up`、`down`、`enter`、`esc`、`space`、
+单个 ASCII 字母或数字，并支持 `dn -> down`、`sp -> space`。每条命令最多 32 个按键，
+相邻按键间隔 100ms；`enter` 只能单独发送。按键结束后自动执行一次 `/con`。
 
-普通文本发送前实时调用 `agent.get`，仅允许 `idle`、`done`。首次发送使用带 wait 的
-`agent.prompt`，并以 `state_change_seq` 确认状态确实变化；收到
-`agent_prompt_stalled` 后只允许一次受审计的 Enter 恢复，再轮询最多 5 秒。未观察到
-变化时回复“发送未生效”，不会宣称已经开始执行。
+普通文本发送前实时调用 `agent.get`，仅允许 `idle`、`done`。首次使用带 wait 的
+`agent.prompt`；收到 `agent_prompt_stalled` 后，只有原 occupant、原状态序列和可输入状态
+都保持不变时才补发一次 Enter，并继续等待状态变化。
 
-分页固定 100 行一页。`/con` 读取最后 100 行并重置页码，`/pageup` 逐步扩大到最多
-1000 行，`/pagedn` 只访问缓存。`blocked`、`done` 和需要输出的 `idle` 主动通知每次也
-只读取最近 100 行，不读取全部新增内容。
+分页固定 100 行一页。`/con` 读取最后 100 行并重置页码，`/pageup` 最多扩展到 1000
+行，`/pagedn` 只访问缓存。`blocked`、`done` 和需要输出的 `idle` 通知也只读最近 100 行。
 
-## 4. Herdr API 关键事实
-
-### 4.1 启动与重连
+## 5. Herdr API 关键事实
 
 每个健康周期按以下顺序建立：
 
 1. `ping`，要求 protocol 精确等于 17。
 2. discovery `session.snapshot`。
 3. 建立通用 pane lifecycle 订阅。
-4. 为当前 Agent pane 建立批量 `pane.agent_status_changed` 订阅，每项显式包含 `pane_id`。
+4. 为当前 Agent pane 建立批量 `pane.agent_status_changed` 订阅，每项包含 `pane_id`。
 5. 再读取权威 `session.snapshot`，消除 snapshot 与订阅确认之间的窗口。
-6. 若 pane/occupant 集合变化，重建状态订阅并再次 snapshot，直到计划稳定。
-7. 用基线替换 Registry，不发送历史状态通知，然后开放输入。
+6. pane/occupant 集合变化时重建状态订阅，直到计划稳定。
+7. 用基线替换 Registry，不发送历史状态通知，然后开放输入和 Relay 上报。
 
-Herdr 断线时立即进入 degraded，暂停 prompt/按键、清空选择和分页；重连后必须重新
-`/ls`、`/sel`。
+Herdr 断线时 `Service.CurrentTargets()` 返回空目录，使 Relay 客户端立即上报会话撤下；
+重连后完全以新快照为准。
 
-### 4.2 订阅的序列语义
+不要依赖以下能力：
 
-不要笼统写成“所有订阅都从 sequence 0 重放”：
+- `PaneReadResult.revision`：审计基线中固定为 `0`。
+- `pane.output_changed`：只有 Schema 类型，没有可用公共输出流。
+- 外部订阅 cursor 或 exactly-once 重放：当前不存在。
 
-- 专用 `pane.agent_status_changed` 订阅在创建时取得 `current_sequence`，从该位置开始
-  接收新状态，不读取订阅前保留的状态事件。
-- 通用 lifecycle 订阅才会从 EventHub 当前保留队列的 sequence 0 读取，因此可能看到
-  保留的 `pane.created`、`pane.updated` 等事件。
+`agent.read(recent_unwrapped)` 返回终端快照，可能包含 prompt、回复、工具日志、spinner、
+状态栏、权限界面和 TUI 重绘。
 
-外部协议没有可持久化 cursor。重连仍必须依靠权威 snapshot 和业务幂等，而不是假定
-事件 exactly-once 或可断点续传。
+## 6. Relay 协议与目录语义
 
-### 4.3 Prompt 确认语义
+- 所有帧包含协议版本和严格类型，未知字段、超限帧和非法身份会被拒绝。
+- 握手顺序为 `client_hello` → `server_hello` → 首个 `session_snapshot`。
+- 服务端每 10 秒心跳，30 秒未收到 pong 关闭连接。
+- 客户端变化检测默认 250ms，服务端要求 30 秒完整校准快照。
+- 服务端目录只接受连接自己的 userid 和 machine_id，不允许一条连接上报其他机器。
+- 全局编号只引用最近一次用户 `/ls` 快照；真正选择保存 `SessionRef`。
+- pane 关闭、occupant 替换、新快照删除或连接断开都会使旧选择失效。
+- Relay 请求和出站队列均有容量上限，不使用无界 goroutine 或无界缓存。
 
-- protocol 17 的完整 `AgentInfo` 必须包含 `state_change_seq`；缺失时按协议错误处理。
-- 普通文本初始状态只接受 `idle`、`done`，并使用带 wait 的 `agent.prompt` 覆盖全部
-  稳定状态。
-- Herdr 固定的 prompt effect 窗口内无变化会返回 `agent_prompt_stalled`。
-- 恢复前再次调用 `agent.get`。occupant 已替换、序列已变化或状态不再可输入时不发送
-  Enter。
-- 只有仍为原 occupant、原序列且状态仍为 `idle`/`done` 时补发一次 Enter；随后通过
-  `agent.get` 比较原序列，最多等待 5 秒。
+## 7. 代码边界
 
-### 4.4 输出限制
-
-`agent.read(recent_unwrapped)` 返回终端快照，内容可能包含 prompt、Agent 回复、工具日志、
-spinner、状态栏、权限界面和 TUI 重绘。`PaneReadResult.revision` 在审计基线中固定为 0，
-没有可用的 `pane.output_changed` 公共流，也不能恢复已经丢失的 alternate-screen 历史。
-
-## 5. 企业微信关键事实
-
-- 连接官方 `wss://openws.work.weixin.qq.com`。
-- 使用 `aibot_subscribe`、`aibot_msg_callback`、`aibot_respond_msg`、
-  `aibot_send_msg`、`ping` 和 `disconnected_event` 必要子集。
-- 主动单聊发送的 `chatid` 是 `allowed_user_id`，`chat_type` 为 `1`。
-- 用户必须先给机器人发过消息，企业微信才允许主动推送；失败只在当前进程重试，不做
-  持久化补发。
-- Secret 只从 `HERDR_PAL_WECOM_SECRET` 读取，配置文件不接受 Secret 字段。
-- `internal/app.Options.WeComEndpoint` 只为兼容端点和本地集成测试注入；CLI 和 JSON
-  配置不暴露 endpoint，空值始终使用官方地址。
-
-## 6. 代码边界
-
+- `cmd/herdr-pal`：Relay 客户端与 `-i` 的公开 CLI。
+- `cmd/herdr-pal-server`：中央服务端 CLI。
+- `internal/serverapp`：服务端配置、TLS、企微与 HTTP 生命周期装配。
+- `internal/server`：在线目录、用户执行器、WSS Hub 和企业微信全局路由。
+- `internal/relayproto`：严格、版本化的 Relay 帧和校验。
+- `internal/relayclient`：WSS 重连、会话快照和本地执行请求。
 - `internal/herdr`：公共 NDJSON 请求、严格响应模型、订阅和 Socket 解析。
-- `internal/wecom`：WebSocket 协议、请求关联、心跳和重连。
-- `internal/interactive`：把 stdin/stdout 适配为单用户本地聊天会话。
-- `internal/session`：快照索引、列表编号、选择和 occupant 身份。
-- `internal/command`：纯命令解析。
+- `internal/session`：本机会话索引、编号、选择和 occupant 身份。
+- `internal/command`：客户端本地命令解析。
 - `internal/panel`：终端规范化、100 行分页和 UTF-8 安全分段。
-- `internal/policy`：单用户单聊权限、按键白名单、幂等和审计模型。
-- `internal/bridge`：入站 Service、状态 Notifier 和 EventSupervisor。
-- `internal/app`：配置、进程锁、依赖装配、三个运行循环和退出协调。
-- `internal/testkit`：仅供测试使用的公开 protocol 17 fake，不包含 Herdr 私有实现。
+- `internal/policy`：按键白名单、消息幂等和审计模型。
+- `internal/bridge`：本地 Service、Notifier 和 EventSupervisor。
+- `internal/interactive`：stdin/stdout 本地聊天适配器。
+- `internal/im`：与具体 IM SDK 无关的入站、回复和通知模型。
+- `internal/wecom`：企业微信协议、请求关联、心跳和重连。
+- `internal/testkit`：仅测试使用的 protocol 17 fake。
 
-不要把 IM SDK、Herdr 协议、命令路由和输出提取合并成 god object。
+旧的直连企微装配仍有内部兼容代码和测试，但公开 CLI 已不再暴露 `-discover-user`，网络
+模式只走 Relay。不要在新功能中继续扩展旧直连路径。
 
-## 7. 验证状态
+## 8. 验证状态
 
-常规验证：
+标准验证：
 
 ```sh
-./unittest.sh
 ./build.sh
-go test ./internal/integration -run TestBridgeEndToEnd
+./unittest.sh
+go test -race ./...
 ```
 
-端到端覆盖：启动订阅、`/ls`/`/sel`/prompt、stalled 后单次 Enter 恢复、working 状态
-拒绝文本、显式 Enter/Space、分页读取次数、blocked/done 100 行、`msgid` 去重、未授权
-与群聊、occupant 替换、Herdr 断线重选、企业微信断线不重放。
+Relay 端到端覆盖三个客户端：同一用户两台机器、另一用户使用相同 machine_id、列表聚合、
+稳定选择、prompt 隔离和带机器/panel 标题的通知：
 
-可选真实 Herdr 测试：
+```sh
+go test -race ./internal/integration \
+  -run TestRelayEndToEndRoutesMultipleUsersAndMachines -count=3
+```
+
+可选真实 Herdr 只读测试：
 
 ```sh
 PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
@@ -163,45 +194,18 @@ HERDR_PAL_INTEGRATION=1 \
 go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 ```
 
-该只读测试先运行 `herdr status server --json`，只有 protocol 17 才继续执行真实
-`ping`、`session.snapshot`、`agent.get`、`agent.read` 和交互模式 `/ls`、`/sel`、`/con`；
-不访问企业微信外网，也不需要真实 Secret。
+实时 prompt 测试必须额外设置 `HERDR_PAL_LIVE_INPUT=1` 和明确的
+`HERDR_PAL_LIVE_PANE_ID`，禁止对未知 pane 进行写入测试。
 
-实时 prompt 测试必须显式指定目标 pane，并额外打开写入门禁：
+## 9. 安全边界与后续工作
 
-```sh
-PATH=/Users/wxc/Code/herdr/target/debug:$PATH \
-HERDR_PAL_INTEGRATION=1 \
-HERDR_PAL_LIVE_INPUT=1 \
-HERDR_PAL_LIVE_PANE_ID='<必须替换为当前 pane ID>' \
-go test ./internal/integration -run '^TestRealHerdrLivePrompt$' -count=1 -v
-```
+- Herdr Socket 永远只在本机访问，不通过 Relay 原样代理。
+- Bot Secret 只存在于 `herdr-pal-server` 环境变量，不进入客户端配置。
+- Relay 当前没有客户端证书、共享 token 或服务端 userid 鉴权；`skip_verify` 默认开启。
+  这是一项明确的受信任内网假设，不适合互联网部署。
+- 日志不记录 Secret、Cookie、完整 prompt 或终端快照；userid 使用 hash，机器标识可见。
+- 不允许 IM 调用 `server.stop`、`pane.close`、任意 `pane.send_input` 或自动审批。
 
-必须先从最新公共 `session.snapshot` 取得目标 pane ID 并替换占位符，禁止原样执行；未
-替换或目标不存在时，测试应在调用 `agent.prompt` 前失败。门禁通过后只发送一次固定
-marker prompt，并通过 `agent.read(recent_unwrapped, 100)` 等待新增 marker，不发送按键。
-
-截至 2026-07-24，真实联调基线为源码 debug Herdr 0.7.5/protocol 17，二进制位于
-`/Users/wxc/Code/herdr/target/debug/herdr`，配置目录为 `~/.config/herdr-dev`。默认
-`PATH` 中的 Homebrew `/opt/homebrew/bin/herdr` 仍为 0.7.1，使用 `~/.config/herdr`；
-两者解析到不同 Socket，因此运行测试或 `herdr-pal -i` 时必须显式使用 debug PATH。
-只读测试和显式门禁的实时 prompt 测试均已在该 protocol 17 服务上完成联调。
-
-## 8. 安全边界
-
-- 不在 `/Users/wxc/Code/herdr` 中实现或修改 Herdr Pal。
-- 不使用 MCP、plugin startup hook、私有 TUI socket、`AppState` 或未公开 Rust 模块。
-- 不暴露原始 Herdr Socket 到网络。
-- 不记录完整 Secret、Cookie、prompt 或终端快照。
-- 未授权用户、群聊、未知 pane、失效 terminal/occupant 和 degraded 状态都不能产生输入。
-- 白名单按键和 stalled prompt 的恢复 Enter 在取得当前选择后同步记录结构化审计；
-  成功、occupant 拒绝、Herdr 查询或发送失败分别记录 `sent`、`rejected`、`failed`。
-  审计只含用户、pane、occupant SHA-256 摘要、规范化按键、时间和结果，且不受普通日志
-  级别过滤。
-- 没有 `server.stop`、`pane.close`、`pane.send_text`、`pane.send_input` 或自动审批入口。
-
-## 9. 后续工作
-
-首版范围完成后再独立评估：多用户/群聊、持久化恢复、模板卡片、更多安全按键、
-`launchd`、多媒体输入，以及官方 Go SDK 出现后的替换策略。任何需要实时结构化输出的
-需求都应先形成 Herdr 公共 API 提案，不能依赖私有内部状态。
+后续优先评估：Relay 客户端认证和证书 pinning、跨重启 StateStore、可靠通知队列、服务
+管理、配置迁移，以及第二个 IM Adapter。实时结构化输出仍应先形成 Herdr 公共 API 提案，
+不能依赖私有 TUI 状态。

@@ -1,391 +1,343 @@
-# Herdr Pal Bridge 推荐架构
+# Herdr Pal Bridge 架构
 
 ## 1. 架构目标
 
-Herdr Pal 作为独立进程运行。它不修改 Herdr，也不要求消息入口理解 Herdr 协议。
-bridge 在本机连接 Herdr Socket，消息侧既可以连接企业微信，也可以使用本机控制台。
+Herdr Pal 由中央服务端和本机客户端组成。服务端集中持有企业微信 Bot ID、Secret 和唯一
+长连接；客户端只访问本机 Herdr 公共 Socket，并通过加密 Relay 上报会话和执行用户请求。
 
 ```text
-┌──────────────────────┐
-│ Herdr Server         │
-│ Local Socket / NDJSON│
-└──────────┬───────────┘
-           │ snapshot / events / read / prompt / send_keys
-           ▼
-┌─────────────────────────────────────────────────────────┐
-│ Herdr Pal 共享 Bridge                                   │
-│                                                         │
-│ HerdrClient ─ SessionRegistry ─ EventSupervisor         │
-│      │               │              │                    │
-│      └──── OutputExtractor ─ Service / Notifier         │
-│                            │                             │
-│           PolicyGuard / Deduper / 内存运行时状态        │
-│                            │                             │
-│                         IMAdapter                       │
-└────────────────────────────┬────────────────────────────┘
-                             │
-                 ┌───────────┴───────────┐
-                 ▼                       ▼
-       ┌──────────────────┐    ┌──────────────────┐
-       │ WeComClient      │    │ ConsoleAdapter   │
-       │ WebSocket 长连接 │    │ stdin / stdout   │
-       └──────────────────┘    └──────────────────┘
+┌───────────────────────┐
+│ 企业微信智能机器人    │
+│ 单个 API 长连接       │
+└───────────┬───────────┘
+            ▼
+┌──────────────────────────────────────────────────────┐
+│ herdr-pal-server                                     │
+│ WeComClient ─ ConversationRouter ─ UserExecutor      │
+│                         │                            │
+│ SessionCatalog ───── ClientHub ─ TLS/WSS             │
+└───────────────┬───────────────────────┬──────────────┘
+                │                       │
+                ▼                       ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│ herdr-pal: home-mac      │  │ herdr-pal: office-pc    │
+│ RelayClient              │  │ RelayClient              │
+│ Service / Notifier       │  │ Service / Notifier       │
+│ SessionRegistry          │  │ SessionRegistry          │
+│ EventSupervisor          │  │ EventSupervisor          │
+│ HerdrClient              │  │ HerdrClient              │
+└────────────┬─────────────┘  └────────────┬─────────────┘
+             │ Local Socket                │ Local Socket
+             ▼                             ▼
+          Herdr                         Herdr
 ```
 
-## 2. 模块边界
+另有独立的 `herdr-pal -i` 入口，把 stdin/stdout 适配为本机聊天框，直接复用客户端 Bridge
+核心，不启动企业微信或 Relay。
 
-### 2.1 HerdrClient
+固定边界：
+
+- 不修改 Herdr，不使用 MCP、plugin startup hook、私有 TUI socket 或内部 Rust 模块。
+- 不把 Herdr 原始 Socket、任意 RPC 或本地文件路径暴露到 Relay。
+- 网络只允许 WSS，不实现明文 WS。
+- 不把终端快照描述成结构化 LLM 消息或完整对话记录。
+- 不自动批准权限请求。
+
+## 2. 服务端模块
+
+### 2.1 WeComClient
+
+职责：
+
+- 独占企业微信智能机器人的 API 长连接。
+- 完成订阅、心跳、`req_id` 关联、文本回调解析、主动发送和重连。
+- 把平台消息转换为 `im.IncomingText`，不理解 Herdr 或 Relay 协议。
+
+服务端不配置 `allowed_user_id`。企业微信应用可见范围决定哪些用户能给机器人发消息，
+Router 只接受单聊文本。Bot Secret 只从 `HERDR_PAL_WECOM_SECRET` 读取。
+
+### 2.2 ConversationRouter
+
+职责：
+
+- 以 userid 为路由和隔离边界。
+- 直接处理 `/userid`、`/ls`、`/N`/`/sel N` 和 `/help`。
+- 将其他输入转发到当前稳定选择所在的机器。
+- 接收客户端后续回复和状态通知，并发送给正确的企业微信用户。
+- 在主动通知前使用最新目录复核目标，补充机器、本地序号和 panel 标题。
+
+Router 不解析 `/con`、`/key` 或普通 prompt 的本地语义。这些内容必须原样交给目标机器，
+由已有 Bridge 策略处理。
+
+### 2.3 UserExecutor
+
+每个 userid 使用独立串行队列，保证该用户的 `/ls`、选择和执行请求有一致顺序；不同用户
+可以并行。队列容量有界，满载时明确拒绝，不创建无界 goroutine。
+
+### 2.4 SessionCatalog
+
+目录只保存在线状态：
+
+```text
+ClientKey = userid + machine_id
+
+SessionRef
+  machine_id
+  local_index
+  pane_id
+  occupant_hash
+```
+
+每个连接只能更新自己的 `ClientKey`。同一用户的全局 `/ls` 将该用户所有机器的当前会话
+排序并建立临时编号快照；`/N` 解析后保存完整 `SessionRef`，后续执行不依赖会变化的全局
+数字。
+
+以下事件立即使目录项或选择失效：
+
+- Relay 连接关闭或心跳超时。
+- 客户端快照删除 pane。
+- pane 中 occupant 被替换。
+- Herdr 进入 degraded，客户端上报空快照。
+
+不同用户可以使用相同 `machine_id`；同一 `(userid, machine_id)` 的后来连接被拒绝。
+
+### 2.5 ClientHub
+
+职责：
+
+- 只在 TLS 请求上接受 WebSocket upgrade。
+- 校验 `client_hello`、首个完整快照、帧版本、大小、字段和身份。
+- 维护每个客户端的有界发送队列、在途请求和心跳状态。
+- 将选择与执行请求关联到对应响应。
+- 把 `execute_push` 和 `notification` 交给 Router。
+- 连接结束时同步撤下目录，不保留离线消息或执行队列。
+
+默认心跳间隔 10 秒，30 秒未收到 pong 关闭连接；完整会话快照校准间隔 30 秒。
+
+### 2.6 TLS 管理
+
+服务端可以加载显式 `cert_file`/`key_file`。二者都留空时，在 `state_dir` 生成并复用
+ECDSA P-256 自签名证书，私钥写入权限为 `0600`。TLS 最低版本为 1.2。
+
+自动证书只覆盖 localhost、本机 hostname 和 loopback 地址。客户端默认
+`skip_verify=true` 是当前受信任内网的产品决定，不构成服务端身份认证。
+
+## 3. 客户端模块
+
+### 3.1 RelayClient
+
+职责：
+
+- 使用配置的 userid 和 machine_id 建立 WSS。
+- 完成握手并立即上报本机完整会话快照。
+- 默认每 250ms 检查会话变化，变化时发送新快照；按服务端间隔发送完整校准快照。
+- 接收稳定目标选择和用户执行请求。
+- 把 Bridge 首段回复、后续分段和结构化通知发回服务端。
+- 断线后指数退避重连，成功握手后重置退避。
+
+客户端不缓存离线 prompt、按键、回复或通知。断线期间产生的内容直接失败，避免重连后
+执行过时动作。
+
+### 3.2 HerdrClient
 
 职责：
 
 - 解析 Herdr Socket 路径和 session。
-- 编码、发送和解析 NDJSON 请求。
-- 解析 protocol 17 的 `state_change_seq`，执行原子 prompt wait 和状态序列轮询。
+- 编码、发送和解析公共 NDJSON 请求。
 - 维护 `events.subscribe` 长连接。
-- 区分请求响应、订阅确认和事件行。
-- 将协议错误转换为稳定的项目内部错误类型。
-- 启动时记录 Herdr version、protocol 和 capabilities。
+- 解析 protocol 17 的 `state_change_seq`，执行 prompt wait 和状态序列轮询。
+- 将协议错误转换为稳定的内部错误类型。
 
-该模块不包含 IM 逻辑、输出清理规则或会话路由。
+普通文本使用 `agent.prompt`，UI 控制使用 `agent.send_keys`。所有 Agent API 使用 pane ID；
+terminal ID 和 occupant 只用于身份复核。
 
-### 2.2 SessionRegistry
+### 3.3 SessionRegistry
 
 职责：
 
 - 使用 `session.snapshot` 建立本地运行时视图。
-- 按 `pane_id`、`terminal_id` 和 Agent name 建立索引。
-- 保存 workspace、tab、pane、agent 的展示信息。
-- 应用 pane 生命周期事件。
-- 在 Agent occupant 变化时使旧绑定失效或进入待确认状态。
+- 按 pane、terminal 和 Agent occupant 建立索引。
+- 保存 workspace、tab、Agent、panel 标题和状态等展示字段。
+- 应用 pane 生命周期事件，使被关闭或替换的目标失效。
 
-缓存是可重建状态，不是事实来源；Herdr 重连后以新快照为准。
+Registry 是可重建缓存，不是事实来源。Herdr 不可用时，对 Relay 暴露空目标；重连后以
+新快照完全替换旧状态。
 
-### 2.3 EventSupervisor
+### 3.4 EventSupervisor
 
-职责：
+每个健康周期：
 
-- 维护 workspace/tab/pane 生命周期订阅。
-- 为当前 Agent pane 建立 `pane.agent_status_changed` 订阅。
-- pane 集合变化后重建 pane 级订阅。
-- 将事件转化为内部的状态迁移记录。
-- 处理 Socket 关闭、超时、Herdr 重启和指数退避重连。
+1. `ping` 并要求 protocol 精确等于 17。
+2. 读取 discovery `session.snapshot`。
+3. 建立通用 pane lifecycle 订阅。
+4. 为当前 Agent pane 建立批量 `pane.agent_status_changed` 订阅，每项显式指定 `pane_id`。
+5. 再读取权威 snapshot，消除 snapshot 与订阅确认之间的窗口。
+6. pane/occupant 集合变化时重建状态订阅并再次收敛。
+7. 设置健康 HerdrClient，开放输入和 Relay 目录上报。
 
-由于状态订阅必须指定 `pane_id`，推荐第一版采用：
+断线时立即进入 degraded、撤下 Relay 会话并暂停输入。重连不恢复旧选择、分页或通知。
 
-- 一个生命周期订阅连接。
-- 一个包含当前所有 pane 状态订阅的批量连接。
-- pane 集合变化时关闭并重建批量状态连接。
+### 3.5 Service 与 PolicyGuard
 
-如果重建造成明显抖动，再演进为每个 pane 一个状态连接或可复用连接池。
+Service 处理从 Relay 或 ConsoleAdapter 进入的本地命令：
 
-### 2.4 OutputExtractor
+- 每条消息先做 userid、单聊和 `msgid` 幂等校验。
+- `/ls` 和 `/sel` 在交互模式中使用本机编号；网络模式由服务端先完成全局选择，再用稳定
+  目标建立本地选择。
+- `/con`、分页、按键和 `/slash` 都复用同一命令解析和安全策略。
+- 每次 prompt 或按键前重新确认 pane、terminal 和 occupant。
 
-这是输出处理的逻辑边界；当前实现由 `Notifier`、`panel` 和消息分段函数共同完成，而非
-一个独立的持久化模块。当前职责和边界是：
+普通 prompt 只接受实时 `idle` 或 `done`：
 
-- 在 `blocked`、`done`，以及从 `working`/`blocked` 转入 `idle` 的状态边界调用
-  `agent.read(recent_unwrapped, 100)`。
-- 只保留最近 100 行，规范化换行与 ANSI/TUI 噪音。
-- 对整份规范化快照计算 hash，参与相同状态通知的内存去重。
-- 按消息大小做 UTF-8 安全分段和截断。
-- 对 alternate-screen Agent 明确标记内容只是当前可见或近期终端快照。
+1. 调用带 wait 的 `agent.prompt`。
+2. 只有状态或 `state_change_seq` 变化才报告成功。
+3. 若返回 `agent_prompt_stalled`，再次复核 occupant、状态和序列。
+4. 仍为原目标和可输入状态时，只补发一次受审计 Enter。
+5. 再等待最多约 5 秒；无变化则报告未生效，不继续重试。
 
-当前没有 revision checkpoint，也没有可靠的增量差分；主动通知发送的是受限的近期
-快照，不能表述为“自上次以来的新增 assistant 内容”。`/pageup` 使用连续重叠锚点扩展
-手工分页缓存，是另一条内存分页路径，不等同于通知增量提取。
+显式按键不二次确认，但只允许预定义白名单，并在每个按键前复核目标。多键间隔 100ms，
+`enter` 不能出现在多键队列。
 
-未来可以把 Agent 特定清理规则、上一快照 checkpoint、最长公共前缀或稳定后缀差分演进
-为独立模块。差分不可信时仍应回退为带说明的短快照，不能伪造精确增量。
+### 3.6 Notifier 与面板输出
 
-### 2.5 ConversationRouter
+Notifier 在 `blocked`、`done`，以及需要输出的 `idle` 状态读取
+`agent.read(recent_unwrapped, 100)`：
 
-职责：
+- 只保留最近 100 行，不读取全部新增历史。
+- 规范化换行与 ANSI/TUI 噪音。
+- 使用状态、目标和快照 hash 做内存去重。
+- 按企业微信限制进行 UTF-8 安全分段。
+- 不改变用户手工 `/con`、`/pageup`、`/pagedn` 的分页位置。
 
-- 管理 IM channel/thread/user 与 Herdr pane/agent 的绑定。
-- 将 Herdr 通知路由到正确的 IM 会话。
-- 将 IM 回复解析为普通 prompt 或显式控制动作。
-- 防止旧 IM thread 向已经被替换的 Agent occupant 发送输入。
+`PaneReadResult.revision` 当前固定为 0，且没有可用的 `pane.output_changed` 公共流，因此
+不能宣称通知内容是精确增量。
 
-当前版本只有一个授权企业微信用户或固定的 `interactive-local` 身份，并在内存中保存
-当前 `/ls` 编号快照、`/sel` 选择和分页缓存。Herdr 断线、pane/occupant 变化或进程重启
-都会清空相关状态，不存在可跨重启恢复的持久 Binding。
+## 4. Relay 协议
 
-未来需要多会话或持久恢复时，可以引入稳定的内部绑定记录：
-
-```text
-Binding
-  id
-  im_adapter
-  im_conversation_id
-  im_thread_id?
-  pane_id
-  terminal_id
-  agent_session_ref?
-  created_at
-  last_verified_at
-  enabled
-```
-
-`pane_id` 用于 API 调用；`terminal_id` 和可用的 agent session reference 用于判断
-pane 中的 Agent 是否已经被替换。
-
-### 2.6 PolicyGuard
-
-职责：
-
-- 校验企业微信用户或固定本地身份是否被授权，并且消息类型为单聊。
-- 区分普通文本、导航按键和不受支持的命令。
-- 只允许预定义的按键白名单。
-- 生成不包含密钥的审计记录。
-
-目标选择与 occupant 实时校验由 `Service`、`SessionRegistry` 和 `HerdrClient` 共同完成，
-但属于同一条输入策略边界，适配器不能绕过。
-
-默认策略：
-
-- 普通文本仅在实时状态为 `idle` 或 `done` 时映射到带 wait 的 `agent.prompt`。
-- 白名单按键命令本身就是用户的显式操作，不二次确认。
-- `agent_prompt_stalled` 只允许在 occupant、状态和序列复核后补发一次受审计的 Enter；
-  `blocked` 永不触发自动 Enter。
-- `ctrl+c`、组合键、退出、关闭 pane 等动作当前不提供入口。
-- Agent 权限审批永不自动执行。
-
-### 2.7 IMAdapter
-
-职责：
-
-- 按各自信任边界接收文本消息。
-- 将来源对象转换为统一内部文本事件。
-- 发送首段回复和后续通知分段。
-
-当前共享能力可以概括为：
+协议使用严格 JSON WebSocket 文本帧，包含固定版本和类型。核心消息：
 
 ```text
-receive() -> IMEvent
-respond(callback_ref, message)
-send_message(target, message)
+client_hello       client → server
+server_hello       server → client
+session_snapshot   client → server
+ping / pong        server ↔ client
+select_request     server → client
+select_result      client → server
+execute_request    server → client
+execute_response   client → server
+execute_push       client → server
+notification       client → server
+protocol_error     双向错误报告
 ```
 
-当前有两个并列适配器：
+协议不传递 Herdr Socket 路径，不提供通用 Herdr RPC，也不允许客户端在连接内切换 userid 或
+machine_id。未知字段、未知类型、非法 SessionRef 和超限帧均拒绝。
 
-- `WeComClient` 负责企业微信智能机器人 WebSocket 长连接、回调接收和消息发送。
-- `ConsoleAdapter` 把 stdin 的逐行输入转换为本地单聊事件，把回复和通知串行写入 stdout；
-  它不是 TUI，也不解析 Herdr 协议。
+Relay 请求语义是 at-most-one automatic attempt：服务端超时时提示“操作可能已经提交”，
+不会自动重试可能产生副作用的执行。协议不承诺 exactly-once；业务层仍依赖 `msgid` 幂等、
+稳定 occupant 校验和有界队列。
 
-两种适配器进入同一套 Bridge 装配。交互模式不会绕过 `PolicyGuard`、`Deduper`、
-`Service`、`Notifier` 或 `EventSupervisor`，因此身份检查、消息幂等、occupant 校验、状态
-订阅、输出限制和按键审计与企业微信模式保持一致。接口保持可扩展，但不为尚未接入的
-平台提前设计公共最小公倍数；消息更新、撤回或交互按钮属于未来适配能力。
+## 5. 关键数据流
 
-### 2.8 StateStore（未来模块）
-
-当前没有 StateStore。会话选择、分页缓存、状态通知 hash、occupant 路由状态和有容量、
-TTL 上限的 `msgid` 幂等键全部只保存在进程内存中；进程重启后不会恢复，也不会补发旧
-通知。
-
-未来若需要跨重启恢复，StateStore 可以保存 IM 与 pane 的最小绑定、通知去重元数据、
-输出 checkpoint 和消息幂等键。Herdr 会话快照不应原样永久保存，并且恢复出的绑定仍须
-用最新 `session.snapshot` 和 occupant 信息重新验证。
-
-## 3. 数据流
-
-### 3.1 启动
+### 5.1 用户发现和全局列表
 
 ```text
-启动 bridge
-  → ping / session.snapshot
-  → 重建 SessionRegistry
-  → 建立生命周期订阅
-  → 建立当前 pane 状态订阅
-  → 用订阅后的权威 snapshot 收敛当前基线
-  → 启动 WeComClient 或 ConsoleAdapter
-  → 等待用户重新 /ls、/sel，不恢复上次选择或分页
+企业微信 /userid
+  → WeComClient 提供回调 userid
+  → Router 原样回复给当前单聊
+
+企业微信 /ls
+  → UserExecutor 按 userid 串行化
+  → SessionCatalog 汇总该用户全部在线 ClientKey
+  → 创建全局编号快照
+  → 返回 [machine/local] Agent — panel title
 ```
 
-如果 Herdr 未运行，bridge 可以等待并重试，但不应未经明确产品决定自动启动或停止
-Herdr。
+### 5.2 选择和执行
 
-### 3.2 状态通知
+```text
+/N
+  → 从最近全局编号快照解析 SessionRef
+  → ClientHub 向目标机器发送 select_request
+  → 客户端用 pane + occupant 建立本地稳定选择
+  → 服务端保存用户选择
+
+普通文本或本地命令
+  → 服务端取得已选 SessionRef
+  → execute_request
+  → 客户端再次选择同一稳定目标
+  → Service 执行状态、权限和 occupant 校验
+  → execute_response / execute_push
+  → 企业微信回复
+```
+
+### 5.3 状态通知
 
 ```text
 pane.agent_status_changed
-  → 校验当前 pane/occupant
-  → 和最近状态比较
-  → 应用通知策略
-  → 必要时 agent.read(recent_unwrapped, 100)
-  → 规范化最近 100 行并计算整快照 hash
-  → 内存去重、分段和安全截断
-  → IMAdapter 发送通知
+  → Notifier 复核本地 occupant
+  → 按策略读取最近 100 行
+  → Relay notification(SessionRef, content)
+  → 服务端用最新目录复核
+  → 补充 [machine/local] Agent — title
+  → 主动发送给连接所属 userid
 ```
 
-推荐状态策略：
+## 6. 重连、一致性和幂等
 
-| 状态 | 默认动作 |
-| --- | --- |
-| `working` | 更新状态，默认不发送大段输出 |
-| `blocked` | 立即通知，读取近期输出，提供安全交互入口 |
-| `done` | 通知完成，读取并发送最近 100 行快照 |
-| `idle` | 仅在从 working/blocked 转入时读取输出 |
-| `unknown` | 标记状态不确定，不宣称任务成功 |
+- Herdr 重连：新 snapshot 完全替换本地 Registry，旧选择和分页失效。
+- Relay 重连：重新握手并发送完整会话快照，不恢复服务端旧选择。
+- Relay 断开：服务端立即删除该 ClientKey 的全部会话。
+- 企业微信重连：只恢复当前连接，不补发断线期间的状态通知。
+- 入站 `msgid`：带 TTL 和容量上限的内存去重。
+- 状态通知：目标、状态和最近快照 hash 的内存去重。
+- 进程重启：所有选择、目录、分页和幂等状态清空。
 
-### 3.3 IM 普通回复
+## 7. 安全边界
 
-```text
-WeComClient：已认证并订阅的 WebSocket → 解码企业微信文本回调 ┐
-ConsoleAdapter：进程 stdin → 固定 interactive-local 单聊身份   ├→ 共享 Bridge
-                                                              ┘
-共享 Bridge
-  → PolicyGuard 校验身份和单聊类型
-  → Deduper 登记 msgid
-  → 解析普通 prompt
-  → agent.get 校验当前选择、occupant 和 idle/done 状态
-  → 带 wait 的 agent.prompt 等待状态或 state_change_seq 变化
-  → stalled 时复核 occupant、状态和序列
-  → 必要时只补发一次受审计的 Enter，再轮询 state_change_seq
-  → 仅在观察到变化后返回实际状态，否则报告未生效
-  → 等待后续状态事件
-```
+- 企业微信 Secret 只在服务端环境变量中；客户端永远不持有。
+- WSS 只提供链路加密。当前客户端可以自行声明 userid，且默认忽略证书验证，因此部署
+  必须限制在受信任内网和受控主机。
+- 日志仅记录错误类别、长度、连接 ID、machine_id 和 userid/occupant 摘要，不记录完整
+  Secret、Cookie、prompt 或终端快照。
+- 外部字符串不能映射成任意 Herdr key；只允许固定按键白名单。
+- 未知用户会话、群聊、未知 pane、失效 occupant、degraded Herdr 和断线客户端都不能
+  产生输入。
+- 不提供 `server.stop`、`pane.close`、`pane.send_text`、通用 `pane.send_input` 或自动
+  审批入口。
 
-正常聊天消息不要调用 `pane.send_text`，因为该接口不会验证当前 pane 中是否仍为原
-Agent。
+## 8. 测试策略
 
-### 3.4 显式控制动作
+单元测试至少覆盖：
 
-```text
-WeComClient
-  → 只接收已认证、已订阅 WebSocket 上通过协议校验的企业微信回调
+- Relay 严格帧、版本、身份、SessionRef 和大小限制。
+- 重复 ClientKey 拒绝、首快照、心跳、断线撤下和有界队列。
+- 多用户目录隔离、全局编号快照、稳定选择和过期目标。
+- 客户端快照变化、校准、重连、选择和执行响应。
+- Herdr NDJSON、订阅确认、事件解析、状态迁移和重连恢复。
+- prompt 状态门禁、stalled 单次 Enter、按键白名单和审计。
+- 100 行通知、分页、ANSI/TUI 清理和 UTF-8 分段。
+- 企业微信重复回调幂等和不同用户串行/并行行为。
 
-ConsoleAdapter
-  → 只接收当前进程 stdin
-  → 写入固定 user_id=interactive-local、chat_type=single
+集成测试使用本地 TLS Relay、三个客户端和 fake Bridge 执行器验证：
 
-两种入口汇合到共享 Bridge
-  → PolicyGuard 校验身份和单聊类型
-  → Deduper 登记 msgid，拒绝重复投递
-  → command.Parse 识别显式按键命令
-  → PolicyGuard.ValidateKey 校验按键白名单
-  → Service 校验当前选择、pane 和 Agent occupant
-  → agent.send_keys
-  → 同步记录用户、pane、occupant 摘要、动作和结果
-```
+- 同一用户两台机器的列表聚合。
+- 不同用户使用相同 machine_id。
+- 选择和 prompt 不跨用户、不跨机器。
+- 通知包含机器、本地序号、Agent 和 panel 标题。
 
-ConsoleAdapter 不验证平台签名；它的信任边界是本机进程 stdin 和固定本地身份。任一消息
-入口都不能把外部字符串直接当作任意 Herdr key string。
+真实 Herdr 集成测试必须能在不访问企业微信外网时运行；写入测试需要显式 pane ID 和额外
+环境门禁。
 
-## 4. 重连和一致性
+## 9. 后续演进
 
-### 4.1 Herdr 连接断开
+优先级较高的后续能力：
 
-1. 将连接状态改为 degraded。
-2. 暂停所有 IM → Herdr 输入。
-3. 使用有上限的指数退避重连。
-4. 重连后执行 `ping` 和 `session.snapshot`。
-5. 用新快照替换 SessionRegistry。
-6. 清空当前选择和分页缓存。
-7. 重建订阅并用订阅后的 snapshot 收敛基线。
-8. 不恢复旧选择，不重放断线期间的旧状态通知。
+- Relay 客户端认证、证书 pinning 或内部 CA。
+- 可选 StateStore 和跨重启最小绑定恢复。
+- 可靠通知队列与明确的投递状态。
+- 服务管理、健康检查和配置迁移。
+- 第二个网络 IM Adapter。
 
-### 4.2 幂等和去重
-
-当前 Herdr 事件没有对外 cursor，企业微信回调也可能重复投递。当前内存去重包括：
-
-- 入站 `msgid`：容量和 TTL 有上限，prompt 与按键只接受第一次投递。
-- 状态通知 key：pane + occupant + status + 最近 100 行规范化快照 hash。
-- pane 失效通知 key：pane + occupant。
-
-进程重启后这些键不会恢复。未来 webhook adapter 或持久化 StateStore 需要另行定义签名
-验证、事件 ID 和跨重启幂等策略。
-
-exactly-once 不作为第一版承诺；目标是 at-least-once 输入接收配合业务幂等，以及
-best-effort 去重通知。
-
-## 5. 错误处理
-
-错误应分为：
-
-- `HerdrUnavailable`：Socket 不可用或重连中。
-- `ProtocolMismatch`：Schema 或响应结构不兼容。
-- `TargetNotFound`：pane/agent 不存在。
-- `OccupantChanged`：pane 仍存在但 Agent 已替换。
-- `InputRejected`：Herdr 拒绝 prompt 或按键。
-- `Unauthorized`：IM 用户或会话没有权限。
-- `OutputUnavailable`：终端近期快照为空、丢失或无法安全处理。
-- `IMDeliveryFailed`：平台限流、网络错误或消息格式错误。
-
-面向用户的错误消息应可操作，例如“Agent 已被替换，请重新绑定”，而不是只展示底层
-Socket 错误。
-
-## 6. 安全边界
-
-- Herdr Socket 只在本机访问。
-- 企业微信当前使用客户端主动建立的 WebSocket 长连接，并通过 Bot ID 与 Secret 完成订阅；
-  Secret 只从 `HERDR_PAL_WECOM_SECRET` 环境变量读取，配置文件拒绝 Secret 字段。
-- 当前没有 webhook 入口。未来若新增 webhook adapter，必须验证平台签名和时间戳。
-- 企业微信模式只允许配置中的一个用户和单聊；交互模式只允许固定的本地身份。
-- 终端输出可能包含源码、密钥和日志，转发前要支持内容过滤和最大长度限制。
-- 日志默认只记录 hash、长度和目标标识，不记录完整 prompt 和输出。
-- 不允许 IM 用户选择任意本地 Socket 路径。
-- 不允许通过 IM 直接调用 Herdr 的 server.stop、pane.close 等高风险 API。
-
-## 7. 测试策略
-
-### 7.1 单元测试
-
-- NDJSON framing 和部分读取。
-- Herdr success/error/event 数据解析。
-- prompt wait、`agent_prompt_stalled`、状态序列轮询和调用方取消。
-- 普通文本状态门禁、occupant 复核、单次 Enter 恢复及三态审计。
-- 状态迁移通知规则。
-- 输出规范化、整快照 hash 去重、分页重叠和截断。
-- Binding occupant 校验。
-- PolicyGuard 动作矩阵。
-- 企业微信回调 `msgid` 内存幂等。
-
-### 7.2 集成测试
-
-- 使用 fake Herdr Socket Server 模拟 snapshot、订阅和断线。
-- 使用 fake IM Adapter 验证发送、更新和失败重试。
-- 测试 pane 创建后状态订阅重建。
-- 测试 Herdr 重启后 pane id/terminal id 改变。
-- 测试相同事件或企业微信回调重放不会产生重复危险输入。
-- 测试 working 状态拒绝普通文本，以及 stalled 后只补发一次 Enter 并确认状态变化。
-
-### 7.3 手工联调
-
-- Agent working → done。
-- Agent working → blocked → 用户选择 → working。
-- Agent 使用 alternate screen 时的输出表现。
-- bridge 和 Herdr 分别重启。
-- IM 限流和网络断开。
-
-## 8. 分阶段交付
-
-### 阶段一：首版 MVP
-
-- 一个网络 IM Adapter 和一个共享核心的本地 ConsoleAdapter。
-- 手工建立一个 IM 会话到 pane 的绑定。
-- snapshot + pane 生命周期 + Agent 状态订阅。
-- blocked/done 时读取 recent_unwrapped 并通知。
-- 普通 IM 文本通过 agent.prompt wait 发送，确认状态变化后才报告成功。
-- Herdr 重连、订阅自动重建和断线后重新选择。
-- `msgid`、状态通知和失效通知的内存幂等。
-- 白名单按键、occupant 校验、结构化审计和安全日志。
-
-### 阶段二：可靠性
-
-- 本地 StateStore。
-- 跨重启绑定、选择和幂等恢复。
-- 上一快照 checkpoint、保守增量差分和 Agent 特定清理规则。
-- 未来 webhook adapter 的验签与持久事件幂等。
-- 更丰富的显式交互按钮和权限策略。
-
-### 阶段三：产品化
-
-- 多 Agent、多会话管理。
-- 管理命令和绑定生命周期。
-- 消息更新、线程化展示和通知聚合。
-- 可观测性、审计和配置迁移。
-- 根据实际需求评估第二个网络 IM 平台 Adapter。
-
-整个路线都不要求修改 Herdr。若未来需要实时结构化输出，应作为独立的 Herdr
-公共 API 提案处理，而不是让 Herdr Pal 依赖私有内部实现。
+任何实时结构化输出需求都应先形成 Herdr 公共 API 提案，不能回退到私有 TUI 状态或内部
+Rust 模块。
