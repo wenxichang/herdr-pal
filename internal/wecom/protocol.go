@@ -11,6 +11,8 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/wenxichang/herdr-pal/internal/im"
 )
 
 const (
@@ -34,15 +36,8 @@ type Headers struct {
 	RequestID string `json:"req_id"`
 }
 
-// IncomingText 是已通过协议校验的企业微信文本回调。
-type IncomingText struct {
-	RequestID string
-	MessageID string
-	BotID     string
-	UserID    string
-	ChatType  string
-	Content   string
-}
+// IncomingText 是平台中立文本消息的兼容别名。
+type IncomingText = im.IncomingText
 
 // Response 是企业微信对单个请求返回的响应。
 type Response struct {

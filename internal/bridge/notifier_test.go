@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
@@ -31,6 +32,24 @@ func TestNotifierWorkingSendsShortMessageWithoutReading(t *testing.T) {
 	messages := im.Messages()
 	if len(messages) != 1 || !strings.Contains(messages[0], "开始工作") || strings.Contains(messages[0], "终端近期快照") {
 		t.Fatalf("working 通知 = %#v", messages)
+	}
+}
+
+func TestNotifierSendsStructuredStableTarget(t *testing.T) {
+	reader := &notifierReader{}
+	sink := &notifierIM{}
+	notifier := mustNotifier(t, sink, reader.ReadRecent)
+
+	if err := notifier.HandleTransition(context.Background(), notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)); err != nil {
+		t.Fatalf("HandleTransition() error = %v", err)
+	}
+	targets := sink.Targets()
+	if len(targets) != 1 {
+		t.Fatalf("notification targets = %#v", targets)
+	}
+	target := targets[0]
+	if target.PaneID != "pane-1" || target.OccupantHash == "" || target.Agent != "claude" || target.DisplayAgent != "Claude" || target.Title != "修复 <问题>" {
+		t.Fatalf("notification target = %#v", target)
 	}
 }
 
@@ -1206,6 +1225,7 @@ func (r *notifierReader) Calls() []notifierReadCall {
 type notifierIM struct {
 	mu       sync.Mutex
 	messages []string
+	targets  []im.NotificationTarget
 	failAt   int
 	calls    int
 }
@@ -1456,14 +1476,29 @@ func (i *notifierIM) RespondMarkdown(context.Context, string, string) error {
 }
 
 func (i *notifierIM) SendMarkdown(_ context.Context, content string) error {
+	return i.record(im.NotificationTarget{}, content)
+}
+
+func (i *notifierIM) SendNotification(_ context.Context, target im.NotificationTarget, content string) error {
+	return i.record(target, content)
+}
+
+func (i *notifierIM) record(target im.NotificationTarget, content string) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.calls++
 	i.messages = append(i.messages, content)
+	i.targets = append(i.targets, target)
 	if i.failAt > 0 && i.calls == i.failAt {
 		return errors.New("send failed")
 	}
 	return nil
+}
+
+func (i *notifierIM) Targets() []im.NotificationTarget {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]im.NotificationTarget(nil), i.targets...)
 }
 
 func (i *notifierIM) Messages() []string {

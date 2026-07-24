@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
@@ -332,9 +333,9 @@ func (d *notificationDispatcher) signal() {
 // 自动快照只保留独立的通知去重状态，不读取或修改手工 PanelBuffer。内部锁只保护去重
 // 元数据，不跨越 Herdr 读取或企业微信发送调用。
 type Notifier struct {
-	im   IMAdapter
-	get  GetAgentFunc
-	read ReadRecentFunc
+	notification im.NotificationSink
+	get          GetAgentFunc
+	read         ReadRecentFunc
 
 	mu       sync.Mutex
 	recent   map[string]notificationKey
@@ -344,18 +345,30 @@ type Notifier struct {
 }
 
 // NewNotifier 创建状态通知器，并要求自动读取前后可实时校验 Agent occupant。
-func NewNotifier(im IMAdapter, get GetAgentFunc, read ReadRecentFunc) (*Notifier, error) {
-	if im == nil || get == nil || read == nil {
+func NewNotifier(adapter IMAdapter, get GetAgentFunc, read ReadRecentFunc) (*Notifier, error) {
+	if adapter == nil || get == nil || read == nil {
 		return nil, ErrInvalidNotifierDependency
 	}
+	notification, ok := adapter.(im.NotificationSink)
+	if !ok {
+		notification = replyNotificationSink{reply: adapter}
+	}
 	return &Notifier{
-		im:       im,
-		get:      get,
-		read:     read,
-		recent:   make(map[string]notificationKey),
-		inflight: make(map[string]chan struct{}),
-		pending:  make(map[string]*notificationProgress),
+		notification: notification,
+		get:          get,
+		read:         read,
+		recent:       make(map[string]notificationKey),
+		inflight:     make(map[string]chan struct{}),
+		pending:      make(map[string]*notificationProgress),
 	}, nil
+}
+
+type replyNotificationSink struct {
+	reply im.ReplySink
+}
+
+func (s replyNotificationSink) SendNotification(ctx context.Context, _ im.NotificationTarget, content string) error {
+	return s.reply.SendMarkdown(ctx, content)
 }
 
 // Reset 清空当前进程内的通知去重基线，供 Herdr 重连后的新健康周期使用。
@@ -424,7 +437,7 @@ func (n *Notifier) HandleTransition(ctx context.Context, transition session.Tran
 			}
 		}
 	}
-	return n.deliverOnce(ctx, transition.Target.PaneID, key, parts)
+	return n.deliverOnce(ctx, transition.Target, key, parts)
 }
 
 // TargetInvalidated 通知 pane 关闭或 occupant 替换。
@@ -433,7 +446,7 @@ func (n *Notifier) TargetInvalidated(ctx context.Context, target session.Target)
 		return ErrInvalidNotifierDependency
 	}
 	key := notificationKey{paneID: target.PaneID, occupantKey: target.OccupantKey, kind: "invalidated"}
-	return n.deliverOnce(ctx, target.PaneID, key, renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target))
+	return n.deliverOnce(ctx, target, key, renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target))
 }
 
 func notificationPolicy(transition session.Transition) (title string, includeSnapshot, notify bool) {
@@ -459,7 +472,15 @@ func notificationPolicy(transition session.Transition) (title string, includeSna
 	}
 }
 
-func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificationKey, parts []string) error {
+func (n *Notifier) deliverOnce(ctx context.Context, target session.Target, key notificationKey, parts []string) error {
+	paneID := target.PaneID
+	notificationTarget := im.NotificationTarget{
+		PaneID:       target.PaneID,
+		OccupantHash: target.OccupantKey,
+		Agent:        target.Agent,
+		DisplayAgent: target.DisplayAgent,
+		Title:        target.Title,
+	}
 	for {
 		n.mu.Lock()
 		if n.recent[paneID] == key {
@@ -500,7 +521,7 @@ func (n *Notifier) deliverOnce(ctx context.Context, paneID string, key notificat
 
 		var err error
 		for index := start; index < len(deliveryParts); index++ {
-			if err = n.im.SendMarkdown(ctx, deliveryParts[index]); err != nil {
+			if err = n.notification.SendNotification(ctx, notificationTarget, deliveryParts[index]); err != nil {
 				break
 			}
 			n.mu.Lock()

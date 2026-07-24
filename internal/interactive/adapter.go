@@ -9,7 +9,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/wenxichang/herdr-pal/internal/wecom"
+	"github.com/wenxichang/herdr-pal/internal/im"
 )
 
 const (
@@ -38,7 +38,7 @@ var (
 type Adapter struct {
 	input        io.Reader
 	output       io.Writer
-	events       chan wecom.IncomingText
+	events       chan im.IncomingText
 	fatalPending chan struct{}
 	fatalReady   chan struct{}
 	stop         chan struct{}
@@ -61,7 +61,7 @@ func NewAdapter(input io.Reader, output io.Writer) (*Adapter, error) {
 	return &Adapter{
 		input:        input,
 		output:       output,
-		events:       make(chan wecom.IncomingText, eventsCapacity),
+		events:       make(chan im.IncomingText, eventsCapacity),
 		fatalPending: make(chan struct{}),
 		fatalReady:   make(chan struct{}),
 		stop:         make(chan struct{}),
@@ -119,7 +119,7 @@ func (a *Adapter) Run(ctx context.Context) error {
 			}
 
 			sequence++
-			message := wecom.IncomingText{
+			message := im.IncomingText{
 				RequestID: fmt.Sprintf("interactive-request-%d", sequence),
 				MessageID: fmt.Sprintf("interactive-message-%d", sequence),
 				BotID:     BotID,
@@ -141,7 +141,7 @@ func (a *Adapter) Run(ctx context.Context) error {
 }
 
 // Events 返回单向入站消息流。
-func (a *Adapter) Events() <-chan wecom.IncomingText {
+func (a *Adapter) Events() <-chan im.IncomingText {
 	if a == nil {
 		return nil
 	}
@@ -156,6 +156,11 @@ func (a *Adapter) RespondMarkdown(ctx context.Context, requestID, content string
 // SendMarkdown 输出带“通知”标签的主动消息。
 func (a *Adapter) SendMarkdown(ctx context.Context, content string) error {
 	return a.write(ctx, markdownBlock("通知", content))
+}
+
+// SendNotification 输出带“通知”标签的结构化主动消息。
+func (a *Adapter) SendNotification(ctx context.Context, _ im.NotificationTarget, content string) error {
+	return a.SendMarkdown(ctx, content)
 }
 
 func (a *Adapter) startRun() error {
@@ -224,7 +229,7 @@ func (a *Adapter) write(ctx context.Context, value string) error {
 	return safeErr
 }
 
-func (a *Adapter) sendEvent(ctx context.Context, message wecom.IncomingText) error {
+func (a *Adapter) sendEvent(ctx context.Context, message im.IncomingText) error {
 	if err := a.runtimeError(ctx); err != nil {
 		return err
 	}

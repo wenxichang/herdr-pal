@@ -18,6 +18,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/interactive"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -130,7 +131,7 @@ func (l *dialPathLease) Close() error {
 type imRuntime interface {
 	bridge.IMAdapter
 	Run(ctx context.Context) error
-	Events() <-chan wecom.IncomingText
+	Events() <-chan im.IncomingText
 }
 
 type runtimeRunner interface {
@@ -138,7 +139,7 @@ type runtimeRunner interface {
 }
 
 type messageHandler interface {
-	HandleMessage(ctx context.Context, message wecom.IncomingText)
+	HandleMessage(ctx context.Context, message im.IncomingText)
 }
 
 type applicationRuntime struct {
@@ -993,7 +994,7 @@ func collectRemainingComponents(results <-chan componentResult, remaining int) <
 	return done
 }
 
-func consumeMessages(ctx context.Context, events <-chan wecom.IncomingText, handler messageHandler) error {
+func consumeMessages(ctx context.Context, events <-chan im.IncomingText, handler messageHandler) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1012,7 +1013,7 @@ func consumeMessages(ctx context.Context, events <-chan wecom.IncomingText, hand
 	}
 }
 
-func consumeSelectedMessage(ctx context.Context, handler messageHandler, message wecom.IncomingText, ok bool) (bool, error) {
+func consumeSelectedMessage(ctx context.Context, handler messageHandler, message im.IncomingText, ok bool) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}

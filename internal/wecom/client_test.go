@@ -176,7 +176,7 @@ func TestClientWaitsBackoffAfterSubscribedSessionEnds(t *testing.T) {
 	awaitDone(t, done)
 }
 
-func TestClientSendMarkdownTargetsConfiguredUserAndWaitsResponse(t *testing.T) {
+func TestClientSendMarkdownToTargetsRequestedUserAndWaitsResponse(t *testing.T) {
 	socket := newFakeSocket()
 	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -184,7 +184,7 @@ func TestClientSendMarkdownTargetsConfiguredUserAndWaitsResponse(t *testing.T) {
 	completeSubscribe(t, client, socket)
 
 	result := make(chan error, 1)
-	go func() { result <- client.SendMarkdown(context.Background(), "主动通知") }()
+	go func() { result <- client.SendMarkdownTo(context.Background(), "user-2", "主动通知") }()
 	write := socket.nextWrite(t)
 	var request struct {
 		Cmd     string  `json:"cmd"`
@@ -197,12 +197,12 @@ func TestClientSendMarkdownTargetsConfiguredUserAndWaitsResponse(t *testing.T) {
 	if err := json.Unmarshal(write, &request); err != nil {
 		t.Fatal(err)
 	}
-	if request.Cmd != "aibot_send_msg" || request.Headers.RequestID == "" || request.Body.ChatID != "user-1" || request.Body.ChatType != 1 {
+	if request.Cmd != "aibot_send_msg" || request.Headers.RequestID == "" || request.Body.ChatID != "user-2" || request.Body.ChatType != 1 {
 		t.Fatalf("send request = %s", write)
 	}
 	socket.push(responseJSON(request.Headers.RequestID, 0))
 	if err := <-result; err != nil {
-		t.Fatalf("SendMarkdown() error = %v", err)
+		t.Fatalf("SendMarkdownTo() error = %v", err)
 	}
 	cancel()
 	awaitDone(t, done)

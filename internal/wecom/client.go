@@ -297,11 +297,16 @@ func (c *Client) RespondMarkdown(ctx context.Context, callbackRequestID, content
 
 // SendMarkdown 向配置中唯一允许的单聊用户主动发送 Markdown 消息。
 func (c *Client) SendMarkdown(ctx context.Context, content string) error {
+	return c.SendMarkdownTo(ctx, c.allowedUserID, content)
+}
+
+// SendMarkdownTo 向指定单聊用户主动发送 Markdown 消息。
+func (c *Client) SendMarkdownTo(ctx context.Context, userID, content string) error {
 	if c == nil {
 		return ErrUnavailable
 	}
 	requestID := c.requestID()
-	payload, err := EncodeSendMarkdown(requestID, c.allowedUserID, content)
+	payload, err := EncodeSendMarkdown(requestID, userID, content)
 	if err != nil {
 		return err
 	}

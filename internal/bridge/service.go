@@ -15,10 +15,10 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/command"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
-	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
 // ErrInvalidServiceDependency 表示 BridgeService 缺少必需依赖。
@@ -47,12 +47,9 @@ type HerdrAPI interface {
 	SendKey(ctx context.Context, target, key string) error
 }
 
-// IMAdapter 是入站命令回复所需的最小企业微信能力。
+// IMAdapter 是入站命令回复所需的平台中立能力。
 type IMAdapter interface {
-	// RespondMarkdown 使用回调 req_id 发送首段 Markdown 回复。
-	RespondMarkdown(ctx context.Context, callbackRequestID, content string) error
-	// SendMarkdown 发送后续 Markdown 分段。
-	SendMarkdown(ctx context.Context, content string) error
+	im.ReplySink
 }
 
 // KeyAuditSink 同步接收已经过安全字段校验的显式按键审计记录。
@@ -192,7 +189,7 @@ func (s *Service) replaceSnapshot(snapshot herdr.Snapshot, reconnect, preserveSt
 }
 
 // HandleMessage 处理一条已完成企业微信协议校验的文本回调。
-func (s *Service) HandleMessage(ctx context.Context, message wecom.IncomingText) {
+func (s *Service) HandleMessage(ctx context.Context, message im.IncomingText) {
 	if s == nil {
 		return
 	}
@@ -258,7 +255,7 @@ func bridgeShortHash(value string) string {
 	return fmt.Sprintf("%x", digest[:8])
 }
 
-func (s *Service) handleList(ctx context.Context, message wecom.IncomingText) {
+func (s *Service) handleList(ctx context.Context, message im.IncomingText) {
 	client, release, availability := s.beginOperationDetailed(false)
 	if availability == operationReady {
 		snapshot, err := client.Snapshot(ctx)
@@ -294,7 +291,7 @@ func (s *Service) handleList(ctx context.Context, message wecom.IncomingText) {
 	s.reply(ctx, message.RequestID, content.String())
 }
 
-func (s *Service) handleSelect(ctx context.Context, message wecom.IncomingText, index int) {
+func (s *Service) handleSelect(ctx context.Context, message im.IncomingText, index int) {
 	s.transitionMu.Lock()
 	s.beginInputBarrierLocked()
 	s.stateMu.Lock()
@@ -319,7 +316,7 @@ func (s *Service) handleSelect(ctx context.Context, message wecom.IncomingText, 
 	s.reply(ctx, message.RequestID, fmt.Sprintf("已选择 %s（面板：%s）。", safeLabel(name), safeLabel(target.PaneID)))
 }
 
-func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, text string) {
+func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, text string) {
 	client, release, ok := s.beginOperation(true)
 	if !ok {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -446,7 +443,7 @@ func (s *Service) replyPromptSuccess(ctx context.Context, requestID string, stat
 	s.reply(ctx, requestID, fmt.Sprintf("已发送，Agent 状态已变为 %s。", safeLabel(string(status))))
 }
 
-func (s *Service) handleKeys(ctx context.Context, message wecom.IncomingText, keys []string) {
+func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys []string) {
 	if len(keys) == 0 {
 		s.reply(ctx, message.RequestID, "按键请求无效，未执行任何操作。")
 		return
@@ -591,7 +588,7 @@ func prepareKeyAudits(userID string, target session.Target, key string, at time.
 	return preparedKeyAudits{sent: audits[0], rejected: audits[1], failed: audits[2]}, nil
 }
 
-func (s *Service) handleContent(ctx context.Context, message wecom.IncomingText) {
+func (s *Service) handleContent(ctx context.Context, message im.IncomingText) {
 	client, release, ok := s.beginOperation(false)
 	if !ok {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -622,7 +619,7 @@ func (s *Service) handleContent(ctx context.Context, message wecom.IncomingText)
 	s.replyPage(ctx, message.RequestID, target, page, lines)
 }
 
-func (s *Service) handlePageUp(ctx context.Context, message wecom.IncomingText) {
+func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
 	client, release, ok := s.beginOperation(false)
 	if !ok {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -653,7 +650,7 @@ func (s *Service) handlePageUp(ctx context.Context, message wecom.IncomingText) 
 	s.replyPage(ctx, message.RequestID, target, page, lines)
 }
 
-func (s *Service) handlePageDown(ctx context.Context, message wecom.IncomingText) {
+func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
 	s.stateMu.Lock()
 	target, err := s.registry.ValidateSelected()
 	if err == nil && s.beforePageDownReply != nil {
