@@ -19,22 +19,24 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr, app.Run))
+	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, app.Run))
 }
 
 type appExecutor func(context.Context, app.Options) error
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute appExecutor) int {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, execute appExecutor) int {
 	flags := flag.NewFlagSet("herdr-pal", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	interactiveMode := flags.Bool("i", false, "进入本地交互模式")
 	configPath := flags.String("config", "", "本地 JSON 配置文件路径")
 	showVersion := flags.Bool("version", false, "显示版本")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "用法: herdr-pal -config /path/to/config.json")
-		fmt.Fprintln(stderr, "       herdr-pal --version")
+		fmt.Fprintln(stderr, "用法: herdr-pal -i [-config /path/to/config.json]")
+		fmt.Fprintln(stderr, "      herdr-pal -config /path/to/config.json")
+		fmt.Fprintln(stderr, "      herdr-pal --version")
 	}
 	if err := flags.Parse(args); err != nil {
-		fmt.Fprintln(stderr, "参数错误，请使用 -config 或 --version。")
+		fmt.Fprintln(stderr, "参数错误，请检查命令行参数。")
 		flags.Usage()
 		return 2
 	}
@@ -42,20 +44,26 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 		flags.Usage()
 		return 2
 	}
+	if *interactiveMode && *showVersion {
+		flags.Usage()
+		return 2
+	}
 	if *showVersion {
 		fmt.Fprintln(stdout, version.String())
 		return 0
 	}
-	if *configPath == "" {
+	if !*interactiveMode && *configPath == "" {
 		flags.Usage()
 		return 2
 	}
 
 	err := execute(ctx, app.Options{
-		ConfigPath: *configPath,
-		Getenv:     os.Getenv,
-		Stdout:     stdout,
-		Stderr:     stderr,
+		Interactive: *interactiveMode,
+		ConfigPath:  *configPath,
+		Stdin:       stdin,
+		Getenv:      os.Getenv,
+		Stdout:      stdout,
+		Stderr:      stderr,
 	})
 	if err == nil || ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return 0
