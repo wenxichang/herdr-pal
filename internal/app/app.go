@@ -18,6 +18,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/interactive"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
@@ -29,6 +30,7 @@ const (
 	defaultShutdownTimeout = 10 * time.Second
 	dedupeTTL              = 24 * time.Hour
 	dedupeCapacity         = 10000
+	maxPureErrorTreeDepth  = 64
 )
 
 var (
@@ -37,7 +39,9 @@ var (
 	// ErrShutdownTimeout 表示部分运行循环未能在退出上限内停止。
 	ErrShutdownTimeout = errors.New("优雅退出超时")
 	// ErrLoopStopped 表示常驻运行循环在未取消时意外结束。
-	ErrLoopStopped = errors.New("运行循环意外结束")
+	ErrLoopStopped               = errors.New("运行循环意外结束")
+	errSocketPathUnresolvable    = errors.New("Herdr Socket 路径无法可靠规范化")
+	errSocketSymlinkUnresolvable = errors.New("Herdr Socket symlink 无法可靠解析")
 
 	// 超时返回时运行循环可能仍持有网络资源，因此必须继续持有文件锁，避免同一进程内
 	// 的 finalizer 或 GC 间接解锁并允许第二个实例启动。该集合只接管超时锁；循环永久
@@ -48,13 +52,17 @@ var (
 
 // Options 是启动 Herdr Pal 所需的外部选项。
 type Options struct {
+	// Interactive 选择使用本机标准输入输出的交互模式。
+	Interactive bool
 	// ConfigPath 是非密钥 JSON 配置文件路径。
 	ConfigPath string
+	// Stdin 是交互模式输入；nil 时使用 os.Stdin。
+	Stdin io.Reader
 	// Getenv 读取企业微信 Secret；nil 时使用 os.Getenv。
 	Getenv func(string) string
 	// Runner 调用 Herdr 公共 CLI 解析 Socket；nil 时使用本机命令执行器。
 	Runner herdr.CommandRunner
-	// Stdout 保留给应用标准输出；nil 时丢弃。
+	// Stdout 是应用标准输出；交互模式下 nil 使用 os.Stdout，普通模式下 nil 丢弃。
 	Stdout io.Writer
 	// Stderr 接收结构化运行日志；nil 时使用 os.Stderr。
 	Stderr io.Writer
@@ -99,18 +107,21 @@ type applicationRuntime struct {
 }
 
 type appDependencies struct {
-	loadConfig      func(string, func(string) string) (config.Config, error)
-	userCacheDir    func() (string, error)
-	mkdirAll        func(string, os.FileMode) error
-	acquireLock     func(string) (processLock, error)
-	resolveSocket   func(context.Context, string, string, herdr.CommandRunner) (string, error)
-	assemble        func(config.Config, string, *slog.Logger) (*applicationRuntime, error)
-	shutdownTimeout time.Duration
+	loadConfig            func(string, func(string) string) (config.Config, error)
+	loadInteractiveConfig func(string) (config.Config, error)
+	userCacheDir          func() (string, error)
+	mkdirAll              func(string, os.FileMode) error
+	acquireLock           func(string) (processLock, error)
+	resolveSocket         func(context.Context, string, string, herdr.CommandRunner) (string, error)
+	assemble              func(config.Config, string, *slog.Logger) (*applicationRuntime, error)
+	assembleInteractive   func(config.Config, string, io.Reader, io.Writer, *slog.Logger) (*applicationRuntime, error)
+	shutdownTimeout       time.Duration
 }
 
 type assemblyDependencies struct {
-	newHerdr func(string) bridge.ManagedHerdr
-	newWeCom func(wecom.ClientConfig) (imRuntime, error)
+	newHerdr       func(string) bridge.ManagedHerdr
+	newWeCom       func(wecom.ClientConfig) (imRuntime, error)
+	newInteractive func(io.Reader, io.Writer) (imRuntime, error)
 }
 
 type staticHerdrFactory struct {
@@ -130,8 +141,15 @@ func (commandRunner) Output(ctx context.Context, name string, args ...string) ([
 	return exec.CommandContext(ctx, name, args...).Output()
 }
 
-// Run 加载配置、获取进程锁并运行 bridge，直到 context 取消或运行循环失败。
-func Run(ctx context.Context, options Options) (runErr error) {
+// Run 按选项选择运行模式，直到 context 取消或运行循环失败。
+func Run(ctx context.Context, options Options) error {
+	if options.Interactive {
+		return runInteractive(ctx, options)
+	}
+	return runWeCom(ctx, options)
+}
+
+func runWeCom(ctx context.Context, options Options) (runErr error) {
 	if ctx == nil {
 		return fmt.Errorf("%w: context 不能为空", ErrConfig)
 	}
@@ -183,18 +201,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	}
 	var timedOutComponentsDone <-chan struct{}
 	defer func() {
-		if errors.Is(runErr, ErrShutdownTimeout) {
-			retainProcessLockUntilDone(lock, timedOutComponentsDone)
-			return
-		}
-		if err := lock.Release(); err != nil {
-			releaseErr := fmt.Errorf("释放进程锁: %w", err)
-			if runErr == nil {
-				runErr = releaseErr
-			} else {
-				runErr = errors.Join(runErr, releaseErr)
-			}
-		}
+		finishProcessLock(lock, &runErr, timedOutComponentsDone)
 	}()
 
 	socketPath, err := dependencies.resolveSocket(ctx, loaded.Herdr.SocketPath, loaded.Herdr.Session, runner)
@@ -221,15 +228,155 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	return runErr
 }
 
+func runInteractive(ctx context.Context, options Options) (runErr error) {
+	if ctx == nil {
+		return fmt.Errorf("%w: context 不能为空", ErrConfig)
+	}
+	dependencies := options.dependencies
+	if dependencies == nil {
+		dependencies = defaultAppDependencies()
+	}
+	runner := options.Runner
+	if runner == nil {
+		runner = commandRunner{}
+	}
+	stdin := options.Stdin
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	stdout := options.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := options.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+
+	loaded, err := dependencies.loadInteractiveConfig(options.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	logger, err := newLogger(stderr, loaded.Log.Level)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	socketPath, err := dependencies.resolveSocket(ctx, loaded.Herdr.SocketPath, loaded.Herdr.Session, runner)
+	if err != nil {
+		return fmt.Errorf("解析 Herdr Socket: %w", err)
+	}
+	stableSocketPath, err := canonicalSocketPath(socketPath)
+	if err != nil {
+		return fmt.Errorf("规范化 Herdr Socket: %w", err)
+	}
+	socketHash := shortHash(stableSocketPath)
+	cacheDir, err := dependencies.userCacheDir()
+	if err != nil {
+		return fmt.Errorf("获取缓存目录: %w", err)
+	}
+	lockDir := filepath.Join(cacheDir, "herdr-pal")
+	if err := dependencies.mkdirAll(lockDir, 0o700); err != nil {
+		return fmt.Errorf("创建锁目录: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, "interactive-"+socketHash+".lock")
+	lock, err := dependencies.acquireLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("获取进程锁: %w", err)
+	}
+	var timedOutComponentsDone <-chan struct{}
+	defer func() {
+		finishProcessLock(lock, &runErr, timedOutComponentsDone)
+	}()
+
+	runtime, err := dependencies.assembleInteractive(loaded, stableSocketPath, stdin, stdout, logger)
+	if err != nil {
+		return fmt.Errorf("组装应用: %w", err)
+	}
+	if runtime == nil || runtime.im == nil || runtime.supervisor == nil || runtime.handler == nil {
+		return errors.New("组装应用: 运行时依赖无效")
+	}
+
+	logger.Info("Herdr Pal 启动", "mode", "interactive", "socket_hash", socketHash)
+	outcome := runRuntime(ctx, runtime, dependencies.shutdownTimeout)
+	runErr = outcome.err
+	timedOutComponentsDone = outcome.componentsDone
+	if runErr != nil {
+		logger.Error("Herdr Pal 停止", "error_type", safeErrorType(runErr))
+	} else {
+		logger.Info("Herdr Pal 已停止", "mode", "interactive", "socket_hash", socketHash)
+	}
+	return runErr
+}
+
+// canonicalSocketPath 冻结交互锁、日志与连接共同使用的路径，避免 symlink 别名和重定向漂移。
+func canonicalSocketPath(socketPath string) (string, error) {
+	if strings.TrimSpace(socketPath) == "" {
+		return "", errors.New("Herdr Socket 路径不能为空")
+	}
+	absolute, err := filepath.Abs(filepath.Clean(socketPath))
+	if err != nil {
+		return "", errSocketPathUnresolvable
+	}
+
+	candidate := absolute
+	suffix := make([]string, 0, 4)
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(candidate)
+		if resolveErr == nil {
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+
+		info, lstatErr := os.Lstat(candidate)
+		if lstatErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return "", errSocketSymlinkUnresolvable
+			}
+			return "", errSocketPathUnresolvable
+		}
+		if !os.IsNotExist(resolveErr) || !os.IsNotExist(lstatErr) {
+			return "", errSocketPathUnresolvable
+		}
+
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", errSocketPathUnresolvable
+		}
+		suffix = append(suffix, filepath.Base(candidate))
+		candidate = parent
+	}
+}
+
+func finishProcessLock(lock processLock, runErr *error, timedOutComponentsDone <-chan struct{}) {
+	if errors.Is(*runErr, ErrShutdownTimeout) {
+		retainProcessLockUntilDone(lock, timedOutComponentsDone)
+		return
+	}
+	if err := lock.Release(); err != nil {
+		releaseErr := fmt.Errorf("释放进程锁: %w", err)
+		if *runErr == nil {
+			*runErr = releaseErr
+		} else {
+			*runErr = errors.Join(*runErr, releaseErr)
+		}
+	}
+}
+
 func defaultAppDependencies() *appDependencies {
 	return &appDependencies{
-		loadConfig:    config.Load,
-		userCacheDir:  os.UserCacheDir,
-		mkdirAll:      os.MkdirAll,
-		acquireLock:   func(path string) (processLock, error) { return processlock.Acquire(path) },
-		resolveSocket: herdr.ResolveSocket,
+		loadConfig:            config.Load,
+		loadInteractiveConfig: config.LoadInteractive,
+		userCacheDir:          os.UserCacheDir,
+		mkdirAll:              os.MkdirAll,
+		acquireLock:           func(path string) (processLock, error) { return processlock.Acquire(path) },
+		resolveSocket:         herdr.ResolveSocket,
 		assemble: func(loaded config.Config, socketPath string, logger *slog.Logger) (*applicationRuntime, error) {
 			return assembleRuntime(loaded, socketPath, logger, defaultAssemblyDependencies())
+		},
+		assembleInteractive: func(loaded config.Config, socketPath string, input io.Reader, output io.Writer, logger *slog.Logger) (*applicationRuntime, error) {
+			return assembleInteractiveRuntime(loaded, socketPath, input, output, logger, defaultAssemblyDependencies())
 		},
 		shutdownTimeout: defaultShutdownTimeout,
 	}
@@ -246,6 +393,9 @@ func defaultAssemblyDependencies() assemblyDependencies {
 				return nil, err
 			}
 			return client, nil
+		},
+		newInteractive: func(input io.Reader, output io.Writer) (imRuntime, error) {
+			return interactive.NewAdapter(input, output)
 		},
 	}
 }
@@ -274,9 +424,68 @@ func assembleRuntime(loaded config.Config, socketPath string, logger *slog.Logge
 	return assembleBridgeRuntime(im, loaded.WeCom.AllowedUserID, client, logger)
 }
 
+func assembleInteractiveRuntime(_ config.Config, socketPath string, input io.Reader, output io.Writer, logger *slog.Logger, dependencies assemblyDependencies) (*applicationRuntime, error) {
+	if logger == nil {
+		return nil, errors.New("结构化日志器无效")
+	}
+	client := dependencies.newHerdr(socketPath)
+	if client == nil {
+		return nil, errors.New("Herdr Client 无效")
+	}
+	im, err := dependencies.newInteractive(input, output)
+	if err != nil {
+		return nil, fmt.Errorf("创建交互适配器: %w", err)
+	}
+	runtime, err := assembleBridgeRuntime(im, interactive.UserID, client, logger)
+	if err != nil {
+		return nil, err
+	}
+	runtime.normalIMExit = func(err error) bool {
+		return isPureErrorTree(err, interactive.ErrInputClosed)
+	}
+	return runtime, nil
+}
+
+// isPureErrorTree 只接受每条解包分支都归结为 target 的有限错误树，避免宽松 Is 匹配隐藏联合根因。
+func isPureErrorTree(err error, target error) bool {
+	return isPureErrorTreeAtDepth(err, target, 0)
+}
+
+func isPureErrorTreeAtDepth(err error, target error, depth int) bool {
+	if err == nil || target == nil {
+		return false
+	}
+	if err == target {
+		return true
+	}
+	if depth >= maxPureErrorTreeDepth {
+		return false
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		children := wrapped.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isPureErrorTreeAtDepth(child, target, depth+1) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return isPureErrorTreeAtDepth(wrapped.Unwrap(), target, depth+1)
+	default:
+		return false
+	}
+}
+
 func assembleBridgeRuntime(im imRuntime, allowedUserID string, client bridge.ManagedHerdr, logger *slog.Logger) (*applicationRuntime, error) {
 	if logger == nil {
 		return nil, errors.New("结构化日志器无效")
+	}
+	if im == nil {
+		return nil, errors.New("IM Adapter 无效")
 	}
 	if client == nil {
 		return nil, errors.New("Herdr Client 无效")
@@ -356,6 +565,14 @@ type runtimeOutcome struct {
 	componentsDone <-chan struct{}
 }
 
+type shutdownCause uint8
+
+const (
+	shutdownCauseComponent shutdownCause = iota
+	shutdownCauseParent
+	shutdownCauseNormalIM
+)
+
 func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTimeout time.Duration) runtimeOutcome {
 	if parent.Err() != nil {
 		return runtimeOutcome{}
@@ -380,15 +597,22 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 
 	collected := make([]componentResult, 0, 3)
 	selectedParent := false
-	var selectedResult *componentResult
+	var selectedResult componentResult
+	selectedComponent := false
 	select {
 	case <-parent.Done():
 		selectedParent = true
 	case result := <-results:
 		collected = append(collected, result)
-		selectedResult = &result
+		selectedResult = result
+		selectedComponent = true
 	}
-	shutdownTriggeredByParent := parentTriggeredShutdown(parent, selectedParent, selectedResult)
+	cause := shutdownCauseComponent
+	if parentTriggeredShutdown(parent, selectedParent, selectedResult, selectedComponent) {
+		cause = shutdownCauseParent
+	} else if normalIMTriggeredShutdown(runtime, selectedResult, selectedComponent) {
+		cause = shutdownCauseNormalIM
+	}
 	// 先停止业务消息消费，再取消两侧连接和未完成请求。
 	stopMessages()
 	cancelComponents()
@@ -401,20 +625,25 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 			collected = append(collected, result)
 		case <-timer.C:
 			componentsDone := collectRemainingComponents(results, 3-len(collected))
-			if rootErr := runtimeRootError(shutdownTriggeredByParent, collected); rootErr != nil {
+			if rootErr := runtimeRootError(cause, collected); rootErr != nil {
 				return runtimeOutcome{err: errors.Join(rootErr, ErrShutdownTimeout), componentsDone: componentsDone}
 			}
 			return runtimeOutcome{err: ErrShutdownTimeout, componentsDone: componentsDone}
 		}
 	}
-	return runtimeOutcome{err: runtimeRootError(shutdownTriggeredByParent, collected)}
+	return runtimeOutcome{err: runtimeRootError(cause, collected)}
 }
 
-func parentTriggeredShutdown(parent context.Context, selectedParent bool, selectedResult *componentResult) bool {
+func parentTriggeredShutdown(parent context.Context, selectedParent bool, selectedResult componentResult, selectedComponent bool) bool {
 	if selectedParent {
 		return true
 	}
-	return selectedResult != nil && selectedResult.shutdownDerived && parent.Err() != nil
+	return selectedComponent && selectedResult.shutdownDerived && parent.Err() != nil
+}
+
+func normalIMTriggeredShutdown(runtime *applicationRuntime, selectedResult componentResult, selectedComponent bool) bool {
+	return runtime != nil && runtime.normalIMExit != nil && selectedComponent &&
+		selectedResult.name == "im" && runtime.normalIMExit(selectedResult.err)
 }
 
 func runComponent(ctx context.Context, name string, primary bool, run func(context.Context) error, results chan<- componentResult) {
@@ -426,9 +655,12 @@ func runComponent(ctx context.Context, name string, primary bool, run func(conte
 	}
 }
 
-func runtimeRootError(shutdownTriggeredByParent bool, results []componentResult) error {
-	if shutdownTriggeredByParent {
+func runtimeRootError(cause shutdownCause, results []componentResult) error {
+	if cause == shutdownCauseParent {
 		return nil
+	}
+	if cause == shutdownCauseNormalIM {
+		return runtimeRootErrorAfterNormalIM(results)
 	}
 	for _, result := range results {
 		if !result.primary || result.err == nil || result.shutdownDerived {
@@ -447,6 +679,22 @@ func runtimeRootError(shutdownTriggeredByParent bool, results []componentResult)
 		}
 	}
 	return ErrLoopStopped
+}
+
+func runtimeRootErrorAfterNormalIM(results []componentResult) error {
+	for _, result := range results {
+		if result.name == "im" || !result.primary || result.err == nil || result.shutdownDerived {
+			continue
+		}
+		return fmt.Errorf("%s 运行失败: %w", result.name, result.err)
+	}
+	for _, result := range results {
+		if result.name == "im" || result.primary || result.err == nil || result.shutdownDerived {
+			continue
+		}
+		return fmt.Errorf("%s 运行失败: %w", result.name, result.err)
+	}
+	return nil
 }
 
 func collectRemainingComponents(results <-chan componentResult, remaining int) <-chan struct{} {
