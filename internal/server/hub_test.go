@@ -124,6 +124,31 @@ func TestHubHeartbeatTimeoutRemovesUnresponsiveClient(t *testing.T) {
 	eventuallyHub(t, func() bool { return !hub.Catalog().HasMachine("user-a", "home-mac") })
 }
 
+func TestHubDispatchesPushAndNotificationThroughBoundedOutboundSink(t *testing.T) {
+	hub, relayServer := startHubServer(t, HubConfig{})
+	sink := &hubOutboundRecorder{events: make(chan string, 2)}
+	if err := hub.SetOutboundSink(sink); err != nil {
+		t.Fatal(err)
+	}
+	client := dialReadyHubClient(t, relayServer, "user-a", "home-mac")
+	defer client.Close()
+	client.WriteFrame(t, relayproto.TypeExecutePush, "request-1", relayproto.ExecutePush{Content: "push"})
+	client.WriteFrame(t, relayproto.TypeNotification, "", relayproto.Notification{
+		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"},
+		Content: "notice",
+	})
+	for _, want := range []string{"push:user-a:push", "notification:user-a:home-mac:notice"} {
+		select {
+		case got := <-sink.events:
+			if got != want {
+				t.Fatalf("event = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing outbound event %q", want)
+		}
+	}
+}
+
 func startHubServer(t *testing.T, config HubConfig) (*ClientHub, *httptest.Server) {
 	t.Helper()
 	hub, err := NewClientHub(NewSessionCatalog(), config, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
@@ -212,4 +237,18 @@ func eventuallyHub(t *testing.T, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition was not satisfied")
+}
+
+type hubOutboundRecorder struct {
+	events chan string
+}
+
+func (sink *hubOutboundRecorder) SendPush(_ context.Context, userID, content string) error {
+	sink.events <- "push:" + userID + ":" + content
+	return nil
+}
+
+func (sink *hubOutboundRecorder) SendNotification(_ context.Context, userID, machineID string, notification relayproto.Notification) error {
+	sink.events <- "notification:" + userID + ":" + machineID + ":" + notification.Content
+	return nil
 }

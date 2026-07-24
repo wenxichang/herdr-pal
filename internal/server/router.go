@@ -45,6 +45,43 @@ type RelayRequester interface {
 	Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (string, error)
 }
 
+// SendPush 把客户端后续分段主动发送给所属企业微信用户。
+func (router *ConversationRouter) SendPush(ctx context.Context, userID, content string) error {
+	if router == nil || strings.TrimSpace(userID) == "" {
+		return ErrInvalidRouterDependency
+	}
+	return router.gateway.SendMarkdownTo(ctx, userID, content)
+}
+
+// SendNotification 复核最新目录并补充机器、本地序号和 panel 标题。
+func (router *ConversationRouter) SendNotification(ctx context.Context, userID, machineID string, notification relayproto.Notification) error {
+	if router == nil || notification.Target.MachineID != machineID {
+		return ErrTargetChanged
+	}
+	entry, err := router.catalog.ResolveTarget(userID, notification.Target)
+	if err != nil {
+		return err
+	}
+	name := entry.Session.DisplayAgent
+	if name == "" {
+		name = entry.Session.Agent
+	}
+	header := fmt.Sprintf("[%s/%d] %s", safeRouterLabel(machineID), entry.Ref.LocalIndex, safeRouterLabel(name))
+	if entry.Session.Title != "" {
+		header += " — " + safeRouterLabel(entry.Session.Title)
+	}
+	parts := panel.SplitMarkdown(header+"\n"+notification.Content, panel.WeComContentLimit)
+	if len(parts) == 0 {
+		return errors.New("通知内容无效")
+	}
+	for _, part := range parts {
+		if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ConversationRouter 处理企业微信全局命令并把其他输入转发给选中机器。
 type ConversationRouter struct {
 	catalog        *SessionCatalog

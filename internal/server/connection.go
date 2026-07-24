@@ -24,10 +24,12 @@ type clientConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	sendQueue  chan relayproto.Frame
-	writerDone chan struct{}
-	ready      atomic.Bool
-	lastPong   atomic.Int64
+	sendQueue     chan relayproto.Frame
+	writerDone    chan struct{}
+	outboundQueue chan relayproto.Frame
+	outboundDone  chan struct{}
+	ready         atomic.Bool
+	lastPong      atomic.Int64
 
 	pendingMu  sync.Mutex
 	pending    map[string]pendingRequest
@@ -39,6 +41,7 @@ func newClientConnection(parent context.Context, id string, key ClientKey, socke
 	connection := &clientConnection{
 		id: id, key: key, socket: socket, ctx: ctx, cancel: cancel,
 		sendQueue: make(chan relayproto.Frame, sendCapacity), writerDone: make(chan struct{}),
+		outboundQueue: make(chan relayproto.Frame, sendCapacity), outboundDone: make(chan struct{}),
 		pending: make(map[string]pendingRequest), maxPending: maxPending,
 	}
 	connection.lastPong.Store(time.Now().UnixNano())

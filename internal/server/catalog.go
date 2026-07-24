@@ -239,6 +239,20 @@ func (catalog *SessionCatalog) Selected(userID string) (CatalogEntry, error) {
 	return entry, nil
 }
 
+// ResolveTarget 从最新目录复核任意稳定目标，不修改用户编号或选择。
+func (catalog *SessionCatalog) ResolveTarget(userID string, target relayproto.SessionRef) (CatalogEntry, error) {
+	if catalog == nil {
+		return CatalogEntry{}, ErrTargetChanged
+	}
+	catalog.mu.RLock()
+	defer catalog.mu.RUnlock()
+	entry, ok := catalog.findEntryLocked(userID, target)
+	if !ok {
+		return CatalogEntry{}, ErrTargetChanged
+	}
+	return entry, nil
+}
+
 func (catalog *SessionCatalog) entriesLocked(userID string) []CatalogEntry {
 	entries := make([]CatalogEntry, 0)
 	for key, machine := range catalog.machines {

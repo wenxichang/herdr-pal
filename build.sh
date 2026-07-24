@@ -20,3 +20,8 @@ CGO_ENABLED=0 go build -trimpath \
 	-ldflags "-X github.com/wenxichang/herdr-pal/internal/version.Version=${VERSION} -X github.com/wenxichang/herdr-pal/internal/version.Commit=${COMMIT} -X github.com/wenxichang/herdr-pal/internal/version.BuiltAt=${BUILT_AT}" \
 	-o dist/herdr-pal \
 	./cmd/herdr-pal
+
+CGO_ENABLED=0 go build -trimpath \
+	-ldflags "-X github.com/wenxichang/herdr-pal/internal/version.Version=${VERSION} -X github.com/wenxichang/herdr-pal/internal/version.Commit=${COMMIT} -X github.com/wenxichang/herdr-pal/internal/version.BuiltAt=${BUILT_AT}" \
+	-o dist/herdr-pal-server \
+	./cmd/herdr-pal-server

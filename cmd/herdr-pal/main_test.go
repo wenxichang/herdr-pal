@@ -32,7 +32,6 @@ func TestRunParsesCLIAndMapsExitCodes(t *testing.T) {
 		forbidStderr    []string
 		wantConfigPath  string
 		wantInteractive bool
-		wantDiscover    bool
 		wantExecutions  int
 	}{
 		{name: "显示版本", args: []string{"--version"}, wantStdout: version.String() + "\n"},
@@ -53,13 +52,7 @@ func TestRunParsesCLIAndMapsExitCodes(t *testing.T) {
 			name: "配置路径启动成功", args: []string{"-config", "/tmp/pal.json"},
 			execute: func(context.Context, app.Options) error { return nil }, wantConfigPath: "/tmp/pal.json", wantExecutions: 1,
 		},
-		{
-			name: "用户发现模式启动成功", args: []string{"-discover-user", "-config", "/tmp/pal.json"},
-			execute: func(context.Context, app.Options) error { return nil }, wantConfigPath: "/tmp/pal.json", wantDiscover: true, wantExecutions: 1,
-		},
-		{name: "用户发现模式必须提供配置", args: []string{"-discover-user"}, wantCode: 2, wantStderrPart: "-config"},
-		{name: "用户发现模式和交互模式互斥", args: []string{"-discover-user", "-i", "-config", "/tmp/pal.json"}, wantCode: 2, wantStderrPart: "用法"},
-		{name: "用户发现模式和版本互斥", args: []string{"-discover-user", "--version", "-config", "/tmp/pal.json"}, wantCode: 2, wantStderrPart: "用法"},
+		{name: "用户发现模式已移除", args: []string{"-discover-user", "-config", "/tmp/pal.json"}, wantCode: 2, wantStderrPart: "参数错误"},
 		{
 			name: "配置错误退出二", args: []string{"-config", "/tmp/bad.json"}, wantCode: 2,
 			execute: func(context.Context, app.Options) error {
@@ -143,9 +136,6 @@ func TestRunParsesCLIAndMapsExitCodes(t *testing.T) {
 			}
 			if gotOptions.Interactive != test.wantInteractive {
 				t.Errorf("Interactive = %t, want %t", gotOptions.Interactive, test.wantInteractive)
-			}
-			if gotOptions.DiscoverUser != test.wantDiscover {
-				t.Errorf("DiscoverUser = %t, want %t", gotOptions.DiscoverUser, test.wantDiscover)
 			}
 			if executions != test.wantExecutions {
 				t.Errorf("execute() calls = %d, want %d", executions, test.wantExecutions)

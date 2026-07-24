@@ -53,6 +53,15 @@ type ClientHub struct {
 
 	mu      sync.RWMutex
 	clients map[ClientKey]*clientConnection
+
+	outboundMu sync.RWMutex
+	outbound   HubOutboundSink
+}
+
+// HubOutboundSink 接收客户端后续分段和结构化主动通知。
+type HubOutboundSink interface {
+	SendPush(ctx context.Context, userID, content string) error
+	SendNotification(ctx context.Context, userID, machineID string, notification relayproto.Notification) error
 }
 
 // NewClientHub 创建空的 Relay WSS 连接中心。
@@ -70,6 +79,20 @@ func (hub *ClientHub) Catalog() *SessionCatalog {
 		return nil
 	}
 	return hub.catalog
+}
+
+// SetOutboundSink 设置企业微信出站接收器；已有接收器时拒绝替换。
+func (hub *ClientHub) SetOutboundSink(sink HubOutboundSink) error {
+	if hub == nil || sink == nil {
+		return ErrInvalidHubDependency
+	}
+	hub.outboundMu.Lock()
+	defer hub.outboundMu.Unlock()
+	if hub.outbound != nil {
+		return ErrInvalidHubDependency
+	}
+	hub.outbound = sink
+	return nil
 }
 
 // ServeHTTP 接受一条只允许 TLS 的 Relay WebSocket 连接。
@@ -190,6 +213,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 	connection.ready.Store(true)
 
 	heartbeatDone := make(chan struct{})
+	go hub.runOutbound(connection)
 	go func() {
 		defer close(heartbeatDone)
 		hub.runHeartbeat(connection)
@@ -197,6 +221,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 	hub.readLoop(connection)
 	connection.cancel()
 	<-heartbeatDone
+	<-connection.outboundDone
 }
 
 func (hub *ClientHub) readLoop(connection *clientConnection) {
@@ -231,9 +256,53 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 				return
 			}
 		case relayproto.TypeExecutePush, relayproto.TypeNotification:
-			// 后续分段和通知在服务端 Runtime 接入动态企业微信发送。
+			select {
+			case connection.outboundQueue <- frame:
+			case <-connection.ctx.Done():
+				return
+			default:
+				return
+			}
 		default:
 			return
+		}
+	}
+}
+
+func (hub *ClientHub) runOutbound(connection *clientConnection) {
+	defer close(connection.outboundDone)
+	for {
+		select {
+		case <-connection.ctx.Done():
+			return
+		case frame := <-connection.outboundQueue:
+			hub.outboundMu.RLock()
+			sink := hub.outbound
+			hub.outboundMu.RUnlock()
+			if sink == nil {
+				continue
+			}
+			var err error
+			switch frame.Type {
+			case relayproto.TypeExecutePush:
+				var push relayproto.ExecutePush
+				push, err = relayproto.DecodePayload[relayproto.ExecutePush](frame)
+				if err == nil {
+					err = sink.SendPush(connection.ctx, connection.key.UserID, push.Content)
+				}
+			case relayproto.TypeNotification:
+				var notification relayproto.Notification
+				notification, err = relayproto.DecodePayload[relayproto.Notification](frame)
+				if err == nil && notification.Target.MachineID != connection.key.MachineID {
+					err = ErrTargetChanged
+				}
+				if err == nil {
+					err = sink.SendNotification(connection.ctx, connection.key.UserID, connection.key.MachineID, notification)
+				}
+			}
+			if err != nil {
+				hub.logger.Warn("Relay 出站消息发送失败", "error_type", "outbound")
+			}
 		}
 	}
 }

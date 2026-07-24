@@ -130,6 +130,49 @@ func TestRouterExecuteTimeoutDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
+	router, gateway, _ := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
+		Sequence: 1,
+		Sessions: []relayproto.Session{{
+			LocalIndex: 2, PaneID: "pane-1", TerminalID: "terminal-1", OccupantHash: "occ-1",
+			Agent: "claude", DisplayAgent: "Claude", Title: "修复登录", Workspace: "backend", Tab: "debug", Status: "blocked",
+		}},
+	})
+	if err := router.SendPush(context.Background(), "user-a", "后续分段"); err != nil {
+		t.Fatalf("SendPush() error = %v", err)
+	}
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{
+		Target:  relayproto.SessionRef{MachineID: "office-pc", LocalIndex: 2, PaneID: "pane-1", OccupantHash: "occ-1"},
+		Content: "Agent 已阻塞，需要你的处理。",
+	}); err != nil {
+		t.Fatalf("SendNotification() error = %v", err)
+	}
+	replies := gateway.Replies()
+	if len(replies) != 2 || replies[0] != "后续分段" {
+		t.Fatalf("replies = %#v", replies)
+	}
+	for _, want := range []string{"[office-pc/2] Claude — 修复登录", "Agent 已阻塞"} {
+		if !strings.Contains(replies[1], want) {
+			t.Fatalf("notification %q lacks %q", replies[1], want)
+		}
+	}
+}
+
+func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
+	router, gateway, _ := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "new-occ", "title")},
+	})
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
+		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "old-occ"},
+		Content: "stale",
+	})
+	if !errors.Is(err, ErrTargetChanged) || gateway.ReplyCount() != 0 {
+		t.Fatalf("SendNotification() = %v, replies %d", err, gateway.ReplyCount())
+	}
+}
+
 func newRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *routerRelay) {
 	t.Helper()
 	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
@@ -194,6 +237,12 @@ func (gateway *routerGateway) ReplyCount() int {
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
 	return len(gateway.replies)
+}
+
+func (gateway *routerGateway) Replies() []string {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	return append([]string(nil), gateway.replies...)
 }
 
 type routerRelayCall struct {
