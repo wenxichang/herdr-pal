@@ -72,7 +72,7 @@ type retainedProcessLock struct {
 	lock processLock
 }
 
-type weComRuntime interface {
+type imRuntime interface {
 	bridge.IMAdapter
 	Run(ctx context.Context) error
 	Events() <-chan wecom.IncomingText
@@ -87,9 +87,10 @@ type messageHandler interface {
 }
 
 type applicationRuntime struct {
-	wecom      weComRuntime
-	supervisor runtimeRunner
-	handler    messageHandler
+	im           imRuntime
+	supervisor   runtimeRunner
+	handler      messageHandler
+	normalIMExit func(error) bool
 
 	herdr    bridge.ManagedHerdr
 	factory  bridge.HerdrFactory
@@ -109,7 +110,7 @@ type appDependencies struct {
 
 type assemblyDependencies struct {
 	newHerdr func(string) bridge.ManagedHerdr
-	newWeCom func(wecom.ClientConfig) (weComRuntime, error)
+	newWeCom func(wecom.ClientConfig) (imRuntime, error)
 }
 
 type staticHerdrFactory struct {
@@ -204,7 +205,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("组装应用: %w", err)
 	}
-	if runtime == nil || runtime.wecom == nil || runtime.supervisor == nil || runtime.handler == nil {
+	if runtime == nil || runtime.im == nil || runtime.supervisor == nil || runtime.handler == nil {
 		return errors.New("组装应用: 运行时依赖无效")
 	}
 
@@ -239,8 +240,12 @@ func defaultAssemblyDependencies() assemblyDependencies {
 		newHerdr: func(socketPath string) bridge.ManagedHerdr {
 			return herdr.NewClient(socketPath, nil, 0)
 		},
-		newWeCom: func(clientConfig wecom.ClientConfig) (weComRuntime, error) {
-			return wecom.NewClient(clientConfig)
+		newWeCom: func(clientConfig wecom.ClientConfig) (imRuntime, error) {
+			client, err := wecom.NewClient(clientConfig)
+			if err != nil {
+				return nil, err
+			}
+			return client, nil
 		},
 	}
 }
@@ -266,9 +271,19 @@ func assembleRuntime(loaded config.Config, socketPath string, logger *slog.Logge
 	if err != nil {
 		return nil, fmt.Errorf("创建企业微信客户端: %w", err)
 	}
+	return assembleBridgeRuntime(im, loaded.WeCom.AllowedUserID, client, logger)
+}
+
+func assembleBridgeRuntime(im imRuntime, allowedUserID string, client bridge.ManagedHerdr, logger *slog.Logger) (*applicationRuntime, error) {
+	if logger == nil {
+		return nil, errors.New("结构化日志器无效")
+	}
+	if client == nil {
+		return nil, errors.New("Herdr Client 无效")
+	}
 	registry := &session.Registry{}
 	buffer := &panel.Buffer{}
-	guard, err := policy.NewGuard(loaded.WeCom.AllowedUserID)
+	guard, err := policy.NewGuard(allowedUserID)
 	if err != nil {
 		return nil, fmt.Errorf("创建输入策略: %w", err)
 	}
@@ -290,7 +305,7 @@ func assembleRuntime(loaded config.Config, socketPath string, logger *slog.Logge
 		return nil, fmt.Errorf("创建 Herdr Supervisor: %w", err)
 	}
 	return &applicationRuntime{
-		wecom: im, supervisor: supervisor, handler: service,
+		im: im, supervisor: supervisor, handler: service,
 		herdr: client, factory: factory, service: service, notifier: notifier,
 	}, nil
 }
@@ -331,6 +346,7 @@ func (h auditLogHandler) WithGroup(name string) slog.Handler {
 
 type componentResult struct {
 	name            string
+	primary         bool
 	err             error
 	shutdownDerived bool
 }
@@ -353,13 +369,13 @@ func runRuntime(parent context.Context, runtime *applicationRuntime, shutdownTim
 	defer cancelComponents()
 	defer stopMessages()
 	results := make(chan componentResult, 3)
-	start := func(name string, run func(context.Context) error) {
-		go runComponent(componentContext, name, run, results)
+	start := func(name string, primary bool, run func(context.Context) error) {
+		go runComponent(componentContext, name, primary, run, results)
 	}
-	start("wecom", runtime.wecom.Run)
-	start("herdr", runtime.supervisor.Run)
-	go runComponent(messageContext, "messages", func(ctx context.Context) error {
-		return consumeMessages(ctx, runtime.wecom.Events(), runtime.handler)
+	start("im", true, runtime.im.Run)
+	start("herdr", true, runtime.supervisor.Run)
+	go runComponent(messageContext, "messages", false, func(ctx context.Context) error {
+		return consumeMessages(ctx, runtime.im.Events(), runtime.handler)
 	}, results)
 
 	collected := make([]componentResult, 0, 3)
@@ -401,11 +417,11 @@ func parentTriggeredShutdown(parent context.Context, selectedParent bool, select
 	return selectedResult != nil && selectedResult.shutdownDerived && parent.Err() != nil
 }
 
-func runComponent(ctx context.Context, name string, run func(context.Context) error, results chan<- componentResult) {
+func runComponent(ctx context.Context, name string, primary bool, run func(context.Context) error, results chan<- componentResult) {
 	err := run(ctx)
 	contextErr := ctx.Err()
 	results <- componentResult{
-		name: name, err: err,
+		name: name, primary: primary, err: err,
 		shutdownDerived: contextErr != nil && errors.Is(err, contextErr),
 	}
 }
@@ -415,7 +431,7 @@ func runtimeRootError(shutdownTriggeredByParent bool, results []componentResult)
 		return nil
 	}
 	for _, result := range results {
-		if (result.name != "wecom" && result.name != "herdr") || result.err == nil || result.shutdownDerived {
+		if !result.primary || result.err == nil || result.shutdownDerived {
 			continue
 		}
 		return fmt.Errorf("%s 运行失败: %w", result.name, result.err)

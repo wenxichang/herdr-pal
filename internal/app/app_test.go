@@ -107,27 +107,12 @@ func TestRunResolvesSocketBeforeAssemblyAndUsesSafeLockName(t *testing.T) {
 	}
 }
 
-func TestAssembleRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testing.T) {
+func TestAssembleBridgeRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testing.T) {
 	managed := newFakeManagedHerdr()
 	im := newFakeWeCom()
-	dependencies := defaultAssemblyDependencies()
-	dependencies.newHerdr = func(socketPath string) bridge.ManagedHerdr {
-		if socketPath != "/tmp/shared.sock" {
-			t.Fatalf("newHerdr socket = %q", socketPath)
-		}
-		return managed
-	}
-	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (weComRuntime, error) {
-		if clientConfig.Endpoint != wecom.DefaultEndpoint || clientConfig.BotID != "bot-sensitive" ||
-			clientConfig.AllowedUserID != "user-sensitive" || clientConfig.Secret != "secret-sensitive" {
-			t.Fatalf("WeCom config = %s", clientConfig)
-		}
-		return im, nil
-	}
-
-	runtime, err := assembleRuntime(testConfig(), "/tmp/shared.sock", slog.New(slog.NewTextHandler(io.Discard, nil)), dependencies)
+	runtime, err := assembleBridgeRuntime(im, "bridge-user", managed, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
-		t.Fatalf("assembleRuntime() error = %v", err)
+		t.Fatalf("assembleBridgeRuntime() error = %v", err)
 	}
 	connected, err := runtime.factory.Connect(context.Background())
 	if err != nil || connected != managed {
@@ -137,7 +122,7 @@ func TestAssembleRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testing.T) {
 	runtime.service.SetHerdr(managed)
 	runtime.service.ReplaceSnapshot(managed.snapshot, false)
 	for index, content := range []string{"/ls", "/sel 1", "继续处理"} {
-		runtime.service.HandleMessage(context.Background(), incoming("service-"+string(rune('a'+index)), content))
+		runtime.service.HandleMessage(context.Background(), incomingForUser("bridge-user", "service-"+string(rune('a'+index)), content))
 	}
 	if got := managed.promptCount(); got != 1 {
 		t.Fatalf("shared client prompt calls = %d, want 1", got)
@@ -158,18 +143,57 @@ func TestAssembleRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testing.T) {
 	}
 }
 
-func TestAssembleRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) {
+func TestAssembleBridgeRuntimeRejectsNilLogger(t *testing.T) {
+	_, err := assembleBridgeRuntime(newFakeWeCom(), "user-sensitive", newFakeManagedHerdr(), nil)
+	if err == nil || !strings.Contains(err.Error(), "结构化日志器无效") {
+		t.Fatalf("assembleBridgeRuntime() error = %v, want invalid logger", err)
+	}
+}
+
+func TestAssembleBridgeRuntimeRejectsNilHerdrClient(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, err := assembleBridgeRuntime(newFakeWeCom(), "user-sensitive", nil, logger)
+	if err == nil || !strings.Contains(err.Error(), "Herdr Client 无效") {
+		t.Fatalf("assembleBridgeRuntime() error = %v, want invalid Herdr client", err)
+	}
+}
+
+func TestAssembleRuntimeCreatesConfiguredClients(t *testing.T) {
 	managed := newFakeManagedHerdr()
 	im := newFakeWeCom()
 	dependencies := defaultAssemblyDependencies()
-	dependencies.newHerdr = func(string) bridge.ManagedHerdr { return managed }
-	dependencies.newWeCom = func(wecom.ClientConfig) (weComRuntime, error) { return im, nil }
+	dependencies.newHerdr = func(socketPath string) bridge.ManagedHerdr {
+		if socketPath != "/tmp/shared.sock" {
+			t.Fatalf("newHerdr socket = %q", socketPath)
+		}
+		return managed
+	}
+	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (imRuntime, error) {
+		if clientConfig.Endpoint != wecom.DefaultEndpoint || clientConfig.BotID != "bot-sensitive" ||
+			clientConfig.AllowedUserID != "user-sensitive" || clientConfig.Secret != "secret-sensitive" {
+			t.Fatalf("WeCom config = %s", clientConfig)
+		}
+		return im, nil
+	}
+
+	runtime, err := assembleRuntime(testConfig(), "/tmp/shared.sock", slog.New(slog.NewTextHandler(io.Discard, nil)), dependencies)
+	if err != nil {
+		t.Fatalf("assembleRuntime() error = %v", err)
+	}
+	if runtime.im != im || runtime.herdr != managed {
+		t.Fatalf("assembleRuntime() clients = %v/%v, want configured IM and Herdr clients", runtime.im, runtime.herdr)
+	}
+}
+
+func TestAssembleBridgeRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) {
+	managed := newFakeManagedHerdr()
+	im := newFakeWeCom()
 	var output bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelError}))
 	logger.Info("普通信息应被过滤", slog.String("content", "private ordinary log"))
-	runtime, err := assembleRuntime(testConfig(), "/tmp/audit.sock", logger, dependencies)
+	runtime, err := assembleBridgeRuntime(im, "user-sensitive", managed, logger)
 	if err != nil {
-		t.Fatalf("assembleRuntime() error = %v", err)
+		t.Fatalf("assembleBridgeRuntime() error = %v", err)
 	}
 	runtime.service.SetHerdr(managed)
 	runtime.service.ReplaceSnapshot(managed.snapshot, false)
@@ -202,7 +226,7 @@ func TestAssembleRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) {
 func TestAssembleRuntimeUsesOfficialWeComEndpointByDefault(t *testing.T) {
 	dependencies := defaultAssemblyDependencies()
 	dependencies.newHerdr = func(string) bridge.ManagedHerdr { return newFakeManagedHerdr() }
-	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (weComRuntime, error) {
+	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (imRuntime, error) {
 		if clientConfig.Endpoint != wecom.DefaultEndpoint {
 			t.Fatalf("WeCom endpoint = %q, want %q", clientConfig.Endpoint, wecom.DefaultEndpoint)
 		}
@@ -218,14 +242,14 @@ func TestRunStartsAllLoopsAndConsumesMessages(t *testing.T) {
 	im := newFakeWeCom()
 	supervisor := newFakeRunner()
 	handler := &fakeHandler{handled: make(chan wecom.IncomingText, 1)}
-	runtime := &applicationRuntime{wecom: im, supervisor: supervisor, handler: handler}
+	runtime := &applicationRuntime{im: im, supervisor: supervisor, handler: handler}
 	options := testOptions(t)
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) { return runtime, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- Run(ctx, options) }()
-	waitClosed(t, im.started, "WeCom Run")
+	waitClosed(t, im.started, "IM Run")
 	waitClosed(t, supervisor.started, "Supervisor Run")
 	im.events <- incoming("message-1", "/ls")
 	select {
@@ -249,7 +273,7 @@ func TestRunDoesNotStartLoopsWhenContextIsAlreadyCanceled(t *testing.T) {
 	options := testOptions(t)
 	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -257,7 +281,7 @@ func TestRunDoesNotStartLoopsWhenContextIsAlreadyCanceled(t *testing.T) {
 	if err := Run(ctx, options); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	for name, started := range map[string]<-chan struct{}{"WeCom": im.started, "Supervisor": supervisor.started} {
+	for name, started := range map[string]<-chan struct{}{"IM": im.started, "Supervisor": supervisor.started} {
 		select {
 		case <-started:
 			t.Fatalf("%s loop started with an already canceled context", name)
@@ -278,27 +302,27 @@ func TestRunCancelsOtherLoopsAfterFatalError(t *testing.T) {
 	options := testOptions(t)
 	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 
 	err := Run(context.Background(), options)
 	if !errors.Is(err, fatal) {
 		t.Fatalf("Run() error = %v, want fatal supervisor error", err)
 	}
-	waitClosed(t, im.stopped, "WeCom cancellation")
+	waitClosed(t, im.stopped, "IM cancellation")
 	if got := lock.releases.Load(); got != 1 {
 		t.Fatalf("lock releases = %d, want 1 after fatal shutdown", got)
 	}
 }
 
-func TestRunPreservesWeComFatalRegardlessOfResultOrder(t *testing.T) {
-	fatal := errors.New("wecom fatal")
+func TestRunPreservesIMFatalRegardlessOfResultOrder(t *testing.T) {
+	fatal := errors.New("im fatal")
 	tests := []struct {
 		name        string
 		closeEvents bool
 		waitForStop bool
 	}{
-		{name: "WeCom 错误先到"},
+		{name: "IM 错误先到"},
 		{name: "Events 关闭先到", closeEvents: true, waitForStop: true},
 	}
 
@@ -312,26 +336,48 @@ func TestRunPreservesWeComFatalRegardlessOfResultOrder(t *testing.T) {
 			}
 			options := testOptions(t)
 			options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-				return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+				return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 			}
 
 			err := Run(context.Background(), options)
 			if !errors.Is(err, fatal) {
-				t.Fatalf("Run() error = %v, want WeCom fatal", err)
+				t.Fatalf("Run() error = %v, want IM fatal", err)
 			}
 			waitClosed(t, supervisor.stopped, "Supervisor cancellation")
 		})
 	}
 }
 
+func TestRunPreservesPrimarySupervisorFatalAfterMessageLoopClosure(t *testing.T) {
+	fatal := errors.New("supervisor fatal after shutdown")
+	im := newOrderedResultWeCom(nil)
+	im.closeEvents = true
+	supervisor := runtimeRunnerFunc(func(ctx context.Context) error {
+		<-ctx.Done()
+		return fatal
+	})
+	options := testOptions(t)
+	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+	}
+
+	err := Run(context.Background(), options)
+	if !errors.Is(err, fatal) {
+		t.Fatalf("Run() error = %v, want primary Supervisor fatal", err)
+	}
+	if errors.Is(err, ErrLoopStopped) {
+		t.Fatalf("Run() error = %v, message loop closure must not replace primary Supervisor fatal", err)
+	}
+}
+
 func TestRunKeepsFatalThatTriggeredShutdownWhenParentCancelsDuringDrain(t *testing.T) {
-	fatal := errors.New("wecom fatal")
+	fatal := errors.New("im fatal")
 	releaseSupervisor := make(chan struct{})
 	supervisor := newGatedCancellationRunner(releaseSupervisor)
 	im := newOrderedResultWeCom(fatal)
 	options := testOptions(t)
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
@@ -347,7 +393,7 @@ func TestRunKeepsFatalThatTriggeredShutdownWhenParentCancelsDuringDrain(t *testi
 }
 
 func TestRunTimeoutKeepsFatalThatTriggeredShutdownBeforeParentCancellation(t *testing.T) {
-	fatal := errors.New("wecom fatal")
+	fatal := errors.New("im fatal")
 	releaseSupervisor := make(chan struct{})
 	supervisor := newGatedCancellationRunner(releaseSupervisor)
 	im := newOrderedResultWeCom(fatal)
@@ -356,7 +402,7 @@ func TestRunTimeoutKeepsFatalThatTriggeredShutdownBeforeParentCancellation(t *te
 	options.dependencies.shutdownTimeout = 20 * time.Millisecond
 	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
@@ -380,12 +426,12 @@ func TestRunParentCancellationFirstRemainsNormal(t *testing.T) {
 	supervisor := newFakeRunner()
 	options := testOptions(t)
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- Run(ctx, options) }()
-	waitClosed(t, im.started, "WeCom Run")
+	waitClosed(t, im.started, "IM Run")
 	waitClosed(t, supervisor.started, "Supervisor Run")
 	cancel()
 
@@ -394,14 +440,14 @@ func TestRunParentCancellationFirstRemainsNormal(t *testing.T) {
 	}
 }
 
-func TestRunParentCancellationWithWeComClosingEventsRemainsNormal(t *testing.T) {
+func TestRunParentCancellationWithIMClosingEventsRemainsNormal(t *testing.T) {
 	for iteration := range 50 {
 		im := newCancelClosingWeCom()
 		supervisor := newFakeRunner()
 		handler := &fakeHandler{handled: make(chan wecom.IncomingText, 1)}
 		options := testOptions(t)
 		options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-			return &applicationRuntime{wecom: im, supervisor: supervisor, handler: handler}, nil
+			return &applicationRuntime{im: im, supervisor: supervisor, handler: handler}, nil
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		result := make(chan error, 1)
@@ -457,13 +503,68 @@ func TestParentTriggeredShutdownClassifiesSimultaneousResultDeterministically(t 
 	}
 }
 
+func TestRuntimeRootErrorPrioritizesPrimaryComponentByRole(t *testing.T) {
+	primaryFatal := errors.New("console fatal")
+	nonPrimaryFatal := errors.New("named wecom but not primary")
+	results := []componentResult{
+		{name: "wecom", primary: false, err: nonPrimaryFatal},
+		{name: "messages", primary: false, err: context.Canceled, shutdownDerived: true},
+		{name: "console", primary: true, err: primaryFatal},
+	}
+
+	err := runtimeRootError(false, results)
+	if !errors.Is(err, primaryFatal) {
+		t.Fatalf("runtimeRootError() = %v, want primary console fatal", err)
+	}
+	if errors.Is(err, nonPrimaryFatal) {
+		t.Fatalf("runtimeRootError() = %v, non-primary component name must not raise priority", err)
+	}
+}
+
+func TestRuntimeRootErrorDoesNotPromoteNonPrimaryWeComName(t *testing.T) {
+	nonPrimaryFatal := errors.New("non-primary fatal")
+	results := []componentResult{
+		{name: "wecom", primary: false, err: nonPrimaryFatal},
+		{name: "messages", primary: false},
+		{name: "herdr", primary: true, err: context.Canceled, shutdownDerived: true},
+	}
+
+	err := runtimeRootError(false, results)
+	if !errors.Is(err, ErrLoopStopped) {
+		t.Fatalf("runtimeRootError() = %v, want ErrLoopStopped before non-primary fallback", err)
+	}
+	if errors.Is(err, nonPrimaryFatal) {
+		t.Fatalf("runtimeRootError() = %v, non-primary wecom name must not raise priority", err)
+	}
+}
+
+func TestRunComponentRecordsPrimaryRole(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		primary bool
+	}{
+		{name: "console", primary: true},
+		{name: "messages", primary: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			results := make(chan componentResult, 1)
+			runComponent(context.Background(), test.name, test.primary, func(context.Context) error { return nil }, results)
+
+			result := <-results
+			if result.primary != test.primary {
+				t.Fatalf("runComponent() primary = %v, want %v", result.primary, test.primary)
+			}
+		})
+	}
+}
+
 func TestRunTreatsIndependentEventsClosureAsUnexpectedLoopStop(t *testing.T) {
 	supervisor := newFakeRunner()
 	im := newOrderedResultWeCom(nil)
 	im.closeEvents = true
 	options := testOptions(t)
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 
 	err := Run(context.Background(), options)
@@ -485,7 +586,7 @@ func TestRunStopsConsumptionAndConnectionsBeforeReleasingLock(t *testing.T) {
 		orderMu.Unlock()
 	}
 	im := newFakeWeCom()
-	im.onStop = func() { record("wecom-closed") }
+	im.onStop = func() { record("im-closed") }
 	supervisor := newFakeRunner()
 	supervisor.onStop = func() { record("herdr-closed") }
 	handler := &fakeHandler{handled: make(chan wecom.IncomingText, 2)}
@@ -493,13 +594,13 @@ func TestRunStopsConsumptionAndConnectionsBeforeReleasingLock(t *testing.T) {
 	options := testOptions(t)
 	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: handler}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: handler}, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- Run(ctx, options) }()
-	waitClosed(t, im.started, "WeCom Run")
+	waitClosed(t, im.started, "IM Run")
 	waitClosed(t, supervisor.started, "Supervisor Run")
 	cancel()
 	im.events <- incoming("late-message", "must-not-run")
@@ -531,7 +632,7 @@ func TestRunBoundsGracefulShutdown(t *testing.T) {
 	options.dependencies.shutdownTimeout = 20 * time.Millisecond
 	options.dependencies.assemble = func(config.Config, string, *slog.Logger) (*applicationRuntime, error) {
 		return &applicationRuntime{
-			wecom:      &blockingWeCom{blockingRunner: stuck, events: make(chan wecom.IncomingText)},
+			im:         &blockingWeCom{blockingRunner: stuck, events: make(chan wecom.IncomingText)},
 			supervisor: supervisor,
 			handler:    &fakeHandler{},
 		}, nil
@@ -539,7 +640,7 @@ func TestRunBoundsGracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- Run(ctx, options) }()
-	waitClosed(t, stuck.started, "stuck WeCom Run")
+	waitClosed(t, stuck.started, "stuck IM Run")
 	waitClosed(t, supervisor.started, "stuck Supervisor Run")
 	cancel()
 
@@ -566,7 +667,7 @@ func TestRunLogsOnlySafeIdentifiers(t *testing.T) {
 		im := newFakeWeCom()
 		supervisor := newFakeRunner()
 		supervisor.result = unsafeError
-		return &applicationRuntime{wecom: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
+		return &applicationRuntime{im: im, supervisor: supervisor, handler: &fakeHandler{}}, nil
 	}
 
 	if err := Run(context.Background(), options); !errors.Is(err, unsafeError) {
@@ -638,13 +739,17 @@ func testConfig() config.Config {
 }
 
 func canceledRuntime() *applicationRuntime {
-	return &applicationRuntime{wecom: newFakeWeCom(), supervisor: newFakeRunner(), handler: &fakeHandler{}}
+	return &applicationRuntime{im: newFakeWeCom(), supervisor: newFakeRunner(), handler: &fakeHandler{}}
 }
 
 func incoming(messageID, content string) wecom.IncomingText {
+	return incomingForUser("user-sensitive", messageID, content)
+}
+
+func incomingForUser(userID, messageID, content string) wecom.IncomingText {
 	return wecom.IncomingText{
 		RequestID: "request-" + messageID, MessageID: messageID, BotID: "bot-sensitive",
-		UserID: "user-sensitive", ChatType: "single", Content: content,
+		UserID: userID, ChatType: "single", Content: content,
 	}
 }
 
@@ -672,6 +777,10 @@ type fakeRunner struct {
 	onStop  func()
 	once    sync.Once
 }
+
+type runtimeRunnerFunc func(context.Context) error
+
+func (f runtimeRunnerFunc) Run(ctx context.Context) error { return f(ctx) }
 
 func newFakeRunner() *fakeRunner {
 	return &fakeRunner{started: make(chan struct{}), stopped: make(chan struct{})}
