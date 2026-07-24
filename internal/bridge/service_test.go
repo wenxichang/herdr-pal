@@ -124,8 +124,11 @@ func TestServicePromptPreservesBytesAndChecksLiveAgent(t *testing.T) {
 	selectTarget(t, service)
 	prompt := "  keep\nall bytes  "
 	service.HandleMessage(context.Background(), incoming("prompt", prompt))
-	if got := fake.prompts(); len(got) != 1 || got[0].text != prompt || got[0].target != "terminal-1" {
+	if got := fake.prompts(); len(got) != 1 || got[0].text != prompt || got[0].target != "pane-1" {
 		t.Fatalf("prompt calls = %#v", got)
+	}
+	if got := fake.gets(); len(got) != 1 || got[0] != "pane-1" {
+		t.Fatalf("GetAgent targets = %#v, want pane-1", got)
 	}
 	if got := fake.callOrder(); strings.Join(got, ",") != "get,prompt" {
 		t.Fatalf("call order = %#v, want get,prompt", got)
@@ -151,6 +154,12 @@ func TestServiceKeyAliasesSendOnceWithoutConfirmation(t *testing.T) {
 			service.HandleMessage(context.Background(), incoming("key-"+test.key, test.content))
 			if got := fake.keys(); len(got) != 1 || got[0].key != test.key {
 				t.Fatalf("key calls = %#v", got)
+			}
+			if got := fake.keys(); got[0].target != "pane-1" {
+				t.Fatalf("SendKey targets = %#v, want pane-1", got)
+			}
+			if got := fake.gets(); len(got) != 1 || got[0] != "pane-1" {
+				t.Fatalf("GetAgent targets = %#v, want pane-1", got)
 			}
 			if got := strings.Join(fake.callOrder(), ","); got != "get,key" {
 				t.Fatalf("key call order = %q, want get,key", got)
@@ -521,6 +530,9 @@ func TestServiceContentAndPaging(t *testing.T) {
 	if got := fake.reads(); len(got) != 1 || got[0].lines != 100 {
 		t.Fatalf("content reads = %#v", got)
 	}
+	if got := fake.reads(); got[0].target != "pane-1" {
+		t.Fatalf("/con target = %#v, want pane-1", got)
+	}
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "第 0 页") {
 		t.Fatalf("content reply = %q", fakeIMFromService(t, service).lastReply())
 	}
@@ -528,6 +540,9 @@ func TestServiceContentAndPaging(t *testing.T) {
 	service.HandleMessage(context.Background(), incoming("pageup", "/pageup"))
 	if got := fake.reads(); len(got) != 2 || got[1].lines != 200 {
 		t.Fatalf("pageup reads = %#v", got)
+	}
+	if got := fake.reads(); got[1].target != "pane-1" {
+		t.Fatalf("/pageup target = %#v, want pane-1", got)
 	}
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "第 1 页") {
 		t.Fatalf("pageup reply = %q", fakeIMFromService(t, service).lastReply())
@@ -910,7 +925,7 @@ func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 	fake.setAgent(herdr.AgentInfo{PaneID: "pane-2", TerminalID: "terminal-2", Agent: stringRef("claude"), DisplayAgent: stringRef("Claude")})
 	service.HandleMessage(context.Background(), incoming("select-two-prompt", "prompt"))
 	got := fake.prompts()
-	if len(got) != 2 || got[1].target != "terminal-2" {
+	if len(got) != 2 || got[1].target != "pane-2" {
 		t.Fatalf("selection target calls = %#v", got)
 	}
 }

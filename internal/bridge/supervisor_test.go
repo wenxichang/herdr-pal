@@ -1142,9 +1142,9 @@ func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisor
 	return &supervisorHarness{supervisor: supervisor, registry: registry, service: service, im: im, reader: reader, factory: factory, waiter: waiter, backoff: backoff, log: log}
 }
 
-func matchingSupervisorAgent(_ context.Context, target string) (herdr.AgentInfo, error) {
+func matchingSupervisorAgent(context.Context, string) (herdr.AgentInfo, error) {
 	return herdr.AgentInfo{
-		PaneID: "pane-1", TerminalID: target, Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"),
+		PaneID: "pane-1", TerminalID: "terminal-1", Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"),
 	}, nil
 }
 

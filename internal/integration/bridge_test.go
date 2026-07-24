@@ -52,7 +52,9 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.send(t, "message-prompt", testUserID, "single", "继续实现端到端测试")
 
 		calls := harness.herdr.WaitCallCount(t, "agent.prompt", 1)
-		assertCallParams(t, calls[0], map[string]any{"target": "terminal-1", "text": "继续实现端到端测试"})
+		assertCallParams(t, calls[0], map[string]any{"target": "pane-1", "text": "继续实现端到端测试"})
+		getCalls := harness.herdr.WaitCallCount(t, "agent.get", 1)
+		assertCallParams(t, getCalls[0], map[string]any{"target": "pane-1"})
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
 	})
 
@@ -65,8 +67,12 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.send(t, "message-space", testUserID, "single", "/space")
 
 		calls := harness.herdr.WaitCallCount(t, "agent.send_keys", 2)
-		assertCallParams(t, calls[0], map[string]any{"target": "terminal-1", "keys": []any{"enter"}})
-		assertCallParams(t, calls[1], map[string]any{"target": "terminal-1", "keys": []any{"space"}})
+		assertCallParams(t, calls[0], map[string]any{"target": "pane-1", "keys": []any{"enter"}})
+		assertCallParams(t, calls[1], map[string]any{"target": "pane-1", "keys": []any{"space"}})
+		getCalls := harness.herdr.WaitCallCount(t, "agent.get", 2)
+		for _, call := range getCalls {
+			assertCallParams(t, call, map[string]any{"target": "pane-1"})
+		}
 	})
 
 	t.Run("终端内容按一百行分页且向下翻页不读取 Herdr", func(t *testing.T) {
@@ -92,8 +98,8 @@ func TestBridgeEndToEnd(t *testing.T) {
 		if len(calls) != 2 {
 			t.Fatalf("agent.read 调用数 = %d, want 2", len(calls))
 		}
-		assertCallParams(t, calls[0], map[string]any{"lines": float64(100)})
-		assertCallParams(t, calls[1], map[string]any{"lines": float64(200)})
+		assertCallParams(t, calls[0], map[string]any{"target": "pane-1", "lines": float64(100)})
+		assertCallParams(t, calls[1], map[string]any{"target": "pane-1", "lines": float64(200)})
 	})
 
 	t.Run("blocked 与 done 自动通知每次只读最近一百行", func(t *testing.T) {

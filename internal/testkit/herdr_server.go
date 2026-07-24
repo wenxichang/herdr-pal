@@ -531,11 +531,23 @@ func requiredTarget(raw json.RawMessage) (string, bool) {
 
 func findAgent(snapshot herdr.Snapshot, target string) (herdr.AgentInfo, bool) {
 	for _, agent := range snapshot.Agents {
-		if target == agent.TerminalID || target == agent.PaneID {
+		if target == agent.PaneID {
 			return agent, true
 		}
 	}
-	return herdr.AgentInfo{}, false
+	var match herdr.AgentInfo
+	matched := false
+	for _, agent := range snapshot.Agents {
+		if agent.Name == nil || strings.TrimSpace(*agent.Name) == "" || target != *agent.Name {
+			continue
+		}
+		if matched {
+			return herdr.AgentInfo{}, false
+		}
+		match = agent
+		matched = true
+	}
+	return match, matched
 }
 
 func snapshotWire(snapshot herdr.Snapshot) map[string]any {

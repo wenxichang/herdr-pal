@@ -272,7 +272,7 @@ func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, 
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
-	current, err := client.GetAgent(ctx, target.TerminalID)
+	current, err := client.GetAgent(ctx, target.PaneID)
 	if err != nil {
 		release()
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -284,7 +284,7 @@ func (s *Service) handlePrompt(ctx context.Context, message wecom.IncomingText, 
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	err = client.Prompt(ctx, target.TerminalID, text)
+	err = client.Prompt(ctx, target.PaneID, text)
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
@@ -318,7 +318,7 @@ func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key
 		s.reply(ctx, message.RequestID, "按键请求无效，未执行任何操作。")
 		return
 	}
-	current, err := client.GetAgent(ctx, target.TerminalID)
+	current, err := client.GetAgent(ctx, target.PaneID)
 	if err != nil {
 		s.keyAudit.RecordKeyAudit(audits.failed)
 		release()
@@ -332,7 +332,7 @@ func (s *Service) handleKey(ctx context.Context, message wecom.IncomingText, key
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	err = client.SendKey(ctx, target.TerminalID, key)
+	err = client.SendKey(ctx, target.PaneID, key)
 	if err != nil {
 		s.keyAudit.RecordKeyAudit(audits.failed)
 	} else {
@@ -389,7 +389,7 @@ func (s *Service) handleContent(ctx context.Context, message wecom.IncomingText)
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
-	result, err := client.ReadRecent(ctx, target.TerminalID, panel.PageSize)
+	result, err := client.ReadRecent(ctx, target.PaneID, panel.PageSize)
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -420,7 +420,7 @@ func (s *Service) handlePageUp(ctx context.Context, message wecom.IncomingText) 
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
 	}
-	result, err := client.ReadRecent(ctx, target.TerminalID, linesToRead)
+	result, err := client.ReadRecent(ctx, target.PaneID, linesToRead)
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, unavailableMessage)

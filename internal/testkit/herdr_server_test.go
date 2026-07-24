@@ -64,6 +64,61 @@ func TestHerdrServerRejectsInvalidPublicRequestShapes(t *testing.T) {
 	}
 }
 
+func TestHerdrServerAgentTargetsRequirePaneIDOrUniqueName(t *testing.T) {
+	server := NewHerdrServer(t, testkitSnapshot())
+	validRequests := []struct {
+		method string
+		params func(string) map[string]any
+	}{
+		{method: "agent.get", params: func(target string) map[string]any { return map[string]any{"target": target} }},
+		{method: "agent.read", params: func(target string) map[string]any {
+			return map[string]any{"target": target, "source": "recent_unwrapped", "lines": 100, "format": "text", "strip_ansi": true}
+		}},
+		{method: "agent.prompt", params: func(target string) map[string]any { return map[string]any{"target": target, "text": "continue"} }},
+		{method: "agent.send_keys", params: func(target string) map[string]any { return map[string]any{"target": target, "keys": []string{"enter"}} }},
+	}
+	for _, test := range validRequests {
+		t.Run(test.method+" rejects terminal ID", func(t *testing.T) {
+			response := rawHerdrRequest(t, server.SocketPath(), map[string]any{
+				"id": test.method + "-terminal", "method": test.method, "params": test.params("terminal-1"),
+			})
+			if response.Error == nil || response.Error.Code != "agent_not_found" {
+				t.Fatalf("response = %#v, want agent_not_found", response)
+			}
+		})
+		t.Run(test.method+" accepts pane ID", func(t *testing.T) {
+			response := rawHerdrRequest(t, server.SocketPath(), map[string]any{
+				"id": test.method + "-pane", "method": test.method, "params": test.params("pane-1"),
+			})
+			if response.Error != nil {
+				t.Fatalf("response = %#v, want success", response)
+			}
+		})
+	}
+
+	unique := testkitSnapshot()
+	uniqueName := "unique-agent"
+	unique.Agents[0].Name = &uniqueName
+	uniqueServer := NewHerdrServer(t, unique)
+	if response := rawHerdrRequest(t, uniqueServer.SocketPath(), map[string]any{
+		"id": "unique-name", "method": "agent.get", "params": map[string]any{"target": "unique-agent"},
+	}); response.Error != nil {
+		t.Fatalf("unique name response = %#v, want success", response)
+	}
+
+	duplicate := unique
+	duplicateAgent := duplicate.Agents[0]
+	duplicateAgent.PaneID = "pane-2"
+	duplicateAgent.TerminalID = "terminal-2"
+	duplicate.Agents = append(duplicate.Agents, duplicateAgent)
+	duplicateServer := NewHerdrServer(t, duplicate)
+	if response := rawHerdrRequest(t, duplicateServer.SocketPath(), map[string]any{
+		"id": "duplicate-name", "method": "agent.get", "params": map[string]any{"target": "unique-agent"},
+	}); response.Error == nil || response.Error.Code != "agent_not_found" {
+		t.Fatalf("duplicate name response = %#v, want agent_not_found", response)
+	}
+}
+
 type rawHerdrResponse struct {
 	ID    string `json:"id"`
 	Error *struct {

@@ -412,10 +412,10 @@ func (n *Notifier) HandleTransition(ctx context.Context, transition session.Tran
 	}
 	parts := renderStatusTitleParts(title, transition.Target)
 	if includeSnapshot {
-		before, err := n.get(ctx, transition.Target.TerminalID)
+		before, err := n.get(ctx, transition.Target.PaneID)
 		if err == nil && session.MatchesAgent(transition.Target, before) {
-			result, readErr := n.read(ctx, transition.Target.TerminalID, panel.PageSize)
-			after, getErr := n.get(ctx, transition.Target.TerminalID)
+			result, readErr := n.read(ctx, transition.Target.PaneID, panel.PageSize)
+			after, getErr := n.get(ctx, transition.Target.PaneID)
 			if readErr == nil && getErr == nil && session.MatchesAgent(transition.Target, after) && result.PaneID == transition.Target.PaneID {
 				lines := lastNotificationLines(panel.Normalize(result.Text))
 				key.snapshotAvailable = true

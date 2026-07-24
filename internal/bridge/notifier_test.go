@@ -57,7 +57,7 @@ func TestNotifierSnapshotPoliciesReadOnlyRecentHundredLines(t *testing.T) {
 				t.Fatalf("HandleTransition() 返回错误：%v", err)
 			}
 			calls := reader.Calls()
-			if len(calls) != 1 || calls[0] != (notifierReadCall{target: "terminal-1", lines: 100}) {
+			if len(calls) != 1 || calls[0] != (notifierReadCall{target: "pane-1", lines: 100}) {
 				t.Fatalf("ReadRecent 调用 = %#v", calls)
 			}
 			messages := im.Messages()
@@ -73,6 +73,31 @@ func TestNotifierSnapshotPoliciesReadOnlyRecentHundredLines(t *testing.T) {
 			snapshot := strings.Join(messages[1:], "\n")
 			if strings.Contains(snapshot, "line-029") || !strings.Contains(snapshot, "line-030") || !strings.Contains(snapshot, "line-129") {
 				t.Fatalf("快照未限制为规范化后的最后 100 行：%q", snapshot)
+			}
+		})
+	}
+}
+
+func TestNotifierSnapshotValidationUsesPaneIDInOrder(t *testing.T) {
+	for _, current := range []herdr.AgentStatus{herdr.AgentStatusBlocked, herdr.AgentStatusDone} {
+		t.Run(string(current), func(t *testing.T) {
+			trace := &notifierCallTrace{}
+			getter := &notifierAgentGetter{agent: notificationAgentInfo(""), trace: trace}
+			reader := &notifierReader{
+				result: herdr.ReadResult{PaneID: "pane-1", Text: "终端近期快照"},
+				trace:  trace,
+			}
+			notifier := mustNotifierWithGetter(t, &notifierIM{}, getter.GetAgent, reader.ReadRecent)
+
+			if err := notifier.HandleTransition(context.Background(), notificationTransition(herdr.AgentStatusWorking, current)); err != nil {
+				t.Fatalf("HandleTransition() 返回错误：%v", err)
+			}
+			if got, want := trace.Calls(), []notifierTargetCall{
+				{method: "get", target: "pane-1"},
+				{method: "read", target: "pane-1", lines: 100},
+				{method: "get", target: "pane-1"},
+			}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("occupant/read 调用顺序 = %#v, want %#v", got, want)
 			}
 		})
 	}
@@ -194,11 +219,13 @@ func TestNotifierPreReadOccupantValidationFailureSkipsTerminalRead(t *testing.T)
 
 func TestNotifierPostReadOccupantReplacementDoesNotLeakSnapshot(t *testing.T) {
 	target := notificationTargetWithSession("session-old")
-	getter := &notifierAgentGetter{agent: notificationAgentInfo("session-old")}
+	trace := &notifierCallTrace{}
+	getter := &notifierAgentGetter{agent: notificationAgentInfo("session-old"), trace: trace}
 	reader := &blockingNotifierReader{
 		result:  herdr.ReadResult{PaneID: target.PaneID, Text: "SENSITIVE-MARKER"},
 		started: make(chan struct{}),
 		release: make(chan struct{}),
+		trace:   trace,
 	}
 	im := &notifierIM{}
 	notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
@@ -218,6 +245,13 @@ func TestNotifierPostReadOccupantReplacementDoesNotLeakSnapshot(t *testing.T) {
 	}
 	if got := getter.CallCount(); got != 2 {
 		t.Fatalf("GetAgent 调用次数 = %d，期望读取前后各一次", got)
+	}
+	if got, want := trace.Calls(), []notifierTargetCall{
+		{method: "get", target: "pane-1"},
+		{method: "read", target: "pane-1", lines: 100},
+		{method: "get", target: "pane-1"},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("occupant/read 调用顺序 = %#v, want %#v", got, want)
 	}
 }
 
@@ -1071,6 +1105,7 @@ type notifierReader struct {
 	results []herdr.ReadResult
 	errors  []error
 	calls   []notifierReadCall
+	trace   *notifierCallTrace
 }
 
 type notifierAgentGetter struct {
@@ -1078,12 +1113,16 @@ type notifierAgentGetter struct {
 	agent herdr.AgentInfo
 	err   error
 	calls int
+	trace *notifierCallTrace
 }
 
-func (g *notifierAgentGetter) GetAgent(context.Context, string) (herdr.AgentInfo, error) {
+func (g *notifierAgentGetter) GetAgent(_ context.Context, target string) (herdr.AgentInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.calls++
+	if g.trace != nil {
+		g.trace.record(notifierTargetCall{method: "get", target: target})
+	}
 	return g.agent, g.err
 }
 
@@ -1105,18 +1144,48 @@ type blockingNotifierReader struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+	trace   *notifierCallTrace
 }
 
-func (r *blockingNotifierReader) ReadRecent(context.Context, string, int) (herdr.ReadResult, error) {
+func (r *blockingNotifierReader) ReadRecent(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
+	if r.trace != nil {
+		r.trace.record(notifierTargetCall{method: "read", target: target, lines: lines})
+	}
 	r.once.Do(func() { close(r.started) })
 	<-r.release
 	return r.result, nil
+}
+
+type notifierTargetCall struct {
+	method string
+	target string
+	lines  int
+}
+
+type notifierCallTrace struct {
+	mu    sync.Mutex
+	calls []notifierTargetCall
+}
+
+func (t *notifierCallTrace) record(call notifierTargetCall) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.calls = append(t.calls, call)
+}
+
+func (t *notifierCallTrace) Calls() []notifierTargetCall {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]notifierTargetCall(nil), t.calls...)
 }
 
 func (r *notifierReader) ReadRecent(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, notifierReadCall{target: target, lines: lines})
+	if r.trace != nil {
+		r.trace.record(notifierTargetCall{method: "read", target: target, lines: lines})
+	}
 	index := len(r.calls) - 1
 	result, err := r.result, r.err
 	if index < len(r.results) {
