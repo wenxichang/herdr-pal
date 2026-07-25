@@ -162,6 +162,21 @@ func (catalog *SessionCatalog) HasMachine(userID, machineID string) bool {
 	return exists
 }
 
+// HasSessions 报告用户当前是否至少有一个在线 Agent 会话。
+func (catalog *SessionCatalog) HasSessions(userID string) bool {
+	if catalog == nil {
+		return false
+	}
+	catalog.mu.RLock()
+	defer catalog.mu.RUnlock()
+	for key, machine := range catalog.machines {
+		if key.UserID == userID && machine.sequence > 0 && len(machine.sessions) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // CreateNumberedSnapshot 聚合用户全部机器并替换最近编号快照。
 func (catalog *SessionCatalog) CreateNumberedSnapshot(userID string) []CatalogEntry {
 	if catalog == nil {

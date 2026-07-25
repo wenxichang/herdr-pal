@@ -57,9 +57,12 @@ func TestSplitMarkdownHasPredictableInvalidAndEmptyLimits(t *testing.T) {
 }
 
 func TestRenderPageWithTotalPlacesCompactContextAfterOutput(t *testing.T) {
-	target := session.Target{PaneID: "w1:p1", Agent: "claude", DisplayAgent: "Claude", Title: "Panel标题"}
+	target := session.Target{
+		PaneID: "w1:p1", Agent: "claude", DisplayAgent: "Claude", Title: "Panel标题",
+		Workspace: "test", Tab: "TAB标题",
+	}
 	content := RenderPageWithTotal(target, 1, 5, []string{"第一行", "第二行"})
-	footer := "[终端输出] Panel标题-claude(w1:p1), 页码:[1/5]"
+	footer := "[终端输出] test/TAB标题-claude(w1:p1), 页码:[1/5]"
 
 	if !strings.HasPrefix(content, "```\n第一行\n第二行\n```") {
 		t.Fatalf("RenderPageWithTotal() output is not first: %q", content)
@@ -69,7 +72,7 @@ func TestRenderPageWithTotalPlacesCompactContextAfterOutput(t *testing.T) {
 	}
 
 	decorated := DecorateRenderedPage(content, "home-mac", 1)
-	if !strings.HasSuffix(decorated, "[终端输出] [home-mac/1] Panel标题-claude(w1:p1), 页码:[1/5]") {
+	if !strings.HasSuffix(decorated, "[终端输出] [home-mac/1] test/TAB标题-claude(w1:p1), 页码:[1/5]") {
 		t.Fatalf("DecorateRenderedPage() = %q", decorated)
 	}
 	withSelection := AppendRenderedPageNote(decorated, "[当前选择] [office-pc/2] 另一个任务-codex(w2:p2)")
@@ -83,13 +86,15 @@ func TestRenderPageAndSplitMarkdownKeepTerminalPageSelfContained(t *testing.T) {
 		PaneID:       "workspace:tab:pane",
 		DisplayAgent: "Codex",
 		Title:        "任务",
+		Workspace:    "工作区",
+		Tab:          "标签页",
 	}
 	content := RenderPage(target, 2, []string{
 		"before ``` dangerous fence",
 		strings.Repeat("中文😀终端内容 ", 40),
 	})
 
-	if !strings.Contains(content, "[终端输出]") || !strings.Contains(content, "任务-Codex") || !strings.Contains(content, "页码:[3/3]") {
+	if !strings.Contains(content, "[终端输出]") || !strings.Contains(content, "工作区/标签页-Codex") || !strings.Contains(content, "页码:[3/3]") {
 		t.Fatalf("RenderPage() missing context: %q", content)
 	}
 	if strings.Contains(content, "before ``` dangerous") {

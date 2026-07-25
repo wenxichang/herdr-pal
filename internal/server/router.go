@@ -20,6 +20,8 @@ var ErrInvalidRouterDependency = errors.New("ConversationRouter 依赖无效")
 
 const defaultRelayRequestTimeout = 20 * time.Second
 
+const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户id，并配置接入herdr-pal，使用/help获取内置命令帮助"
+
 const serverHelpText = `输入帮助：
 /userid             显示当前企业微信 userid
 /ls                 列出全部在线机器上的 Agent
@@ -162,7 +164,15 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 func (router *ConversationRouter) handleAuthorized(ctx context.Context, message im.IncomingText) {
 	action, err := parseServerAction(message.Content)
 	if err != nil {
+		if !router.catalog.HasSessions(message.UserID) {
+			router.reply(ctx, message, noAvailableSessionsMessage)
+			return
+		}
 		router.reply(ctx, message, err.Error())
+		return
+	}
+	if action.kind != serverActionUserID && action.kind != serverActionHelp && !router.catalog.HasSessions(message.UserID) {
+		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
 	}
 	switch action.kind {
@@ -202,7 +212,7 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 			fmt.Fprintf(&content, " — %s", safeRouterLabel(entry.Session.Title))
 		}
 		content.WriteString(marker)
-		fmt.Fprintf(&content, "\n   工作区：%s / %s\n   状态：%s", safeRouterLabel(entry.Session.Workspace), safeRouterLabel(entry.Session.Tab), safeRouterLabel(entry.Session.Status))
+		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)), safeRouterLabel(entry.Session.Status))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	router.reply(ctx, message, content.String())
@@ -276,10 +286,7 @@ func (router *ConversationRouter) decorateTerminalContent(userID string, source 
 }
 
 func catalogTargetLabel(entry CatalogEntry) string {
-	title := entry.Session.Title
-	if title == "" {
-		title = "未命名"
-	}
+	workspace := panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)
 	agent := entry.Session.Agent
 	if agent == "" {
 		agent = entry.Session.DisplayAgent
@@ -289,7 +296,7 @@ func catalogTargetLabel(entry CatalogEntry) string {
 	}
 	return fmt.Sprintf("[%s/%d] %s-%s(%s)",
 		safeRouterLabel(entry.Ref.MachineID), entry.Ref.LocalIndex,
-		safeRouterLabel(title), safeRouterLabel(agent), safeRouterLabel(entry.Session.PaneID))
+		safeRouterLabel(workspace), safeRouterLabel(agent), safeRouterLabel(entry.Session.PaneID))
 }
 
 type serverActionKind uint8

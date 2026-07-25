@@ -35,10 +35,7 @@ func RenderPageWithTotal(target session.Target, current, total int, lines []stri
 	if total < current {
 		total = current
 	}
-	title := target.Title
-	if title == "" {
-		title = "未命名"
-	}
+	workspace := WorkspaceLabel(target.Workspace, target.Tab)
 	agent := target.Agent
 	if agent == "" {
 		agent = target.DisplayAgent
@@ -50,8 +47,24 @@ func RenderPageWithTotal(target session.Target, current, total int, lines []stri
 	for index, line := range lines {
 		body[index] = neutralizeFence(line)
 	}
-	footer := fmt.Sprintf("%s%s-%s(%s), 页码:[%d/%d]", footerPrefix, safeLabel(title), safeLabel(agent), safeLabel(target.PaneID), current, total)
+	footer := fmt.Sprintf("%s%s-%s(%s), 页码:[%d/%d]", footerPrefix, safeLabel(workspace), safeLabel(agent), safeLabel(target.PaneID), current, total)
 	return renderPageParts(strings.Join(body, "\n"), footer)
+}
+
+// WorkspaceLabel 返回与 Agent 列表一致的工作区和 Tab 展示文本。
+func WorkspaceLabel(workspace, tab string) string {
+	workspace = strings.TrimSpace(workspace)
+	tab = strings.TrimSpace(tab)
+	switch {
+	case workspace != "" && tab != "":
+		return workspace + "/" + tab
+	case workspace != "":
+		return workspace
+	case tab != "":
+		return tab
+	default:
+		return "未知工作区"
+	}
 }
 
 // DecorateRenderedPage 为终端页补充 Relay 机器标识和本地序号。

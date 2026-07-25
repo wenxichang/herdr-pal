@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +28,34 @@ func TestRouterHandlesUserIDWithoutOnlineClient(t *testing.T) {
 	}
 }
 
+func TestRouterExplainsHowToConnectWhenNoSessions(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-empty", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{Sequence: 1})
+	want := "当前没有可用会话，使用/userid 获取用户id，并配置接入herdr-pal，使用/help获取内置命令帮助"
+	for index, content := range []string{"/ls", "/1", "/con", "继续处理"} {
+		router.Handle(context.Background(), routerMessage(
+			"request-empty-"+strconv.Itoa(index), "message-empty-"+strconv.Itoa(index), "user-a", content,
+		))
+		if got := gateway.LastReply(); got != want {
+			t.Fatalf("content %q reply = %q, want %q", content, got, want)
+		}
+	}
+	if relay.CallCount() != 0 {
+		t.Fatalf("relay calls = %d, want 0", relay.CallCount())
+	}
+}
+
+func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	router.Handle(context.Background(), routerMessage("request-help", "message-help", "user-a", "/help"))
+	if got := gateway.LastReply(); !strings.Contains(got, "/userid") || !strings.Contains(got, "/help") {
+		t.Fatalf("help reply = %q", got)
+	}
+	if relay.CallCount() != 0 {
+		t.Fatalf("relay calls = %d, want 0", relay.CallCount())
+	}
+}
+
 func TestRouterListsMachinesWithTitleWorkspaceTabAndStatus(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
@@ -38,7 +67,7 @@ func TestRouterListsMachinesWithTitleWorkspaceTabAndStatus(t *testing.T) {
 	})
 	router.Handle(context.Background(), routerMessage("request-1", "message-1", "user-a", "/ls"))
 	got := gateway.LastReply()
-	for _, want := range []string{"1. [home-mac/1] Codex — 实现 Relay", "工作区：herdr-pal / main", "状态：working"} {
+	for _, want := range []string{"1. [home-mac/1] Codex — 实现 Relay", "工作区：herdr-pal/main", "状态：working"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("reply %q lacks %q", got, want)
 		}
@@ -78,6 +107,7 @@ func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
 	})
 	relay.executeReply = panel.RenderPageWithTotal(session.Target{
 		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "Panel标题",
+		Workspace: "workspace", Tab: "main",
 	}, 1, 1, []string{"选择后的终端内容"})
 
 	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
@@ -88,7 +118,7 @@ func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
 		t.Fatalf("relay calls = %#v, want select then /con", calls)
 	}
 	reply := gateway.LastReply()
-	if !strings.HasPrefix(reply, "```\n选择后的终端内容") || !strings.Contains(reply, "[终端输出] [home-mac/1] Panel标题-codex(w1:p1), 页码:[1/1]") {
+	if !strings.HasPrefix(reply, "```\n选择后的终端内容") || !strings.Contains(reply, "[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]") {
 		t.Fatalf("select reply = %q", reply)
 	}
 }
@@ -206,6 +236,7 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	}
 	content := panel.RenderPageWithTotal(session.Target{
 		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "后台任务",
+		Workspace: "workspace", Tab: "main",
 	}, 1, 2, []string{"后续终端分段"})
 
 	err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{
@@ -219,8 +250,8 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	}
 	reply := gateway.LastReply()
 	for _, want := range []string{
-		"[终端输出] [home-mac/1] 后台任务-codex(w1:p1), 页码:[1/2]",
-		"[当前选择] [office-pc/2] 当前任务-codex(w2:p2)",
+		"[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/2]",
+		"[当前选择] [office-pc/2] workspace/main-codex(w2:p2)",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal push %q lacks %q", reply, want)
@@ -262,6 +293,7 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 	}
 	content := panel.RenderPageWithTotal(session.Target{
 		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "后台任务",
+		Workspace: "workspace", Tab: "main",
 	}, 1, 1, []string{"后台输出"})
 
 	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
@@ -273,8 +305,8 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 	}
 	reply := gateway.LastReply()
 	for _, want := range []string{
-		"[终端输出] [home-mac/1] 后台任务-codex(w1:p1), 页码:[1/1]",
-		"[当前选择] [office-pc/2] 当前任务-codex(w2:p2)",
+		"[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]",
+		"[当前选择] [office-pc/2] workspace/main-codex(w2:p2)",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal notification %q lacks %q", reply, want)

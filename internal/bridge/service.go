@@ -317,7 +317,7 @@ func (s *Service) handleList(ctx context.Context, message im.IncomingText) {
 		if name == "" {
 			name = target.Agent
 		}
-		fmt.Fprintf(&content, "\n%d. %s%s\n   标题：%s\n   工作区：%s / %s\n   状态：%s\n   面板：%s", index+1, safeLabel(name), marker, safeLabel(target.Title), safeLabel(target.Workspace), safeLabel(target.Tab), safeLabel(string(target.Status)), safeLabel(target.PaneID))
+		fmt.Fprintf(&content, "\n%d. %s%s\n   标题：%s\n   工作区：%s\n   状态：%s\n   面板：%s", index+1, safeLabel(name), marker, safeLabel(target.Title), safeLabel(panel.WorkspaceLabel(target.Workspace, target.Tab)), safeLabel(string(target.Status)), safeLabel(target.PaneID))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	s.reply(ctx, message.RequestID, content.String())

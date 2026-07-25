@@ -249,7 +249,7 @@ func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T
 	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("list-details", "/ls"))
 	list := fakeIMFromService(t, service).lastReply()
-	for _, want := range []string{"1. Claude", "标题：第一项 ``\u200b`注入", "工作区一 / 标签一", "状态：blocked", "面板：pane-a", "2. Codex", "标题：第二项", "工作区二 / 标签二", "状态：done", "面板：pane-z"} {
+	for _, want := range []string{"1. Claude", "标题：第一项 ``\u200b`注入", "工作区一/标签一", "状态：blocked", "面板：pane-a", "2. Codex", "标题：第二项", "工作区二/标签二", "状态：done", "面板：pane-z"} {
 		if !strings.Contains(list, want) {
 			t.Fatalf("list missing %q: %q", want, list)
 		}

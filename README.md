@@ -187,8 +187,9 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 `/userid`、`/ls`、选择和 `/help` 由服务端处理；其余输入原样转发到当前选择所在机器，
 继续使用本地 Bridge 的状态、occupant、分页和按键策略。
 
-终端内容优先展示输出，末尾使用 `[终端输出] [machine/index] 标题-agent(pane), 页码:[当前/缓存总页数]`
+终端内容优先展示输出，末尾使用 `[终端输出] [machine/index] 工作区/Tab-agent(pane), 页码:[当前/缓存总页数]`
 标明来源。若来源与当前选择不同，会再附加一行 `[当前选择]`，避免多机器通知混淆。
+用户当前没有任何在线会话时，除 `/userid` 和 `/help` 外的输入会提示如何配置客户端接入。
 
 `/key KEYS` 使用逗号或空白分隔，允许 `up`、`down`、`enter`、`esc`、`space` 或单个
 ASCII 字母和数字；`dn` 是 `down` 的缩写，`sp` 是 `space` 的缩写。单条命令最多 32
@@ -204,10 +205,10 @@ ASCII 字母和数字；`dn` 是 `down` 的缩写，`sp` 是 `space` 的缩写�
 
 ```text
 1. [home-mac/1] Codex — 修复登录测试
-   工作区：backend / main
+   工作区：backend/main
    状态：idle
 2. [office-pc/1] Claude — 整理文档
-   工作区：docs / main
+   工作区：docs/main
    状态：working
 ```
 
