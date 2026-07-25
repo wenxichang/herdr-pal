@@ -112,7 +112,9 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("创建状态通知器: %w", err)
 	}
-	supervisor, err := bridge.NewSupervisor(staticHerdrFactory{client: herdrClient}, registry, service, notifier, bridge.SupervisorOptions{})
+	supervisor, err := bridge.NewSupervisor(staticHerdrFactory{client: herdrClient}, registry, service, notifier, bridge.SupervisorOptions{
+		Logger: logger.With("component", "herdr_supervisor", "machine_id", loaded.Relay.MachineID),
+	})
 	if err != nil {
 		return fmt.Errorf("创建 Herdr Supervisor: %w", err)
 	}

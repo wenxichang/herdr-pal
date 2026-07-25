@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"math"
 	"reflect"
 	"runtime"
@@ -18,6 +19,83 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
+
+func TestSupervisorLogsAppliedStatusTransitionAndNotificationDelivery(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(
+		supervisorPaneWithSession("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle, "sensitive-session-id"),
+	))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{client}, slog.New(slog.NewTextHandler(logs, nil)).With("machine_id", "home-mac"))
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "状态监督基线", func() bool { return serviceAvailable(harness.service) })
+
+	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusWorking))
+	awaitSupervisorCondition(t, "状态通知日志", func() bool {
+		return strings.Contains(logs.String(), "Agent 状态通知已发送")
+	})
+
+	output := logs.String()
+	for _, want := range []string{
+		"Agent 状态发生变化",
+		"machine_id=home-mac",
+		"pane_id=pane-1",
+		"agent=codex",
+		"previous_status=idle",
+		"current_status=working",
+		"notification_required=true",
+		"occupant_hash=",
+		"Agent 状态通知已入队",
+		"Agent 状态通知已发送",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("状态诊断日志缺少 %q：\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "sensitive-session-id") {
+		t.Fatalf("状态诊断日志泄露完整会话标识：\n%s", output)
+	}
+}
+
+func TestSupervisorLogsIgnoredUnknownPaneStatusEvent(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(
+		supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
+	))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{client}, slog.New(slog.NewTextHandler(logs, nil)))
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "状态监督基线", func() bool { return serviceAvailable(harness.service) })
+
+	status.Emit(supervisorStatusEvent("pane-missing", "workspace-1", "claude", herdr.AgentStatusDone))
+	awaitSupervisorCondition(t, "未知 pane 状态日志", func() bool {
+		return strings.Contains(logs.String(), "Agent 状态事件已忽略")
+	})
+
+	output := logs.String()
+	for _, want := range []string{"reason=unknown_pane", "pane_id=pane-missing", "agent=claude", "current_status=done"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("未知 pane 状态日志缺少 %q：\n%s", want, output)
+		}
+	}
+	if messages := harness.im.Messages(); len(messages) != 0 {
+		t.Fatalf("未知 pane 状态事件发送了通知：%#v", messages)
+	}
+}
 
 func TestSupervisorConnectsChecksSnapshotsAndBuildsBaselineSubscriptions(t *testing.T) {
 	lifecycle := newSupervisorStream()
@@ -1151,6 +1229,11 @@ func (i *epochNotifierIM) Messages() []string {
 
 func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisorHarness {
 	t.Helper()
+	return newSupervisorHarnessWithLogger(t, clients, nil)
+}
+
+func newSupervisorHarnessWithLogger(t *testing.T, clients []*supervisorClient, logger *slog.Logger) *supervisorHarness {
+	t.Helper()
 	registry := &session.Registry{}
 	guard, err := policy.NewGuard("user-1")
 	if err != nil {
@@ -1175,6 +1258,7 @@ func newSupervisorHarness(t *testing.T, clients []*supervisorClient) *supervisor
 	waiter := newSupervisorWaiter()
 	backoff := &supervisorBackoff{delays: []time.Duration{time.Second}}
 	supervisor, err := NewSupervisor(factory, registry, service, notifier, SupervisorOptions{
+		Logger:                logger,
 		Backoff:               backoff,
 		Wait:                  waiter.Wait,
 		DebounceDelay:         100 * time.Millisecond,
@@ -1311,6 +1395,23 @@ func supervisorLifecycleEvent(kind string) herdr.Event {
 type supervisorCallLog struct {
 	mu      sync.Mutex
 	entries []string
+}
+
+type lockedLogBuffer struct {
+	mu      sync.Mutex
+	content strings.Builder
+}
+
+func (b *lockedLogBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.content.Write(data)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.content.String()
 }
 
 func (l *supervisorCallLog) Add(entry string) {

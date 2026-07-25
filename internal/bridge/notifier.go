@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +68,7 @@ type notificationDispatcherOptions struct {
 	Capacity int
 	Backoff  RetryPolicy
 	Wait     SupervisorWaitFunc
+	Logger   *slog.Logger
 }
 
 // notificationDispatcher 在 Supervisor 整个 Run 生命周期内串行发送主动通知。
@@ -78,6 +80,7 @@ type notificationDispatcher struct {
 	capacity int
 	backoff  RetryPolicy
 	wait     SupervisorWaitFunc
+	logger   *slog.Logger
 	wake     chan struct{}
 
 	mu                 sync.Mutex
@@ -101,8 +104,11 @@ func newNotificationDispatcher(notifier *Notifier, options notificationDispatche
 	if options.Wait == nil {
 		options.Wait = waitSupervisorDelay
 	}
+	if options.Logger == nil {
+		options.Logger = slog.New(slog.DiscardHandler)
+	}
 	return &notificationDispatcher{
-		notifier: notifier, capacity: options.Capacity, backoff: options.Backoff, wait: options.Wait,
+		notifier: notifier, capacity: options.Capacity, backoff: options.Backoff, wait: options.Wait, logger: options.Logger,
 		wake: make(chan struct{}, 1), pendingStatus: make(map[string]*notificationTask),
 		pendingInvalidated: make(map[string]*notificationTask),
 	}
@@ -135,16 +141,21 @@ func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.
 	d.mu.Lock()
 	if epoch == 0 || d.currentEpoch != epoch {
 		d.mu.Unlock()
+		d.logger.Warn("Agent 状态通知未入队", append(statusTransitionLogArgs(transition), "reason", "stale_epoch")...)
 		return nil
 	}
 	paneID := transition.Target.PaneID
-	d.dropPaneStatusLocked(paneID)
+	dropped := d.dropPaneStatusLocked(paneID)
 	if _, _, notify := notificationPolicy(transition); !notify {
 		d.mu.Unlock()
+		d.logStatusReplacement(dropped, transition.Current)
+		d.logger.Info("Agent 状态无需通知", statusTransitionLogArgs(transition)...)
 		return nil
 	}
 	if len(d.queue) >= d.capacity {
 		d.mu.Unlock()
+		d.logStatusReplacement(dropped, transition.Current)
+		d.logger.Error("Agent 状态通知未入队", append(statusTransitionLogArgs(transition), "reason", "queue_full")...)
 		return ErrNotificationQueueFull
 	}
 	d.nextTaskID++
@@ -152,20 +163,24 @@ func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.
 	d.queue = append(d.queue, task)
 	d.pendingStatus[paneID] = task
 	d.mu.Unlock()
+	d.logStatusReplacement(dropped, transition.Current)
+	d.logger.Info("Agent 状态通知已入队", statusTransitionLogArgs(transition)...)
 	d.signal()
 	return nil
 }
 
 func (d *notificationDispatcher) EnqueueInvalidated(target session.Target) error {
 	d.mu.Lock()
-	d.dropPaneStatusLocked(target.PaneID)
+	dropped := d.dropPaneStatusLocked(target.PaneID)
 	key := target.PaneID + "\x00" + target.OccupantKey
 	if d.pendingInvalidated[key] != nil {
 		d.mu.Unlock()
+		d.logStatusCancellation(dropped, "target_invalidated", herdr.AgentStatusUnknown)
 		return nil
 	}
 	if len(d.queue) >= d.capacity {
 		d.mu.Unlock()
+		d.logStatusCancellation(dropped, "target_invalidated", herdr.AgentStatusUnknown)
 		return ErrNotificationQueueFull
 	}
 	d.nextTaskID++
@@ -176,6 +191,7 @@ func (d *notificationDispatcher) EnqueueInvalidated(target session.Target) error
 	d.queue = append(d.queue, task)
 	d.pendingInvalidated[key] = task
 	d.mu.Unlock()
+	d.logStatusCancellation(dropped, "target_invalidated", herdr.AgentStatusUnknown)
 	d.signal()
 	return nil
 }
@@ -191,10 +207,13 @@ func (d *notificationDispatcher) Run(ctx context.Context) error {
 		}
 		err := d.deliver(taskContext, task)
 		for err != nil && taskContext.Err() == nil && d.taskCurrent(task) {
-			if waitErr := d.wait(taskContext, d.backoff.Next()); waitErr != nil {
+			delay := d.backoff.Next()
+			d.logStatusDeliveryFailure(task, err, delay)
+			if waitErr := d.wait(taskContext, delay); waitErr != nil {
 				if taskContext.Err() != nil {
 					break
 				}
+				d.logStatusDeliveryStopped(task, "retry_wait_failed")
 				d.backoff.Reset()
 				d.finish(task.id, cancel)
 				return fmt.Errorf("主动通知重试等待失败: %w", waitErr)
@@ -203,6 +222,17 @@ func (d *notificationDispatcher) Run(ctx context.Context) error {
 				break
 			}
 			err = d.deliver(taskContext, task)
+		}
+		if task.kind == notificationTaskStatus {
+			if err == nil {
+				d.logger.Info("Agent 状态通知已发送", statusTransitionLogArgs(task.transition)...)
+			} else {
+				reason := "context_canceled"
+				if ctx.Err() == nil {
+					reason = "replaced_or_epoch_ended"
+				}
+				d.logStatusDeliveryStopped(task, reason)
+			}
 		}
 		d.backoff.Reset()
 		d.finish(task.id, cancel)
@@ -303,9 +333,11 @@ func (d *notificationDispatcher) dropStatusLocked(epoch uint64) {
 	}
 }
 
-func (d *notificationDispatcher) dropPaneStatusLocked(paneID string) {
+func (d *notificationDispatcher) dropPaneStatusLocked(paneID string) *notificationTask {
+	var dropped *notificationTask
 	pending := d.pendingStatus[paneID]
 	if pending != nil {
+		dropped = pending
 		kept := d.queue[:0]
 		for _, task := range d.queue {
 			if task != pending {
@@ -316,9 +348,57 @@ func (d *notificationDispatcher) dropPaneStatusLocked(paneID string) {
 		delete(d.pendingStatus, paneID)
 	}
 	if d.active != nil && d.active.kind == notificationTaskStatus && d.active.paneID == paneID && d.activeCancel != nil {
+		dropped = d.active
 		d.activeCancel()
 	}
 	d.notifier.discardStatus(paneID)
+	return dropped
+}
+
+func (d *notificationDispatcher) logStatusReplacement(task *notificationTask, replacement herdr.AgentStatus) {
+	d.logStatusCancellation(task, "replaced", replacement)
+}
+
+func (d *notificationDispatcher) logStatusCancellation(task *notificationTask, reason string, replacement herdr.AgentStatus) {
+	if task == nil || task.kind != notificationTaskStatus {
+		return
+	}
+	args := append(statusTransitionLogArgs(task.transition), "reason", reason)
+	if replacement != herdr.AgentStatusUnknown {
+		args = append(args, "replacement_status", replacement)
+	}
+	d.logger.Warn("Agent 状态通知已取消", args...)
+}
+
+func (d *notificationDispatcher) logStatusDeliveryFailure(task *notificationTask, err error, delay time.Duration) {
+	if task.kind != notificationTaskStatus {
+		return
+	}
+	d.logger.Warn("Agent 状态通知发送失败", append(
+		statusTransitionLogArgs(task.transition), "error_type", notificationDeliveryErrorType(err), "retry_delay", delay,
+	)...)
+}
+
+func (d *notificationDispatcher) logStatusDeliveryStopped(task *notificationTask, reason string) {
+	if task.kind != notificationTaskStatus {
+		return
+	}
+	d.logger.Warn("Agent 状态通知发送已停止", append(
+		statusTransitionLogArgs(task.transition), "reason", reason,
+	)...)
+}
+
+func notificationDeliveryErrorType(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "context"
+	case errors.Is(err, session.ErrListSnapshotExpired), errors.Is(err, session.ErrSelectionInvalid):
+		return "target_changed"
+	case errors.Is(err, herdr.ErrUnavailable):
+		return "herdr_unavailable"
+	default:
+		return "delivery"
+	}
 }
 
 func (d *notificationDispatcher) signal() {

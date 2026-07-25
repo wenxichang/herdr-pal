@@ -795,7 +795,9 @@ func assembleBridgeRuntime(im imRuntime, allowedUserID string, client bridge.Man
 		return nil, fmt.Errorf("创建状态通知器: %w", err)
 	}
 	factory := staticHerdrFactory{client: client}
-	supervisor, err := bridge.NewSupervisor(factory, registry, service, notifier, bridge.SupervisorOptions{})
+	supervisor, err := bridge.NewSupervisor(factory, registry, service, notifier, bridge.SupervisorOptions{
+		Logger: logger.With("component", "herdr_supervisor"),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("创建 Herdr Supervisor: %w", err)
 	}

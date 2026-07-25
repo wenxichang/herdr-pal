@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -57,6 +58,8 @@ type SupervisorWaitFunc func(ctx context.Context, delay time.Duration) error
 
 // SupervisorOptions 配置可测试的重连和生命周期 debounce 行为。
 type SupervisorOptions struct {
+	// Logger 接收状态变化与通知调度诊断日志；nil 时丢弃日志。
+	Logger *slog.Logger
 	// Backoff 是普通连接、快照或事件流失败后的退避策略。
 	Backoff RetryPolicy
 	// Wait 同时承载退避和可取消 debounce 等待。
@@ -85,6 +88,7 @@ type Supervisor struct {
 	registry *session.Registry
 	service  *Service
 	notifier *Notifier
+	logger   *slog.Logger
 
 	backoff                   RetryPolicy
 	wait                      SupervisorWaitFunc
@@ -136,8 +140,11 @@ func NewSupervisor(factory HerdrFactory, registry *session.Registry, service *Se
 	if options.NotificationWait == nil {
 		options.NotificationWait = waitSupervisorDelay
 	}
+	if options.Logger == nil {
+		options.Logger = slog.New(slog.DiscardHandler)
+	}
 	return &Supervisor{
-		factory: factory, registry: registry, service: service, notifier: notifier,
+		factory: factory, registry: registry, service: service, notifier: notifier, logger: options.Logger,
 		backoff: options.Backoff, wait: options.Wait,
 		debounceDelay: options.DebounceDelay, snapshotInterval: options.SnapshotInterval,
 		protocolProbeInterval: options.ProtocolProbeInterval,
@@ -158,6 +165,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		Capacity: s.notificationQueueCapacity,
 		Backoff:  s.notificationBackoff,
 		Wait:     s.notificationWait,
+		Logger:   s.logger,
 	})
 	dispatcherResult := make(chan error, 1)
 	go func() {
@@ -337,21 +345,48 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 				}
 				event, err := herdr.DecodeAgentStatusEvent(message.event)
 				if err != nil {
+					s.logger.Error("Agent 状态事件解析失败", "error_type", "protocol")
 					return finish(err)
 				}
 				// ApplyStatus 只在 Registry 自身锁内更新状态字段；occupant、选择与 Panel 的
 				// 复合变化仍统一由 Service.ReplaceSnapshot 串行处理。
 				transition, err := s.registry.ApplyStatus(event)
 				if err != nil {
-					if errors.Is(err, session.ErrUnknownPane) || errors.Is(err, session.ErrStaleAgentEvent) {
+					reason := "registry"
+					if errors.Is(err, session.ErrUnknownPane) {
+						reason = "unknown_pane"
+					} else if errors.Is(err, session.ErrStaleAgentEvent) {
+						reason = "stale_agent"
+					}
+					if reason != "registry" {
+						s.logger.Warn("Agent 状态事件已忽略",
+							"reason", reason,
+							"pane_id", event.PaneID,
+							"agent", statusEventAgent(event),
+							"current_status", event.AgentStatus,
+						)
 						continue
 					}
+					s.logger.Error("Agent 状态事件应用失败",
+						"pane_id", event.PaneID,
+						"agent", statusEventAgent(event),
+						"current_status", event.AgentStatus,
+						"error_type", "registry",
+					)
 					return finish(err)
 				}
 				if transition.Previous == transition.Current {
+					s.logger.Debug("Agent 重复状态事件已忽略", statusTransitionLogArgs(transition)...)
 					continue
 				}
+				_, _, notify := notificationPolicy(transition)
+				s.logger.Info("Agent 状态发生变化", append(
+					statusTransitionLogArgs(transition), "notification_required", notify,
+				)...)
 				if err := dispatcher.EnqueueStatus(epoch, transition); err != nil {
+					s.logger.Error("Agent 状态通知入队失败", append(
+						statusTransitionLogArgs(transition), "error_type", "queue",
+					)...)
 					return finish(err)
 				}
 			case supervisorDebounceElapsed:
@@ -367,6 +402,23 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 				}
 			}
 		}
+	}
+}
+
+func statusEventAgent(event herdr.AgentStatusEvent) string {
+	if event.Agent == nil {
+		return ""
+	}
+	return *event.Agent
+}
+
+func statusTransitionLogArgs(transition session.Transition) []any {
+	return []any{
+		"pane_id", transition.Target.PaneID,
+		"occupant_hash", bridgeShortHash(transition.Target.OccupantKey),
+		"agent", transition.Target.Agent,
+		"previous_status", transition.Previous,
+		"current_status", transition.Current,
 	}
 }
 

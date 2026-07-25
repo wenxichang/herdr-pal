@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -575,6 +576,68 @@ func TestNotificationDispatcherRetriesInvalidationWithInjectedWait(t *testing.T)
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherLogsStatusRetryAndSuccess(t *testing.T) {
+	im := &failOnceNotifierIM{failAt: 1}
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	retry := &notificationRetry{delay: 7 * time.Second}
+	waiter := newNotificationRetryWaiter()
+	logs := &lockedLogBuffer{}
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Backoff:  retry,
+		Wait:     waiter.Wait,
+		Logger:   slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+	epoch := dispatcher.BeginEpoch()
+
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)); err != nil {
+		t.Fatalf("EnqueueStatus() 返回错误：%v", err)
+	}
+	wait := <-waiter.started
+	output := logs.String()
+	for _, want := range []string{"Agent 状态通知发送失败", "pane_id=pane-1", "current_status=working", "error_type=delivery", "retry_delay=7s"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("通知失败日志缺少 %q：\n%s", want, output)
+		}
+	}
+	close(wait.release)
+	awaitNotifierCondition(t, "状态通知发送成功日志", func() bool {
+		return strings.Contains(logs.String(), "Agent 状态通知已发送")
+	})
+
+	dispatcher.EndEpoch(epoch)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
+func TestNotificationDispatcherLogsStatusReplacement(t *testing.T) {
+	logs := &lockedLogBuffer{}
+	notifier := mustNotifier(t, &notifierIM{}, (&notifierReader{}).ReadRecent)
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 1,
+		Logger:   slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	epoch := dispatcher.BeginEpoch()
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
+		t.Fatalf("done EnqueueStatus() 返回错误：%v", err)
+	}
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusDone, herdr.AgentStatusIdle)); err != nil {
+		t.Fatalf("idle EnqueueStatus() 返回错误：%v", err)
+	}
+
+	output := logs.String()
+	for _, want := range []string{"Agent 状态通知已取消", "pane_id=pane-1", "current_status=done", "replacement_status=idle"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("通知替换日志缺少 %q：\n%s", want, output)
+		}
 	}
 }
 
