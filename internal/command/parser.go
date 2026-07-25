@@ -51,7 +51,7 @@ const maxKeySequence = 32
 
 const helpText = `输入帮助：
 /ls                 列出 Agent
-/N 或 /sel N        选择第 N 个 Agent
+/N 或 /sel N        选择第 N 个 Agent，并显示最新 100 行
 /help               显示本帮助
 /con                显示最新 100 行并重置分页
 /pageup、/pagedn    上翻、下翻缓存

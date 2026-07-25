@@ -592,8 +592,7 @@ func renderStatusTitleParts(title string, target session.Target) []string {
 }
 
 func renderNotificationSnapshot(target session.Target, lines []string) []string {
-	content := panel.RenderPage(target, 0, lines)
-	content = strings.Replace(content, "第 0 页", "范围：最近最多 100 行", 1)
+	content := panel.RenderPageWithTotal(target, 1, 1, lines)
 	return panel.SplitMarkdown(content, panel.WeComContentLimit)
 }
 

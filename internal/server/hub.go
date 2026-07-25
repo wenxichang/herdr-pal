@@ -60,7 +60,7 @@ type ClientHub struct {
 
 // HubOutboundSink 接收客户端后续分段和结构化主动通知。
 type HubOutboundSink interface {
-	SendPush(ctx context.Context, userID, content string) error
+	SendPush(ctx context.Context, userID string, push relayproto.ExecutePush) error
 	SendNotification(ctx context.Context, userID, machineID string, notification relayproto.Notification) error
 }
 
@@ -289,8 +289,11 @@ func (hub *ClientHub) runOutbound(connection *clientConnection) {
 			case relayproto.TypeExecutePush:
 				var push relayproto.ExecutePush
 				push, err = relayproto.DecodePayload[relayproto.ExecutePush](frame)
+				if err == nil && (push.Target.MachineID != connection.key.MachineID || relayproto.ValidateSessionRef(push.Target) != nil) {
+					err = ErrTargetChanged
+				}
 				if err == nil {
-					err = sink.SendPush(connection.ctx, connection.key.UserID, push.Content)
+					err = sink.SendPush(connection.ctx, connection.key.UserID, push)
 				}
 			case relayproto.TypeNotification:
 				var notification relayproto.Notification

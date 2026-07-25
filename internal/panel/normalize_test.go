@@ -39,6 +39,16 @@ func TestNormalizePreservesMeaningfulWhitespaceAndUnicode(t *testing.T) {
 	}
 }
 
+func TestNormalizeCollapsesLongHorizontalRules(t *testing.T) {
+	input := "保留 ──────\n压缩 ────────────── 尾部\n分开 ─────── x ────────"
+
+	got := panel.Normalize(input)
+	want := []string{"保留 ──────", "压缩 ────── 尾部", "分开 ────── x ──────"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Normalize() = %#v, want %#v", got, want)
+	}
+}
+
 func TestNormalizeReplacesInvalidUTF8(t *testing.T) {
 	input := string([]byte{'a', 0xff, 'b'})
 

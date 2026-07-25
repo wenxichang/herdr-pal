@@ -56,6 +56,28 @@ func TestSplitMarkdownHasPredictableInvalidAndEmptyLimits(t *testing.T) {
 	}
 }
 
+func TestRenderPageWithTotalPlacesCompactContextAfterOutput(t *testing.T) {
+	target := session.Target{PaneID: "w1:p1", Agent: "claude", DisplayAgent: "Claude", Title: "Panel标题"}
+	content := RenderPageWithTotal(target, 1, 5, []string{"第一行", "第二行"})
+	footer := "[终端输出] Panel标题-claude(w1:p1), 页码:[1/5]"
+
+	if !strings.HasPrefix(content, "```\n第一行\n第二行\n```") {
+		t.Fatalf("RenderPageWithTotal() output is not first: %q", content)
+	}
+	if !strings.HasSuffix(content, footer) {
+		t.Fatalf("RenderPageWithTotal() footer = %q, want suffix %q", content, footer)
+	}
+
+	decorated := DecorateRenderedPage(content, "home-mac", 1)
+	if !strings.HasSuffix(decorated, "[终端输出] [home-mac/1] Panel标题-claude(w1:p1), 页码:[1/5]") {
+		t.Fatalf("DecorateRenderedPage() = %q", decorated)
+	}
+	withSelection := AppendRenderedPageNote(decorated, "[当前选择] [office-pc/2] 另一个任务-codex(w2:p2)")
+	if !strings.HasSuffix(withSelection, "[当前选择] [office-pc/2] 另一个任务-codex(w2:p2)") {
+		t.Fatalf("AppendRenderedPageNote() = %q", withSelection)
+	}
+}
+
 func TestRenderPageAndSplitMarkdownKeepTerminalPageSelfContained(t *testing.T) {
 	target := session.Target{
 		PaneID:       "workspace:tab:pane",
@@ -67,7 +89,7 @@ func TestRenderPageAndSplitMarkdownKeepTerminalPageSelfContained(t *testing.T) {
 		strings.Repeat("中文😀终端内容 ", 40),
 	})
 
-	if !strings.Contains(content, "终端近期快照") || !strings.Contains(content, "Codex") || !strings.Contains(content, "第 2 页") {
+	if !strings.Contains(content, "[终端输出]") || !strings.Contains(content, "任务-Codex") || !strings.Contains(content, "页码:[3/3]") {
 		t.Fatalf("RenderPage() missing context: %q", content)
 	}
 	if strings.Contains(content, "before ``` dangerous") {
@@ -83,14 +105,14 @@ func TestRenderPageAndSplitMarkdownKeepTerminalPageSelfContained(t *testing.T) {
 		if len(part) > limit || !utf8.ValidString(part) {
 			t.Fatalf("part %d exceeds limit or is invalid UTF-8", index)
 		}
-		if !strings.Contains(part, "终端近期快照") || !strings.Contains(part, "第 2 页") {
+		if !strings.Contains(part, "[终端输出]") || !strings.Contains(part, "页码:[3/3]") {
 			t.Fatalf("part %d missing page context: %q", index, part)
 		}
-		marker := fmt.Sprintf("分段 %d/%d", index+1, len(parts))
+		marker := fmt.Sprintf("[分段] [%d/%d]", index+1, len(parts))
 		if !strings.Contains(part, marker) {
 			t.Fatalf("part %d missing marker %q: %q", index, marker, part)
 		}
-		if strings.Count(part, "```") != 2 || !strings.HasSuffix(part, "\n```") {
+		if strings.Count(part, "```") != 2 || !strings.HasPrefix(part, "```\n") || !strings.Contains(part, "\n```\n[分段]") {
 			t.Fatalf("part %d does not have an independent closed code block: %q", index, part)
 		}
 	}
@@ -102,14 +124,14 @@ func TestSplitMarkdownAllowsEmptyTerminalPageAtExactWrapperLimit(t *testing.T) {
 	if !ok || body != "" {
 		t.Fatalf("RenderPage() = %q, want empty rendered terminal page", content)
 	}
-	limit := len(header) + len("\n分段 1/1") + len(codeFenceOpen) + len(codeFenceClose)
+	limit := len(content)
 
 	parts := SplitMarkdown(content, limit)
 	if len(parts) != 1 || len(parts[0]) != limit {
 		t.Fatalf("SplitMarkdown() = %#v, want one %d-byte part", parts, limit)
 	}
-	if !strings.HasSuffix(parts[0], "\n```") {
-		t.Fatalf("part does not close its code block: %q", parts[0])
+	if !strings.HasSuffix(parts[0], header) {
+		t.Fatalf("part does not keep its footer: %q", parts[0])
 	}
 	if got := SplitMarkdown(content, limit-1); got != nil {
 		t.Fatalf("SplitMarkdown(..., %d) = %#v, want nil", limit-1, got)
@@ -117,12 +139,12 @@ func TestSplitMarkdownAllowsEmptyTerminalPageAtExactWrapperLimit(t *testing.T) {
 }
 
 func TestSplitMarkdownUsesActualOneDigitPartCountAtExactLimit(t *testing.T) {
-	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{"abcdefghij"})
-	header, body, ok := renderedPageParts(content)
+	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{strings.Repeat("a", 50)})
+	footer, body, ok := renderedPageParts(content)
 	if !ok {
 		t.Fatalf("RenderPage() = %q, want rendered terminal page", content)
 	}
-	limit := len(header) + len("\n分段 1/5") + len(codeFenceOpen) + len(codeFenceClose) + 2
+	limit := len(footer) + len("\n[分段] [1/5]") + len(codeFenceOpen) + len(codeFenceClose) + 1 + 10
 
 	parts := SplitMarkdown(content, limit)
 	if len(parts) != 5 {
@@ -132,7 +154,7 @@ func TestSplitMarkdownUsesActualOneDigitPartCountAtExactLimit(t *testing.T) {
 		t.Fatalf("joined body = %q, want %q", got, body)
 	}
 	for index, part := range parts {
-		if len(part) > limit || !strings.Contains(part, fmt.Sprintf("分段 %d/5", index+1)) {
+		if len(part) > limit || !strings.Contains(part, fmt.Sprintf("[分段] [%d/5]", index+1)) {
 			t.Fatalf("part %d = %q", index, part)
 		}
 	}
@@ -154,11 +176,11 @@ func TestSplitMarkdownDoesNotSplitContentThatAlreadyFits(t *testing.T) {
 
 func TestSplitMarkdownRecalculatesBudgetWhenPartCountReachesTen(t *testing.T) {
 	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{strings.Repeat("aaa\n", 10)})
-	header, body, ok := renderedPageParts(content)
+	footer, body, ok := renderedPageParts(content)
 	if !ok {
 		t.Fatalf("RenderPage() = %q, want rendered terminal page", content)
 	}
-	limit := len(header) + len("\n分段 99/99") + len(codeFenceOpen) + len(codeFenceClose) + 4
+	limit := len(footer) + len("\n[分段] [99/99]") + len(codeFenceOpen) + len(codeFenceClose) + 1 + 4
 
 	parts := SplitMarkdown(content, limit)
 	if len(parts) != 10 {
@@ -168,7 +190,7 @@ func TestSplitMarkdownRecalculatesBudgetWhenPartCountReachesTen(t *testing.T) {
 		t.Fatalf("joined body = %q, want %q", got, body)
 	}
 	for index, part := range parts {
-		if len(part) > limit || !strings.Contains(part, fmt.Sprintf("分段 %d/10", index+1)) {
+		if len(part) > limit || !strings.Contains(part, fmt.Sprintf("[分段] [%d/10]", index+1)) {
 			t.Fatalf("part %d = %q", index, part)
 		}
 	}
@@ -176,11 +198,11 @@ func TestSplitMarkdownRecalculatesBudgetWhenPartCountReachesTen(t *testing.T) {
 
 func TestSplitMarkdownNonEmptyUnicodeRequiresRuneAndWrapperSpace(t *testing.T) {
 	content := RenderPage(session.Target{PaneID: "pane-1", DisplayAgent: "Codex"}, 0, []string{"😀"})
-	header, body, ok := renderedPageParts(content)
+	_, body, ok := renderedPageParts(content)
 	if !ok {
 		t.Fatalf("RenderPage() = %q, want rendered terminal page", content)
 	}
-	limit := len(header) + len("\n分段 1/1") + len(codeFenceOpen) + len(codeFenceClose) + len(body)
+	limit := len(content)
 
 	parts := SplitMarkdown(content, limit)
 	if len(parts) != 1 || len(parts[0]) != limit || joinRenderedBodies(t, parts) != body {

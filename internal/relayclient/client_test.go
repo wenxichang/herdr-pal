@@ -18,10 +18,14 @@ import (
 
 func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 	hub, relayServer := startRelayClientHub(t)
+	outbound := &relayOutboundRecorder{pushes: make(chan relayproto.ExecutePush, 1)}
+	if err := hub.SetOutboundSink(outbound); err != nil {
+		t.Fatal(err)
+	}
 	executor := &fakeExecutor{targets: []session.Target{{
 		PaneID: "pane-1", TerminalID: "terminal-1", OccupantKey: "occ-1", Agent: "codex",
 		DisplayAgent: "Codex", Title: "title", Status: herdr.AgentStatusIdle, Workspace: "workspace", Tab: "main",
-	}}}
+	}}, pushContent: "later"}
 	client, err := New(Config{
 		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
 		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
@@ -52,6 +56,14 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 	}
 	if selected := executor.Selected(); selected.PaneID != "pane-1" || selected.OccupantHash != "occ-1" {
 		t.Fatalf("selected = %#v", selected)
+	}
+	select {
+	case push := <-outbound.pushes:
+		if push.Content != "later" || push.Target != target {
+			t.Fatalf("push = %#v, want target %#v", push, target)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing execute push")
 	}
 }
 
@@ -126,10 +138,11 @@ func relayClientURL(relayServer *httptest.Server) string {
 }
 
 type fakeExecutor struct {
-	mu       sync.Mutex
-	targets  []session.Target
-	selected relayproto.SessionRef
-	sink     im.ReplySink
+	mu          sync.Mutex
+	targets     []session.Target
+	selected    relayproto.SessionRef
+	sink        im.ReplySink
+	pushContent string
 }
 
 func (executor *fakeExecutor) CurrentTargets() []session.Target {
@@ -152,6 +165,9 @@ func (executor *fakeExecutor) SelectTarget(paneID, occupantHash string) error {
 
 func (executor *fakeExecutor) HandleMessage(ctx context.Context, message im.IncomingText) {
 	_ = executor.sink.RespondMarkdown(ctx, message.RequestID, "handled: "+message.Content)
+	if executor.pushContent != "" {
+		_ = executor.sink.SendMarkdown(ctx, executor.pushContent)
+	}
 }
 
 func (executor *fakeExecutor) Selected() relayproto.SessionRef {
@@ -169,6 +185,19 @@ func (executor *fakeExecutor) SetTitle(title string) {
 type discardWriter struct{}
 
 func (discardWriter) Write(data []byte) (int, error) { return len(data), nil }
+
+type relayOutboundRecorder struct {
+	pushes chan relayproto.ExecutePush
+}
+
+func (recorder *relayOutboundRecorder) SendPush(_ context.Context, _ string, push relayproto.ExecutePush) error {
+	recorder.pushes <- push
+	return nil
+}
+
+func (*relayOutboundRecorder) SendNotification(context.Context, string, string, relayproto.Notification) error {
+	return nil
+}
 
 func eventuallyClient(t *testing.T, condition func() bool) {
 	t.Helper()

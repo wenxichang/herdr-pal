@@ -24,6 +24,30 @@ func TestBufferRefreshStoresNewestPageAndCopiesInput(t *testing.T) {
 	}
 }
 
+func TestBufferPagePositionUsesCurrentCachedPages(t *testing.T) {
+	latest := numberedLinesRange(150, 180)
+	history := numberedLinesRange(0, 150)
+	var buffer Buffer
+	buffer.Refresh("target-a", latest)
+	if current, total := buffer.PagePosition(); current != 1 || total != 1 {
+		t.Fatalf("PagePosition() = %d/%d, want 1/1", current, total)
+	}
+
+	snapshot := append(append([]string(nil), history...), latest...)
+	if err := buffer.Expand("target-a", snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if current, total := buffer.PagePosition(); current != 2 || total != 3 {
+		t.Fatalf("PagePosition() = %d/%d, want 2/3", current, total)
+	}
+	if err := buffer.PageDown(); err != nil {
+		t.Fatal(err)
+	}
+	if current, total := buffer.PagePosition(); current != 1 || total != 3 {
+		t.Fatalf("PagePosition() = %d/%d, want 1/3", current, total)
+	}
+}
+
 func TestBufferNextReadSizeIncreasesToMaximum(t *testing.T) {
 	var buffer Buffer
 	buffer.Refresh("target-a", numberedLines(100))

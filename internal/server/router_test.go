@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/im"
+	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
+	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
 func TestRouterHandlesUserIDWithoutOnlineClient(t *testing.T) {
@@ -56,7 +58,7 @@ func TestRouterSelectsStableTargetBeforeForwardingInput(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-prompt", "message-prompt", "user-a", "继续实现"))
 
 	calls := relay.Calls()
-	if len(calls) != 2 || calls[0].kind != "select" || calls[1].kind != "execute" {
+	if len(calls) != 3 || calls[0].kind != "select" || calls[1].kind != "execute" || calls[2].kind != "execute" {
 		t.Fatalf("relay calls = %#v", calls)
 	}
 	for _, call := range calls {
@@ -64,8 +66,30 @@ func TestRouterSelectsStableTargetBeforeForwardingInput(t *testing.T) {
 			t.Fatalf("relay call = %#v", call)
 		}
 	}
-	if calls[1].message.Content != "继续实现" || gateway.LastReply() != "客户端已处理。" {
-		t.Fatalf("execute = %#v, reply = %q", calls[1], gateway.LastReply())
+	if calls[1].message.Content != "/con" || calls[2].message.Content != "继续实现" || gateway.LastReply() != "客户端已处理。" {
+		t.Fatalf("execute = %#v, reply = %q", calls, gateway.LastReply())
+	}
+}
+
+func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-1", "Panel标题")},
+	})
+	relay.executeReply = panel.RenderPageWithTotal(session.Target{
+		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "Panel标题",
+	}, 1, 1, []string{"选择后的终端内容"})
+
+	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
+	router.Handle(context.Background(), routerMessage("request-select", "message-select", "user-a", "/1"))
+
+	calls := relay.Calls()
+	if len(calls) != 2 || calls[0].kind != "select" || calls[1].kind != "execute" || calls[1].message.Content != "/con" {
+		t.Fatalf("relay calls = %#v, want select then /con", calls)
+	}
+	reply := gateway.LastReply()
+	if !strings.HasPrefix(reply, "```\n选择后的终端内容") || !strings.Contains(reply, "[终端输出] [home-mac/1] Panel标题-codex(w1:p1), 页码:[1/1]") {
+		t.Fatalf("select reply = %q", reply)
 	}
 }
 
@@ -139,7 +163,10 @@ func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
 			Agent: "claude", DisplayAgent: "Claude", Title: "修复登录", Workspace: "backend", Tab: "debug", Status: "blocked",
 		}},
 	})
-	if err := router.SendPush(context.Background(), "user-a", "后续分段"); err != nil {
+	if err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{
+		Target:  relayproto.SessionRef{MachineID: "office-pc", LocalIndex: 2, PaneID: "pane-1", OccupantHash: "occ-1"},
+		Content: "后续分段",
+	}); err != nil {
 		t.Fatalf("SendPush() error = %v", err)
 	}
 	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{
@@ -159,6 +186,48 @@ func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
 	}
 }
 
+func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *testing.T) {
+	router, gateway, _ := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
+	})
+	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
+	})
+	entries := router.catalog.CreateNumberedSnapshot("user-a")
+	var selected relayproto.SessionRef
+	for _, entry := range entries {
+		if entry.Ref.MachineID == "office-pc" {
+			selected = entry.Ref
+		}
+	}
+	if err := router.catalog.SetSelection("user-a", selected); err != nil {
+		t.Fatal(err)
+	}
+	content := panel.RenderPageWithTotal(session.Target{
+		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "后台任务",
+	}, 1, 2, []string{"后续终端分段"})
+
+	err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{
+		Target: relayproto.SessionRef{
+			MachineID: "home-mac", LocalIndex: 1, PaneID: "w1:p1", OccupantHash: "occ-home",
+		},
+		Content: content,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := gateway.LastReply()
+	for _, want := range []string{
+		"[终端输出] [home-mac/1] 后台任务-codex(w1:p1), 页码:[1/2]",
+		"[当前选择] [office-pc/2] 当前任务-codex(w2:p2)",
+	} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("terminal push %q lacks %q", reply, want)
+		}
+	}
+}
+
 func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
@@ -170,6 +239,49 @@ func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
 	})
 	if !errors.Is(err, ErrTargetChanged) || gateway.ReplyCount() != 0 {
 		t.Fatalf("SendNotification() = %v, replies %d", err, gateway.ReplyCount())
+	}
+}
+
+func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T) {
+	router, gateway, _ := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
+	})
+	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
+	})
+	entries := router.catalog.CreateNumberedSnapshot("user-a")
+	var selected relayproto.SessionRef
+	for _, entry := range entries {
+		if entry.Ref.MachineID == "office-pc" {
+			selected = entry.Ref
+		}
+	}
+	if err := router.catalog.SetSelection("user-a", selected); err != nil {
+		t.Fatal(err)
+	}
+	content := panel.RenderPageWithTotal(session.Target{
+		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "后台任务",
+	}, 1, 1, []string{"后台输出"})
+
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
+		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "w1:p1", OccupantHash: "occ-home"},
+		Content: content,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := gateway.LastReply()
+	for _, want := range []string{
+		"[终端输出] [home-mac/1] 后台任务-codex(w1:p1), 页码:[1/1]",
+		"[当前选择] [office-pc/2] 当前任务-codex(w2:p2)",
+	} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("terminal notification %q lacks %q", reply, want)
+		}
+	}
+	if !strings.HasPrefix(reply, "```\n后台输出") {
+		t.Fatalf("terminal output should precede context: %q", reply)
 	}
 }
 

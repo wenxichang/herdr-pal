@@ -120,7 +120,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 		for _, call := range getCalls {
 			assertCallParams(t, call, map[string]any{"target": "pane-1"})
 		}
-		readCalls := harness.herdr.WaitCallCount(t, "agent.read", 2)
+		readCalls := harness.herdr.WaitCallCount(t, "agent.read", 3)
 		for _, call := range readCalls {
 			assertCallParams(t, call, map[string]any{"target": "pane-1", "lines": float64(100)})
 		}
@@ -146,11 +146,12 @@ func TestBridgeEndToEnd(t *testing.T) {
 		}
 
 		calls := harness.herdr.Calls("agent.read")
-		if len(calls) != 2 {
-			t.Fatalf("agent.read 调用数 = %d, want 2", len(calls))
+		if len(calls) != 3 {
+			t.Fatalf("agent.read 调用数 = %d, want 3", len(calls))
 		}
 		assertCallParams(t, calls[0], map[string]any{"target": "pane-1", "lines": float64(100)})
-		assertCallParams(t, calls[1], map[string]any{"target": "pane-1", "lines": float64(200)})
+		assertCallParams(t, calls[1], map[string]any{"target": "pane-1", "lines": float64(100)})
+		assertCallParams(t, calls[2], map[string]any{"target": "pane-1", "lines": float64(200)})
 	})
 
 	t.Run("blocked 与 done 自动通知每次只读最近一百行", func(t *testing.T) {

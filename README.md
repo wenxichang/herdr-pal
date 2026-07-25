@@ -175,9 +175,9 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 | --- | --- |
 | `/userid` | 服务端直接显示当前企业微信 `userid` |
 | `/ls` | 聚合当前用户全部在线机器上的 Agent，并建立本次编号快照 |
-| `/1`、`/sel 1` | 从最近一次 `/ls` 选择编号 1 |
+| `/1`、`/sel 1` | 从最近一次 `/ls` 选择编号 1，并立即返回 `/con` 内容 |
 | `/help` | 显示输入帮助 |
-| `/con` | 读取当前 Agent 最新 100 行，并重置到第 0 页 |
+| `/con` | 读取当前 Agent 最新 100 行，并重置到第 1 页 |
 | `/pageup`、`/pagedn` | 上翻或下翻当前机器上的面板缓存 |
 | `/enter`、`/key enter` | 发送 `enter` |
 | `/key KEYS` | 发送一个或多个受限按键，结束后自动执行 `/con` |
@@ -186,6 +186,9 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 
 `/userid`、`/ls`、选择和 `/help` 由服务端处理；其余输入原样转发到当前选择所在机器，
 继续使用本地 Bridge 的状态、occupant、分页和按键策略。
+
+终端内容优先展示输出，末尾使用 `[终端输出] [machine/index] 标题-agent(pane), 页码:[当前/缓存总页数]`
+标明来源。若来源与当前选择不同，会再附加一行 `[当前选择]`，避免多机器通知混淆。
 
 `/key KEYS` 使用逗号或空白分隔，允许 `up`、`down`、`enter`、`esc`、`space` 或单个
 ASCII 字母和数字；`dn` 是 `down` 的缩写，`sp` 是 `space` 的缩写。单条命令最多 32

@@ -144,8 +144,9 @@ func TestServiceHelpDoesNotCallHerdr(t *testing.T) {
 }
 
 func TestServiceSelectShorthandUsesListSnapshot(t *testing.T) {
-	service, _ := newTestService(t)
+	service, fake := newTestService(t)
 	service.HandleMessage(context.Background(), incoming("short-list", "/ls"))
+	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: "选择后的终端内容"}
 
 	service.HandleMessage(context.Background(), incoming("short-select", "/1"))
 
@@ -153,8 +154,11 @@ func TestServiceSelectShorthandUsesListSnapshot(t *testing.T) {
 	if err != nil || selected.PaneID != "pane-1" {
 		t.Fatalf("/<NUM> selection = %#v, %v, want pane-1", selected, err)
 	}
-	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "已选择") {
-		t.Fatalf("/<NUM> reply = %q, want 已选择", reply)
+	if reads := fake.reads(); len(reads) != 1 || reads[0].target != "pane-1" || reads[0].lines != panel.PageSize {
+		t.Fatalf("/<NUM> reads = %#v, want immediate /con", reads)
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "选择后的终端内容") || !strings.Contains(reply, "页码:[1/1]") {
+		t.Fatalf("/<NUM> reply = %q, want immediate terminal page", reply)
 	}
 }
 
@@ -195,7 +199,7 @@ func TestServiceListAndSelectionResetPanel(t *testing.T) {
 		t.Fatalf("list reply = %q", list)
 	}
 	service.HandleMessage(context.Background(), incoming("select", "/sel 1"))
-	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "已选择") {
+	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "[终端输出]") {
 		t.Fatalf("select reply = %q", fakeIMFromService(t, service).lastReply())
 	}
 	service.HandleMessage(context.Background(), incoming("list-selected", "/ls"))
@@ -250,6 +254,7 @@ func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T
 			t.Fatalf("list missing %q: %q", want, list)
 		}
 	}
+	fake.setRead(herdr.ReadResult{PaneID: "pane-a", Text: "第一项终端"}, nil)
 	service.HandleMessage(context.Background(), incoming("list-select", "/sel 1"))
 	service.HandleMessage(context.Background(), incoming("list-current", "/ls"))
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "1. Claude（当前选择）") {
@@ -606,6 +611,11 @@ func TestServiceKeySequenceSendsInOrderWithIntervalsAndRefreshesContent(t *testi
 	if !strings.Contains(reply, "4/4") || !strings.Contains(reply, "console-after-keys") {
 		t.Fatalf("key sequence reply = %q", reply)
 	}
+	footerIndex := strings.Index(reply, "[终端输出]")
+	summaryIndex := strings.Index(reply, "按键已发送")
+	if !strings.HasPrefix(reply, "```\nconsole-after-keys") || footerIndex < 0 || summaryIndex < footerIndex {
+		t.Fatalf("key sequence reply order = %q, want output, footer, then summary", reply)
+	}
 }
 
 func TestServiceKeySequenceStopsOnSendFailureAndStillRefreshes(t *testing.T) {
@@ -800,6 +810,7 @@ func TestServiceInputMismatchDoesNotInvalidateNewSelection(t *testing.T) {
 				close(requestDone)
 			}()
 			awaitSignal(t, fake.getStarted, "GetAgent")
+			fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 			selectDone := make(chan struct{})
 			go func() {
 				service.HandleMessage(context.Background(), incoming("input-mismatch-select-"+test.name, "/sel 2"))
@@ -860,9 +871,10 @@ func TestServiceReadMismatchDoesNotInvalidateNewSelectionOrPanel(t *testing.T) {
 				close(oldDone)
 			}()
 			awaitSignal(t, fake.readStarted, "old ReadRecent")
+			fake.clearReadStarted()
 			service.HandleMessage(context.Background(), incoming("read-mismatch-list-"+test.name, "/ls"))
-			service.HandleMessage(context.Background(), incoming("read-mismatch-select-"+test.name, "/sel 2"))
 			fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: namedLines("B", 100, 200)}, nil)
+			service.HandleMessage(context.Background(), incoming("read-mismatch-select-"+test.name, "/sel 2"))
 			service.HandleMessage(context.Background(), incoming("read-mismatch-new-"+test.name, "/con"))
 			close(oldReadBlock)
 			awaitSignal(t, oldDone, "old mismatched read")
@@ -1049,7 +1061,7 @@ func TestServiceContentAndPaging(t *testing.T) {
 	if got := fake.reads(); got[0].target != "pane-1" {
 		t.Fatalf("/con target = %#v, want pane-1", got)
 	}
-	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "第 0 页") {
+	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "页码:[1/1]") {
 		t.Fatalf("content reply = %q", fakeIMFromService(t, service).lastReply())
 	}
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(0, 200)}
@@ -1060,14 +1072,14 @@ func TestServiceContentAndPaging(t *testing.T) {
 	if got := fake.reads(); got[1].target != "pane-1" {
 		t.Fatalf("/pageup target = %#v, want pane-1", got)
 	}
-	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "第 1 页") {
+	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "页码:[2/2]") {
 		t.Fatalf("pageup reply = %q", fakeIMFromService(t, service).lastReply())
 	}
 	service.HandleMessage(context.Background(), incoming("pagedown", "/pagedn"))
 	if got := len(fake.reads()); got != 2 {
 		t.Fatalf("pagedown unexpectedly read Herdr: %#v", fake.reads())
 	}
-	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "第 0 页") {
+	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "页码:[1/2]") {
 		t.Fatalf("pagedown reply = %q", fakeIMFromService(t, service).lastReply())
 	}
 }
@@ -1084,10 +1096,11 @@ func TestServiceSelectResetsExistingPanelCache(t *testing.T) {
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(0, 200)}
 	service.HandleMessage(context.Background(), incoming("select-pageup", "/pageup"))
 	service.HandleMessage(context.Background(), incoming("select-list-again", "/ls"))
+	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 	service.HandleMessage(context.Background(), incoming("select-two", "/sel 2"))
 	beforeReads := len(fake.reads())
 	service.HandleMessage(context.Background(), incoming("select-pagedown", "/pagedn"))
-	if len(fake.reads()) != beforeReads || !strings.Contains(fakeIMFromService(t, service).lastReply(), "/con") {
+	if len(fake.reads()) != beforeReads || !strings.Contains(fakeIMFromService(t, service).lastReply(), "最新") || strings.Contains(fakeIMFromService(t, service).lastReply(), "line-100") {
 		t.Fatalf("selection retained old panel: reads=%#v reply=%q", fake.reads(), fakeIMFromService(t, service).lastReply())
 	}
 }
@@ -1100,20 +1113,23 @@ func TestServiceBlockedReadCannotRestoreOldPanelAfterSelectionChanges(t *testing
 	service.HandleMessage(context.Background(), incoming("read-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("read-select-one", "/sel 1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: "OLD-TERMINAL-CONTENT"}
-	fake.blockRead = make(chan struct{})
+	oldReadBlock := make(chan struct{})
+	fake.blockRead = oldReadBlock
 	fake.readStarted = make(chan struct{}, 1)
 	readDone := make(chan struct{})
 	go func() { service.HandleMessage(context.Background(), incoming("read-old", "/con")); close(readDone) }()
 	awaitSignal(t, fake.readStarted, "ReadRecent")
+	fake.clearReadStarted()
 	service.HandleMessage(context.Background(), incoming("read-list-again", "/ls"))
+	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "NEW-TERMINAL-CONTENT"}, nil)
 	service.HandleMessage(context.Background(), incoming("read-select-two", "/sel 2"))
-	close(fake.blockRead)
+	close(oldReadBlock)
 	awaitSignal(t, readDone, "old /con")
 	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-TERMINAL-CONTENT") || !strings.Contains(reply, "/con") {
 		t.Fatalf("old read was applied after selection switch: %q", reply)
 	}
 	service.HandleMessage(context.Background(), incoming("read-after-pagedown", "/pagedn"))
-	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-TERMINAL-CONTENT") || !strings.Contains(reply, "/con") {
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-TERMINAL-CONTENT") || !strings.Contains(reply, "最新") {
 		t.Fatalf("old panel leaked after selection switch: %q", reply)
 	}
 }
@@ -1142,11 +1158,11 @@ func TestServiceBlockedReadCannotRestoreOldPanelAfterInvalidation(t *testing.T) 
 	awaitSignal(t, invalidated, "InvalidateSelection")
 	close(fake.blockRead)
 	awaitSignal(t, readDone, "old /con")
-	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-INVALIDATED-CONTENT") || strings.Contains(reply, "终端近期快照") {
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-INVALIDATED-CONTENT") || strings.Contains(reply, "[终端输出]") {
 		t.Fatalf("old read was applied after invalidation: %q", reply)
 	}
 	service.HandleMessage(context.Background(), incoming("invalidate-read-pagedown", "/pagedn"))
-	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-INVALIDATED-CONTENT") || strings.Contains(reply, "终端近期快照") {
+	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-INVALIDATED-CONTENT") || strings.Contains(reply, "[终端输出]") {
 		t.Fatalf("old panel leaked after invalidation: %q", reply)
 	}
 }
@@ -1438,6 +1454,7 @@ func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 		close(promptDone)
 	}()
 	awaitSignal(t, fake.promptStarted, "Prompt")
+	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 	selectDone := make(chan struct{})
 	go func() {
 		service.HandleMessage(context.Background(), incoming("select-two", "/sel 2"))
@@ -1482,6 +1499,7 @@ func TestServiceConcurrentSelectAndPageDownNeverMixTargetAndPanel(t *testing.T) 
 		close(pageDone)
 	}()
 	awaitSignal(t, hookEntered, "/pagedn hook")
+	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 	go func() {
 		service.HandleMessage(context.Background(), incoming("mix-select-two", "/sel 2"))
 		close(selectDone)
@@ -1569,6 +1587,9 @@ func selectTarget(t *testing.T, service *Service) {
 	t.Helper()
 	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
 	service.HandleMessage(context.Background(), incoming("select-target", "/sel 1"))
+	if fake, ok := service.client.Load().client.(*fakeHerdr); ok {
+		fake.clearReads()
+	}
 }
 
 func incoming(messageID, content string) wecom.IncomingText {
@@ -1821,6 +1842,23 @@ func (f *fakeHerdr) reads() []readCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]readCall(nil), f.readCalls...)
+}
+func (f *fakeHerdr) clearReads() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readCalls = nil
+	kept := f.order[:0]
+	for _, call := range f.order {
+		if call != "read" {
+			kept = append(kept, call)
+		}
+	}
+	f.order = kept
+}
+func (f *fakeHerdr) clearReadStarted() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readStarted = nil
 }
 func (f *fakeHerdr) gets() []string {
 	f.mu.Lock()

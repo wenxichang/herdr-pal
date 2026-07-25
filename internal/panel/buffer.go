@@ -127,6 +127,16 @@ func (b *Buffer) Render() []string {
 	return append([]string(nil), b.lines[start:end]...)
 }
 
+// PagePosition 返回从最新页开始、从 1 起算的页码和当前缓存总页数。
+func (b *Buffer) PagePosition() (current, total int) {
+	if len(b.lines) == 0 {
+		return 0, 0
+	}
+	olderLines := len(b.lines) - b.latestPageLen()
+	total = 1 + (olderLines+PageSize-1)/PageSize
+	return b.page + 1, total
+}
+
 func (b *Buffer) hasCachedOlderPage() bool {
 	return len(b.lines)-b.latestPageLen() > b.page*PageSize
 }

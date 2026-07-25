@@ -23,7 +23,7 @@ const defaultRelayRequestTimeout = 20 * time.Second
 const serverHelpText = `输入帮助：
 /userid             显示当前企业微信 userid
 /ls                 列出全部在线机器上的 Agent
-/N 或 /sel N        选择第 N 个 Agent
+/N 或 /sel N        选择第 N 个 Agent，并显示最新 100 行
 /help               显示本帮助
 /con                 显示当前 Agent 最新 100 行并重置分页
 /pageup、/pagedn    上翻、下翻缓存
@@ -45,12 +45,26 @@ type RelayRequester interface {
 	Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (string, error)
 }
 
-// SendPush 把客户端后续分段主动发送给所属企业微信用户。
-func (router *ConversationRouter) SendPush(ctx context.Context, userID, content string) error {
+// SendPush 复核后续分段的稳定来源，并发送给所属企业微信用户。
+func (router *ConversationRouter) SendPush(ctx context.Context, userID string, push relayproto.ExecutePush) error {
 	if router == nil || strings.TrimSpace(userID) == "" {
 		return ErrInvalidRouterDependency
 	}
-	return router.gateway.SendMarkdownTo(ctx, userID, content)
+	entry, err := router.catalog.ResolveTarget(userID, push.Target)
+	if err != nil {
+		return err
+	}
+	content := router.decorateTerminalContent(userID, entry, push.Content)
+	parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
+	if len(parts) == 0 {
+		return errors.New("后续分段内容无效")
+	}
+	for _, part := range parts {
+		if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SendNotification 复核最新目录并补充机器、本地序号和 panel 标题。
@@ -61,6 +75,19 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 	entry, err := router.catalog.ResolveTarget(userID, notification.Target)
 	if err != nil {
 		return err
+	}
+	if panel.IsRenderedPage(notification.Content) {
+		content := router.decorateTerminalContent(userID, entry, notification.Content)
+		parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
+		if len(parts) == 0 {
+			return errors.New("通知内容无效")
+		}
+		for _, part := range parts {
+			if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	name := entry.Session.DisplayAgent
 	if name == "" {
@@ -198,11 +225,19 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
-	name := entry.Session.DisplayAgent
-	if name == "" {
-		name = entry.Session.Agent
+	consoleMessage := message
+	consoleMessage.Content = "/con"
+	requestContext, cancel = context.WithTimeout(ctx, router.requestTimeout)
+	content, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
+	cancel()
+	if err != nil {
+		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(err))
+		return
 	}
-	router.reply(ctx, message, fmt.Sprintf("已选择 [%s/%d] %s。", safeRouterLabel(entry.Ref.MachineID), entry.Ref.LocalIndex, safeRouterLabel(name)))
+	if strings.TrimSpace(content) == "" {
+		content = "已选择 " + catalogTargetLabel(entry) + "。"
+	}
+	router.reply(ctx, message, router.decorateTerminalContent(message.UserID, entry, content))
 }
 
 func (router *ConversationRouter) handleExecute(ctx context.Context, message im.IncomingText) {
@@ -225,7 +260,36 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 	if strings.TrimSpace(content) == "" {
 		content = "客户端已处理。"
 	}
-	router.reply(ctx, message, content)
+	router.reply(ctx, message, router.decorateTerminalContent(message.UserID, entry, content))
+}
+
+func (router *ConversationRouter) decorateTerminalContent(userID string, source CatalogEntry, content string) string {
+	if !panel.IsRenderedPage(content) {
+		return content
+	}
+	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Ref.LocalIndex)
+	selected, err := router.catalog.Selected(userID)
+	if err == nil && !sameSessionRef(selected.Ref, source.Ref) {
+		content = panel.AppendRenderedPageNote(content, "[当前选择] "+catalogTargetLabel(selected))
+	}
+	return content
+}
+
+func catalogTargetLabel(entry CatalogEntry) string {
+	title := entry.Session.Title
+	if title == "" {
+		title = "未命名"
+	}
+	agent := entry.Session.Agent
+	if agent == "" {
+		agent = entry.Session.DisplayAgent
+	}
+	if agent == "" {
+		agent = entry.Session.PaneID
+	}
+	return fmt.Sprintf("[%s/%d] %s-%s(%s)",
+		safeRouterLabel(entry.Ref.MachineID), entry.Ref.LocalIndex,
+		safeRouterLabel(title), safeRouterLabel(agent), safeRouterLabel(entry.Session.PaneID))
 }
 
 type serverActionKind uint8

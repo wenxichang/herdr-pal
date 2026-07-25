@@ -13,28 +13,73 @@ import (
 const WeComContentLimit = 20000
 
 const (
-	codeFenceOpen  = "\n```\n"
+	codeFenceOpen  = "```\n"
 	codeFenceClose = "\n```"
+	footerPrefix   = "[终端输出] "
 )
 
-// RenderPage 将终端行标记为“终端近期快照”，而非 assistant 回复。
+// RenderPage 将终端行标记为“终端输出”，而非 assistant 回复。
 //
 // 返回内容是完整的 Markdown 逻辑页。调用方应将它原样交给 SplitMarkdown，以便分段后
 // 仍保留目标、页码和独立闭合的代码块。
 func RenderPage(target session.Target, page int, lines []string) string {
-	name := target.DisplayAgent
-	if name == "" {
-		name = target.Agent
+	current := max(1, page+1)
+	return RenderPageWithTotal(target, current, current, lines)
+}
+
+// RenderPageWithTotal 将终端输出放在前面，并在末尾附加从 1 开始的缓存页码。
+func RenderPageWithTotal(target session.Target, current, total int, lines []string) string {
+	if current < 1 {
+		current = 1
 	}
-	if name == "" {
-		name = target.PaneID
+	if total < current {
+		total = current
 	}
-	header := fmt.Sprintf("终端近期快照\n目标：%s（%s）\n第 %d 页", safeLabel(name), safeLabel(target.PaneID), page)
+	title := target.Title
+	if title == "" {
+		title = "未命名"
+	}
+	agent := target.Agent
+	if agent == "" {
+		agent = target.DisplayAgent
+	}
+	if agent == "" {
+		agent = target.PaneID
+	}
 	body := make([]string, len(lines))
 	for index, line := range lines {
 		body[index] = neutralizeFence(line)
 	}
-	return header + codeFenceOpen + strings.Join(body, "\n") + codeFenceClose
+	footer := fmt.Sprintf("%s%s-%s(%s), 页码:[%d/%d]", footerPrefix, safeLabel(title), safeLabel(agent), safeLabel(target.PaneID), current, total)
+	return renderPageParts(strings.Join(body, "\n"), footer)
+}
+
+// DecorateRenderedPage 为终端页补充 Relay 机器标识和本地序号。
+func DecorateRenderedPage(content, machineID string, localIndex int) string {
+	footer, body, ok := renderedPageParts(content)
+	if !ok || machineID == "" || localIndex < 1 {
+		return content
+	}
+	source := fmt.Sprintf("[%s/%d] ", safeLabel(machineID), localIndex)
+	if strings.HasPrefix(strings.TrimPrefix(footer, footerPrefix), source) {
+		return content
+	}
+	footer = strings.Replace(footer, footerPrefix, footerPrefix+source, 1)
+	return renderPageParts(body, footer)
+}
+
+// AppendRenderedPageNote 在终端页脚后追加一行简短上下文。
+func AppendRenderedPageNote(content, note string) string {
+	if _, _, ok := renderedPageParts(content); !ok || strings.TrimSpace(note) == "" {
+		return content
+	}
+	return content + "\n" + safeLabel(note)
+}
+
+// IsRenderedPage 报告内容是否是可安全重分段的终端页。
+func IsRenderedPage(content string) bool {
+	_, _, ok := renderedPageParts(content)
+	return ok
 }
 
 // SplitMarkdown 按 UTF-8 字节上限切分企业微信 Markdown。
@@ -47,25 +92,24 @@ func SplitMarkdown(content string, limit int) []string {
 		return nil
 	}
 	content = strings.ToValidUTF8(content, "�")
-	if header, body, ok := renderedPageParts(content); ok {
-		return splitRenderedPage(header, body, limit)
+	if footer, body, ok := renderedPageParts(content); ok {
+		return splitRenderedPage(footer, body, limit)
 	}
 	return splitPlain(content, limit)
 }
 
-func splitRenderedPage(header, body string, limit int) []string {
+func splitRenderedPage(footer, body string, limit int) []string {
+	complete := renderPageParts(body, footer)
+	if len(complete) <= limit {
+		return []string{complete}
+	}
 	if body == "" {
-		part := fmt.Sprintf("%s\n分段 1/1%s%s", header, codeFenceOpen, codeFenceClose)
-		if len(part) > limit {
-			return nil
-		}
-		return []string{part}
+		return nil
 	}
 
-	maxDigits := len(strconv.Itoa(max(1, len(body))))
-	for digits := 1; digits <= maxDigits; {
-		markerReserve := "\n分段 " + strings.Repeat("9", digits) + "/" + strings.Repeat("9", digits)
-		payloadLimit := limit - len(header) - len(markerReserve) - len(codeFenceOpen) - len(codeFenceClose)
+	for digits := 1; digits <= len(strconv.Itoa(max(1, len(body)))); {
+		markerReserve := "\n[分段] [" + strings.Repeat("9", digits) + "/" + strings.Repeat("9", digits) + "]"
+		payloadLimit := limit - len(codeFenceOpen) - len(codeFenceClose) - len(markerReserve) - 1 - len(footer)
 		if payloadLimit <= 0 {
 			return nil
 		}
@@ -78,15 +122,15 @@ func splitRenderedPage(header, body string, limit int) []string {
 			digits = requiredDigits
 			continue
 		}
-		return wrapRenderedParts(header, parts)
+		return wrapRenderedParts(footer, parts)
 	}
 	return nil
 }
 
-func wrapRenderedParts(header string, parts []string) []string {
+func wrapRenderedParts(footer string, parts []string) []string {
 	result := make([]string, len(parts))
 	for index, part := range parts {
-		result[index] = fmt.Sprintf("%s\n分段 %d/%d%s%s%s", header, index+1, len(parts), codeFenceOpen, part, codeFenceClose)
+		result[index] = fmt.Sprintf("%s%s%s\n[分段] [%d/%d]\n%s", codeFenceOpen, part, codeFenceClose, index+1, len(parts), footer)
 	}
 	return result
 }
@@ -118,14 +162,27 @@ func splitPlain(content string, limit int) []string {
 	return parts
 }
 
-func renderedPageParts(content string) (header, body string, ok bool) {
-	open := strings.Index(content, codeFenceOpen)
-	if open < 0 || !strings.HasPrefix(content, "终端近期快照\n") || !strings.HasSuffix(content, codeFenceClose) {
+func renderedPageParts(content string) (footer, body string, ok bool) {
+	if !strings.HasPrefix(content, codeFenceOpen) {
 		return "", "", false
 	}
-	bodyStart := open + len(codeFenceOpen)
-	bodyEnd := len(content) - len(codeFenceClose)
-	return content[:open], content[bodyStart:bodyEnd], true
+	footerStart := strings.LastIndex(content, "\n"+footerPrefix)
+	if footerStart < 0 {
+		return "", "", false
+	}
+	bodyEnd := strings.LastIndex(content[:footerStart], codeFenceClose)
+	if bodyEnd < len(codeFenceOpen) {
+		return "", "", false
+	}
+	footer = content[footerStart+1:]
+	if !strings.HasPrefix(footer, footerPrefix) {
+		return "", "", false
+	}
+	return footer, content[len(codeFenceOpen):bodyEnd], true
+}
+
+func renderPageParts(body, footer string) string {
+	return codeFenceOpen + body + codeFenceClose + "\n" + footer
 }
 
 func safeLabel(value string) string {

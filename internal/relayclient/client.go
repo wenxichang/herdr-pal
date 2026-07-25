@@ -66,6 +66,7 @@ type Client struct {
 
 	executionMu     sync.Mutex
 	activeRequestID string
+	activeTarget    relayproto.SessionRef
 }
 
 type clientSession struct {
@@ -150,11 +151,12 @@ func (client *Client) RespondMarkdown(ctx context.Context, requestID, content st
 func (client *Client) SendMarkdown(ctx context.Context, content string) error {
 	client.executionMu.Lock()
 	requestID := client.activeRequestID
+	target := client.activeTarget
 	client.executionMu.Unlock()
 	if requestID == "" {
 		return ErrUnavailable
 	}
-	return client.writeCurrent(ctx, relayproto.TypeExecutePush, requestID, relayproto.ExecutePush{Content: content})
+	return client.writeCurrent(ctx, relayproto.TypeExecutePush, requestID, relayproto.ExecutePush{Target: target, Content: content})
 }
 
 // SendNotification 发送携带稳定本机目标的主动通知；断线时直接失败且不缓存。
@@ -316,11 +318,13 @@ func (client *Client) handleExecute(current *clientSession, frame relayproto.Fra
 	}
 	client.executionMu.Lock()
 	client.activeRequestID = frame.RequestID
+	client.activeTarget = request.Target
 	client.executionMu.Unlock()
 	client.localExecutor().HandleMessage(current.ctx, message)
 	client.executionMu.Lock()
 	if client.activeRequestID == frame.RequestID {
 		client.activeRequestID = ""
+		client.activeTarget = relayproto.SessionRef{}
 	}
 	client.executionMu.Unlock()
 	return nil

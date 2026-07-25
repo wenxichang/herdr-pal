@@ -62,8 +62,9 @@ Router 只接受单聊文本。Bot Secret 只从 `HERDR_PAL_WECOM_SECRET` 读取
 
 - 以 userid 为路由和隔离边界。
 - 直接处理 `/userid`、`/ls`、`/N`/`/sel N` 和 `/help`。
+- 选择成功后向目标客户端执行一次 `/con`，在同一条回复中返回最新终端页。
 - 将其他输入转发到当前稳定选择所在的机器。
-- 接收客户端后续回复和状态通知，并发送给正确的企业微信用户。
+- 接收客户端后续回复和状态通知，按稳定来源补充机器、标题和 pane 后发送给正确用户。
 - 在主动通知前使用最新目录复核目标，补充机器、本地序号和 panel 标题。
 
 Router 不解析 `/con`、`/key` 或普通 prompt 的本地语义。这些内容必须原样交给目标机器，
@@ -109,7 +110,7 @@ SessionRef
 - 校验 `client_hello`、首个完整快照、帧版本、大小、字段和身份。
 - 维护每个客户端的有界发送队列、在途请求和心跳状态。
 - 将选择与执行请求关联到对应响应。
-- 把 `execute_push` 和 `notification` 交给 Router。
+- 复核 `execute_push` 和 `notification` 携带的稳定目标，再交给 Router。
 - 连接结束时同步撤下目录，不保留离线消息或执行队列。
 
 默认心跳间隔 10 秒，30 秒未收到 pong 关闭连接；完整会话快照校准间隔 30 秒。
@@ -214,7 +215,7 @@ Notifier 在 `blocked`、`done`，以及需要输出的 `idle` 状态读取
 
 ## 4. Relay 协议
 
-协议使用严格 JSON WebSocket 文本帧，包含固定版本和类型。核心消息：
+Relay protocol 2 使用严格 JSON WebSocket 文本帧，包含固定版本和类型。核心消息：
 
 ```text
 client_hello       client → server
@@ -230,7 +231,8 @@ notification       client → server
 protocol_error     双向错误报告
 ```
 
-协议不传递 Herdr Socket 路径，不提供通用 Herdr RPC，也不允许客户端在连接内切换 userid 或
+`execute_push` 与 `notification` 都携带稳定 `SessionRef`，使服务端在用户切换选择后仍能
+正确标注消息来源。协议不传递 Herdr Socket 路径，不提供通用 Herdr RPC，也不允许客户端在连接内切换 userid 或
 machine_id。未知字段、未知类型、非法 SessionRef 和超限帧均拒绝。
 
 Relay 请求语义是 at-most-one automatic attempt：服务端超时时提示“操作可能已经提交”，
@@ -261,6 +263,8 @@ Relay 请求语义是 at-most-one automatic attempt：服务端超时时提示�
   → ClientHub 向目标机器发送 select_request
   → 客户端用 pane + occupant 建立本地稳定选择
   → 服务端保存用户选择
+  → execute_request(/con)
+  → 返回最新 100 行终端页
 
 普通文本或本地命令
   → 服务端取得已选 SessionRef

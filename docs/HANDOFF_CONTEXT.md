@@ -7,6 +7,7 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 - `herdr-pal-server` 独占一个企业微信智能机器人长连接，并监听 WSS Relay。
 - 每台运行 Herdr 的机器启动一个 `herdr-pal`，连接本机 Herdr 公共 Socket，并向服务端
   上报 `(userid, machine_id)` 及全部 Agent 会话。
+- 当前 Relay 协议版本为 2；`execute_push` 从该版本起携带稳定 `SessionRef`。
 - 用户在企业微信单聊中执行 `/ls`，获得自己所有在线机器的聚合列表；选择后，服务端使用
   稳定的机器、pane 和 occupant 身份路由请求。
 - `herdr-pal -i` 继续提供不经过网络的本机控制台模式。
@@ -67,7 +68,7 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 - `/userid`、`/ls`、`/N`/`/sel N`、`/help` 由服务端处理。
 - 其余内容要求已有稳定选择，然后作为 `execute_request` 发给目标机器。
 - 客户端先用稳定引用选择本地目标，再进入原有 `Bridge Service`。
-- 服务端等待首段 `execute_response`；后续分段通过 `execute_push` 主动发送。
+- 服务端等待首段 `execute_response`；后续分段通过携带稳定目标的 `execute_push` 主动发送。
 - 超时时服务端不自动重试，避免可能已经提交的 prompt 或按键重复执行。
 
 ### 3.4 状态通知
@@ -99,6 +100,7 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 
 `/userid` 只在企业微信服务端模式有意义。`/<NUM>` 等同 `/sel <NUM>`。全局 `/ls` 条目
 使用 `[machine_id/local_index]` 并包含 Agent、panel 标题、workspace、tab 和状态。
+选择成功后立即在目标机器执行 `/con`，将最新 100 行作为选择回复。
 
 `/key KEYS` 支持逗号或空白混合分隔，允许 `up`、`down`、`enter`、`esc`、`space`、
 单个 ASCII 字母或数字，并支持 `dn -> down`、`sp -> space`。每条命令最多 32 个按键，
@@ -110,6 +112,9 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 
 分页固定 100 行一页。`/con` 读取最后 100 行并重置页码，`/pageup` 最多扩展到 1000
 行，`/pagedn` 只访问缓存。`blocked`、`done` 和需要输出的 `idle` 通知也只读最近 100 行。
+页码使用当前缓存范围，例如初次 `/con` 为 `[1/1]`，上翻扩展后为 `[2/2]`。
+终端输出放在消息前部，机器、会话标题、pane 和页码摘要放在末尾；来源与当前选择不同时
+额外附加当前选择摘要。
 
 ## 5. Herdr API 关键事实
 

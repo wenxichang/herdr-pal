@@ -132,12 +132,15 @@ func TestHubDispatchesPushAndNotificationThroughBoundedOutboundSink(t *testing.T
 	}
 	client := dialReadyHubClient(t, relayServer, "user-a", "home-mac")
 	defer client.Close()
-	client.WriteFrame(t, relayproto.TypeExecutePush, "request-1", relayproto.ExecutePush{Content: "push"})
+	client.WriteFrame(t, relayproto.TypeExecutePush, "request-1", relayproto.ExecutePush{
+		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"},
+		Content: "push",
+	})
 	client.WriteFrame(t, relayproto.TypeNotification, "", relayproto.Notification{
 		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"},
 		Content: "notice",
 	})
-	for _, want := range []string{"push:user-a:push", "notification:user-a:home-mac:notice"} {
+	for _, want := range []string{"push:user-a:home-mac:push", "notification:user-a:home-mac:notice"} {
 		select {
 		case got := <-sink.events:
 			if got != want {
@@ -243,8 +246,8 @@ type hubOutboundRecorder struct {
 	events chan string
 }
 
-func (sink *hubOutboundRecorder) SendPush(_ context.Context, userID, content string) error {
-	sink.events <- "push:" + userID + ":" + content
+func (sink *hubOutboundRecorder) SendPush(_ context.Context, userID string, push relayproto.ExecutePush) error {
+	sink.events <- "push:" + userID + ":" + push.Target.MachineID + ":" + push.Content
 	return nil
 }
 

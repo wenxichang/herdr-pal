@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+func TestProtocolVersionIncludesStableExecutePushTarget(t *testing.T) {
+	if ProtocolVersion != 2 {
+		t.Fatalf("ProtocolVersion = %d, want 2", ProtocolVersion)
+	}
+}
+
 func TestFrameRoundTripUsesStrictVersionedEnvelope(t *testing.T) {
 	frame, err := NewFrame(TypeClientHello, "request-1", ClientHello{
 		UserID: "zhangsan", MachineID: "home-mac", ClientVersion: "v0.1.0",
@@ -39,10 +45,10 @@ func TestDecodeRejectsUnknownFieldTrailingJSONAndVersionMismatch(t *testing.T) {
 		raw  []byte
 		want error
 	}{
-		{name: "unknown field", raw: []byte(`{"protocol":1,"type":"ping","payload":{"nonce":"n"},"extra":1}`), want: ErrInvalidFrame},
-		{name: "trailing json", raw: []byte(`{"protocol":1,"type":"ping","payload":{"nonce":"n"}} {}`), want: ErrInvalidFrame},
-		{name: "protocol mismatch", raw: []byte(`{"protocol":2,"type":"ping","payload":{"nonce":"n"}}`), want: ErrProtocolMismatch},
-		{name: "unknown type", raw: []byte(`{"protocol":1,"type":"future","payload":{}}`), want: ErrInvalidFrame},
+		{name: "unknown field", raw: []byte(`{"protocol":2,"type":"ping","payload":{"nonce":"n"},"extra":1}`), want: ErrInvalidFrame},
+		{name: "trailing json", raw: []byte(`{"protocol":2,"type":"ping","payload":{"nonce":"n"}} {}`), want: ErrInvalidFrame},
+		{name: "protocol mismatch", raw: []byte(`{"protocol":1,"type":"ping","payload":{"nonce":"n"}}`), want: ErrProtocolMismatch},
+		{name: "unknown type", raw: []byte(`{"protocol":2,"type":"future","payload":{}}`), want: ErrInvalidFrame},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -58,8 +64,8 @@ func TestDecodePayloadRejectsUnknownFieldAndTrailingJSON(t *testing.T) {
 		raw     []byte
 		wantErr bool
 	}{
-		{raw: []byte(`{"protocol":1,"type":"ping","payload":{"nonce":"n","extra":1}}`), wantErr: true},
-		{raw: []byte(`{"protocol":1,"type":"ping","payload":{"nonce":"n"}}`)},
+		{raw: []byte(`{"protocol":2,"type":"ping","payload":{"nonce":"n","extra":1}}`), wantErr: true},
+		{raw: []byte(`{"protocol":2,"type":"ping","payload":{"nonce":"n"}}`)},
 	} {
 		frame, err := Decode(test.raw)
 		if err != nil {

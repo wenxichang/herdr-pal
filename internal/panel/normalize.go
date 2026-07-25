@@ -13,6 +13,7 @@ func Normalize(text string) []string {
 	text = strings.ToValidUTF8(text, "�")
 	text = stripANSI(text)
 	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = collapseHorizontalRules(text)
 
 	lines := strings.Split(text, "\n")
 	for index, line := range lines {
@@ -25,6 +26,25 @@ func Normalize(text string) []string {
 		lines = lines[:len(lines)-1]
 	}
 	return lines
+}
+
+func collapseHorizontalRules(text string) string {
+	const maximum = 6
+	var result strings.Builder
+	result.Grow(len(text))
+	run := 0
+	for _, current := range text {
+		if current == '─' {
+			run++
+			if run <= maximum {
+				result.WriteRune(current)
+			}
+			continue
+		}
+		run = 0
+		result.WriteRune(current)
+	}
+	return result.String()
 }
 
 func stripANSI(text string) string {

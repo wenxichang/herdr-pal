@@ -327,7 +327,7 @@ func (s *Service) handleSelect(ctx context.Context, message im.IncomingText, ind
 	s.transitionMu.Lock()
 	s.beginInputBarrierLocked()
 	s.stateMu.Lock()
-	target, err := s.registry.Select(index)
+	_, err := s.registry.Select(index)
 	if err == nil {
 		s.resetPanelLocked()
 	} else if errors.Is(err, session.ErrListSnapshotExpired) {
@@ -341,11 +341,7 @@ func (s *Service) handleSelect(ctx context.Context, message im.IncomingText, ind
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
-	name := target.DisplayAgent
-	if name == "" {
-		name = target.Agent
-	}
-	s.reply(ctx, message.RequestID, fmt.Sprintf("已选择 %s（面板：%s）。", safeLabel(name), safeLabel(target.PaneID)))
+	s.handleContent(ctx, message)
 }
 
 func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, text string) {
@@ -561,12 +557,13 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台目标已变化，请重新执行 /ls 和 /sel。")
 		return
 	}
-	lines, page, applyErr := s.applyRefresh(target, generation, panel.Normalize(result.Text))
+	lines, currentPage, totalPages, applyErr := s.applyRefresh(target, generation, panel.Normalize(result.Text))
 	if applyErr != nil {
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台刷新失败："+readApplyErrorMessage(applyErr))
 		return
 	}
-	s.reply(ctx, message.RequestID, summary+"\n\n"+panel.RenderPage(target, page, lines))
+	content := panel.RenderPageWithTotal(target, currentPage, totalPages, lines)
+	s.reply(ctx, message.RequestID, panel.AppendRenderedPageNote(content, summary))
 }
 
 func keySequenceSummary(sent, total int, failureMessage string) string {
@@ -643,12 +640,12 @@ func (s *Service) handleContent(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	lines, page, err := s.applyRefresh(target, generation, panel.Normalize(result.Text))
+	lines, currentPage, totalPages, err := s.applyRefresh(target, generation, panel.Normalize(result.Text))
 	if err != nil {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
 	}
-	s.replyPage(ctx, message.RequestID, target, page, lines)
+	s.replyPage(ctx, message.RequestID, target, currentPage, totalPages, lines)
 }
 
 func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
@@ -674,12 +671,12 @@ func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	lines, page, err := s.applyExpand(target, generation, panel.Normalize(result.Text))
+	lines, currentPage, totalPages, err := s.applyExpand(target, generation, panel.Normalize(result.Text))
 	if err != nil {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
 	}
-	s.replyPage(ctx, message.RequestID, target, page, lines)
+	s.replyPage(ctx, message.RequestID, target, currentPage, totalPages, lines)
 }
 
 func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
@@ -692,13 +689,14 @@ func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
 		err = panel.ErrPanelChanged
 	}
 	var lines []string
-	page := 0
+	currentPage, totalPages := 0, 0
 	if err == nil {
 		err = s.panel.PageDown()
 		if err == nil {
 			s.page--
 			s.generation++
-			lines, page = s.panel.Render(), s.page
+			lines = s.panel.Render()
+			currentPage, totalPages = s.panel.PagePosition()
 		}
 	}
 	s.stateMu.Unlock()
@@ -710,7 +708,7 @@ func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
 		}
 		return
 	}
-	s.replyPage(ctx, message.RequestID, target, page, lines)
+	s.replyPage(ctx, message.RequestID, target, currentPage, totalPages, lines)
 }
 
 func (s *Service) selectedTarget() (session.Target, error) {
@@ -772,41 +770,43 @@ func (s *Service) capturePageUpTarget() (session.Target, int, uint64, error) {
 	return target, lines, s.generation, err
 }
 
-func (s *Service) applyRefresh(expected session.Target, generation uint64, normalized []string) ([]string, int, error) {
+func (s *Service) applyRefresh(expected session.Target, generation uint64, normalized []string) ([]string, int, int, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	target, err := s.registry.ValidateSelected()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	if s.generation != generation || !sameTarget(target, expected) {
-		return nil, 0, panel.ErrPanelChanged
+		return nil, 0, 0, panel.ErrPanelChanged
 	}
 	s.panel.Refresh(target.OccupantKey, normalized)
 	s.panelReady, s.page = true, 0
 	s.generation++
-	return s.panel.Render(), s.page, nil
+	currentPage, totalPages := s.panel.PagePosition()
+	return s.panel.Render(), currentPage, totalPages, nil
 }
 
-func (s *Service) applyExpand(expected session.Target, generation uint64, normalized []string) ([]string, int, error) {
+func (s *Service) applyExpand(expected session.Target, generation uint64, normalized []string) ([]string, int, int, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	target, err := s.registry.ValidateSelected()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	if s.generation != generation || !sameTarget(target, expected) || !s.panelReady {
-		return nil, 0, panel.ErrPanelChanged
+		return nil, 0, 0, panel.ErrPanelChanged
 	}
 	if err := s.panel.Expand(target.OccupantKey, normalized); err != nil {
 		if errors.Is(err, panel.ErrPanelChanged) {
 			s.resetPanelLocked()
 		}
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	s.page++
 	s.generation++
-	return s.panel.Render(), s.page, nil
+	currentPage, totalPages := s.panel.PagePosition()
+	return s.panel.Render(), currentPage, totalPages, nil
 }
 
 func (s *Service) beginOperation(input bool) (HerdrAPI, func(), bool) {
@@ -873,8 +873,8 @@ func (s *Service) resetPanelLocked() {
 	s.generation++
 }
 
-func (s *Service) replyPage(ctx context.Context, requestID string, target session.Target, page int, lines []string) {
-	s.reply(ctx, requestID, panel.RenderPage(target, page, lines))
+func (s *Service) replyPage(ctx context.Context, requestID string, target session.Target, currentPage, totalPages int, lines []string) {
+	s.reply(ctx, requestID, panel.RenderPageWithTotal(target, currentPage, totalPages, lines))
 }
 
 func (s *Service) reply(ctx context.Context, requestID, content string) {

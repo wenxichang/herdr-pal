@@ -43,8 +43,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 
 	selectReply := sendInteractiveLine(t, application, "/sel 1")
 	assertReplyBlock(t, selectReply)
-	if !strings.Contains(selectReply, "已选择") {
-		t.Fatalf("/sel 1 回复 = %q, want 已选择", selectReply)
+	if !strings.Contains(selectReply, "[终端输出]") || !strings.Contains(selectReply, "页码:[1/1]") {
+		t.Fatalf("/sel 1 回复 = %q, want terminal content", selectReply)
 	}
 
 	herdrServer.SetOutput(numberedLines(250))
@@ -53,8 +53,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	if !strings.Contains(contentReply, "line-151") || !strings.Contains(contentReply, "line-250") || strings.Contains(contentReply, "line-150") {
 		t.Fatalf("/con 回复不代表最后 100 行：%q", contentReply)
 	}
-	readCalls := herdrServer.WaitCallCount(t, "agent.read", 1)
-	assertCallParams(t, readCalls[0], map[string]any{"target": "pane-1", "lines": float64(100)})
+	readCalls := herdrServer.WaitCallCount(t, "agent.read", 2)
+	assertCallParams(t, readCalls[1], map[string]any{"target": "pane-1", "lines": float64(100)})
 
 	promptReply := sendInteractiveLine(t, application, interactivePrompt)
 	assertReplyBlock(t, promptReply)
@@ -77,8 +77,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	}
 	keyCalls := herdrServer.WaitCallCount(t, "agent.send_keys", 1)
 	assertCallParams(t, keyCalls[0], map[string]any{"target": "pane-1", "keys": []any{"space"}})
-	readCalls = herdrServer.WaitCallCount(t, "agent.read", 2)
-	assertCallParams(t, readCalls[1], map[string]any{"target": "pane-1", "lines": float64(100)})
+	readCalls = herdrServer.WaitCallCount(t, "agent.read", 3)
+	assertCallParams(t, readCalls[2], map[string]any{"target": "pane-1", "lines": float64(100)})
 	waitForConsoleOutput(t, application.stderr, 0, "显式按键审计", func(output string) bool {
 		return strings.Contains(output, "user_id=interactive-local") &&
 			strings.Contains(output, "pane_id=pane-1") &&
@@ -94,8 +94,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	}); delivered != 1 {
 		t.Fatalf("blocked 事件写入订阅数 = %d, want 1", delivered)
 	}
-	readCalls = herdrServer.WaitCallCount(t, "agent.read", 3)
-	assertCallParams(t, readCalls[2], map[string]any{"target": "pane-1", "lines": float64(100)})
+	readCalls = herdrServer.WaitCallCount(t, "agent.read", 4)
+	assertCallParams(t, readCalls[3], map[string]any{"target": "pane-1", "lines": float64(100)})
 	notification := waitForConsoleOutput(t, application.stdout, notificationStart, "blocked 主动通知", func(output string) bool {
 		return strings.Count(output, "\n[通知]\n") == 2 &&
 			strings.Contains(output, "line-081") && strings.Contains(output, "line-180") &&
@@ -108,8 +108,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 
 	assertStableCount(t, func() int { return len(herdrServer.Calls("agent.prompt")) }, 1)
 	assertStableCount(t, func() int { return len(herdrServer.Calls("agent.send_keys")) }, 1)
-	if calls := herdrServer.Calls("agent.read"); len(calls) != 3 {
-		t.Fatalf("agent.read 调用数 = %d, want 3", len(calls))
+	if calls := herdrServer.Calls("agent.read"); len(calls) != 4 {
+		t.Fatalf("agent.read 调用数 = %d, want 4", len(calls))
 	}
 
 	stdout := application.stdout.String()

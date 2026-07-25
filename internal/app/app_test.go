@@ -797,8 +797,8 @@ func TestAssembleBridgeRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testin
 	if err != nil {
 		t.Fatalf("Notifier.HandleTransition() error = %v", err)
 	}
-	if gotGet, gotRead := managed.getCount()-getsBeforeNotification, managed.readCount(); gotGet != 2 || gotRead != 1 {
-		t.Fatalf("shared notifier get/read calls = %d/%d, want 2/1", gotGet, gotRead)
+	if gotGet, gotRead := managed.getCount()-getsBeforeNotification, managed.readCount(); gotGet != 2 || gotRead != 2 {
+		t.Fatalf("shared notifier get/read calls = %d/%d, want 2/2", gotGet, gotRead)
 	}
 }
 

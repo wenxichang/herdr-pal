@@ -86,7 +86,7 @@ func TestNotifierSnapshotPoliciesReadOnlyRecentHundredLines(t *testing.T) {
 			if !strings.Contains(messages[0], test.wantText) {
 				t.Fatalf("状态标题 = %q，期望包含 %q", messages[0], test.wantText)
 			}
-			if !strings.HasPrefix(messages[1], "终端近期快照\n") || !strings.Contains(messages[1], "范围：最近最多 100 行") {
+			if !strings.HasPrefix(messages[1], "```\n") || !strings.Contains(messages[1], "[终端输出]") || !strings.Contains(messages[1], "页码:[1/1]") {
 				t.Fatalf("快照标题不符合约定：%q", messages[1])
 			}
 			snapshot := strings.Join(messages[1:], "\n")
@@ -356,7 +356,7 @@ func TestNotifierSnapshotSplittingIsUTF8AndCodeFenceSafe(t *testing.T) {
 		t.Fatalf("长快照未分段：共 %d 条", len(messages))
 	}
 	for index, message := range messages[1:] {
-		if len(message) > panel.WeComContentLimit || !strings.HasSuffix(message, "\n```") || strings.Count(message, "```") != 2 {
+		if len(message) > panel.WeComContentLimit || !strings.Contains(message, "\n```\n") || !strings.Contains(message, "[终端输出]") || strings.Count(message, "```") != 2 {
 			t.Fatalf("快照分段 %d 不安全：bytes=%d content=%q", index, len(message), message)
 		}
 	}
