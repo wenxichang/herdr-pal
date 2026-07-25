@@ -641,6 +641,48 @@ func TestNotificationDispatcherLogsStatusReplacement(t *testing.T) {
 	}
 }
 
+func TestNotificationDispatcherPermanentInvalidationFailureDoesNotBlockStatus(t *testing.T) {
+	im := newTargetChangedNotifierIM()
+	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
+	retry := &notificationRetry{delay: time.Hour}
+	logs := &lockedLogBuffer{}
+	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
+		Capacity: 2,
+		Backoff:  retry,
+		Logger:   slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- dispatcher.Run(ctx) }()
+	epoch := dispatcher.BeginEpoch()
+
+	if err := dispatcher.EnqueueInvalidated(notificationTarget()); err != nil {
+		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
+	}
+	select {
+	case <-im.invalidated:
+	case <-time.After(3 * time.Second):
+		t.Fatal("目标失效通知未开始发送")
+	}
+	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)); err != nil {
+		t.Fatalf("EnqueueStatus() 返回错误：%v", err)
+	}
+	awaitNotifierCondition(t, "永久错误后的状态通知", func() bool { return len(im.Messages()) == 1 })
+	if retry.NextCount() != 0 {
+		t.Fatalf("永久目标变化错误进入重试：Next=%d", retry.NextCount())
+	}
+	if output := logs.String(); !strings.Contains(output, "Agent 目标失效通知发送已停止") ||
+		!strings.Contains(output, "error_type=target_changed") || !strings.Contains(output, "retryable=false") {
+		t.Fatalf("永久目标变化错误日志不完整：\n%s", output)
+	}
+
+	dispatcher.EndEpoch(epoch)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
+	}
+}
+
 func TestNotificationDispatcherInvalidationCancelsSamePaneStatusRetry(t *testing.T) {
 	im := &failOnceNotifierIM{failAt: 1}
 	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
@@ -1305,6 +1347,38 @@ type cancelCountingNotifierIM struct {
 	mu           sync.Mutex
 	calls        int
 	firstStarted chan struct{}
+}
+
+type targetChangedNotifierIM struct {
+	mu          sync.Mutex
+	messages    []string
+	invalidated chan struct{}
+	once        sync.Once
+}
+
+func newTargetChangedNotifierIM() *targetChangedNotifierIM {
+	return &targetChangedNotifierIM{invalidated: make(chan struct{})}
+}
+
+func (i *targetChangedNotifierIM) RespondMarkdown(context.Context, string, string) error {
+	return errors.New("Notifier 不应回复入站回调")
+}
+
+func (i *targetChangedNotifierIM) SendMarkdown(_ context.Context, content string) error {
+	if strings.Contains(content, "目标已失效") {
+		i.once.Do(func() { close(i.invalidated) })
+		return session.ErrListSnapshotExpired
+	}
+	i.mu.Lock()
+	i.messages = append(i.messages, content)
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *targetChangedNotifierIM) Messages() []string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]string(nil), i.messages...)
 }
 
 func newCancelCountingNotifierIM() *cancelCountingNotifierIM {

@@ -206,7 +206,7 @@ func (d *notificationDispatcher) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		err := d.deliver(taskContext, task)
-		for err != nil && taskContext.Err() == nil && d.taskCurrent(task) {
+		for err != nil && !isPermanentNotificationError(err) && taskContext.Err() == nil && d.taskCurrent(task) {
 			delay := d.backoff.Next()
 			d.logStatusDeliveryFailure(task, err, delay)
 			if waitErr := d.wait(taskContext, delay); waitErr != nil {
@@ -223,10 +223,14 @@ func (d *notificationDispatcher) Run(ctx context.Context) error {
 			}
 			err = d.deliver(taskContext, task)
 		}
+		permanentFailure := err != nil && isPermanentNotificationError(err)
+		if permanentFailure {
+			d.logPermanentNotificationFailure(task, err)
+		}
 		if task.kind == notificationTaskStatus {
 			if err == nil {
 				d.logger.Info("Agent 状态通知已发送", statusTransitionLogArgs(task.transition)...)
-			} else {
+			} else if !permanentFailure {
 				reason := "context_canceled"
 				if ctx.Err() == nil {
 					reason = "replaced_or_epoch_ended"
@@ -386,6 +390,28 @@ func (d *notificationDispatcher) logStatusDeliveryStopped(task *notificationTask
 	d.logger.Warn("Agent 状态通知发送已停止", append(
 		statusTransitionLogArgs(task.transition), "reason", reason,
 	)...)
+}
+
+func (d *notificationDispatcher) logPermanentNotificationFailure(task *notificationTask, err error) {
+	errorType := notificationDeliveryErrorType(err)
+	switch task.kind {
+	case notificationTaskStatus:
+		d.logger.Warn("Agent 状态通知发送已停止", append(
+			statusTransitionLogArgs(task.transition), "reason", "permanent_error", "error_type", errorType, "retryable", false,
+		)...)
+	case notificationTaskInvalidated:
+		d.logger.Warn("Agent 目标失效通知发送已停止",
+			"pane_id", task.target.PaneID,
+			"occupant_hash", bridgeShortHash(task.target.OccupantKey),
+			"agent", task.target.Agent,
+			"error_type", errorType,
+			"retryable", false,
+		)
+	}
+}
+
+func isPermanentNotificationError(err error) bool {
+	return errors.Is(err, session.ErrListSnapshotExpired) || errors.Is(err, session.ErrSelectionInvalid)
 }
 
 func notificationDeliveryErrorType(err error) string {
