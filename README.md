@@ -85,7 +85,8 @@ Agent。
 
 1. 在企业微信创建智能机器人，选择 API 模式的长连接接入，取得 Bot ID 和 Secret。
 2. 让需要使用机器人的用户处于该应用允许范围内。
-3. 复制 `server-config.example.json`，填写 Bot ID 和监听地址。
+3. 将 `server-config.example.json` 复制到 `~/.config/herdr-pal/server-config.json`，填写
+   Bot ID 和监听地址。
 4. 只通过环境变量提供 Secret，然后手工启动服务端。
 
 服务端配置示例：
@@ -109,8 +110,11 @@ Agent。
 
 ```sh
 export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
-./dist/herdr-pal-server -config /绝对路径/server.json
+./dist/herdr-pal-server
 ```
+
+未指定 `-config` 时，服务端默认读取 `~/.config/herdr-pal/server-config.json`；仍可使用
+`-config /绝对路径/server.json` 显式覆盖。
 
 `cert_file` 和 `key_file` 必须同时填写或同时留空。留空时服务端在 `state_dir` 中生成并
 复用自签名证书；`state_dir` 留空则使用用户配置目录下的 `herdr-pal-server`。私钥权限会
@@ -127,8 +131,9 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 
 ## 配置和启动每台客户端
 
-每台运行 Herdr 的机器复制 `config.example.json`，填写从 `/userid` 得到的值、该机器的
-稳定标识和服务端地址：
+每台运行 Herdr 的机器将 `config.example.json` 复制到
+`~/.config/herdr-pal/config.json`，填写从 `/userid` 得到的值、该机器的稳定标识和服务端
+地址：
 
 ```json
 {
@@ -160,8 +165,11 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 启动客户端：
 
 ```sh
-./dist/herdr-pal -config /绝对路径/client.json
+./dist/herdr-pal
 ```
+
+未指定 `-config` 时，客户端默认读取 `~/.config/herdr-pal/config.json`；仍可使用
+`-config /绝对路径/client.json` 显式覆盖。
 
 需要保留日志时：
 
@@ -236,9 +244,10 @@ ASCII 字母和数字；`dn` 是 `down` 的缩写，`sp` 是 `space` 的缩写�
 ./dist/herdr-pal -i -config /绝对路径/interactive.json
 ```
 
-交互模式可不提供配置文件。需要覆盖 Herdr session、Socket 或日志级别时，仅配置
-`herdr` 和 `log`。提示符、`[回复]` 和 `[通知]` 写到 stdout，结构化运行日志和按键审计
-写到 stderr。`Ctrl+C`、`SIGTERM` 或 stdin 的 `Ctrl+D` 可正常退出。
+交互模式可不提供配置文件，也不会自动读取客户端默认配置。需要覆盖 Herdr session、Socket
+或日志级别时，仅配置 `herdr` 和 `log` 并显式传入 `-config`。提示符、`[回复]` 和
+`[通知]` 写到 stdout，结构化运行日志和按键审计写到 stderr。`Ctrl+C`、`SIGTERM` 或
+stdin 的 `Ctrl+D` 可正常退出。
 
 ## 测试
 

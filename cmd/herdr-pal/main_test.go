@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,6 +14,9 @@ import (
 )
 
 func TestRunParsesCLIAndMapsExitCodes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaultConfigPath := filepath.Join(home, ".config", "herdr-pal", "config.json")
 	originalVersion, originalCommit, originalBuiltAt := version.Version, version.Commit, version.BuiltAt
 	t.Cleanup(func() {
 		version.Version, version.Commit, version.BuiltAt = originalVersion, originalCommit, originalBuiltAt
@@ -43,7 +47,10 @@ func TestRunParsesCLIAndMapsExitCodes(t *testing.T) {
 			name: "交互模式允许配置路径", args: []string{"-i", "-config", "local.json"}, wantConfigPath: "local.json", wantInteractive: true, wantExecutions: 1,
 			execute: func(context.Context, app.Options) error { return nil },
 		},
-		{name: "没有参数", wantCode: 2, wantStderrPart: "-config"},
+		{
+			name: "没有参数时使用默认配置", wantConfigPath: defaultConfigPath, wantExecutions: 1,
+			execute: func(context.Context, app.Options) error { return nil },
+		},
 		{name: "未知参数", args: []string{"--unknown"}, wantCode: 2, wantStderrPart: "参数错误"},
 		{name: "交互模式和版本互斥", args: []string{"-i", "--version"}, wantCode: 2, wantStderrPart: "用法"},
 		{name: "版本参数后有额外内容", args: []string{"--version", "extra"}, wantCode: 2, wantStderrPart: "用法"},

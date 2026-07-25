@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/wenxichang/herdr-pal/internal/serverapp"
@@ -11,6 +12,8 @@ import (
 )
 
 func TestRunServerParsesConfigAndVersion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	originalVersion := version.Version
 	t.Cleanup(func() { version.Version = originalVersion })
 	version.Version = "v1.0.0"
@@ -24,8 +27,20 @@ func TestRunServerParsesConfigAndVersion(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	var gotDefault serverapp.Options
+	code := run(context.Background(), nil, &stdout, &stderr, func(_ context.Context, options serverapp.Options) error {
+		gotDefault = options
+		return nil
+	})
+	wantDefault := filepath.Join(home, ".config", "herdr-pal", "server-config.json")
+	if code != 0 || gotDefault.ConfigPath != wantDefault {
+		t.Fatalf("default run() = %d, config path %q, want %q", code, gotDefault.ConfigPath, wantDefault)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
 	var got serverapp.Options
-	code := run(context.Background(), []string{"-config", "/tmp/server.json"}, &stdout, &stderr, func(_ context.Context, options serverapp.Options) error {
+	code = run(context.Background(), []string{"-config", "/tmp/server.json"}, &stdout, &stderr, func(_ context.Context, options serverapp.Options) error {
 		got = options
 		return nil
 	})

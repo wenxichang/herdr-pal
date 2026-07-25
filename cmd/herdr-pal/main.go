@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/wenxichang/herdr-pal/internal/app"
+	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
@@ -32,7 +33,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	showVersion := flags.Bool("version", false, "显示版本")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "用法: herdr-pal -i [-config /path/to/config.json]")
-		fmt.Fprintln(stderr, "      herdr-pal -config /path/to/config.json")
+		fmt.Fprintln(stderr, "      herdr-pal [-config /path/to/config.json]")
 		fmt.Fprintln(stderr, "      herdr-pal --version")
 	}
 	if err := flags.Parse(args); err != nil {
@@ -52,14 +53,19 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintln(stdout, version.String())
 		return 0
 	}
-	if !*interactiveMode && *configPath == "" {
-		flags.Usage()
-		return 2
+	resolvedConfigPath := *configPath
+	if !*interactiveMode && resolvedConfigPath == "" {
+		var err error
+		resolvedConfigPath, err = config.DefaultClientPath()
+		if err != nil {
+			fmt.Fprintln(stderr, "无法确定默认配置文件路径，请显式指定 -config。")
+			return 2
+		}
 	}
 
 	err := execute(ctx, app.Options{
 		Interactive: *interactiveMode,
-		ConfigPath:  *configPath,
+		ConfigPath:  resolvedConfigPath,
 		Stdin:       stdin,
 		Getenv:      os.Getenv,
 		Stdout:      stdout,

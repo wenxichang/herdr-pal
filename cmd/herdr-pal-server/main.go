@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/serverapp"
 	"github.com/wenxichang/herdr-pal/internal/version"
@@ -30,7 +31,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 	configPath := flags.String("config", "", "服务端 JSON 配置文件路径")
 	showVersion := flags.Bool("version", false, "显示版本")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "用法: herdr-pal-server -config /path/to/server.json")
+		fmt.Fprintln(stderr, "用法: herdr-pal-server [-config /path/to/server.json]")
 		fmt.Fprintln(stderr, "      herdr-pal-server --version")
 	}
 	if err := flags.Parse(args); err != nil {
@@ -46,11 +47,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 		fmt.Fprintln(stdout, version.String())
 		return 0
 	}
-	if *configPath == "" {
-		flags.Usage()
-		return 2
+	resolvedConfigPath := *configPath
+	if resolvedConfigPath == "" {
+		var err error
+		resolvedConfigPath, err = config.DefaultServerPath()
+		if err != nil {
+			fmt.Fprintln(stderr, "无法确定默认配置文件路径，请显式指定 -config。")
+			return 2
+		}
 	}
-	err := execute(ctx, serverapp.Options{ConfigPath: *configPath, Getenv: os.Getenv, Stderr: stderr})
+	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stderr: stderr})
 	if err == nil || ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return 0
 	}

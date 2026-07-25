@@ -15,6 +15,11 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 `build.sh` 使用 `CGO_ENABLED=0` 生成 `dist/herdr-pal` 和
 `dist/herdr-pal-server` 两个单文件。所有运行状态保存在内存中。
 
+网络模式未指定 `-config` 时，`herdr-pal-server` 默认读取
+`~/.config/herdr-pal/server-config.json`，`herdr-pal` 默认读取
+`~/.config/herdr-pal/config.json`。`herdr-pal -i` 继续允许无配置运行，不自动加载该默认
+客户端配置。
+
 当前实现包括：
 
 - 企业微信智能机器人 API 模式 WebSocket 长连接、订阅、心跳、响应关联和重连。
