@@ -47,6 +47,8 @@ herdr status server --json
 
 - `dist/herdr-pal-server`
 - `dist/herdr-pal`
+- `dist/herdr-pal-server-linux-amd64`
+- `dist/herdr-pal-linux-amd64`
 
 ## 第一步：申请企业微信智能机器人
 
@@ -220,6 +222,9 @@ cp config.example.json ~/.config/herdr-pal/config.json
 普通文本只会发送给当前处于可输入状态的 Agent；Agent 正在工作或等待人工操作时，会返回
 提示而不会强行插入新任务。
 
+如果发送成功后 Agent 在同一面板内创建了新会话，客户端和服务端会同步更新当前选择；后续
+`/ls`、普通输入和完成通知继续指向新会话，不需要重新执行 `/N`。
+
 ## 本机交互模式
 
 不连接企业微信和服务端，直接在当前终端中操作 Herdr：
@@ -277,6 +282,8 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 - 检查 `herdr status server --json` 是否显示 protocol 17。
 - 查看客户端日志是否已经连接 Relay，并成功上报会话。
 - 确认客户端配置的 `userid` 与机器人 `/userid` 返回值完全一致。
+- 新建或启动 Agent 后，客户端最长约 10 秒会主动刷新 Herdr 会话并上报；随后重新执行
+  `/ls`。
 
 ### 客户端无法连接服务端
 

@@ -9,7 +9,7 @@ import (
 
 const (
 	// ProtocolVersion 是当前 Relay 协议版本。
-	ProtocolVersion = 2
+	ProtocolVersion = 3
 	// MaxFrameBytes 是单条 WebSocket 文本帧允许的最大字节数。
 	MaxFrameBytes = 1 << 20
 	// MaxSessionsPerSnapshot 是单台机器可上报的最大会话数。
@@ -143,7 +143,8 @@ type ExecuteRequest struct {
 }
 
 type ExecuteResponse struct {
-	Content string `json:"content"`
+	Content        string      `json:"content"`
+	SelectedTarget *SessionRef `json:"selected_target,omitempty"`
 }
 
 type ExecutePush struct {

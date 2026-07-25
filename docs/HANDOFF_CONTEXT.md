@@ -7,13 +7,15 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 - `herdr-pal-server` 独占一个企业微信智能机器人长连接，并监听 WSS Relay。
 - 每台运行 Herdr 的机器启动一个 `herdr-pal`，连接本机 Herdr 公共 Socket，并向服务端
   上报 `(userid, machine_id)` 及全部 Agent 会话。
-- 当前 Relay 协议版本为 2；`execute_push` 从该版本起携带稳定 `SessionRef`。
+- 当前 Relay 协议版本为 3；`execute_push` 从版本 2 起携带稳定 `SessionRef`，版本 3 的
+  `execute_response` 可以回传客户端已确认的新选择。
 - 用户在企业微信单聊中执行 `/ls`，获得自己所有在线机器的聚合列表；选择后，服务端使用
   稳定的机器、pane 和 occupant 身份路由请求。
 - `herdr-pal -i` 继续提供不经过网络的本机控制台模式。
 
-`build.sh` 使用 `CGO_ENABLED=0` 生成 `dist/herdr-pal` 和
-`dist/herdr-pal-server` 两个单文件。所有运行状态保存在内存中。
+`build.sh` 使用 `CGO_ENABLED=0` 同时生成当前系统及 Linux AMD64 的客户端、服务端单文件：
+`dist/herdr-pal`、`dist/herdr-pal-server`、`dist/herdr-pal-linux-amd64` 和
+`dist/herdr-pal-server-linux-amd64`。所有运行状态保存在内存中。
 
 网络模式未指定 `-config` 时，`herdr-pal-server` 默认读取
 `~/.config/herdr-pal/server-config.json`，`herdr-pal` 默认读取
@@ -65,7 +67,8 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 2. 解析本机 Herdr Socket，获取对应 Socket 的进程锁。
 3. 启动 `EventSupervisor`，按最新 `session.snapshot` 接管本机会话。
 4. 建立 Relay WSS，发送 `client_hello` 和首个完整 `session_snapshot`。
-5. 会话变化后最多约 250ms 上报新快照，并按服务端协商间隔发送校准快照。
+5. EventSupervisor 每 10 秒主动重新读取一次 Herdr 权威 `session.snapshot`；Registry 变化后，
+   Relay 客户端最多约 250ms 上报新快照，并按服务端协商间隔发送校准快照。
 6. Relay 断线时不缓存 prompt、按键或通知，指数退避重连。
 
 ### 3.3 企业微信输入
@@ -74,6 +77,8 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 - 其余内容要求已有稳定选择，然后作为 `execute_request` 发给目标机器。
 - 客户端先用稳定引用选择本地目标，再进入原有 `Bridge Service`。
 - 服务端等待首段 `execute_response`；后续分段通过携带稳定目标的 `execute_push` 主动发送。
+- prompt 成功后若同一 pane 的 Agent 会话发生切换，客户端先立即上报新快照，再在
+  `execute_response` 中回传新 `SessionRef`；服务端只在旧选择仍匹配时原子重绑。
 - 超时时服务端不自动重试，避免可能已经提交的 prompt 或按键重复执行。
 
 ### 3.4 状态通知
@@ -131,7 +136,8 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 4. 为当前 Agent pane 建立批量 `pane.agent_status_changed` 订阅，每项包含 `pane_id`。
 5. 再读取权威 `session.snapshot`，消除 snapshot 与订阅确认之间的窗口。
 6. pane/occupant 集合变化时重建状态订阅，直到计划稳定。
-7. 用基线替换 Registry，不发送历史状态通知，然后开放输入和 Relay 上报。
+7. 健康周期内每 10 秒主动读取权威 snapshot，弥补 lifecycle 事件缺失或延迟。
+8. 用基线替换 Registry，不发送历史状态通知，然后开放输入和 Relay 上报。
 
 Herdr 断线时 `Service.CurrentTargets()` 返回空目录，使 Relay 客户端立即上报会话撤下；
 重连后完全以新快照为准。
@@ -154,6 +160,8 @@ Herdr 断线时 `Service.CurrentTargets()` 返回空目录，使 Relay 客户端
 - 服务端目录只接受连接自己的 userid 和 machine_id，不允许一条连接上报其他机器。
 - 全局编号只引用最近一次用户 `/ls` 快照；真正选择保存 `SessionRef`。
 - pane 关闭、occupant 替换、新快照删除或连接断开都会使旧选择失效。
+- 只有执行响应明确确认同一机器、同一 pane 的新 occupant 时，服务端才等待对应快照并
+  自动更新选择；不会仅凭普通 occupant 变化猜测新目标。
 - Relay 请求和出站队列均有容量上限，不使用无界 goroutine 或无界缓存。
 
 ## 7. 代码边界

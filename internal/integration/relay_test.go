@@ -138,6 +138,15 @@ func (executor *integrationRelayExecutor) CurrentTargets() []session.Target {
 	return []session.Target{executor.target}
 }
 
+func (executor *integrationRelayExecutor) SelectedTarget() (session.Target, error) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if !executor.selected {
+		return session.Target{}, session.ErrNoSelection
+	}
+	return executor.target, nil
+}
+
 func (executor *integrationRelayExecutor) SelectTarget(paneID, occupantHash string) error {
 	executor.mu.Lock()
 	defer executor.mu.Unlock()

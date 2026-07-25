@@ -156,6 +156,11 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target relaypr
 	if err != nil {
 		return "", err
 	}
+	if result.SelectedTarget != nil {
+		if err := hub.catalog.RebindSelection(ctx, userID, target, *result.SelectedTarget); err != nil {
+			return "", err
+		}
+	}
 	return result.Content, nil
 }
 

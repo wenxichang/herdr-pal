@@ -16,6 +16,7 @@ import (
 
 const (
 	defaultSupervisorDebounce      = 100 * time.Millisecond
+	defaultSupervisorSnapshot      = 10 * time.Second
 	defaultProtocolProbeInterval   = 30 * time.Second
 	defaultSupervisorBackoffMin    = time.Second
 	defaultSupervisorBackoffMax    = 30 * time.Second
@@ -62,6 +63,8 @@ type SupervisorOptions struct {
 	Wait SupervisorWaitFunc
 	// DebounceDelay 是生命周期事件合并窗口。
 	DebounceDelay time.Duration
+	// SnapshotInterval 是健康周期主动重新读取权威会话快照的间隔。
+	SnapshotInterval time.Duration
 	// ProtocolProbeInterval 是协议不匹配时的慢探测间隔。
 	ProtocolProbeInterval time.Duration
 	// StableWindow 是健康周期持续多久后才重置普通退避。
@@ -86,6 +89,7 @@ type Supervisor struct {
 	backoff                   RetryPolicy
 	wait                      SupervisorWaitFunc
 	debounceDelay             time.Duration
+	snapshotInterval          time.Duration
 	protocolProbeInterval     time.Duration
 	stableWindow              time.Duration
 	now                       func() time.Time
@@ -111,6 +115,9 @@ func NewSupervisor(factory HerdrFactory, registry *session.Registry, service *Se
 	if options.DebounceDelay <= 0 {
 		options.DebounceDelay = defaultSupervisorDebounce
 	}
+	if options.SnapshotInterval <= 0 {
+		options.SnapshotInterval = defaultSupervisorSnapshot
+	}
 	if options.ProtocolProbeInterval <= 0 {
 		options.ProtocolProbeInterval = defaultProtocolProbeInterval
 	}
@@ -132,8 +139,9 @@ func NewSupervisor(factory HerdrFactory, registry *session.Registry, service *Se
 	return &Supervisor{
 		factory: factory, registry: registry, service: service, notifier: notifier,
 		backoff: options.Backoff, wait: options.Wait,
-		debounceDelay: options.DebounceDelay, protocolProbeInterval: options.ProtocolProbeInterval,
-		stableWindow: options.StableWindow, now: options.Now,
+		debounceDelay: options.DebounceDelay, snapshotInterval: options.SnapshotInterval,
+		protocolProbeInterval: options.ProtocolProbeInterval,
+		stableWindow:          options.StableWindow, now: options.Now,
 		notificationQueueCapacity: options.NotificationQueueCapacity,
 		notificationBackoff:       options.NotificationBackoff, notificationWait: options.NotificationWait,
 	}, nil
@@ -241,8 +249,44 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 		statusGeneration++
 		startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
 	}
+	snapshotTicker := time.NewTicker(s.snapshotInterval)
+	defer snapshotTicker.Stop()
 	finish := func(err error) (bool, error) {
 		return !s.now().Before(healthyStarted.Add(s.stableWindow)), err
+	}
+	refreshSnapshot := func() error {
+		discovery, err := s.snapshot(ctx, client)
+		if err != nil {
+			return err
+		}
+		rebuilds := 0
+		status, statusPlan, discovery, rebuilds, err = s.reconcileStatusSubscriptions(
+			ctx, client, status, statusPlan, discovery,
+			func() { statusGeneration++ },
+		)
+		if err != nil {
+			return err
+		}
+		var changes session.ChangeSet
+		if rebuilds == 0 {
+			changes = s.service.ReplaceSnapshotPreservingStatus(discovery)
+		} else {
+			changes = s.service.ReplaceSnapshot(discovery, false)
+		}
+		for _, target := range changes.RemovedTargets {
+			if err := dispatcher.EnqueueInvalidated(target); err != nil {
+				return err
+			}
+		}
+		for _, target := range changes.ReplacedTargets {
+			if err := dispatcher.EnqueueInvalidated(target); err != nil {
+				return err
+			}
+		}
+		if rebuilds > 0 && status != nil {
+			startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
+		}
+		return nil
 	}
 
 	var debounceCancel context.CancelFunc
@@ -263,6 +307,10 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 		select {
 		case <-ctx.Done():
 			return finish(ctx.Err())
+		case <-snapshotTicker.C:
+			if err := refreshSnapshot(); err != nil {
+				return finish(err)
+			}
 		case message := <-messages:
 			if s.messageObserved != nil {
 				s.messageObserved(message)
@@ -314,36 +362,8 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 					debounceCancel()
 				}
 				debounceCancel = nil
-				discovery, err := s.snapshot(ctx, client)
-				if err != nil {
+				if err := refreshSnapshot(); err != nil {
 					return finish(err)
-				}
-				rebuilds := 0
-				status, statusPlan, discovery, rebuilds, err = s.reconcileStatusSubscriptions(
-					ctx, client, status, statusPlan, discovery,
-					func() { statusGeneration++ },
-				)
-				if err != nil {
-					return finish(err)
-				}
-				var changes session.ChangeSet
-				if rebuilds == 0 {
-					changes = s.service.ReplaceSnapshotPreservingStatus(discovery)
-				} else {
-					changes = s.service.ReplaceSnapshot(discovery, false)
-				}
-				for _, target := range changes.RemovedTargets {
-					if err := dispatcher.EnqueueInvalidated(target); err != nil {
-						return finish(err)
-					}
-				}
-				for _, target := range changes.ReplacedTargets {
-					if err := dispatcher.EnqueueInvalidated(target); err != nil {
-						return finish(err)
-					}
-				}
-				if rebuilds > 0 && status != nil {
-					startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
 				}
 			}
 		}

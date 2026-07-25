@@ -175,7 +175,8 @@ Registry 是可重建缓存，不是事实来源。Herdr 不可用时，对 Rela
 4. 为当前 Agent pane 建立批量 `pane.agent_status_changed` 订阅，每项显式指定 `pane_id`。
 5. 再读取权威 snapshot，消除 snapshot 与订阅确认之间的窗口。
 6. pane/occupant 集合变化时重建状态订阅并再次收敛。
-7. 设置健康 HerdrClient，开放输入和 Relay 目录上报。
+7. 健康周期内每 10 秒主动读取一次权威 snapshot，弥补 lifecycle 事件缺失或延迟。
+8. 设置健康 HerdrClient，开放输入和 Relay 目录上报。
 
 断线时立即进入 degraded、撤下 Relay 会话并暂停输入。重连不恢复旧选择、分页或通知。
 
@@ -216,7 +217,7 @@ Notifier 在 `blocked`、`done`，以及需要输出的 `idle` 状态读取
 
 ## 4. Relay 协议
 
-Relay protocol 2 使用严格 JSON WebSocket 文本帧，包含固定版本和类型。核心消息：
+Relay protocol 3 使用严格 JSON WebSocket 文本帧，包含固定版本和类型。核心消息：
 
 ```text
 client_hello       client → server
@@ -233,8 +234,12 @@ protocol_error     双向错误报告
 ```
 
 `execute_push` 与 `notification` 都携带稳定 `SessionRef`，使服务端在用户切换选择后仍能
-正确标注消息来源。协议不传递 Herdr Socket 路径，不提供通用 Herdr RPC，也不允许客户端在连接内切换 userid 或
-machine_id。未知字段、未知类型、非法 SessionRef 和超限帧均拒绝。
+正确标注消息来源。`execute_response` 可以携带可选的 `selected_target`：仅用于 prompt
+成功后同一机器、同一 pane 内的 Agent 会话切换。客户端必须先上报包含新 occupant 的完整
+快照，服务端再校验旧选择没有被用户改到其他会话，并原子重绑。
+
+协议不传递 Herdr Socket 路径，不提供通用 Herdr RPC，也不允许客户端在连接内切换 userid
+或 machine_id。未知字段、未知类型、非法 SessionRef 和超限帧均拒绝。
 
 Relay 请求语义是 at-most-one automatic attempt：服务端超时时提示“操作可能已经提交”，
 不会自动重试可能产生副作用的执行。协议不承诺 exactly-once；业务层仍依赖 `msgid` 幂等、
@@ -272,6 +277,8 @@ Relay 请求语义是 at-most-one automatic attempt：服务端超时时提示�
   → execute_request
   → 客户端再次选择同一稳定目标
   → Service 执行状态、权限和 occupant 校验
+  → 若 prompt 后同 pane 会话切换，立即上报快照并回传 selected_target
+  → 服务端等待新目标进入目录，并在旧选择未被覆盖时原子重绑
   → execute_response / execute_push
   → 企业微信回复
 ```

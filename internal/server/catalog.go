@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -50,6 +51,7 @@ type routingState struct {
 	numbered      []relayproto.SessionRef
 	numberedValid bool
 	selected      *relayproto.SessionRef
+	invalidated   *relayproto.SessionRef
 }
 
 // SessionCatalog 保存所有在线机器的最新完整快照和用户路由状态。
@@ -61,6 +63,7 @@ type SessionCatalog struct {
 	byKey       map[ClientKey]string
 	machines    map[ClientKey]machineState
 	routing     map[string]routingState
+	updates     chan struct{}
 }
 
 // NewSessionCatalog 创建空的在线会话目录。
@@ -70,6 +73,7 @@ func NewSessionCatalog() *SessionCatalog {
 		byKey:       make(map[ClientKey]string),
 		machines:    make(map[ClientKey]machineState),
 		routing:     make(map[string]routingState),
+		updates:     make(chan struct{}),
 	}
 }
 
@@ -92,6 +96,7 @@ func (catalog *SessionCatalog) Attach(connectionID string, key ClientKey) (bool,
 	catalog.connections[connectionID] = key
 	catalog.byKey[key] = connectionID
 	catalog.machines[key] = machineState{connectionID: connectionID}
+	catalog.signalUpdateLocked()
 	return true, nil
 }
 
@@ -120,6 +125,7 @@ func (catalog *SessionCatalog) ApplySnapshot(connectionID string, snapshot relay
 	current.sessions = append([]relayproto.Session(nil), snapshot.Sessions...)
 	catalog.machines[key] = current
 	catalog.invalidateChangedSelectionLocked(key.UserID)
+	catalog.signalUpdateLocked()
 	return nil
 }
 
@@ -147,7 +153,11 @@ func (catalog *SessionCatalog) Detach(connectionID string) bool {
 	if routing.selected != nil && routing.selected.MachineID == key.MachineID {
 		routing.selected = nil
 	}
+	if routing.invalidated != nil && routing.invalidated.MachineID == key.MachineID {
+		routing.invalidated = nil
+	}
 	catalog.routing[key.UserID] = routing
+	catalog.signalUpdateLocked()
 	return true
 }
 
@@ -230,8 +240,54 @@ func (catalog *SessionCatalog) SetSelection(userID string, target relayproto.Ses
 	routing := catalog.routing[userID]
 	selected := entry.Ref
 	routing.selected = &selected
+	routing.invalidated = nil
 	catalog.routing[userID] = routing
+	catalog.signalUpdateLocked()
 	return nil
+}
+
+// RebindSelection 等待客户端确认的新 occupant 出现在目录后，原子更新当前选择。
+//
+// replacement 必须仍位于 expected 的同一机器和 pane；用户已经选择其他目标时不会覆盖。
+func (catalog *SessionCatalog) RebindSelection(ctx context.Context, userID string, expected, replacement relayproto.SessionRef) error {
+	if catalog == nil || relayproto.ValidateSessionRef(expected) != nil || relayproto.ValidateSessionRef(replacement) != nil ||
+		expected.MachineID != replacement.MachineID || expected.PaneID != replacement.PaneID {
+		return ErrTargetChanged
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		catalog.mu.Lock()
+		if _, online := catalog.machines[ClientKey{UserID: userID, MachineID: expected.MachineID}]; !online {
+			catalog.mu.Unlock()
+			return ErrTargetChanged
+		}
+		routing := catalog.routing[userID]
+		selectionMatches := routing.selected != nil && sameCatalogTarget(*routing.selected, expected)
+		selectionAlreadyRebound := routing.selected != nil && sameCatalogTarget(*routing.selected, replacement)
+		selectionWasInvalidated := routing.selected == nil && routing.invalidated != nil && sameCatalogTarget(*routing.invalidated, expected)
+		if !selectionMatches && !selectionAlreadyRebound && !selectionWasInvalidated {
+			catalog.mu.Unlock()
+			return ErrTargetChanged
+		}
+		if entry, exists := catalog.findEntryLocked(userID, replacement); exists {
+			selected := entry.Ref
+			routing.selected = &selected
+			routing.invalidated = nil
+			catalog.routing[userID] = routing
+			catalog.signalUpdateLocked()
+			catalog.mu.Unlock()
+			return nil
+		}
+		updates := catalog.updates
+		catalog.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-updates:
+		}
+	}
 }
 
 // Selected 返回仍存在且 occupant 未变化的当前选择。
@@ -247,8 +303,11 @@ func (catalog *SessionCatalog) Selected(userID string) (CatalogEntry, error) {
 	}
 	entry, ok := catalog.findEntryLocked(userID, *routing.selected)
 	if !ok {
+		invalidated := *routing.selected
 		routing.selected = nil
+		routing.invalidated = &invalidated
 		catalog.routing[userID] = routing
+		catalog.signalUpdateLocked()
 		return CatalogEntry{}, ErrNoSelection
 	}
 	return entry, nil
@@ -321,9 +380,20 @@ func (catalog *SessionCatalog) invalidateChangedSelectionLocked(userID string) {
 		return
 	}
 	if _, ok := catalog.findEntryLocked(userID, *routing.selected); !ok {
+		invalidated := *routing.selected
 		routing.selected = nil
+		routing.invalidated = &invalidated
 		catalog.routing[userID] = routing
 	}
+}
+
+func (catalog *SessionCatalog) signalUpdateLocked() {
+	close(catalog.updates)
+	catalog.updates = make(chan struct{})
+}
+
+func sameCatalogTarget(left, right relayproto.SessionRef) bool {
+	return left.MachineID == right.MachineID && left.PaneID == right.PaneID && left.OccupantHash == right.OccupantHash
 }
 
 func cloneEntries(entries []CatalogEntry) []CatalogEntry {

@@ -165,6 +165,14 @@ func (s *Service) CurrentTargets() []session.Target {
 	return s.registry.CurrentTargets()
 }
 
+// SelectedTarget 返回当前仍有效的本机稳定选择。
+func (s *Service) SelectedTarget() (session.Target, error) {
+	if s == nil {
+		return session.Target{}, session.ErrNoSelection
+	}
+	return s.selectedTarget()
+}
+
 // SelectTarget 按 pane 和 occupant 稳定身份选择本机目标。
 func (s *Service) SelectTarget(paneID, occupantKey string) error {
 	if s == nil {

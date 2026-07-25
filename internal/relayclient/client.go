@@ -48,6 +48,7 @@ type Config struct {
 // Executor 是 Relay 请求所需的本地 Bridge 能力。
 type Executor interface {
 	CurrentTargets() []session.Target
+	SelectedTarget() (session.Target, error)
 	SelectTarget(paneID, occupantHash string) error
 	HandleMessage(ctx context.Context, message im.IncomingText)
 }
@@ -70,10 +71,11 @@ type Client struct {
 }
 
 type clientSession struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	connection *websocket.Conn
-	writeMu    sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	connection       *websocket.Conn
+	snapshotRequests chan chan error
+	writeMu          sync.Mutex
 }
 
 // New 创建尚未启动的 Relay 客户端；Run 前必须设置 Executor。
@@ -144,7 +146,27 @@ func (client *Client) Run(ctx context.Context) error {
 
 // RespondMarkdown 把 Bridge 首段回复写成 execute_response。
 func (client *Client) RespondMarkdown(ctx context.Context, requestID, content string) error {
-	return client.writeCurrent(ctx, relayproto.TypeExecuteResponse, requestID, relayproto.ExecuteResponse{Content: content})
+	response := relayproto.ExecuteResponse{Content: content}
+	client.executionMu.Lock()
+	activeRequestID := client.activeRequestID
+	activeTarget := client.activeTarget
+	client.executionMu.Unlock()
+	if activeRequestID == requestID {
+		if selected, err := client.selectedSessionRef(); err == nil &&
+			selected.MachineID == activeTarget.MachineID && selected.PaneID == activeTarget.PaneID &&
+			selected.OccupantHash != activeTarget.OccupantHash {
+			response.SelectedTarget = &selected
+			client.executionMu.Lock()
+			if client.activeRequestID == requestID && client.activeTarget == activeTarget {
+				client.activeTarget = selected
+			}
+			client.executionMu.Unlock()
+			if err := client.reportCurrentSnapshot(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return client.writeCurrent(ctx, relayproto.TypeExecuteResponse, requestID, response)
 }
 
 // SendMarkdown 把当前执行产生的后续分段写成 execute_push。
@@ -188,7 +210,10 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 	}
 	connection.SetReadLimit(relayproto.MaxFrameBytes)
 	sessionContext, cancelSession := context.WithCancel(parent)
-	current := &clientSession{ctx: sessionContext, cancel: cancelSession, connection: connection}
+	current := &clientSession{
+		ctx: sessionContext, cancel: cancelSession, connection: connection,
+		snapshotRequests: make(chan chan error),
+	}
 	client.setCurrent(current)
 	defer client.clearCurrent(current)
 	defer current.close()
@@ -231,6 +256,19 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 	}
 	calibrationTicker := time.NewTicker(snapshotInterval)
 	defer calibrationTicker.Stop()
+	sendSnapshot := func(force bool) error {
+		candidate := BuildSnapshot(sequence+1, client.localExecutor().CurrentTargets())
+		candidateFingerprint := SnapshotFingerprint(candidate)
+		if !force && candidateFingerprint == fingerprint {
+			return nil
+		}
+		if err := current.write(parent, relayproto.TypeSessionSnapshot, "", candidate); err != nil {
+			return err
+		}
+		sequence++
+		fingerprint = candidateFingerprint
+		return nil
+	}
 	for {
 		select {
 		case <-parent.Done():
@@ -238,23 +276,19 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 		case err := <-readResult:
 			return err
 		case <-pollTicker.C:
-			candidate := BuildSnapshot(sequence+1, client.localExecutor().CurrentTargets())
-			candidateFingerprint := SnapshotFingerprint(candidate)
-			if candidateFingerprint == fingerprint {
-				continue
-			}
-			if err := current.write(parent, relayproto.TypeSessionSnapshot, "", candidate); err != nil {
+			if err := sendSnapshot(false); err != nil {
 				return err
 			}
-			sequence++
-			fingerprint = candidateFingerprint
 		case <-calibrationTicker.C:
-			candidate := BuildSnapshot(sequence+1, client.localExecutor().CurrentTargets())
-			if err := current.write(parent, relayproto.TypeSessionSnapshot, "", candidate); err != nil {
+			if err := sendSnapshot(true); err != nil {
 				return err
 			}
-			sequence++
-			fingerprint = SnapshotFingerprint(candidate)
+		case result := <-current.snapshotRequests:
+			err := sendSnapshot(true)
+			result <- err
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -344,6 +378,48 @@ func (client *Client) localExecutor() Executor {
 	client.executorMu.RLock()
 	defer client.executorMu.RUnlock()
 	return client.executor
+}
+
+func (client *Client) selectedSessionRef() (relayproto.SessionRef, error) {
+	executor := client.localExecutor()
+	selected, err := executor.SelectedTarget()
+	if err != nil {
+		return relayproto.SessionRef{}, err
+	}
+	for index, current := range executor.CurrentTargets() {
+		if current.PaneID == selected.PaneID && current.OccupantKey == selected.OccupantKey {
+			return relayproto.SessionRef{
+				MachineID: client.config.MachineID, LocalIndex: index + 1,
+				PaneID: selected.PaneID, OccupantHash: selected.OccupantKey,
+			}, nil
+		}
+	}
+	return relayproto.SessionRef{}, session.ErrListSnapshotExpired
+}
+
+func (client *Client) reportCurrentSnapshot(ctx context.Context) error {
+	client.currentMu.RLock()
+	current := client.current
+	client.currentMu.RUnlock()
+	if current == nil {
+		return ErrUnavailable
+	}
+	result := make(chan error, 1)
+	select {
+	case current.snapshotRequests <- result:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-current.ctx.Done():
+		return ErrUnavailable
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-current.ctx.Done():
+		return ErrUnavailable
+	}
 }
 
 func (client *Client) setCurrent(current *clientSession) {

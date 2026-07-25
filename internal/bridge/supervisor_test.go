@@ -114,6 +114,50 @@ func TestSupervisorInitialPaneSetReconcilesUntilStatusSubscriptionsStabilize(t *
 	}
 }
 
+func TestSupervisorDefaultsPeriodicSnapshotIntervalToTenSeconds(t *testing.T) {
+	client := newSupervisorClient(supervisorSnapshot())
+	client.lifecycleStreams = []*supervisorStream{newSupervisorStream()}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	if got := harness.supervisor.snapshotInterval; got != 10*time.Second {
+		t.Fatalf("snapshot interval = %v, want 10s", got)
+	}
+}
+
+func TestSupervisorPeriodicSnapshotDiscoversAgentWithoutLifecycleEvent(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	firstStatus := newSupervisorStream()
+	refreshedStatus := newSupervisorStream()
+	initial := supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))
+	changed := supervisorSnapshot(
+		supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
+		supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusWorking),
+	)
+	client := newSupervisorClient(initial, initial, changed, changed)
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{firstStatus, refreshedStatus}
+	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	harness.supervisor.snapshotInterval = 10 * time.Millisecond
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	if specs := awaitSupervisorSubscribe(t, client); !reflect.DeepEqual(specs, herdr.StatusSubscriptions([]string{"pane-1"})) {
+		t.Fatalf("initial status specs = %#v", specs)
+	}
+	if specs := awaitSupervisorSubscribe(t, client); !reflect.DeepEqual(specs, herdr.StatusSubscriptions([]string{"pane-1", "pane-2"})) {
+		t.Fatalf("refreshed status specs = %#v", specs)
+	}
+	awaitSupervisorCondition(t, "periodic snapshot Agent", func() bool {
+		return client.SnapshotCount() >= 4 && len(harness.registry.AgentPaneIDs()) == 2
+	})
+	if firstStatus.CloseCount() != 1 {
+		t.Fatalf("old status stream close count = %d, want 1", firstStatus.CloseCount())
+	}
+	if messages := harness.im.Messages(); len(messages) != 0 {
+		t.Fatalf("periodic structural refresh emitted status history: %#v", messages)
+	}
+}
+
 func TestSupervisorStatusEventAppliesThenNotifiesAndSuppressesReplay(t *testing.T) {
 	lifecycle := newSupervisorStream()
 	status := newSupervisorStream()

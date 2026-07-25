@@ -45,8 +45,8 @@ func TestServiceSelectTargetUsesStableIdentity(t *testing.T) {
 	if err := service.SelectTarget(targets[0].PaneID, targets[0].OccupantKey); err != nil {
 		t.Fatalf("SelectTarget() error = %v", err)
 	}
-	if selected, err := service.registry.ValidateSelected(); err != nil || selected != targets[0] {
-		t.Fatalf("ValidateSelected() = %#v, %v", selected, err)
+	if selected, err := service.SelectedTarget(); err != nil || selected != targets[0] {
+		t.Fatalf("SelectedTarget() = %#v, %v", selected, err)
 	}
 	if err := service.SelectTarget(targets[0].PaneID, "stale"); !errors.Is(err, session.ErrListSnapshotExpired) {
 		t.Fatalf("SelectTarget(stale) error = %v", err)
