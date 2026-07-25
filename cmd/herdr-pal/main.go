@@ -75,7 +75,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 0
 	}
 	if errors.Is(err, app.ErrConfig) {
-		fmt.Fprintln(stderr, "配置错误，请检查配置文件和必填环境变量。")
+		if detail, ok := app.ConfigErrorDetail(err); ok {
+			if resolvedConfigPath == "" {
+				fmt.Fprintf(stderr, "配置错误：%s\n", detail)
+			} else {
+				fmt.Fprintf(stderr, "配置错误（%s）：%s\n", resolvedConfigPath, detail)
+			}
+		} else {
+			fmt.Fprintln(stderr, "配置错误，请检查配置文件和必填环境变量。")
+		}
 		return 2
 	}
 	if errors.Is(err, processlock.ErrAlreadyRunning) {

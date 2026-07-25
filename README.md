@@ -256,6 +256,12 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 配置错误（/home/user/.config/herdr-pal/server-config.json）：缺少环境变量 HERDR_PAL_WECOM_SECRET
 ```
 
+客户端和本机交互模式也会打印对应配置路径及加载或校验原因，例如：
+
+```text
+配置错误（/home/user/.config/herdr-pal/config.json）：读取配置文件: open ...: no such file or directory
+```
+
 其他服务端启动或运行错误也会直接打印完整原因；错误内容中的当前机器人 Secret 会替换为
 `[REDACTED]`。
 

@@ -421,7 +421,7 @@ func runWeCom(ctx context.Context, options Options) (runErr error) {
 
 func runInteractive(ctx context.Context, options Options) (runErr error) {
 	if ctx == nil {
-		return fmt.Errorf("%w: context 不能为空", ErrConfig)
+		return newConfigError("context 不能为空")
 	}
 	dependencies := options.dependencies
 	if dependencies == nil {
@@ -446,11 +446,11 @@ func runInteractive(ctx context.Context, options Options) (runErr error) {
 
 	loaded, err := dependencies.loadInteractiveConfig(options.ConfigPath)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
+		return newConfigError(err.Error())
 	}
 	logger, err := newLogger(stderr, loaded.Log.Level)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
+		return newConfigError(err.Error())
 	}
 	socketPath, err := dependencies.resolveSocket(ctx, loaded.Herdr.SocketPath, loaded.Herdr.Session, runner)
 	if err != nil {

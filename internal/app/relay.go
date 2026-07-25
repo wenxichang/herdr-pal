@@ -23,7 +23,7 @@ import (
 // RunCLI 按公开 CLI 模式运行本地交互或 Relay 客户端。
 func RunCLI(ctx context.Context, options Options) error {
 	if options.DiscoverUser {
-		return fmt.Errorf("%w: -discover-user 已移除", ErrConfig)
+		return newConfigError("-discover-user 已移除")
 	}
 	if options.Interactive {
 		return Run(ctx, options)
@@ -34,10 +34,10 @@ func RunCLI(ctx context.Context, options Options) error {
 // RunRelay 连接本机 Herdr 与中央 Relay Server，直到 context 取消或关键组件失败。
 func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if ctx == nil {
-		return fmt.Errorf("%w: context 不能为空", ErrConfig)
+		return newConfigError("context 不能为空")
 	}
 	if strings.TrimSpace(options.ConfigPath) == "" {
-		return fmt.Errorf("%w: 缺少 -config", ErrConfig)
+		return newConfigError("缺少 -config")
 	}
 	stderr := options.Stderr
 	if stderr == nil {
@@ -45,11 +45,11 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	}
 	loaded, err := config.LoadClient(options.ConfigPath)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
+		return newConfigError(err.Error())
 	}
 	logger, err := newLogger(stderr, loaded.Log.Level)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
+		return newConfigError(err.Error())
 	}
 	runner := options.Runner
 	if runner == nil {

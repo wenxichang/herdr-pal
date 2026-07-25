@@ -164,3 +164,32 @@ func TestRunParsesCLIAndMapsExitCodes(t *testing.T) {
 		})
 	}
 }
+
+func TestRunReportsDetailedConfigErrors(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaultPath := filepath.Join(home, ".config", "herdr-pal", "config.json")
+	for _, test := range []struct {
+		name     string
+		args     []string
+		wantPath string
+	}{
+		{name: "默认客户端配置", wantPath: defaultPath},
+		{name: "交互模式显式配置", args: []string{"-i", "-config", filepath.Join(home, "missing-interactive.json")}, wantPath: filepath.Join(home, "missing-interactive.json")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+
+			code := run(context.Background(), test.args, bytes.NewReader(nil), &stdout, &stderr, app.RunCLI)
+
+			if code != 2 {
+				t.Fatalf("run() = %d, want 2", code)
+			}
+			for _, want := range []string{"配置错误（" + test.wantPath + "）", "读取配置文件"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want to contain %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
