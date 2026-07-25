@@ -250,6 +250,15 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 - 服务端确认已设置 `HERDR_PAL_WECOM_SECRET`。
 - 客户端确认 `url`、`userid` 和 `machine_id` 已填写。
 
+服务端会同时打印配置文件路径和具体原因，例如：
+
+```text
+配置错误（/home/user/.config/herdr-pal/server-config.json）：缺少环境变量 HERDR_PAL_WECOM_SECRET
+```
+
+其他服务端启动或运行错误也会直接打印完整原因；错误内容中的当前机器人 Secret 会替换为
+`[REDACTED]`。
+
 ### 服务端无法连接企业微信
 
 - 确认机器人选择的是 API 长连接模式。

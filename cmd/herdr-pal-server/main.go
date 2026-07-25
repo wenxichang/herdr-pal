@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/wenxichang/herdr-pal/internal/config"
@@ -61,13 +62,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 		return 0
 	}
 	if errors.Is(err, serverapp.ErrConfig) {
-		fmt.Fprintln(stderr, "配置错误，请检查服务端配置文件和必填环境变量。")
+		detail := strings.TrimPrefix(safeServerError(err), serverapp.ErrConfig.Error()+": ")
+		fmt.Fprintf(stderr, "配置错误（%s）：%s\n", resolvedConfigPath, detail)
 		return 2
 	}
 	if errors.Is(err, processlock.ErrAlreadyRunning) {
 		fmt.Fprintln(stderr, processlock.ErrAlreadyRunning)
 		return 1
 	}
-	fmt.Fprintln(stderr, "Herdr Pal Server 启动或运行失败，请检查安全日志。")
+	fmt.Fprintf(stderr, "Herdr Pal Server 启动或运行失败：%s\n", safeServerError(err))
 	return 1
+}
+
+func safeServerError(err error) string {
+	message := err.Error()
+	secret := os.Getenv(config.SecretEnvName)
+	if strings.TrimSpace(secret) != "" {
+		message = strings.ReplaceAll(message, secret, "[REDACTED]")
+	}
+	return message
 }

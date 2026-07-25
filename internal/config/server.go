@@ -42,7 +42,7 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 		return ServerConfig{}, fmt.Errorf("缺少必填字段 bot_id")
 	}
 	if strings.TrimSpace(loaded.WeCom.Secret) == "" {
-		return ServerConfig{}, fmt.Errorf("缺少必填字段 secret")
+		return ServerConfig{}, fmt.Errorf("缺少环境变量 %s", SecretEnvName)
 	}
 	if strings.TrimSpace(loaded.Server.Listen) == "" {
 		return ServerConfig{}, fmt.Errorf("缺少必填字段 listen")

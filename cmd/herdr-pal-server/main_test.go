@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wenxichang/herdr-pal/internal/serverapp"
@@ -51,21 +53,40 @@ func TestRunServerParsesConfigAndVersion(t *testing.T) {
 
 func TestRunServerMapsConfigAndRuntimeErrors(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		err  error
-		code int
+		name          string
+		err           error
+		secret        string
+		code          int
+		wantParts     []string
+		forbiddenPart string
 	}{
-		{name: "config", err: serverapp.ErrConfig, code: 2},
-		{name: "runtime", err: errors.New("secret-sensitive"), code: 1},
+		{
+			name: "config detail", err: fmt.Errorf("%w: 缺少必填字段 bot_id", serverapp.ErrConfig), code: 2,
+			wantParts: []string{"配置错误（/tmp/server.json）", "缺少必填字段 bot_id"},
+		},
+		{
+			name: "runtime detail", err: errors.New("监听 Relay 地址: bind: address already in use"), code: 1,
+			wantParts: []string{"Herdr Pal Server 启动或运行失败", "监听 Relay 地址: bind: address already in use"},
+		},
+		{
+			name: "secret redaction", err: errors.New("企业微信认证失败: secret-sensitive"), secret: "secret-sensitive", code: 1,
+			wantParts: []string{"企业微信认证失败", "[REDACTED]"}, forbiddenPart: "secret-sensitive",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HERDR_PAL_WECOM_SECRET", test.secret)
 			var stdout, stderr bytes.Buffer
 			code := run(context.Background(), []string{"-config", "/tmp/server.json"}, &stdout, &stderr, func(context.Context, serverapp.Options) error { return test.err })
 			if code != test.code {
 				t.Fatalf("code = %d", code)
 			}
-			if bytes.Contains(stderr.Bytes(), []byte("secret-sensitive")) {
-				t.Fatalf("stderr leaked runtime error: %q", stderr.String())
+			for _, want := range test.wantParts {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want to contain %q", stderr.String(), want)
+				}
+			}
+			if test.forbiddenPart != "" && strings.Contains(stderr.String(), test.forbiddenPart) {
+				t.Errorf("stderr contains forbidden value %q: %q", test.forbiddenPart, stderr.String())
 			}
 		})
 	}

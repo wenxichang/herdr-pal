@@ -78,7 +78,7 @@ func TestLoadServerRequiresListenSecretAndCertificatePair(t *testing.T) {
 		field  string
 	}{
 		{name: "listen", raw: `{"wecom":{"bot_id":"bot"},"server":{},"log":{}}`, secret: "secret", field: "listen"},
-		{name: "secret", raw: `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"log":{}}`, secret: " ", field: "secret"},
+		{name: "secret", raw: `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"log":{}}`, secret: " ", field: SecretEnvName},
 		{name: "certificate pair", raw: `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443","cert_file":"cert.pem"},"log":{}}`, secret: "secret", field: "cert_file"},
 	}
 	for _, test := range tests {
