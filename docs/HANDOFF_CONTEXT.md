@@ -13,9 +13,9 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
   稳定的机器、pane 和 occupant 身份路由请求。
 - `herdr-pal -i` 继续提供不经过网络的本机控制台模式。
 
-`build.sh` 使用 `CGO_ENABLED=0` 同时生成当前系统及 Linux AMD64 的客户端、服务端单文件：
-`dist/herdr-pal`、`dist/herdr-pal-server`、`dist/herdr-pal-linux-amd64` 和
-`dist/herdr-pal-server-linux-amd64`。所有运行状态保存在内存中。
+`build.sh` 使用 `CGO_ENABLED=0` 同时生成 Darwin/Linux 的 AMD64、ARM64 客户端和服务端
+单文件，文件名均包含操作系统及架构；另外保留 `dist/herdr-pal` 和
+`dist/herdr-pal-server` 作为当前构建机器的便捷名称。所有运行状态保存在内存中。
 
 网络模式未指定 `-config` 时，`herdr-pal-server` 默认读取
 `~/.config/herdr-pal/server-config.json`，`herdr-pal` 默认读取

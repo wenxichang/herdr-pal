@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestBuildScriptProducesNativeAndLinuxAMD64Binaries(t *testing.T) {
+func TestBuildScriptProducesDarwinAndLinuxArchitectureMatrix(t *testing.T) {
 	root := repositoryRoot(t)
 	temporaryRoot := t.TempDir()
 	buildScript, err := os.ReadFile(filepath.Join(root, "build.sh"))
@@ -56,14 +56,28 @@ exit 0
 		t.Fatalf("build.sh error = %v\n%s", err, output)
 	}
 
-	for _, name := range []string{
-		"herdr-pal",
-		"herdr-pal-server",
-		"herdr-pal-linux-amd64",
-		"herdr-pal-server-linux-amd64",
-	} {
+	targets := []struct {
+		name   string
+		goos   string
+		goarch string
+	}{
+		{name: "herdr-pal-darwin-amd64", goos: "darwin", goarch: "amd64"},
+		{name: "herdr-pal-server-darwin-amd64", goos: "darwin", goarch: "amd64"},
+		{name: "herdr-pal-darwin-arm64", goos: "darwin", goarch: "arm64"},
+		{name: "herdr-pal-server-darwin-arm64", goos: "darwin", goarch: "arm64"},
+		{name: "herdr-pal-linux-amd64", goos: "linux", goarch: "amd64"},
+		{name: "herdr-pal-server-linux-amd64", goos: "linux", goarch: "amd64"},
+		{name: "herdr-pal-linux-arm64", goos: "linux", goarch: "arm64"},
+		{name: "herdr-pal-server-linux-arm64", goos: "linux", goarch: "arm64"},
+	}
+	for _, target := range targets {
+		if _, err := os.Stat(filepath.Join(temporaryRoot, "dist", target.name)); err != nil {
+			t.Errorf("missing build output %s: %v", target.name, err)
+		}
+	}
+	for _, name := range []string{"herdr-pal", "herdr-pal-server"} {
 		if _, err := os.Stat(filepath.Join(temporaryRoot, "dist", name)); err != nil {
-			t.Errorf("missing build output %s: %v", name, err)
+			t.Errorf("missing native convenience output %s: %v", name, err)
 		}
 	}
 	logData, err := os.ReadFile(logPath)
@@ -71,9 +85,10 @@ exit 0
 		t.Fatal(err)
 	}
 	logText := string(logData)
-	for _, name := range []string{"herdr-pal-linux-amd64", "herdr-pal-server-linux-amd64"} {
-		if !strings.Contains(logText, "linux|amd64|0|build") || !strings.Contains(logText, "-o dist/"+name) {
-			t.Errorf("linux/amd64 build invocation missing for %s:\n%s", name, logText)
+	for _, target := range targets {
+		invocation := target.goos + "|" + target.goarch + "|0|build"
+		if !strings.Contains(logText, invocation) || !strings.Contains(logText, "-o dist/"+target.name) {
+			t.Errorf("%s/%s build invocation missing for %s:\n%s", target.goos, target.goarch, target.name, logText)
 		}
 	}
 }

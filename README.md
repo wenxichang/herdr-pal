@@ -45,10 +45,22 @@ herdr status server --json
 
 构建产物：
 
+- `dist/herdr-pal-darwin-amd64`
+- `dist/herdr-pal-darwin-arm64`
+- `dist/herdr-pal-linux-amd64`
+- `dist/herdr-pal-linux-arm64`
+- `dist/herdr-pal-server-darwin-amd64`
+- `dist/herdr-pal-server-darwin-arm64`
+- `dist/herdr-pal-server-linux-amd64`
+- `dist/herdr-pal-server-linux-arm64`
+
+同时保留当前构建机器的便捷名称：
+
 - `dist/herdr-pal-server`
 - `dist/herdr-pal`
-- `dist/herdr-pal-server-linux-amd64`
-- `dist/herdr-pal-linux-amd64`
+
+GitHub Release 只发布带操作系统和架构后缀的文件。Intel/AMD x64 选择 `amd64`，Apple
+Silicon 或 ARM64 Linux 选择 `arm64`。
 
 ## 第一步：申请企业微信智能机器人
 

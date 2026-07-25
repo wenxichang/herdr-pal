@@ -33,5 +33,11 @@ build_binary() {
 
 build_binary dist/herdr-pal ./cmd/herdr-pal
 build_binary dist/herdr-pal-server ./cmd/herdr-pal-server
+build_binary dist/herdr-pal-darwin-amd64 ./cmd/herdr-pal darwin amd64
+build_binary dist/herdr-pal-server-darwin-amd64 ./cmd/herdr-pal-server darwin amd64
+build_binary dist/herdr-pal-darwin-arm64 ./cmd/herdr-pal darwin arm64
+build_binary dist/herdr-pal-server-darwin-arm64 ./cmd/herdr-pal-server darwin arm64
 build_binary dist/herdr-pal-linux-amd64 ./cmd/herdr-pal linux amd64
 build_binary dist/herdr-pal-server-linux-amd64 ./cmd/herdr-pal-server linux amd64
+build_binary dist/herdr-pal-linux-arm64 ./cmd/herdr-pal linux arm64
+build_binary dist/herdr-pal-server-linux-arm64 ./cmd/herdr-pal-server linux arm64
