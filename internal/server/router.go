@@ -280,7 +280,8 @@ func (router *ConversationRouter) decorateTerminalContent(userID string, source 
 	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Ref.LocalIndex)
 	selected, err := router.catalog.Selected(userID)
 	if err == nil && !sameSessionRef(selected.Ref, source.Ref) {
-		content = panel.AppendRenderedPageNote(content, "[当前选择] "+catalogTargetLabel(selected))
+		warning := "⚠️⚠️⚠️[当前会话] " + catalogTargetLabel(selected) + ", 你的输入将不会发送给当前输出的会话，注意切换。"
+		content = panel.AppendRenderedPageNote(content, warning)
 	}
 	return content
 }

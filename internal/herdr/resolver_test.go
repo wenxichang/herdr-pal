@@ -3,10 +3,68 @@ package herdr
 import (
 	"context"
 	"errors"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestResolveSocketFallsBackToDefaultHomeSocketWhenCLIFails(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "hp-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "herdr", "herdr.sock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	runner := &fakeCommandRunner{err: errors.New("herdr CLI unavailable")}
+
+	resolved, err := ResolveSocket(context.Background(), "", "", runner)
+
+	if err != nil {
+		t.Fatalf("ResolveSocket() error = %v", err)
+	}
+	if resolved != path {
+		t.Fatalf("ResolveSocket() = %q, want %q", resolved, path)
+	}
+	assertCommandCall(t, runner, "herdr", "status", "server", "--json")
+}
+
+func TestResolveSocketDoesNotInferNamedHomeSocketWhenCLIFails(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "hp-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".config", "herdr", "sessions", "work", "herdr.sock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	runner := &fakeCommandRunner{err: errors.New("herdr CLI unavailable")}
+
+	_, err = ResolveSocket(context.Background(), "", "work", runner)
+
+	if err == nil {
+		t.Fatal("ResolveSocket() should not infer a named HOME socket")
+	}
+	assertCommandCall(t, runner, "herdr", "session", "list", "--json")
+}
 
 type fakeCommandRunner struct {
 	output []byte
@@ -111,6 +169,7 @@ func TestResolveSocketRejectsUnavailableOrMalformedCLIResults(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
 			var runner CommandRunner
 			if test.name != "runner 为空" {
 				runner = &fakeCommandRunner{output: []byte(test.output), err: test.err}

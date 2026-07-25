@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 // CommandRunner 定义调用 Herdr 公共 CLI 所需的最小能力。
@@ -28,18 +32,51 @@ type sessionStatus struct {
 	SocketPath *string `json:"socket_path"`
 }
 
-// ResolveSocket 通过显式路径或 Herdr 公共 CLI 解析本地 Socket 路径。
+// ResolveSocket 依次通过显式路径、Herdr 公共 CLI 和默认 HOME 路径解析本地 Socket。
 func ResolveSocket(ctx context.Context, explicitPath, sessionName string, runner CommandRunner) (string, error) {
 	if explicitPath != "" {
 		return explicitPath, nil
 	}
+	var cliErr error
 	if runner == nil {
-		return "", errors.New("解析 Herdr Socket 失败：CommandRunner 不能为空")
+		cliErr = errors.New("解析 Herdr Socket 失败：CommandRunner 不能为空")
+	} else if sessionName == "" || sessionName == "default" {
+		var path string
+		path, cliErr = resolveDefaultSocket(ctx, runner)
+		if cliErr == nil {
+			return path, nil
+		}
+	} else {
+		var path string
+		path, cliErr = resolveNamedSocket(ctx, sessionName, runner)
+		if cliErr == nil {
+			return path, nil
+		}
 	}
-	if sessionName == "" || sessionName == "default" {
-		return resolveDefaultSocket(ctx, runner)
+	if ctx.Err() != nil {
+		return "", cliErr
 	}
-	return resolveNamedSocket(ctx, sessionName, runner)
+	if path, err := resolveHomeSocket(sessionName); err == nil {
+		return path, nil
+	}
+	return "", cliErr
+}
+
+func resolveHomeSocket(sessionName string) (string, error) {
+	if sessionName != "" && sessionName != "default" {
+		return "", errors.New("命名会话不使用 HOME 默认 Socket")
+	}
+	home := strings.TrimSpace(os.Getenv("HOME"))
+	if home == "" {
+		return "", errors.New("HOME 为空")
+	}
+	path := filepath.Join(home, ".config", "herdr", "herdr.sock")
+	connection, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err != nil {
+		return "", errors.New("HOME Socket 不可连接")
+	}
+	_ = connection.Close()
+	return path, nil
 }
 
 func resolveDefaultSocket(ctx context.Context, runner CommandRunner) (string, error) {

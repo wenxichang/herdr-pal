@@ -143,7 +143,8 @@ ECDSA P-256 自签名证书，私钥写入权限为 `0600`。TLS 最低版本为
 
 职责：
 
-- 解析 Herdr Socket 路径和 session。
+- 按“显式路径、公共 CLI、默认 HOME 路径”的顺序解析 Herdr Socket；HOME 回退只支持默认
+  session 的 `$HOME/.config/herdr/herdr.sock`，命名 session 不猜测路径。
 - 编码、发送和解析公共 NDJSON 请求。
 - 维护 `events.subscribe` 长连接。
 - 解析 protocol 17 的 `state_change_seq`，执行 prompt wait 和状态序列轮询。

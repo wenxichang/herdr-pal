@@ -251,7 +251,7 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	reply := gateway.LastReply()
 	for _, want := range []string{
 		"[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/2]",
-		"[当前选择] [office-pc/2] workspace/main-codex(w2:p2)",
+		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，注意切换。",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal push %q lacks %q", reply, want)
@@ -306,7 +306,7 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 	reply := gateway.LastReply()
 	for _, want := range []string{
 		"[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]",
-		"[当前选择] [office-pc/2] workspace/main-codex(w2:p2)",
+		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，注意切换。",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal notification %q lacks %q", reply, want)

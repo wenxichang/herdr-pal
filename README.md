@@ -54,9 +54,11 @@ herdr status server --json
 herdr session list --json
 ```
 
-`PATH` 决定 Herdr Pal 通过公共 CLI 解析哪套 Herdr 配置和 Socket。调用
-`agent.get`、`agent.read`、`agent.prompt` 和 `agent.send_keys` 时一律使用 pane ID；
-terminal ID 和 occupant 用于防止输入落到被替换的 Agent。
+`PATH` 决定 Herdr Pal 通过公共 CLI 解析哪套 Herdr 配置和 Socket。默认 session 的
+CLI 查询失败时，还会尝试连接 `$HOME/.config/herdr/herdr.sock`；命名 session 只使用
+CLI 结果，不猜测其它路径。调用 `agent.get`、`agent.read`、`agent.prompt` 和
+`agent.send_keys` 时一律使用 pane ID；terminal ID 和 occupant 用于防止输入落到被替换的
+Agent。
 
 ## 构建
 
@@ -149,7 +151,8 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 - `machine_id` 是用户可见的机器标识，建议使用稳定、简短且易区分的名称。
 - 默认 Herdr session 时，`session` 和 `socket_path` 都留空；命名 session 填写
   `session`。
-- 只有明确需要覆盖公共 CLI 解析结果时才填写本机 `socket_path`。
+- 只有明确需要覆盖自动探测结果时才填写本机 `socket_path`。留空时优先调用公共 CLI；
+  默认 session 的 CLI 查询失败后只尝试 `$HOME/.config/herdr/herdr.sock`。
 - `skip_verify` 默认就是 `true`，用于接受服务端自动生成的自签名证书；设为 `false` 时
   必须让系统信任服务端证书且证书名称匹配地址。
 - `log.level` 支持 `debug`、`info`、`warn`、`error`。
@@ -188,7 +191,8 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 继续使用本地 Bridge 的状态、occupant、分页和按键策略。
 
 终端内容优先展示输出，末尾使用 `[终端输出] [machine/index] 工作区/Tab-agent(pane), 页码:[当前/缓存总页数]`
-标明来源。若来源与当前选择不同，会再附加一行 `[当前选择]`，避免多机器通知混淆。
+标明来源。若来源与当前选择不同，会再附加一行
+`⚠️⚠️⚠️[当前会话] [machine/index] 工作区/Tab-agent(pane), 你的输入将不会发送给当前输出的会话，注意切换。`
 用户当前没有任何在线会话时，除 `/userid` 和 `/help` 外的输入会提示如何配置客户端接入。
 
 `/key KEYS` 使用逗号或空白分隔，允许 `up`、`down`、`enter`、`esc`、`space` 或单个
