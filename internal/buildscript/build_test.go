@@ -1,6 +1,8 @@
 package buildscript
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,6 +80,28 @@ exit 0
 	for _, name := range []string{"herdr-pal", "herdr-pal-server"} {
 		if _, err := os.Stat(filepath.Join(temporaryRoot, "dist", name)); err != nil {
 			t.Errorf("missing native convenience output %s: %v", name, err)
+		}
+	}
+	checksumData, err := os.ReadFile(filepath.Join(temporaryRoot, "dist", "SHA256SUMS"))
+	if err != nil {
+		t.Fatalf("missing SHA256SUMS: %v", err)
+	}
+	checksumLines := strings.Split(strings.TrimSpace(string(checksumData)), "\n")
+	if len(checksumLines) != len(targets) {
+		t.Fatalf("SHA256SUMS line count = %d, want %d:\n%s", len(checksumLines), len(targets), checksumData)
+	}
+	for index, target := range targets {
+		fields := strings.Fields(checksumLines[index])
+		if len(fields) != 2 {
+			t.Fatalf("invalid checksum line %q", checksumLines[index])
+		}
+		binaryData, err := os.ReadFile(filepath.Join(temporaryRoot, "dist", target.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(binaryData)
+		if fields[0] != hex.EncodeToString(digest[:]) || fields[1] != target.name {
+			t.Errorf("checksum line = %q, want digest for %s", checksumLines[index], target.name)
 		}
 	}
 	logData, err := os.ReadFile(logPath)

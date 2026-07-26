@@ -43,3 +43,28 @@ build_binary dist/herdr-pal-linux-amd64 ./cmd/herdr-pal linux amd64
 build_binary dist/herdr-pal-server-linux-amd64 ./cmd/herdr-pal-server linux amd64
 build_binary dist/herdr-pal-linux-arm64 ./cmd/herdr-pal linux arm64
 build_binary dist/herdr-pal-server-linux-arm64 ./cmd/herdr-pal-server linux arm64
+
+write_checksums() {
+	(
+		cd dist
+		set -- \
+			herdr-pal-darwin-amd64 \
+			herdr-pal-server-darwin-amd64 \
+			herdr-pal-darwin-arm64 \
+			herdr-pal-server-darwin-arm64 \
+			herdr-pal-linux-amd64 \
+			herdr-pal-server-linux-amd64 \
+			herdr-pal-linux-arm64 \
+			herdr-pal-server-linux-arm64
+		if command -v sha256sum >/dev/null 2>&1; then
+			sha256sum "$@" > SHA256SUMS
+		elif command -v shasum >/dev/null 2>&1; then
+			shasum -a 256 "$@" > SHA256SUMS
+		else
+			printf '%s\n' "缺少 sha256sum 或 shasum，无法生成发布校验和。" >&2
+			exit 1
+		fi
+	)
+}
+
+write_checksums
