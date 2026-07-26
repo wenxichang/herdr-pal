@@ -27,6 +27,7 @@ var ErrInvalidServiceDependency = errors.New("BridgeService 依赖无效")
 const (
 	promptRecoveryTimeout = 5 * time.Second
 	keySequenceInterval   = 100 * time.Millisecond
+	keyReadbackDelay      = 200 * time.Millisecond
 )
 
 type keyIntervalWaiter func(context.Context, time.Duration) error
@@ -75,6 +76,7 @@ type Service struct {
 	logger   *slog.Logger
 
 	waitKeyInterval keyIntervalWaiter
+	waitKeyReadback keyIntervalWaiter
 
 	client atomic.Pointer[clientHolder]
 
@@ -103,7 +105,8 @@ func NewService(registry *session.Registry, buffer *panel.Buffer, guard *policy.
 	}
 	service := &Service{
 		registry: registry, panel: buffer, guard: guard, deduper: deduper,
-		im: im, keyAudit: keyAudit, logger: logger, waitKeyInterval: waitKeyInterval,
+		im: im, keyAudit: keyAudit, logger: logger,
+		waitKeyInterval: waitKeyInterval, waitKeyReadback: waitKeyInterval,
 	}
 	service.opCond = sync.NewCond(&service.opMu)
 	return service, nil
@@ -181,8 +184,9 @@ func (s *Service) SelectTarget(paneID, occupantKey string) error {
 	s.transitionMu.Lock()
 	s.beginInputBarrierLocked()
 	s.stateMu.Lock()
-	_, err := s.registry.SelectTarget(paneID, occupantKey)
-	if err == nil {
+	previous, previousErr := s.registry.ValidateSelected()
+	selected, err := s.registry.SelectTarget(paneID, occupantKey)
+	if err == nil && (previousErr != nil || !sameTarget(previous, selected)) {
 		s.resetPanelLocked()
 	}
 	s.stateMu.Unlock()
@@ -325,7 +329,7 @@ func (s *Service) handleList(ctx context.Context, message im.IncomingText) {
 		if name == "" {
 			name = target.Agent
 		}
-		fmt.Fprintf(&content, "\n%d. %s%s\n   标题：%s\n   工作区：%s\n   状态：%s\n   面板：%s", index+1, safeLabel(name), marker, safeLabel(target.Title), safeLabel(panel.WorkspaceLabel(target.Workspace, target.Tab)), safeLabel(string(target.Status)), safeLabel(target.PaneID))
+		fmt.Fprintf(&content, "\n%d. %s%s\n   标题：%s\n   工作区：%s\n   状态：%s\n   面板：%s", index+1, safeLabel(name), marker, safeLabel(target.Title), safeLabel(panel.WorkspaceLabel(target.Workspace, target.Tab)), safeLabel(panel.AgentStatusLabel(target.Status)), safeLabel(target.PaneID))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	s.reply(ctx, message.RequestID, content.String())
@@ -544,6 +548,13 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 				failureMessage = "按键序列已取消，后续未执行。"
 				break
 			}
+		}
+	}
+	if sent > 0 {
+		if waitErr := s.waitKeyReadback(ctx, keyReadbackDelay); waitErr != nil {
+			release()
+			s.reply(ctx, message.RequestID, keySequenceSummary(sent, len(keys), failureMessage)+"\n\n控制台刷新已取消，请重新执行 /con。")
+			return
 		}
 	}
 

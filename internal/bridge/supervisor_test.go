@@ -276,7 +276,8 @@ func TestSupervisorNotificationDeliveryDoesNotBlockStatusLoopAndCoalescesLatest(
 	))
 	client.lifecycleStreams = []*supervisorStream{lifecycle}
 	client.statusStreams = []*supervisorStream{status}
-	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{client}, slog.New(slog.NewTextHandler(logs, nil)))
 	im := newGatedNotifierIM()
 	harness.supervisor.notifier = mustNotifierWithGetter(t, im, matchingSupervisorAgent, harness.reader.ReadRecent)
 
@@ -294,7 +295,15 @@ func TestSupervisorNotificationDeliveryDoesNotBlockStatusLoopAndCoalescesLatest(
 	awaitSupervisorCondition(t, "阻塞发送期间处理最新状态", func() bool {
 		for _, target := range harness.registry.CreateListSnapshot() {
 			if target.PaneID == "pane-2" {
-				return target.Status == herdr.AgentStatusDone
+				if target.Status != herdr.AgentStatusDone {
+					return false
+				}
+				for _, line := range strings.Split(logs.String(), "\n") {
+					if strings.Contains(line, "Agent 状态通知已入队") && strings.Contains(line, "pane_id=pane-2") && strings.Contains(line, "current_status=done") {
+						return true
+					}
+				}
+				return false
 			}
 		}
 		return false

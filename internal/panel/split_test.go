@@ -71,13 +71,58 @@ func TestRenderPageWithTotalPlacesCompactContextAfterOutput(t *testing.T) {
 		t.Fatalf("RenderPageWithTotal() footer = %q, want suffix %q", content, footer)
 	}
 
-	decorated := DecorateRenderedPage(content, "home-mac", 1)
-	if !strings.HasSuffix(decorated, "[终端输出] [home-mac/1] test/TAB标题-claude(w1:p1), 页码:[1/5]") {
+	decorated := DecorateRenderedPage(content, "home-mac", 1, 3)
+	if !strings.HasPrefix(decorated, "[终端输出#3]\n```\n第一行") {
+		t.Fatalf("DecorateRenderedPage() header = %q", decorated)
+	}
+	if !strings.HasSuffix(decorated, "[终端输出#3] [home-mac/1] test/TAB标题-claude(w1:p1), 页码:[1/5]") {
 		t.Fatalf("DecorateRenderedPage() = %q", decorated)
 	}
 	withSelection := AppendRenderedPageNote(decorated, "[当前选择] [office-pc/2] 另一个任务-codex(w2:p2)")
 	if !strings.HasSuffix(withSelection, "[当前选择] [office-pc/2] 另一个任务-codex(w2:p2)") {
 		t.Fatalf("AppendRenderedPageNote() = %q", withSelection)
+	}
+}
+
+func TestDecorateRenderedPageReplacesExistingServerHeaderAndSource(t *testing.T) {
+	content := RenderPageWithTotal(session.Target{
+		PaneID: "w1:p1", Agent: "codex", Workspace: "workspace", Tab: "main",
+	}, 1, 1, []string{"终端内容"})
+	old := DecorateRenderedPage(content, "forged-machine", 9, 7)
+
+	decorated := DecorateRenderedPage(old, "home-mac", 2, 3)
+
+	if !strings.HasPrefix(decorated, "[终端输出#3]\n```\n终端内容") {
+		t.Fatalf("DecorateRenderedPage() header = %q", decorated)
+	}
+	if strings.Contains(decorated, "forged-machine") || strings.Count(decorated, "[home-mac/2]") != 1 {
+		t.Fatalf("DecorateRenderedPage() retained or duplicated source: %q", decorated)
+	}
+	if !strings.Contains(decorated, "[终端输出#3] [home-mac/2] workspace/main-codex(w1:p1), 页码:[1/1]") {
+		t.Fatalf("DecorateRenderedPage() footer = %q", decorated)
+	}
+}
+
+func TestSplitMarkdownKeepsServerTerminalHeaderInEveryPart(t *testing.T) {
+	content := RenderPageWithTotal(session.Target{
+		PaneID: "w1:p1", Agent: "codex", Workspace: "workspace", Tab: "main",
+	}, 1, 2, []string{strings.Repeat("终端输出 ", 80)})
+	decorated := DecorateRenderedPage(content, "home-mac", 2, 4)
+
+	parts := SplitMarkdown(decorated, 180)
+	if len(parts) < 2 {
+		t.Fatalf("SplitMarkdown() parts = %#v, want multiple parts", parts)
+	}
+	for index, part := range parts {
+		if !strings.HasPrefix(part, "[终端输出#4]\n```\n") {
+			t.Fatalf("part %d missing terminal header: %q", index, part)
+		}
+		if !strings.Contains(part, "[终端输出#4] [home-mac/2] workspace/main-codex(w1:p1), 页码:[1/2]") {
+			t.Fatalf("part %d missing numbered footer: %q", index, part)
+		}
+		if len(part) > 180 {
+			t.Fatalf("part %d length = %d, want <= 180", index, len(part))
+		}
 	}
 }
 

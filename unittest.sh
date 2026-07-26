@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+export GOTOOLCHAIN=go1.26.5+auto
+
 cd "$(dirname "$0")"
 
 if [ -n "$(gofmt -l .)" ]; then

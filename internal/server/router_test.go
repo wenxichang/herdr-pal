@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -67,13 +68,35 @@ func TestRouterListsMachinesWithTitleWorkspaceTabAndStatus(t *testing.T) {
 	})
 	router.Handle(context.Background(), routerMessage("request-1", "message-1", "user-a", "/ls"))
 	got := gateway.LastReply()
-	for _, want := range []string{"1. [home-mac/1] Codex — 实现 Relay", "工作区：herdr-pal/main", "状态：working"} {
+	for _, want := range []string{"1. [home-mac/1] Codex — 实现 Relay", "工作区：herdr-pal/main", "状态：working ⏳"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("reply %q lacks %q", got, want)
 		}
 	}
 	if relay.CallCount() != 0 {
 		t.Fatal("/ls should not reach relay")
+	}
+}
+
+func TestRouterListDisplaysEmojiForEveryAgentStatus(t *testing.T) {
+	router, gateway, _ := newRouterHarness(t)
+	statuses := []string{"done", "working", "blocked", "idle", "unknown"}
+	sessions := make([]relayproto.Session, len(statuses))
+	for index, status := range statuses {
+		sessions[index] = relaySession(index+1, fmt.Sprintf("pane-%d", index+1), fmt.Sprintf("occ-%d", index+1), status)
+		sessions[index].Status = status
+	}
+	attachSnapshot(t, router.catalog, "conn-status", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: sessions,
+	})
+
+	router.Handle(context.Background(), routerMessage("request-status-list", "message-status-list", "user-a", "/ls"))
+
+	reply := gateway.LastReply()
+	for _, want := range []string{"状态：done ✅", "状态：working ⏳", "状态：blocked ⁉️", "状态：idle 💤", "状态：unknown ❔"} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("status list %q lacks %q", reply, want)
+		}
 	}
 }
 
@@ -118,8 +141,56 @@ func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
 		t.Fatalf("relay calls = %#v, want select then /con", calls)
 	}
 	reply := gateway.LastReply()
-	if !strings.HasPrefix(reply, "```\n选择后的终端内容") || !strings.Contains(reply, "[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]") {
+	if !strings.HasPrefix(reply, "[终端输出#1]\n```\n选择后的终端内容") || !strings.Contains(reply, "[终端输出#1] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]") {
 		t.Fatalf("select reply = %q", reply)
+	}
+}
+
+func TestRouterTerminalNotificationCreatesNumberedSnapshotWhenListWasNotRequested(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w1:p1", "occ-1", "后台任务")},
+	})
+	content := panel.RenderPageWithTotal(session.Target{
+		PaneID: "w1:p1", Agent: "codex", Workspace: "workspace", Tab: "main",
+	}, 1, 1, []string{"自动编号输出"})
+
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
+		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 2, PaneID: "w1:p1", OccupantHash: "occ-1"},
+		Content: content,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply := gateway.LastReply(); !strings.HasPrefix(reply, "[终端输出#1]\n```\n自动编号输出") || !strings.Contains(reply, "[终端输出#1] [home-mac/2]") {
+		t.Fatalf("notification reply = %q", reply)
+	}
+
+	router.Handle(context.Background(), routerMessage("request-select-auto", "message-select-auto", "user-a", "/1"))
+	calls := relay.Calls()
+	if len(calls) != 2 || calls[0].kind != "select" || calls[0].target.PaneID != "w1:p1" || calls[1].kind != "execute" {
+		t.Fatalf("automatic numbered snapshot calls = %#v", calls)
+	}
+}
+
+func TestRouterTerminalDecorationRejectsSourceRemovedAfterResolution(t *testing.T) {
+	router, _, _ := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	})
+	entry, err := router.catalog.ResolveTarget("user-a", relayproto.SessionRef{
+		MachineID: "home-mac", LocalIndex: 1, PaneID: "w1:p1", OccupantHash: "occ-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.catalog.Detach("conn-1")
+	content := panel.RenderPageWithTotal(session.Target{PaneID: "w1:p1", Agent: "codex"}, 1, 1, []string{"旧输出"})
+
+	decorated, err := router.decorateTerminalContent("user-a", entry, content)
+
+	if !errors.Is(err, ErrTargetChanged) || decorated != "" {
+		t.Fatalf("decorateTerminalContent() = %q, %v, want ErrTargetChanged", decorated, err)
 	}
 }
 
@@ -250,8 +321,8 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	}
 	reply := gateway.LastReply()
 	for _, want := range []string{
-		"[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/2]",
-		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，注意切换。",
+		"[终端输出#1] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/2]",
+		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，使用 /1 切换到当前输出的会话。",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal push %q lacks %q", reply, want)
@@ -305,14 +376,14 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 	}
 	reply := gateway.LastReply()
 	for _, want := range []string{
-		"[终端输出] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]",
-		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，注意切换。",
+		"[终端输出#1] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]",
+		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，使用 /1 切换到当前输出的会话。",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal notification %q lacks %q", reply, want)
 		}
 	}
-	if !strings.HasPrefix(reply, "```\n后台输出") {
+	if !strings.HasPrefix(reply, "[终端输出#1]\n```\n后台输出") {
 		t.Fatalf("terminal output should precede context: %q", reply)
 	}
 }

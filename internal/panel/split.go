@@ -67,17 +67,26 @@ func WorkspaceLabel(workspace, tab string) string {
 	}
 }
 
-// DecorateRenderedPage 为终端页补充 Relay 机器标识和本地序号。
-func DecorateRenderedPage(content, machineID string, localIndex int) string {
+// DecorateRenderedPage 为服务端终端页补充全局列表序号、Relay 机器标识和本地序号。
+func DecorateRenderedPage(content, machineID string, localIndex, listIndex int) string {
 	footer, body, ok := renderedPageParts(content)
-	if !ok || machineID == "" || localIndex < 1 {
+	if !ok || machineID == "" || localIndex < 1 || listIndex < 1 {
 		return content
 	}
 	source := fmt.Sprintf("[%s/%d] ", safeLabel(machineID), localIndex)
-	if strings.HasPrefix(strings.TrimPrefix(footer, footerPrefix), source) {
+	prefix, ok := terminalFooterPrefix(footer)
+	if !ok {
 		return content
 	}
-	footer = strings.Replace(footer, footerPrefix, footerPrefix+source, 1)
+	numberedPrefix := fmt.Sprintf("[终端输出#%d] ", listIndex)
+	if prefix == numberedPrefix && strings.HasPrefix(strings.TrimPrefix(footer, prefix), source) {
+		return content
+	}
+	rest := strings.TrimPrefix(footer, prefix)
+	if prefix != footerPrefix {
+		rest = stripDecoratedSource(rest)
+	}
+	footer = numberedPrefix + source + rest
 	return renderPageParts(body, footer)
 }
 
@@ -122,7 +131,11 @@ func splitRenderedPage(footer, body string, limit int) []string {
 
 	for digits := 1; digits <= len(strconv.Itoa(max(1, len(body)))); {
 		markerReserve := "\n[分段] [" + strings.Repeat("9", digits) + "/" + strings.Repeat("9", digits) + "]"
-		payloadLimit := limit - len(codeFenceOpen) - len(codeFenceClose) - len(markerReserve) - 1 - len(footer)
+		headerReserve := 0
+		if header := renderedPageHeader(footer); header != "" {
+			headerReserve = len(header) + 1
+		}
+		payloadLimit := limit - headerReserve - len(codeFenceOpen) - len(codeFenceClose) - len(markerReserve) - 1 - len(footer)
 		if payloadLimit <= 0 {
 			return nil
 		}
@@ -142,8 +155,13 @@ func splitRenderedPage(footer, body string, limit int) []string {
 
 func wrapRenderedParts(footer string, parts []string) []string {
 	result := make([]string, len(parts))
+	header := renderedPageHeader(footer)
+	prefix := ""
+	if header != "" {
+		prefix = header + "\n"
+	}
 	for index, part := range parts {
-		result[index] = fmt.Sprintf("%s%s%s\n[分段] [%d/%d]\n%s", codeFenceOpen, part, codeFenceClose, index+1, len(parts), footer)
+		result[index] = fmt.Sprintf("%s%s%s%s\n[分段] [%d/%d]\n%s", prefix, codeFenceOpen, part, codeFenceClose, index+1, len(parts), footer)
 	}
 	return result
 }
@@ -176,26 +194,89 @@ func splitPlain(content string, limit int) []string {
 }
 
 func renderedPageParts(content string) (footer, body string, ok bool) {
-	if !strings.HasPrefix(content, codeFenceOpen) {
+	page := content
+	declaredHeader := ""
+	if strings.HasPrefix(page, "[终端输出#") {
+		newline := strings.IndexByte(page, '\n')
+		if newline < 0 {
+			return "", "", false
+		}
+		declaredHeader = page[:newline]
+		page = page[newline+1:]
+	}
+	if !strings.HasPrefix(page, codeFenceOpen) {
 		return "", "", false
 	}
-	footerStart := strings.LastIndex(content, "\n"+footerPrefix)
+	footerStart := strings.LastIndex(page, "\n[终端输出")
 	if footerStart < 0 {
 		return "", "", false
 	}
-	bodyEnd := strings.LastIndex(content[:footerStart], codeFenceClose)
+	bodyEnd := strings.LastIndex(page[:footerStart], codeFenceClose)
 	if bodyEnd < len(codeFenceOpen) {
 		return "", "", false
 	}
-	footer = content[footerStart+1:]
-	if !strings.HasPrefix(footer, footerPrefix) {
+	footer = page[footerStart+1:]
+	if _, valid := terminalFooterPrefix(footer); !valid || declaredHeader != renderedPageHeader(footer) {
 		return "", "", false
 	}
-	return footer, content[len(codeFenceOpen):bodyEnd], true
+	return footer, page[len(codeFenceOpen):bodyEnd], true
 }
 
 func renderPageParts(body, footer string) string {
-	return codeFenceOpen + body + codeFenceClose + "\n" + footer
+	content := codeFenceOpen + body + codeFenceClose + "\n" + footer
+	if header := renderedPageHeader(footer); header != "" {
+		return header + "\n" + content
+	}
+	return content
+}
+
+func terminalFooterPrefix(footer string) (string, bool) {
+	if strings.HasPrefix(footer, footerPrefix) {
+		return footerPrefix, true
+	}
+	const numberedStart = "[终端输出#"
+	if !strings.HasPrefix(footer, numberedStart) {
+		return "", false
+	}
+	closeIndex := strings.Index(footer[len(numberedStart):], "] ")
+	if closeIndex < 1 {
+		return "", false
+	}
+	closeIndex += len(numberedStart)
+	number := footer[len(numberedStart):closeIndex]
+	index, err := strconv.Atoi(number)
+	if err != nil || index < 1 {
+		return "", false
+	}
+	return footer[:closeIndex+2], true
+}
+
+func renderedPageHeader(footer string) string {
+	prefix, ok := terminalFooterPrefix(footer)
+	if !ok || prefix == footerPrefix {
+		return ""
+	}
+	return strings.TrimSuffix(prefix, " ")
+}
+
+func stripDecoratedSource(footer string) string {
+	if !strings.HasPrefix(footer, "[") {
+		return footer
+	}
+	closeIndex := strings.Index(footer, "] ")
+	if closeIndex < 3 {
+		return footer
+	}
+	source := footer[1:closeIndex]
+	slashIndex := strings.LastIndexByte(source, '/')
+	if slashIndex < 1 {
+		return footer
+	}
+	localIndex, err := strconv.Atoi(source[slashIndex+1:])
+	if err != nil || localIndex < 1 {
+		return footer
+	}
+	return footer[closeIndex+2:]
 }
 
 func safeLabel(value string) string {

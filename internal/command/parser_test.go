@@ -128,7 +128,7 @@ func TestHelpTextDocumentsSupportedCommands(t *testing.T) {
 	t.Parallel()
 
 	help := HelpText()
-	for _, want := range []string{"/help", "/N", "/sel N", "/key", "dn", "sp", "/enter", "/slash"} {
+	for _, want := range []string{"/help", "/N", "/sel N", "/key", "dn", "sp", "/enter", "/slash", "等待 200ms"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("HelpText() = %q, want %q", help, want)
 		}

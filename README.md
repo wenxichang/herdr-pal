@@ -26,7 +26,7 @@ herdr-pal-server
 - 每台客户端机器已经安装并启动 Herdr。
 - Herdr 公共 Socket API protocol 必须为 `17`。
 - 企业微信中有权限创建或使用智能机器人。
-- 从源码构建需要 Go 1.26。
+- 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
 
 检查 Herdr：
 
@@ -224,12 +224,19 @@ cp config.example.json ~/.config/herdr-pal/config.json
 | `/slash clear` | 向 Agent 发送 `/clear` |
 | 普通文本 | 发送给当前选择的 Agent |
 
+`/ls` 中的状态会显示为 `done ✅`、`working ⏳`、`blocked ⁉️`、`idle 💤` 或
+`unknown ❔`，企业微信和本机交互模式保持一致。
+
 `/key` 支持 `up`、`down`、`esc`、`space`、单个 ASCII 字母和数字；`dn` 可代替
 `down`，`sp` 可代替 `space`。多个按键可用逗号或空格分隔，间隔 100ms。
-`enter` 只能单独发送。
+全部按键发送完成后会等待 200ms，再自动读取一次 `/con` 内容；`enter` 只能单独发送。
 
 `/con` 和翻页命令以 100 行为一页。通知也只读取最近 100 行，较早内容可以通过
 `/pageup` 查看。
+
+企业微信中的终端页会在开头和末尾显示 `[终端输出#N]`，其中 `N` 是当前全局 `/ls`
+列表序号。尚未执行 `/ls` 时，服务端会按当前在线会话自动建立编号。输出来源不是当前选择
+时，消息末尾会提示使用对应的 `/N` 切换到该输出会话。
 
 普通文本只会发送给当前处于可输入状态的 Agent；Agent 正在工作或等待人工操作时，会返回
 提示而不会强行插入新任务。

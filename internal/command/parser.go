@@ -60,7 +60,7 @@ const helpText = `输入帮助：
 /slash TEXT         将 /TEXT 作为普通消息发送给 Agent
 
 按键支持 up、down、esc、space、单个 ASCII 字母或数字；dn 等同 down，sp 等同 space。
-相邻按键间隔 100ms。enter 只能单独发送，不能出现在多键队列中。
+相邻按键间隔 100ms；全部发送后等待 200ms，再读取控制台。enter 只能单独发送，不能出现在多键队列中。
 其他不以 / 开头的文本会直接发送给当前 Agent。`
 
 // HelpText 返回当前支持的聊天输入帮助。

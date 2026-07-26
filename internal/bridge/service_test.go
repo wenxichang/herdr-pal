@@ -195,7 +195,7 @@ func TestServiceListAndSelectionResetPanel(t *testing.T) {
 	service, _ := newTestService(t)
 	service.HandleMessage(context.Background(), incoming("list", "/ls"))
 	list := fakeIMFromService(t, service).lastReply()
-	if !strings.Contains(list, "1.") || !strings.Contains(list, "workspace-1") || strings.Contains(list, "当前选择") {
+	if !strings.Contains(list, "1.") || !strings.Contains(list, "workspace-1") || !strings.Contains(list, "状态：working ⏳") || strings.Contains(list, "当前选择") {
 		t.Fatalf("list reply = %q", list)
 	}
 	service.HandleMessage(context.Background(), incoming("select", "/sel 1"))
@@ -249,7 +249,7 @@ func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T
 	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("list-details", "/ls"))
 	list := fakeIMFromService(t, service).lastReply()
-	for _, want := range []string{"1. Claude", "标题：第一项 ``\u200b`注入", "工作区一/标签一", "状态：blocked", "面板：pane-a", "2. Codex", "标题：第二项", "工作区二/标签二", "状态：done", "面板：pane-z"} {
+	for _, want := range []string{"1. Claude", "标题：第一项 ``\u200b`注入", "工作区一/标签一", "状态：blocked ⁉️", "面板：pane-a", "2. Codex", "标题：第二项", "工作区二/标签二", "状态：done ✅", "面板：pane-z"} {
 		if !strings.Contains(list, want) {
 			t.Fatalf("list missing %q: %q", want, list)
 		}
@@ -615,6 +615,33 @@ func TestServiceKeySequenceSendsInOrderWithIntervalsAndRefreshesContent(t *testi
 	summaryIndex := strings.Index(reply, "按键已发送")
 	if !strings.HasPrefix(reply, "```\nconsole-after-keys") || footerIndex < 0 || summaryIndex < footerIndex {
 		t.Fatalf("key sequence reply order = %q, want output, footer, then summary", reply)
+	}
+}
+
+func TestServiceKeySequenceWaitsAfterLastKeyBeforeRefreshingContent(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: "console-after-delay"}, nil)
+	service.waitKeyInterval = func(context.Context, time.Duration) error { return nil }
+	var delays []time.Duration
+	service.waitKeyReadback = func(_ context.Context, duration time.Duration) error {
+		delays = append(delays, duration)
+		if got := len(fake.keys()); got != 2 {
+			t.Fatalf("keys before readback wait = %d, want 2", got)
+		}
+		if got := len(fake.reads()); got != 0 {
+			t.Fatalf("reads before readback wait = %d, want 0", got)
+		}
+		return nil
+	}
+
+	service.HandleMessage(context.Background(), incoming("key-readback-delay", "/key down space"))
+
+	if len(delays) != 1 || delays[0] != 200*time.Millisecond {
+		t.Fatalf("readback delays = %#v, want [200ms]", delays)
+	}
+	if got := fake.reads(); len(got) != 1 {
+		t.Fatalf("read calls = %#v, want one call after delay", got)
 	}
 }
 
@@ -1081,6 +1108,27 @@ func TestServiceContentAndPaging(t *testing.T) {
 	}
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "页码:[1/2]") {
 		t.Fatalf("pagedown reply = %q", fakeIMFromService(t, service).lastReply())
+	}
+}
+
+func TestServiceReselectSameTargetPreservesPanelForPageUp(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: textLines(100, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("reselect-content", "/con"))
+	target, err := service.SelectedTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: textLines(0, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("reselect-pageup", "/pageup"))
+
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "页码:[2/2]") || strings.Contains(reply, "终端内容已变化") {
+		t.Fatalf("pageup after same target reselect = %q", reply)
 	}
 }
 
@@ -1570,6 +1618,7 @@ func newTestServiceWithLogger(t *testing.T, logger *slog.Logger) (*Service, *fak
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.waitKeyReadback = func(context.Context, time.Duration) error { return nil }
 	service.SetHerdr(fake)
 	return service, fake
 }

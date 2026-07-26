@@ -93,6 +93,29 @@ exit 0
 	}
 }
 
+func TestGoModuleRequiresPatchedProductionToolchain(t *testing.T) {
+	module, err := os.ReadFile(filepath.Join(repositoryRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(module), "toolchain go1.26.5") {
+		t.Fatalf("go.mod must require patched production toolchain go1.26.5:\n%s", module)
+	}
+}
+
+func TestProjectScriptsRequirePatchedProductionToolchain(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, name := range []string{"build.sh", "unittest.sh"} {
+		content, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(content), "GOTOOLCHAIN=go1.26.5+auto") {
+			t.Fatalf("%s must require GOTOOLCHAIN=go1.26.5+auto:\n%s", name, content)
+		}
+	}
+}
+
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
 	_, currentFile, _, ok := runtime.Caller(0)

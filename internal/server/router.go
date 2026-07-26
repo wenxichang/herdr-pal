@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -56,7 +57,10 @@ func (router *ConversationRouter) SendPush(ctx context.Context, userID string, p
 	if err != nil {
 		return err
 	}
-	content := router.decorateTerminalContent(userID, entry, push.Content)
+	content, err := router.decorateTerminalContent(userID, entry, push.Content)
+	if err != nil {
+		return err
+	}
 	parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
 	if len(parts) == 0 {
 		return errors.New("后续分段内容无效")
@@ -79,7 +83,10 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 		return err
 	}
 	if panel.IsRenderedPage(notification.Content) {
-		content := router.decorateTerminalContent(userID, entry, notification.Content)
+		content, err := router.decorateTerminalContent(userID, entry, notification.Content)
+		if err != nil {
+			return err
+		}
 		parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
 		if len(parts) == 0 {
 			return errors.New("通知内容无效")
@@ -212,7 +219,7 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 			fmt.Fprintf(&content, " — %s", safeRouterLabel(entry.Session.Title))
 		}
 		content.WriteString(marker)
-		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)), safeRouterLabel(entry.Session.Status))
+		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)), safeRouterLabel(panel.AgentStatusLabel(herdr.AgentStatus(entry.Session.Status))))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	router.reply(ctx, message, content.String())
@@ -247,7 +254,12 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	if strings.TrimSpace(content) == "" {
 		content = "已选择 " + catalogTargetLabel(entry) + "。"
 	}
-	router.reply(ctx, message, router.decorateTerminalContent(message.UserID, entry, content))
+	decorated, decorateErr := router.decorateTerminalContent(message.UserID, entry, content)
+	if decorateErr != nil {
+		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(decorateErr))
+		return
+	}
+	router.reply(ctx, message, decorated)
 }
 
 func (router *ConversationRouter) handleExecute(ctx context.Context, message im.IncomingText) {
@@ -270,20 +282,29 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 	if strings.TrimSpace(content) == "" {
 		content = "客户端已处理。"
 	}
-	router.reply(ctx, message, router.decorateTerminalContent(message.UserID, entry, content))
+	decorated, decorateErr := router.decorateTerminalContent(message.UserID, entry, content)
+	if decorateErr != nil {
+		router.reply(ctx, message, safeRouterError(decorateErr))
+		return
+	}
+	router.reply(ctx, message, decorated)
 }
 
-func (router *ConversationRouter) decorateTerminalContent(userID string, source CatalogEntry, content string) string {
+func (router *ConversationRouter) decorateTerminalContent(userID string, source CatalogEntry, content string) (string, error) {
 	if !panel.IsRenderedPage(content) {
-		return content
+		return content, nil
 	}
-	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Ref.LocalIndex)
-	selected, err := router.catalog.Selected(userID)
-	if err == nil && !sameSessionRef(selected.Ref, source.Ref) {
-		warning := "⚠️⚠️⚠️[当前会话] " + catalogTargetLabel(selected) + ", 你的输入将不会发送给当前输出的会话，注意切换。"
+	listIndex, err := router.catalog.EnsureNumberedIndex(userID, source.Ref)
+	if err != nil {
+		return "", err
+	}
+	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Ref.LocalIndex, listIndex)
+	selected, selectedErr := router.catalog.Selected(userID)
+	if selectedErr == nil && !sameSessionRef(selected.Ref, source.Ref) {
+		warning := fmt.Sprintf("⚠️⚠️⚠️[当前会话] %s, 你的输入将不会发送给当前输出的会话，使用 /%d 切换到当前输出的会话。", catalogTargetLabel(selected), listIndex)
 		content = panel.AppendRenderedPageNote(content, warning)
 	}
-	return content
+	return content, nil
 }
 
 func catalogTargetLabel(entry CatalogEntry) string {

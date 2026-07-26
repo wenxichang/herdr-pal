@@ -226,6 +226,39 @@ func (catalog *SessionCatalog) ResolveNumbered(userID string, index int) (Catalo
 	return entry, nil
 }
 
+// EnsureNumberedIndex 返回目标在当前全局列表中的一开始编号。
+//
+// 尚无编号快照或目标未包含在旧快照中时，会按当前在线目录重新建立编号，使展示的 /N
+// 可以立即用于选择该目标。
+func (catalog *SessionCatalog) EnsureNumberedIndex(userID string, target relayproto.SessionRef) (int, error) {
+	if catalog == nil {
+		return 0, ErrNoListSnapshot
+	}
+	catalog.mu.Lock()
+	defer catalog.mu.Unlock()
+	if _, ok := catalog.findEntryLocked(userID, target); !ok {
+		return 0, ErrTargetChanged
+	}
+	routing := catalog.routing[userID]
+	if routing.numberedValid {
+		if index := numberedTargetIndex(routing.numbered, target); index > 0 {
+			return index, nil
+		}
+	}
+	entries := catalog.entriesLocked(userID)
+	routing.numbered = make([]relayproto.SessionRef, len(entries))
+	for index := range entries {
+		routing.numbered[index] = entries[index].Ref
+	}
+	routing.numberedValid = true
+	catalog.routing[userID] = routing
+	index := numberedTargetIndex(routing.numbered, target)
+	if index == 0 {
+		return 0, ErrTargetChanged
+	}
+	return index, nil
+}
+
 // SetSelection 保存已经由客户端复核成功的当前选择。
 func (catalog *SessionCatalog) SetSelection(userID string, target relayproto.SessionRef) error {
 	if catalog == nil {
@@ -394,6 +427,15 @@ func (catalog *SessionCatalog) signalUpdateLocked() {
 
 func sameCatalogTarget(left, right relayproto.SessionRef) bool {
 	return left.MachineID == right.MachineID && left.PaneID == right.PaneID && left.OccupantHash == right.OccupantHash
+}
+
+func numberedTargetIndex(numbered []relayproto.SessionRef, target relayproto.SessionRef) int {
+	for index, current := range numbered {
+		if sameCatalogTarget(current, target) {
+			return index + 1
+		}
+	}
+	return 0
 }
 
 func cloneEntries(entries []CatalogEntry) []CatalogEntry {
