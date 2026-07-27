@@ -134,34 +134,35 @@ func (hub *ClientHub) Select(ctx context.Context, userID string, target relaypro
 }
 
 // Execute 向目标机器转发一条用户输入并等待首段回复。
-func (hub *ClientHub) Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (string, error) {
+func (hub *ClientHub) Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (RelayExecution, error) {
 	if err := relayproto.ValidateSessionRef(target); err != nil {
-		return "", ErrTargetChanged
+		return RelayExecution{}, ErrTargetChanged
 	}
 	connection := hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID})
 	if connection == nil {
-		return "", ErrClientUnavailable
+		return RelayExecution{}, ErrClientUnavailable
 	}
 	frame, err := relayproto.NewFrame(relayproto.TypeExecuteRequest, randomHubID(), relayproto.ExecuteRequest{
 		Target: target, MessageID: message.MessageID, UserID: userID, Content: message.Content,
 	})
 	if err != nil {
-		return "", err
+		return RelayExecution{}, err
 	}
 	response, err := connection.request(ctx, frame, relayproto.TypeExecuteResponse)
 	if err != nil {
-		return "", err
+		return RelayExecution{}, err
 	}
 	result, err := relayproto.DecodePayload[relayproto.ExecuteResponse](response)
 	if err != nil {
-		return "", err
+		return RelayExecution{}, err
 	}
 	if result.SelectedTarget != nil {
-		if err := hub.catalog.RebindSelection(ctx, userID, target, *result.SelectedTarget); err != nil {
-			return "", err
+		if err := relayproto.ValidateSessionRef(*result.SelectedTarget); err != nil ||
+			result.SelectedTarget.MachineID != target.MachineID || result.SelectedTarget.PaneID != target.PaneID {
+			return RelayExecution{}, ErrTargetChanged
 		}
 	}
-	return result.Content, nil
+	return RelayExecution{Content: result.Content, SelectedTarget: result.SelectedTarget}, nil
 }
 
 func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn) {

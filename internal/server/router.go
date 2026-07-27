@@ -21,6 +21,8 @@ var ErrInvalidRouterDependency = errors.New("ConversationRouter 依赖无效")
 
 const defaultRelayRequestTimeout = 20 * time.Second
 
+const backgroundNotificationActivityWindow = 2 * time.Minute
+
 const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户id，并配置接入herdr-pal，使用/help获取内置命令帮助"
 
 const defaultHelpRelayURL = "wss://管理员提供的地址:9443"
@@ -33,11 +35,13 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"`/userid` 获取当前企业微信用户 ID\n" +
 	"`/ls` 列出所有在线机器和 Agent\n" +
 	"`/N` 或 `/sel N` 选择第 N 个会话\n" +
+	"`/N 内容` 在第 N 个会话执行，成功后切换；`#N 内容` 执行但不切换\n" +
 	"`/con` 查看当前会话最近 100 行\n" +
 	"`/pageup`、`/pagedn` 上下翻页\n" +
 	"`/slash clear` 向 Agent 发送 `/clear`\n" +
 	"普通文字直接发送给当前 Agent\n" +
 	"`/help` 显示本帮助\n\n" +
+	"定向前缀不能用于 `/userid`、`/ls`、`/help`、`/N` 或 `/sel N`。\n\n" +
 	"【按键操作】\n" +
 	"`/key up`、`/key down` 发送方向键\n" +
 	"`/key space`、`/key esc` 发送空格或 Esc\n" +
@@ -120,7 +124,13 @@ type WeComGateway interface {
 // RelayRequester 是 Router 复核选择和执行用户输入所需的客户端能力。
 type RelayRequester interface {
 	Select(ctx context.Context, userID string, target relayproto.SessionRef) error
-	Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (string, error)
+	Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (RelayExecution, error)
+}
+
+// RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
+type RelayExecution struct {
+	Content        string
+	SelectedTarget *relayproto.SessionRef
 }
 
 // SendPush 复核后续分段的稳定来源，并发送给所属企业微信用户。
@@ -132,6 +142,7 @@ func (router *ConversationRouter) SendPush(ctx context.Context, userID string, p
 	if err != nil {
 		return err
 	}
+	router.activity.Touch(userID, router.now())
 	content, err := router.decorateTerminalContent(userID, entry, push.Content)
 	if err != nil {
 		return err
@@ -157,7 +168,17 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 	if err != nil {
 		return err
 	}
+	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
 	if panel.IsRenderedPage(notification.Content) {
+		selected, selectedErr := router.catalog.Selected(userID)
+		if selectedErr == nil && !sameSessionRef(selected.Ref, entry.Ref) && recentlyActive {
+			listIndex, err := router.catalog.EnsureNumberedIndex(userID, entry.Ref)
+			if err != nil {
+				return err
+			}
+			content := fmt.Sprintf("⚠️ %s 有新的输出，等待你的回复，使用/%d切换", catalogTargetLabel(entry), listIndex)
+			return router.gateway.SendMarkdownTo(ctx, userID, content)
+		}
 		content, err := router.decorateTerminalContent(userID, entry, notification.Content)
 		if err != nil {
 			return err
@@ -203,6 +224,8 @@ type ConversationRouter struct {
 	logger         *slog.Logger
 	helpText       string
 	requestTimeout time.Duration
+	activity       *userActivityTracker
+	now            func() time.Time
 }
 
 // ConversationRouterConfig 是服务端会话路由器的展示配置。
@@ -224,6 +247,7 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
 		deduper: deduper, logger: logger, helpText: buildServerHelpText(config.RelayURL), requestTimeout: defaultRelayRequestTimeout,
+		activity: newUserActivityTracker(), now: time.Now,
 	}, nil
 }
 
@@ -265,6 +289,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		router.reply(ctx, message, err.Error())
 		return
 	}
+	router.activity.Touch(message.UserID, router.now())
 	if action.kind != serverActionUserID && action.kind != serverActionHelp && !router.catalog.HasSessions(message.UserID) {
 		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
@@ -278,6 +303,8 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		router.handleSelect(ctx, message, action.index)
 	case serverActionHelp:
 		router.reply(ctx, message, router.helpText)
+	case serverActionDirected:
+		router.handleDirectedExecute(ctx, message, action)
 	default:
 		router.handleExecute(ctx, message)
 	}
@@ -332,12 +359,19 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	consoleMessage := message
 	consoleMessage.Content = "/con"
 	requestContext, cancel = context.WithTimeout(ctx, router.requestTimeout)
-	content, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
-	cancel()
+	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
 	if err != nil {
+		cancel()
 		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(err))
 		return
 	}
+	entry, err = router.rebindSelectedExecution(requestContext, message.UserID, entry, result)
+	cancel()
+	if err != nil {
+		router.reply(ctx, message, "已选择目标，但"+safeRouterError(err))
+		return
+	}
+	content := result.Content
 	if strings.TrimSpace(content) == "" {
 		content = "已选择 " + catalogTargetLabel(entry) + "。"
 	}
@@ -356,9 +390,9 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		return
 	}
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	content, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, message)
-	cancel()
+	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, message)
 	if err != nil {
+		cancel()
 		if errors.Is(err, context.DeadlineExceeded) {
 			router.reply(ctx, message, "操作可能已经提交，请先检查目标会话；服务端不会自动重试。")
 			return
@@ -366,6 +400,13 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
+	entry, err = router.rebindSelectedExecution(requestContext, message.UserID, entry, result)
+	cancel()
+	if err != nil {
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	content := result.Content
 	if strings.TrimSpace(content) == "" {
 		content = "客户端已处理。"
 	}
@@ -375,6 +416,77 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		return
 	}
 	router.reply(ctx, message, decorated)
+}
+
+func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, message im.IncomingText, action serverAction) {
+	entry, err := router.catalog.ResolveNumbered(message.UserID, action.index)
+	if err != nil {
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	directedMessage := message
+	directedMessage.Content = action.content
+	selectedBefore, selectedErr := router.catalog.Selected(message.UserID)
+	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
+	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, directedMessage)
+	if err != nil {
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) {
+			router.reply(ctx, message, "操作可能已经提交，但未切换当前会话；请先检查目标会话。")
+			return
+		}
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	finalEntry := entry
+	if result.SelectedTarget != nil {
+		if action.switchAfter {
+			if err := router.catalog.SetSelectionWhenAvailable(requestContext, message.UserID, *result.SelectedTarget); err != nil {
+				cancel()
+				router.reply(ctx, message, "操作已执行，但切换当前会话失败："+safeRouterError(err))
+				return
+			}
+		} else if selectedErr == nil && sameSessionRef(selectedBefore.Ref, entry.Ref) {
+			if err := router.catalog.RebindSelection(requestContext, message.UserID, entry.Ref, *result.SelectedTarget); err != nil {
+				cancel()
+				router.reply(ctx, message, "操作已执行，但当前会话更新失败："+safeRouterError(err))
+				return
+			}
+		}
+		finalEntry, err = router.catalog.WaitForTarget(requestContext, message.UserID, *result.SelectedTarget)
+		if err != nil {
+			cancel()
+			router.reply(ctx, message, "操作已执行，但目标会话更新失败："+safeRouterError(err))
+			return
+		}
+	} else if action.switchAfter {
+		if err := router.catalog.SetSelection(message.UserID, entry.Ref); err != nil {
+			cancel()
+			router.reply(ctx, message, "操作已执行，但切换当前会话失败："+safeRouterError(err))
+			return
+		}
+	}
+	cancel()
+	content := result.Content
+	if strings.TrimSpace(content) == "" {
+		content = "客户端已处理。"
+	}
+	decorated, err := router.decorateTerminalContent(message.UserID, finalEntry, content)
+	if err != nil {
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	router.reply(ctx, message, decorated)
+}
+
+func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, userID string, source CatalogEntry, result RelayExecution) (CatalogEntry, error) {
+	if result.SelectedTarget == nil {
+		return source, nil
+	}
+	if err := router.catalog.RebindSelection(ctx, userID, source.Ref, *result.SelectedTarget); err != nil {
+		return CatalogEntry{}, err
+	}
+	return router.catalog.ResolveTarget(userID, *result.SelectedTarget)
 }
 
 func (router *ConversationRouter) decorateTerminalContent(userID string, source CatalogEntry, content string) (string, error) {
@@ -416,11 +528,14 @@ const (
 	serverActionList
 	serverActionSelect
 	serverActionHelp
+	serverActionDirected
 )
 
 type serverAction struct {
-	kind  serverActionKind
-	index int
+	kind        serverActionKind
+	index       int
+	content     string
+	switchAfter bool
 }
 
 func parseServerAction(content string) (serverAction, error) {
@@ -429,6 +544,9 @@ func parseServerAction(content string) (serverAction, error) {
 		return serverAction{}, errors.New("输入不能为空。")
 	}
 	fields := strings.Fields(trimmed)
+	if action, matched, err := parseDirectedAction(trimmed, fields[0]); matched {
+		return action, err
+	}
 	switch fields[0] {
 	case "/userid":
 		if len(fields) != 1 {
@@ -461,6 +579,33 @@ func parseServerAction(content string) (serverAction, error) {
 		}
 	}
 	return serverAction{kind: serverActionForward}, nil
+}
+
+func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
+	if len(prefix) < 2 || (prefix[0] != '/' && prefix[0] != '#') {
+		return serverAction{}, false, nil
+	}
+	index, err := positiveASCIIInt(prefix[1:])
+	if err != nil {
+		return serverAction{}, false, nil
+	}
+	remainder := strings.TrimSpace(trimmed[len(prefix):])
+	if remainder == "" {
+		if prefix[0] == '/' {
+			return serverAction{}, false, nil
+		}
+		return serverAction{}, true, errors.New("#N 用法: #N 内容")
+	}
+	nested, err := parseServerAction(remainder)
+	if err != nil || nested.kind != serverActionForward {
+		return serverAction{}, true, errors.New("定向输入不能执行 /userid、/ls、/help、/N 或 /sel N。")
+	}
+	return serverAction{
+		kind:        serverActionDirected,
+		index:       index,
+		content:     remainder,
+		switchAfter: prefix[0] == '/',
+	}, true, nil
 }
 
 func positiveASCIIInt(value string) (int, error) {

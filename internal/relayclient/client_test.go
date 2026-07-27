@@ -50,9 +50,9 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 	if err := hub.Select(context.Background(), "user-a", target); err != nil {
 		t.Fatalf("Select() error = %v", err)
 	}
-	content, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "prompt"})
-	if err != nil || content != "handled: prompt" {
-		t.Fatalf("Execute() = %q, %v", content, err)
+	result, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "prompt"})
+	if err != nil || result.Content != "handled: prompt" {
+		t.Fatalf("Execute() = %#v, %v", result, err)
 	}
 	if selected := executor.Selected(); selected.PaneID != "pane-1" || selected.OccupantHash != "occ-1" {
 		t.Fatalf("selected = %#v", selected)
@@ -132,11 +132,14 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content, err := hub.Execute(context.Background(), "user-a", oldTarget, im.IncomingText{
+	result, err := hub.Execute(context.Background(), "user-a", oldTarget, im.IncomingText{
 		MessageID: "message-rebind", UserID: "user-a", Content: "prompt",
 	})
-	if err != nil || content != "handled: prompt" {
-		t.Fatalf("Execute() = %q, %v", content, err)
+	if err != nil || result.Content != "handled: prompt" || result.SelectedTarget == nil {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	if err := hub.Catalog().RebindSelection(context.Background(), "user-a", oldTarget, *result.SelectedTarget); err != nil {
+		t.Fatal(err)
 	}
 	eventuallyClient(t, func() bool {
 		selected, selectedErr := hub.Catalog().Selected("user-a")

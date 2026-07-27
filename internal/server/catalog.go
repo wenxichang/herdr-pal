@@ -279,6 +279,40 @@ func (catalog *SessionCatalog) SetSelection(userID string, target relayproto.Ses
 	return nil
 }
 
+// SetSelectionWhenAvailable 等待目标出现在最新快照中，并把它保存为当前选择。
+func (catalog *SessionCatalog) SetSelectionWhenAvailable(ctx context.Context, userID string, target relayproto.SessionRef) error {
+	if catalog == nil || relayproto.ValidateSessionRef(target) != nil {
+		return ErrTargetChanged
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		catalog.mu.Lock()
+		if _, online := catalog.machines[ClientKey{UserID: userID, MachineID: target.MachineID}]; !online {
+			catalog.mu.Unlock()
+			return ErrTargetChanged
+		}
+		if entry, exists := catalog.findEntryLocked(userID, target); exists {
+			routing := catalog.routing[userID]
+			selected := entry.Ref
+			routing.selected = &selected
+			routing.invalidated = nil
+			catalog.routing[userID] = routing
+			catalog.signalUpdateLocked()
+			catalog.mu.Unlock()
+			return nil
+		}
+		updates := catalog.updates
+		catalog.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-updates:
+		}
+	}
+}
+
 // RebindSelection 等待客户端确认的新 occupant 出现在目录后，原子更新当前选择。
 //
 // replacement 必须仍位于 expected 的同一机器和 pane；用户已经选择其他目标时不会覆盖。
@@ -358,6 +392,34 @@ func (catalog *SessionCatalog) ResolveTarget(userID string, target relayproto.Se
 		return CatalogEntry{}, ErrTargetChanged
 	}
 	return entry, nil
+}
+
+// WaitForTarget 等待稳定目标出现在最新在线目录中，但不修改用户选择。
+func (catalog *SessionCatalog) WaitForTarget(ctx context.Context, userID string, target relayproto.SessionRef) (CatalogEntry, error) {
+	if catalog == nil || relayproto.ValidateSessionRef(target) != nil {
+		return CatalogEntry{}, ErrTargetChanged
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		catalog.mu.Lock()
+		if _, online := catalog.machines[ClientKey{UserID: userID, MachineID: target.MachineID}]; !online {
+			catalog.mu.Unlock()
+			return CatalogEntry{}, ErrTargetChanged
+		}
+		if entry, exists := catalog.findEntryLocked(userID, target); exists {
+			catalog.mu.Unlock()
+			return entry, nil
+		}
+		updates := catalog.updates
+		catalog.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return CatalogEntry{}, ctx.Err()
+		case <-updates:
+		}
+	}
 }
 
 func (catalog *SessionCatalog) entriesLocked(userID string) []CatalogEntry {

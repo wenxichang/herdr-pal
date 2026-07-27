@@ -70,24 +70,26 @@ func TestHubCorrelatesSelectAndExecuteResponses(t *testing.T) {
 	}
 
 	executeDone := make(chan struct {
-		content string
-		err     error
+		result RelayExecution
+		err    error
 	}, 1)
 	go func() {
-		content, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "prompt"})
+		result, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "prompt"})
 		executeDone <- struct {
-			content string
-			err     error
-		}{content, err}
+			result RelayExecution
+			err    error
+		}{result, err}
 	}()
 	executeRequest := client.ReadFrame(t)
 	if executeRequest.Type != relayproto.TypeExecuteRequest || executeRequest.RequestID == "" {
 		t.Fatalf("execute request = %#v", executeRequest)
 	}
-	client.WriteFrame(t, relayproto.TypeExecuteResponse, executeRequest.RequestID, relayproto.ExecuteResponse{Content: "done"})
+	replacement := target
+	replacement.OccupantHash = "occ-2"
+	client.WriteFrame(t, relayproto.TypeExecuteResponse, executeRequest.RequestID, relayproto.ExecuteResponse{Content: "done", SelectedTarget: &replacement})
 	result := <-executeDone
-	if result.err != nil || result.content != "done" {
-		t.Fatalf("Execute() = %q, %v", result.content, result.err)
+	if result.err != nil || result.result.Content != "done" || result.result.SelectedTarget == nil || *result.result.SelectedTarget != replacement {
+		t.Fatalf("Execute() = %#v, %v", result.result, result.err)
 	}
 }
 
@@ -103,6 +105,25 @@ func TestHubMapsClientTargetRejection(t *testing.T) {
 	client.WriteFrame(t, relayproto.TypeSelectResult, request.RequestID, relayproto.SelectResult{Code: relayproto.CodeTargetChanged, Message: "changed"})
 	if err := <-done; !errors.Is(err, ErrTargetChanged) {
 		t.Fatalf("Select() error = %v", err)
+	}
+}
+
+func TestHubRejectsExecuteReplacementOutsideOriginalPane(t *testing.T) {
+	hub, server := startHubServer(t, HubConfig{})
+	client := dialReadyHubClient(t, server, "user-a", "home-mac")
+	defer client.Close()
+	eventuallyHub(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
+	target := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "prompt"})
+		done <- err
+	}()
+	request := client.ReadFrame(t)
+	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 2, PaneID: "pane-2", OccupantHash: "occ-2"}
+	client.WriteFrame(t, relayproto.TypeExecuteResponse, request.RequestID, relayproto.ExecuteResponse{Content: "done", SelectedTarget: &replacement})
+	if err := <-done; !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("Execute() error = %v", err)
 	}
 }
 

@@ -191,6 +191,77 @@ func TestCatalogRebindSelectionDoesNotOverwriteNewSelection(t *testing.T) {
 	}
 }
 
+func TestCatalogWaitForTargetDoesNotChangeSelection(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{
+			relaySession(1, "pane-1", "occ-current", "current"),
+			relaySession(2, "pane-2", "occ-old", "old"),
+		},
+	})
+	current := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-current"}
+	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 2, PaneID: "pane-2", OccupantHash: "occ-new"}
+	if err := catalog.SetSelection("user-a", current); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := catalog.WaitForTarget(ctx, "user-a", replacement)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForTarget() returned before snapshot: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
+		Sequence: 2, Sessions: []relayproto.Session{
+			relaySession(1, "pane-1", "occ-current", "current"),
+			relaySession(2, "pane-2", "occ-new", "new"),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	selected, err := catalog.Selected("user-a")
+	if err != nil || selected.Ref != current {
+		t.Fatalf("Selected() = %#v, %v, want current", selected, err)
+	}
+}
+
+func TestCatalogSetSelectionWhenAvailableWaitsForSnapshot(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-old", "old")},
+	})
+	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-new"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- catalog.SetSelectionWhenAvailable(ctx, "user-a", replacement) }()
+	select {
+	case err := <-done:
+		t.Fatalf("SetSelectionWhenAvailable() returned before snapshot: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
+		Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-new", "new")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	selected, err := catalog.Selected("user-a")
+	if err != nil || selected.Ref != replacement {
+		t.Fatalf("Selected() = %#v, %v, want replacement", selected, err)
+	}
+}
+
 func attachSnapshot(t *testing.T, catalog *SessionCatalog, connectionID string, key ClientKey, snapshot relayproto.SessionSnapshot) {
 	t.Helper()
 	if _, err := catalog.Attach(connectionID, key); err != nil {
