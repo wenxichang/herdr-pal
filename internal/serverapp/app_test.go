@@ -11,6 +11,34 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/im"
 )
 
+func TestBuildRelayURLHintUsesConfiguredAddressAndListenPort(t *testing.T) {
+	got, err := buildRelayURLHint("10.1.3.4", "0.0.0.0:9443")
+	if err != nil {
+		t.Fatalf("buildRelayURLHint() error = %v", err)
+	}
+	if got != "wss://10.1.3.4:9443" {
+		t.Fatalf("buildRelayURLHint() = %q, want wss://10.1.3.4:9443", got)
+	}
+}
+
+func TestBuildRelayURLHintUsesPlaceholderWhenAddressIsEmpty(t *testing.T) {
+	got, err := buildRelayURLHint("", "127.0.0.1:9555")
+	if err != nil {
+		t.Fatalf("buildRelayURLHint() error = %v", err)
+	}
+	if got != "wss://管理员提供的地址:9555" {
+		t.Fatalf("buildRelayURLHint() = %q, want placeholder URL", got)
+	}
+}
+
+func TestBuildRelayURLHintRejectsAddressWithPortOrScheme(t *testing.T) {
+	for _, address := range []string{"10.1.3.4:9555", "wss://10.1.3.4", "host/path", "host\nother"} {
+		if _, err := buildRelayURLHint(address, "0.0.0.0:9443"); err == nil {
+			t.Fatalf("buildRelayURLHint(%q) should reject invalid address", address)
+		}
+	}
+}
+
 func TestNewLoggerRejectsUnknownLevel(t *testing.T) {
 	if _, err := newLogger(&bytes.Buffer{}, "verbose"); err == nil {
 		t.Fatal("newLogger() should reject unknown level")

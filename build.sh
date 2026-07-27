@@ -43,6 +43,7 @@ build_binary dist/herdr-pal-linux-amd64 ./cmd/herdr-pal linux amd64
 build_binary dist/herdr-pal-server-linux-amd64 ./cmd/herdr-pal-server linux amd64
 build_binary dist/herdr-pal-linux-arm64 ./cmd/herdr-pal linux arm64
 build_binary dist/herdr-pal-server-linux-arm64 ./cmd/herdr-pal-server linux arm64
+build_binary dist/herdr-pal-windows-amd64.exe ./cmd/herdr-pal windows amd64
 
 write_checksums() {
 	(
@@ -55,7 +56,8 @@ write_checksums() {
 			herdr-pal-linux-amd64 \
 			herdr-pal-server-linux-amd64 \
 			herdr-pal-linux-arm64 \
-			herdr-pal-server-linux-arm64
+			herdr-pal-server-linux-arm64 \
+			herdr-pal-windows-amd64.exe
 		if command -v sha256sum >/dev/null 2>&1; then
 			sha256sum "$@" > SHA256SUMS
 		elif command -v shasum >/dev/null 2>&1; then

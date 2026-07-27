@@ -145,8 +145,11 @@ ECDSA P-256 自签名证书，私钥写入权限为 `0600`。TLS 最低版本为
 
 职责：
 
-- 按“显式路径、公共 CLI、默认 HOME 路径”的顺序解析 Herdr Socket；HOME 回退只支持默认
-  session 的 `$HOME/.config/herdr/herdr.sock`，命名 session 不猜测路径。
+- 按“显式路径、公共 CLI、平台默认路径”的顺序解析 Herdr endpoint；Unix 默认回退为
+  `$HOME/.config/herdr/herdr.sock`，Windows 按 Herdr 的环境变量优先级推导 marker 路径，
+  命名 session 均不猜测路径。
+- Unix 使用 Unix Domain Socket；Windows 将 marker 路径映射为
+  `\\.\pipe\<marker path>` 并使用 Named Pipe。协议层不感知平台差异。
 - 编码、发送和解析公共 NDJSON 请求。
 - 维护 `events.subscribe` 长连接。
 - 解析 protocol 17 的 `state_change_seq`，执行 prompt wait 和状态序列轮询。

@@ -86,7 +86,7 @@ func (c *Client) Subscribe(ctx context.Context, specs []SubscriptionSpec) (Subsc
 
 	handshakeContext, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	conn, err := c.dialer.DialContext(handshakeContext, "unix", c.socketPath)
+	conn, err := c.dialer.DialContext(handshakeContext, localSocketNetwork(), c.socketPath)
 	if err != nil {
 		return nil, unavailableContextError(handshakeContext, err)
 	}

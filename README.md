@@ -28,6 +28,12 @@ herdr-pal-server
 - 企业微信中有权限创建或使用智能机器人。
 - 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
 
+支持的平台：
+
+- macOS AMD64/ARM64：客户端和服务端。
+- Linux AMD64/ARM64：客户端和服务端，推荐用于部署服务端。
+- Windows AMD64：客户端 Beta，与 Herdr Windows Beta 配套使用。
+
 检查 Herdr：
 
 ```sh
@@ -53,6 +59,7 @@ herdr status server --json
 - `dist/herdr-pal-server-darwin-arm64`
 - `dist/herdr-pal-server-linux-amd64`
 - `dist/herdr-pal-server-linux-arm64`
+- `dist/herdr-pal-windows-amd64.exe`
 
 同时保留当前构建机器的便捷名称：
 
@@ -60,7 +67,8 @@ herdr status server --json
 - `dist/herdr-pal`
 
 GitHub Release 只发布带操作系统和架构后缀的文件。Intel/AMD x64 选择 `amd64`，Apple
-Silicon 或 ARM64 Linux 选择 `arm64`。
+Silicon 或 ARM64 Linux 选择 `arm64`。Windows 当前只发布客户端 AMD64 Beta，不发布
+Windows 服务端。
 
 ## 第一步：申请企业微信智能机器人
 
@@ -94,6 +102,7 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
   },
   "server": {
     "listen": "0.0.0.0:9443",
+    "addr_hint": "10.1.3.4",
     "cert_file": "",
     "key_file": "",
     "state_dir": ""
@@ -103,6 +112,10 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
   }
 }
 ```
+
+`addr_hint` 填写客户端机器能够访问的服务端主机名或 IP，不要包含 `wss://`、端口或路径。
+服务端会自动使用 `listen` 中的端口，在企业微信 `/help` 的客户端配置示例中生成
+`wss://10.1.3.4:9443`。留空时 `/help` 继续显示需要向管理员获取地址的占位提示。
 
 设置 Secret 并启动：
 
@@ -180,6 +193,19 @@ cp config.example.json ~/.config/herdr-pal/config.json
 ```sh
 ./dist/herdr-pal
 ```
+
+Windows PowerShell 使用 AMD64 Beta 版本：
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\herdr-pal" | Out-Null
+Copy-Item .\config.example.json "$env:USERPROFILE\.config\herdr-pal\config.json"
+.\dist\herdr-pal-windows-amd64.exe
+```
+
+Windows 默认配置文件是 `%USERPROFILE%\.config\herdr-pal\config.json`。Herdr 的
+`session` 和 `socket_path` 通常保持为空，客户端会调用 Herdr CLI 获取 marker 路径，并
+通过对应的 Windows Named Pipe 连接。Windows 版本目前随 Herdr Windows 一同按 Beta
+支持，建议先在非关键会话中验证 Agent、终端和输入法行为。
 
 未指定 `-config` 时，客户端默认读取：
 
@@ -318,6 +344,9 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 $HOME/.config/herdr/herdr.sock
 ```
 
+Windows 会依次按 `XDG_CONFIG_HOME`、`APPDATA`、`USERPROFILE`、`HOME` 推导 Herdr 默认
+marker 路径，并尝试连接对应的 Named Pipe。
+
 命名 session 不猜测路径。如果仍然失败，在客户端配置中显式填写 `herdr.socket_path`。
 
 ## 安全提示
@@ -347,3 +376,4 @@ $HOME/.config/herdr/herdr.sock
 - [Bridge 架构](docs/BRIDGE_ARCHITECTURE.md)
 - [Herdr API 审计](docs/HERDR_API_AUDIT.md)
 - [维护交接](docs/HANDOFF_CONTEXT.md)
+- [Windows AMD64 支持](docs/WINDOWS_AMD64_SUPPORT.md)

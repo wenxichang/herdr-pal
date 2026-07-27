@@ -13,9 +13,10 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
   稳定的机器、pane 和 occupant 身份路由请求。
 - `herdr-pal -i` 继续提供不经过网络的本机控制台模式。
 
-`build.sh` 使用 `CGO_ENABLED=0` 同时生成 Darwin/Linux 的 AMD64、ARM64 客户端和服务端
-单文件，文件名均包含操作系统及架构；另外保留 `dist/herdr-pal` 和
-`dist/herdr-pal-server` 作为当前构建机器的便捷名称。所有运行状态保存在内存中。
+`build.sh` 使用 `CGO_ENABLED=0` 同时生成 Darwin/Linux 的 AMD64、ARM64 客户端和服务端，
+以及 Windows AMD64 客户端 Beta。文件名均包含操作系统及架构；另外保留
+`dist/herdr-pal` 和 `dist/herdr-pal-server` 作为当前构建机器的便捷名称。Windows 暂不
+发布服务端。所有运行状态保存在内存中。
 
 网络模式未指定 `-config` 时，`herdr-pal-server` 默认读取
 `~/.config/herdr-pal/server-config.json`，`herdr-pal` 默认读取
@@ -54,12 +55,14 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 
 ### 3.1 服务端启动
 
-1. `config.LoadServer` 读取 Bot ID、监听地址和 TLS 路径，从
+1. `config.LoadServer` 读取 Bot ID、监听地址、客户端可访问的 `addr_hint` 和 TLS 路径，从
    `HERDR_PAL_WECOM_SECRET` 读取 Secret。
 2. `EnsureTLS` 加载外部证书；若未配置则在状态目录生成并复用自签名证书，私钥 `0600`。
 3. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
 4. 启动唯一企业微信连接和 TLS HTTP/WebSocket 监听。
 5. 用户发送 `/userid` 时，直接返回企业微信回调中的 userid，不要求已有客户端在线。
+6. 用户发送 `/help` 时，服务端把 `addr_hint` 与 `listen` 端口组合为客户端 WSS URL，并
+   写入返回的 `config.json` 示例；未配置 `addr_hint` 时保留管理员地址占位提示。
 
 ### 3.2 客户端启动
 
@@ -175,7 +178,8 @@ Herdr 断线时 `Service.CurrentTargets()` 返回空目录，使 Relay 客户端
 - `internal/server`：在线目录、用户执行器、WSS Hub 和企业微信全局路由。
 - `internal/relayproto`：严格、版本化的 Relay 帧和校验。
 - `internal/relayclient`：WSS 重连、会话快照和本地执行请求。
-- `internal/herdr`：公共 NDJSON 请求、严格响应模型、订阅和 Socket 解析。
+- `internal/herdr`：公共 NDJSON 请求、严格响应模型、订阅、Unix Socket/Windows Named
+  Pipe 平台传输和 endpoint 解析。
 - `internal/session`：本机会话索引、编号、选择和 occupant 身份。
 - `internal/command`：客户端本地命令解析。
 - `internal/panel`：终端规范化、100 行分页和 UTF-8 安全分段。

@@ -41,7 +41,7 @@ type Client struct {
 // NewClient 创建使用 socketPath 的 Herdr 客户端。
 func NewClient(socketPath string, dialer Dialer, timeout time.Duration) *Client {
 	if dialer == nil {
-		dialer = &net.Dialer{}
+		dialer = newLocalDialer()
 	}
 	if timeout <= 0 {
 		timeout = defaultRequestTimeout
@@ -63,7 +63,7 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 		return err
 	}
 
-	conn, err := c.dialer.DialContext(requestContext, "unix", c.socketPath)
+	conn, err := c.dialer.DialContext(requestContext, localSocketNetwork(), c.socketPath)
 	if err != nil {
 		return unavailableContextError(requestContext, err)
 	}

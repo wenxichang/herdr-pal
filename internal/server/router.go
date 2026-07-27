@@ -23,18 +23,93 @@ const defaultRelayRequestTimeout = 20 * time.Second
 
 const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户id，并配置接入herdr-pal，使用/help获取内置命令帮助"
 
-const serverHelpText = `输入帮助：
-/userid             显示当前企业微信 userid
-/ls                 列出全部在线机器上的 Agent
-/N 或 /sel N        选择第 N 个 Agent，并显示最新 100 行
-/help               显示本帮助
-/con                 显示当前 Agent 最新 100 行并重置分页
-/pageup、/pagedn    上翻、下翻缓存
-/key KEYS           发送受限按键
-/enter              等同 /key enter
-/slash TEXT         将 /TEXT 作为普通消息发送给 Agent
+const defaultHelpRelayURL = "wss://管理员提供的地址:9443"
 
-除 /userid、/ls、选择和 /help 外，输入会转发给当前选择所在机器。`
+const helpRelayURLToken = "{{RELAY_URL}}"
+
+const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
+	"已经完成配置时：`/ls` 查看会话 → `/1` 选择会话 → 直接发送任务。\n\n" +
+	"【基本控制】\n" +
+	"`/userid` 获取当前企业微信用户 ID\n" +
+	"`/ls` 列出所有在线机器和 Agent\n" +
+	"`/N` 或 `/sel N` 选择第 N 个会话\n" +
+	"`/con` 查看当前会话最近 100 行\n" +
+	"`/pageup`、`/pagedn` 上下翻页\n" +
+	"`/slash clear` 向 Agent 发送 `/clear`\n" +
+	"普通文字直接发送给当前 Agent\n" +
+	"`/help` 显示本帮助\n\n" +
+	"【按键操作】\n" +
+	"`/key up`、`/key down` 发送方向键\n" +
+	"`/key space`、`/key esc` 发送空格或 Esc\n" +
+	"`/enter` 等同 `/key enter`\n" +
+	"`/key down,sp,dn,A,7` 连续发送多个按键\n\n" +
+	"按键可用逗号或空格分隔，最多 32 个；`dn` 表示 down，`sp` 表示 space，也支持单个英文字母和数字。" +
+	"按键间隔 100ms，完成后自动返回终端内容。Enter 只能单独发送。\n\n" +
+	"【1. 安装 Herdr】\n" +
+	"下载及安装说明：\n" +
+	"https://herdr.dev/docs/install/\n\n" +
+	"Linux/macOS：\n" +
+	"`curl -fsSL https://herdr.dev/install.sh | sh`\n\n" +
+	"Windows AMD64 Beta：\n" +
+	"`powershell -ExecutionPolicy Bypass -c \"irm https://herdr.dev/install.ps1 | iex\"`\n\n" +
+	"运行 `herdr`，启动需要远程操作的 Agent。可执行以下命令检查服务：\n\n" +
+	"`herdr status server --json`\n\n" +
+	"输出中的 `protocol` 应为 `17`。\n\n" +
+	"【2. 安装 herdr-pal】\n" +
+	"下载最新版本：\n" +
+	"https://github.com/wenxichang/herdr-pal/releases/latest\n\n" +
+	"选择对应文件：\n" +
+	"- Apple Silicon：`herdr-pal-darwin-arm64`\n" +
+	"- Intel Mac：`herdr-pal-darwin-amd64`\n" +
+	"- Linux x64：`herdr-pal-linux-amd64`\n" +
+	"- Linux ARM64：`herdr-pal-linux-arm64`\n" +
+	"- Windows x64：`herdr-pal-windows-amd64.exe`\n\n" +
+	"Linux/macOS 下载后执行：\n" +
+	"`chmod +x herdr-pal-*`\n\n" +
+	"【3. 创建 config.json】\n" +
+	"放置位置：\n\n" +
+	"Linux/macOS：\n" +
+	"`~/.config/herdr-pal/config.json`\n\n" +
+	"Windows：\n" +
+	"`%USERPROFILE%\\.config\\herdr-pal\\config.json`\n\n" +
+	"配置示例：\n\n" +
+	"{\n" +
+	"  \"relay\": {\n" +
+	"    \"url\": \"" + helpRelayURLToken + "\",\n" +
+	"    \"userid\": \"在机器人中发送 /userid 获取\",\n" +
+	"    \"machine_id\": \"home-mac\",\n" +
+	"    \"skip_verify\": true\n" +
+	"  },\n" +
+	"  \"herdr\": {\n" +
+	"    \"session\": \"\",\n" +
+	"    \"socket_path\": \"\"\n" +
+	"  },\n" +
+	"  \"log\": {\n" +
+	"    \"level\": \"info\"\n" +
+	"  }\n" +
+	"}\n\n" +
+	"字段说明：\n" +
+	"- `relay.url`：向 Herdr Pal 服务管理员获取\n" +
+	"- `relay.userid`：在机器人单聊中发送 `/userid` 获取\n" +
+	"- `relay.machine_id`：自行设置的机器名称，同一用户的每台机器不能重复\n" +
+	"- `relay.skip_verify`：通常保持 `true`，管理员另有要求时按其说明填写\n" +
+	"- `herdr.session`：默认会话留空；使用命名会话时填写会话名\n" +
+	"- `herdr.socket_path`：通常留空，由程序自动探测\n" +
+	"- `log.level`：通常使用 `info`\n\n" +
+	"【4. 启动】\n" +
+	"Linux/macOS：\n" +
+	"`./herdr-pal-对应平台文件`\n\n" +
+	"Windows：\n" +
+	"`.\\herdr-pal-windows-amd64.exe`\n\n" +
+	"启动成功后回到企微，发送 `/ls`，再用 `/N` 选择会话。"
+
+func buildServerHelpText(relayURL string) string {
+	relayURL = strings.TrimSpace(relayURL)
+	if relayURL == "" {
+		relayURL = defaultHelpRelayURL
+	}
+	return strings.Replace(serverHelpTextTemplate, helpRelayURLToken, relayURL, 1)
+}
 
 // WeComGateway 是 Router 回复企业微信消息所需的动态用户发送能力。
 type WeComGateway interface {
@@ -126,17 +201,29 @@ type ConversationRouter struct {
 	relay          RelayRequester
 	deduper        *policy.Deduper
 	logger         *slog.Logger
+	helpText       string
 	requestTimeout time.Duration
+}
+
+// ConversationRouterConfig 是服务端会话路由器的展示配置。
+type ConversationRouterConfig struct {
+	// RelayURL 是在 /help 客户端配置示例中展示的 WSS 地址。
+	RelayURL string
 }
 
 // NewConversationRouter 创建多用户会话路由器。
 func NewConversationRouter(catalog *SessionCatalog, executor *UserExecutor, gateway WeComGateway, relay RelayRequester, deduper *policy.Deduper, logger *slog.Logger) (*ConversationRouter, error) {
+	return NewConversationRouterWithConfig(ConversationRouterConfig{}, catalog, executor, gateway, relay, deduper, logger)
+}
+
+// NewConversationRouterWithConfig 使用展示配置创建多用户会话路由器。
+func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *SessionCatalog, executor *UserExecutor, gateway WeComGateway, relay RelayRequester, deduper *policy.Deduper, logger *slog.Logger) (*ConversationRouter, error) {
 	if catalog == nil || executor == nil || gateway == nil || relay == nil || deduper == nil || logger == nil {
 		return nil, ErrInvalidRouterDependency
 	}
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
-		deduper: deduper, logger: logger, requestTimeout: defaultRelayRequestTimeout,
+		deduper: deduper, logger: logger, helpText: buildServerHelpText(config.RelayURL), requestTimeout: defaultRelayRequestTimeout,
 	}, nil
 }
 
@@ -190,7 +277,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	case serverActionSelect:
 		router.handleSelect(ctx, message, action.index)
 	case serverActionHelp:
-		router.reply(ctx, message, serverHelpText)
+		router.reply(ctx, message, router.helpText)
 	default:
 		router.handleExecute(ctx, message)
 	}

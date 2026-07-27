@@ -49,11 +49,47 @@ func TestRouterExplainsHowToConnectWhenNoSessions(t *testing.T) {
 func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
 	router.Handle(context.Background(), routerMessage("request-help", "message-help", "user-a", "/help"))
-	if got := gateway.LastReply(); !strings.Contains(got, "/userid") || !strings.Contains(got, "/help") {
-		t.Fatalf("help reply = %q", got)
+	help := gateway.LastReply()
+	for _, want := range []string{
+		"### Herdr Pal 快速上手",
+		"/userid",
+		"/key down,sp,dn,A,7",
+		"https://herdr.dev/docs/install/",
+		"https://github.com/wenxichang/herdr-pal/releases/latest",
+		"herdr-pal-windows-amd64.exe",
+		`%USERPROFILE%\.config\herdr-pal\config.json`,
+		`"url": "wss://管理员提供的地址:9443"`,
+		"relay.url",
+		"herdr.socket_path",
+		"protocol",
+		"17",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help reply lacks %q:\n%s", want, help)
+		}
+	}
+	for _, forbidden := range []string{"server-config", "HERDR_PAL_WECOM_SECRET", "herdr-pal-server", "Bot ID"} {
+		if strings.Contains(help, forbidden) {
+			t.Fatalf("help reply contains server deployment field %q:\n%s", forbidden, help)
+		}
+	}
+	if len(help) > panel.WeComContentLimit {
+		t.Fatalf("help reply size = %d, want at most %d bytes", len(help), panel.WeComContentLimit)
 	}
 	if relay.CallCount() != 0 {
 		t.Fatalf("relay calls = %d, want 0", relay.CallCount())
+	}
+}
+
+func TestRouterHelpUsesConfiguredRelayURL(t *testing.T) {
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RelayURL: "wss://10.1.3.4:9443"})
+	router.Handle(context.Background(), routerMessage("request-help-url", "message-help-url", "user-a", "/help"))
+	help := gateway.LastReply()
+	if !strings.Contains(help, `"url": "wss://10.1.3.4:9443"`) {
+		t.Fatalf("help reply lacks configured relay URL:\n%s", help)
+	}
+	if strings.Contains(help, "管理员提供的地址") {
+		t.Fatalf("help reply retained address placeholder:\n%s", help)
 	}
 }
 
@@ -389,6 +425,10 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 }
 
 func newRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *routerRelay) {
+	return newRouterHarnessWithConfig(t, ConversationRouterConfig{})
+}
+
+func newRouterHarnessWithConfig(t *testing.T, config ConversationRouterConfig) (*ConversationRouter, *routerGateway, *routerRelay) {
 	t.Helper()
 	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
 	if err != nil {
@@ -396,7 +436,7 @@ func newRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *route
 	}
 	gateway := &routerGateway{}
 	relay := &routerRelay{executeReply: "客户端已处理。"}
-	router, err := NewConversationRouter(NewSessionCatalog(), NewUserExecutor(64), gateway, relay, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+	router, err := NewConversationRouterWithConfig(config, NewSessionCatalog(), NewUserExecutor(64), gateway, relay, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

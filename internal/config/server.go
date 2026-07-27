@@ -23,6 +23,7 @@ type ServerWeComConfig struct {
 // ListenerConfig 是 Relay WSS 监听和证书配置。
 type ListenerConfig struct {
 	Listen   string `json:"listen"`
+	AddrHint string `json:"addr_hint"`
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
 	StateDir string `json:"state_dir"`

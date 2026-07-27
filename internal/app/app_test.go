@@ -289,6 +289,30 @@ func TestRunInteractiveCanonicalizesSocketAliasesForLockIdentity(t *testing.T) {
 
 }
 
+func TestCanonicalSocketPathPreservesWindowsMarkerSpelling(t *testing.T) {
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "target.sock")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("create marker target: %v", err)
+	}
+	alias := filepath.Join(tempDir, "marker-link.sock")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Skipf("platform does not support symlink: %v", err)
+	}
+	want, err := filepath.Abs(filepath.Clean(alias))
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+
+	got, err := canonicalSocketPathForPlatform(alias, false)
+	if err != nil {
+		t.Fatalf("canonicalSocketPathForPlatform() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("Windows marker identity = %q, want spelling-preserving path %q", got, want)
+	}
+}
+
 func TestRunInteractiveResolvesSymlinkParentWithMissingSocketLeaf(t *testing.T) {
 	tempDir := t.TempDir()
 	realDir := filepath.Join(tempDir, "real-parent")
@@ -543,6 +567,22 @@ func TestPrepareStableDialPathUsesByteLimitAndShortensLongBasename(t *testing.T)
 
 	if strings.Contains(errStableDialPathTooLong.Error(), sensitiveEndpoint) {
 		t.Fatalf("stable path length error leaked canonical endpoint: %v", errStableDialPathTooLong)
+	}
+}
+
+func TestPrepareStableDialPathBypassesUnixAliasForWindowsTransport(t *testing.T) {
+	endpoint := `C:\Users\alice\AppData\Local\herdr\` + strings.Repeat("long-", 32) + `herdr.sock`
+
+	lease, err := prepareStableDialPathForPlatform(endpoint, false)
+	if err != nil {
+		t.Fatalf("prepareStableDialPathForPlatform() error = %v", err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	if lease.Path() != endpoint {
+		t.Fatalf("Windows dial path = %q, want marker path %q", lease.Path(), endpoint)
+	}
+	if lease.aliasDir != "" || lease.aliasLink != "" {
+		t.Fatalf("Windows dial path created Unix alias: %#v", lease)
 	}
 }
 

@@ -5,11 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"os"
-	"path/filepath"
 	"strings"
-	"time"
 )
 
 // CommandRunner 定义调用 Herdr 公共 CLI 所需的最小能力。
@@ -60,23 +56,6 @@ func ResolveSocket(ctx context.Context, explicitPath, sessionName string, runner
 		return path, nil
 	}
 	return "", cliErr
-}
-
-func resolveHomeSocket(sessionName string) (string, error) {
-	if sessionName != "" && sessionName != "default" {
-		return "", errors.New("命名会话不使用 HOME 默认 Socket")
-	}
-	home := strings.TrimSpace(os.Getenv("HOME"))
-	if home == "" {
-		return "", errors.New("HOME 为空")
-	}
-	path := filepath.Join(home, ".config", "herdr", "herdr.sock")
-	connection, err := net.DialTimeout("unix", path, 200*time.Millisecond)
-	if err != nil {
-		return "", errors.New("HOME Socket 不可连接")
-	}
-	_ = connection.Close()
-	return path, nil
 }
 
 func resolveDefaultSocket(ctx context.Context, runner CommandRunner) (string, error) {

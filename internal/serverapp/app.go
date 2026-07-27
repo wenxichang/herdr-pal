@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,7 +87,14 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	router, err := server.NewConversationRouter(catalog, server.NewUserExecutor(64), weComClient, hub, deduper, logger)
+	relayURL, err := buildRelayURLHint(loaded.Server.AddrHint, loaded.Server.Listen)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	router, err := server.NewConversationRouterWithConfig(
+		server.ConversationRouterConfig{RelayURL: relayURL},
+		catalog, server.NewUserExecutor(64), weComClient, hub, deduper, logger,
+	)
 	if err != nil {
 		return err
 	}
@@ -101,6 +109,47 @@ func Run(ctx context.Context, options Options) error {
 	tlsListener := tls.NewListener(listener, tlsConfig)
 	logger.Info("Herdr Pal Server 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "listen", loaded.Server.Listen)
 	return runServerComponents(ctx, weComClient, router, httpServer, tlsListener)
+}
+
+func buildRelayURLHint(addrHint, listen string) (string, error) {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(listen))
+	if err != nil {
+		return "", fmt.Errorf("listen 无法提取端口")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("listen 端口无效")
+	}
+
+	addrHint = strings.TrimSpace(addrHint)
+	if addrHint == "" {
+		return fmt.Sprintf("wss://管理员提供的地址:%d", portNumber), nil
+	}
+	if ip := net.ParseIP(strings.Trim(addrHint, "[]")); ip != nil {
+		return "wss://" + net.JoinHostPort(ip.String(), port), nil
+	}
+	if !validAddressHint(addrHint) {
+		return "", fmt.Errorf("addr_hint 必须是主机名或 IP，不能包含协议、端口或路径")
+	}
+	return "wss://" + net.JoinHostPort(addrHint, port), nil
+}
+
+func validAddressHint(value string) bool {
+	if len(value) == 0 || len(value) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 type weComRuntime interface {

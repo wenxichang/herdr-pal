@@ -18,7 +18,8 @@
 Herdr 提供本地 Socket API：
 
 - Unix 使用本地 Socket 文件；服务端将权限限制为 `0600`。
-- Windows 通过 `interprocess::local_socket` 使用对应的本地 IPC 实现。
+- Windows 使用 Named Pipe；Herdr 把 CLI 返回的 marker 文件路径作为 namespaced 名称，
+  实际端点为 `\\.\pipe\<marker path>`。
 - 普通请求和响应使用换行分隔 JSON（NDJSON）。
 - 请求格式是 Herdr 自定义的 `{id, method, params}`，不是 JSON-RPC。
 - 普通连接通常发送一个请求并接收一个响应。
@@ -49,6 +50,7 @@ Herdr 提供本地 Socket API：
 - `src/api/server.rs:645`：长连接事件订阅。
 - `src/api/server.rs:28`：Unix Socket 权限模式。
 - `src/api/client.rs:31`：Herdr 内部可复用 NDJSON 客户端。
+- `src/ipc.rs:31`：Windows `GenericNamespaced` Named Pipe 映射。
 
 ## 3. 会话初始化
 

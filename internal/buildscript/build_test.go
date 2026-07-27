@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestBuildScriptProducesDarwinAndLinuxArchitectureMatrix(t *testing.T) {
+func TestBuildScriptProducesReleaseArchitectureMatrix(t *testing.T) {
 	root := repositoryRoot(t)
 	temporaryRoot := t.TempDir()
 	buildScript, err := os.ReadFile(filepath.Join(root, "build.sh"))
@@ -71,6 +71,7 @@ exit 0
 		{name: "herdr-pal-server-linux-amd64", goos: "linux", goarch: "amd64"},
 		{name: "herdr-pal-linux-arm64", goos: "linux", goarch: "arm64"},
 		{name: "herdr-pal-server-linux-arm64", goos: "linux", goarch: "arm64"},
+		{name: "herdr-pal-windows-amd64.exe", goos: "windows", goarch: "amd64"},
 	}
 	for _, target := range targets {
 		if _, err := os.Stat(filepath.Join(temporaryRoot, "dist", target.name)); err != nil {

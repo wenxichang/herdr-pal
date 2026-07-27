@@ -506,14 +506,22 @@ func runInteractive(ctx context.Context, options Options) (runErr error) {
 	return runErr
 }
 
-// canonicalSocketPath 冻结交互锁和日志使用的端点身份，避免 symlink 别名和重定向漂移。
+// canonicalSocketPath 按平台冻结交互锁、日志和本地连接使用的端点身份。
 func canonicalSocketPath(socketPath string) (string, error) {
+	return canonicalSocketPathForPlatform(socketPath, platformResolvesSocketSymlinks())
+}
+
+func canonicalSocketPathForPlatform(socketPath string, resolveSymlinks bool) (string, error) {
 	if strings.TrimSpace(socketPath) == "" {
 		return "", errors.New("Herdr Socket 路径不能为空")
 	}
 	absolute, err := filepath.Abs(filepath.Clean(socketPath))
 	if err != nil {
 		return "", errSocketPathUnresolvable
+	}
+	if !resolveSymlinks {
+		// Windows Named Pipe 名称来自 marker 路径字符串，解析 junction 会改变端点名称。
+		return absolute, nil
 	}
 
 	resolved, resolveErr := filepath.EvalSymlinks(absolute)
@@ -547,7 +555,11 @@ func canonicalSocketPath(socketPath string) (string, error) {
 
 // prepareStableDialPath 为过长端点创建进程私有短别名，同时保持 canonical endpoint 身份不变。
 func prepareStableDialPath(canonicalEndpoint string) (*dialPathLease, error) {
-	if len([]byte(canonicalEndpoint)) < unixSocketPathByteLimit {
+	return prepareStableDialPathForPlatform(canonicalEndpoint, platformUsesUnixSocketAlias())
+}
+
+func prepareStableDialPathForPlatform(canonicalEndpoint string, useUnixAlias bool) (*dialPathLease, error) {
+	if !useUnixAlias || len([]byte(canonicalEndpoint)) < unixSocketPathByteLimit {
 		return &dialPathLease{path: canonicalEndpoint}, nil
 	}
 

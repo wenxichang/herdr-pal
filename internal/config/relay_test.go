@@ -49,10 +49,10 @@ func TestLoadClientRejectsPlainWSOldWeComAndUnknownNestedField(t *testing.T) {
 
 func TestLoadServerReadsSecretAndDefaultsStateDirectory(t *testing.T) {
 	path := writeConfig(t, `{
-  "wecom": {"bot_id": "bot-1"},
-  "server": {"listen": "127.0.0.1:9443"},
-  "log": {}
-}`)
+	  "wecom": {"bot_id": "bot-1"},
+	  "server": {"listen": "127.0.0.1:9443", "addr_hint": "10.1.3.4"},
+	  "log": {}
+	}`)
 	loaded, err := LoadServer(path, func(name string) string {
 		if name != SecretEnvName {
 			t.Fatalf("getenv name = %q", name)
@@ -64,6 +64,9 @@ func TestLoadServerReadsSecretAndDefaultsStateDirectory(t *testing.T) {
 	}
 	if loaded.WeCom.BotID != "bot-1" || loaded.WeCom.Secret != "secret-value" || loaded.Server.Listen != "127.0.0.1:9443" {
 		t.Fatalf("LoadServer() = %#v", loaded)
+	}
+	if loaded.Server.AddrHint != "10.1.3.4" {
+		t.Fatalf("LoadServer() addr_hint = %q, want 10.1.3.4", loaded.Server.AddrHint)
 	}
 	if filepath.Base(loaded.Server.StateDir) != "herdr-pal-server" || loaded.Log.Level != "info" {
 		t.Fatalf("LoadServer() defaults = %#v", loaded)
