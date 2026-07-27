@@ -601,7 +601,7 @@ func TestNotificationDispatcherLogsStatusRetryAndSuccess(t *testing.T) {
 	}
 	wait := <-waiter.started
 	output := logs.String()
-	for _, want := range []string{"Agent 状态通知发送失败", "pane_id=pane-1", "current_status=working", "error_type=delivery", "retry_delay=7s"} {
+	for _, want := range []string{"Agent 状态通知发送失败", "pane_id=pane-1", "current_status=working", "error_type=delivery", "reason=\"send failed\"", "retry_delay=7s"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("通知失败日志缺少 %q：\n%s", want, output)
 		}
@@ -672,7 +672,9 @@ func TestNotificationDispatcherPermanentInvalidationFailureDoesNotBlockStatus(t 
 		t.Fatalf("永久目标变化错误进入重试：Next=%d", retry.NextCount())
 	}
 	if output := logs.String(); !strings.Contains(output, "Agent 目标失效通知发送已停止") ||
-		!strings.Contains(output, "error_type=target_changed") || !strings.Contains(output, "retryable=false") {
+		!strings.Contains(output, "error_type=target_changed") ||
+		!strings.Contains(output, "error_reason=\"Agent 列表快照已过期\"") ||
+		!strings.Contains(output, "retryable=false") {
 		t.Fatalf("永久目标变化错误日志不完整：\n%s", output)
 	}
 

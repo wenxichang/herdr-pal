@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,9 +86,10 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	defer func() { finishDialPathLease(stableDialPath, &runErr, timedOutComponentsDone, logger) }()
 
 	herdrClient := herdr.NewClient(stableDialPath.Path(), nil, 0)
+	relayLogger := logger.With("component", "relay_connection", "machine_id", loaded.Relay.MachineID)
 	relay, err := relayclient.New(relayclient.Config{
 		URL: loaded.Relay.URL, UserID: loaded.Relay.UserID, MachineID: loaded.Relay.MachineID,
-		SkipVerify: loaded.Relay.SkipVerify, Version: version.String(), Logger: logger,
+		SkipVerify: loaded.Relay.SkipVerify, Version: version.String(), Logger: relayLogger,
 	})
 	if err != nil {
 		return fmt.Errorf("创建 Relay 客户端: %w", err)
@@ -119,20 +121,36 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		return fmt.Errorf("创建 Herdr Supervisor: %w", err)
 	}
 
-	logger.Info("Herdr Pal Relay 客户端启动", "user_hash", shortHash(loaded.Relay.UserID), "machine_id", loaded.Relay.MachineID, "socket_hash", socketHash)
+	herdrSession := strings.TrimSpace(loaded.Herdr.Session)
+	if herdrSession == "" {
+		herdrSession = "auto"
+	}
+	logger.Info("Herdr Pal Relay 客户端启动",
+		"client_version", version.String(),
+		"user_hash", shortHash(loaded.Relay.UserID),
+		"machine_id", loaded.Relay.MachineID,
+		"relay_endpoint", relayLogEndpoint(loaded.Relay.URL),
+		"skip_verify", loaded.Relay.SkipVerify,
+		"herdr_session", herdrSession,
+		"socket_hash", socketHash,
+	)
 	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, supervisor.Run, defaultShutdownTimeout)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		logger.Error("Herdr Pal Relay 客户端停止", "error_type", safeErrorType(runErr))
+		logger.Error("Herdr Pal Relay 客户端停止",
+			"component", relayComponentName(runErr),
+			"error_type", safeErrorType(runErr),
+			"reason", safeRelayRuntimeReason(runErr, loaded.Relay.UserID, loaded.Relay.URL),
+		)
 	}
 	return runErr
 }
 
 func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(context.Context) error, shutdownTimeout time.Duration) (error, <-chan struct{}) {
 	componentContext, cancel := context.WithCancel(ctx)
-	results := make(chan error, 2)
+	results := make(chan componentResult, 2)
 	done := make(chan struct{})
-	go func() { results <- runRelay(componentContext) }()
-	go func() { results <- runSupervisor(componentContext) }()
+	go runComponent(componentContext, "relay_connection", true, runRelay, results)
+	go runComponent(componentContext, "herdr_supervisor", true, runSupervisor, results)
 	first := <-results
 	cancel()
 	go func() {
@@ -149,8 +167,72 @@ func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(contex
 		if ctx.Err() != nil {
 			return ctx.Err(), nil
 		}
-		return first, nil
+		return relayComponentRootError(first), nil
 	case <-timer.C:
+		if rootErr := relayComponentRootError(first); rootErr != nil {
+			return errors.Join(rootErr, ErrShutdownTimeout), done
+		}
 		return ErrShutdownTimeout, done
 	}
+}
+
+type relayComponentError struct {
+	component string
+	err       error
+}
+
+func (e *relayComponentError) Error() string {
+	return fmt.Sprintf("%s 运行失败: %v", e.component, e.err)
+}
+
+func (e *relayComponentError) Unwrap() error { return e.err }
+
+func relayComponentRootError(result componentResult) error {
+	if result.shutdownDerived {
+		return nil
+	}
+	err := result.err
+	if err == nil {
+		err = ErrLoopStopped
+	}
+	return &relayComponentError{component: result.name, err: err}
+}
+
+func relayComponentName(err error) string {
+	var componentErr *relayComponentError
+	if errors.As(err, &componentErr) {
+		return componentErr.component
+	}
+	if errors.Is(err, ErrShutdownTimeout) {
+		return "shutdown"
+	}
+	return "unknown"
+}
+
+func safeRelayRuntimeReason(err error, userID, endpoint string) string {
+	if err == nil {
+		return ""
+	}
+	reason := err.Error()
+	if userID = strings.TrimSpace(userID); userID != "" {
+		reason = strings.ReplaceAll(reason, userID, "[userid]")
+	}
+	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
+		reason = strings.ReplaceAll(reason, endpoint, relayLogEndpoint(endpoint))
+	}
+	reason = strings.Join(strings.Fields(reason), " ")
+	const maxRunes = 512
+	runes := []rune(reason)
+	if len(runes) > maxRunes {
+		reason = string(runes[:maxRunes]) + "..."
+	}
+	return reason
+}
+
+func relayLogEndpoint(raw string) string {
+	endpoint, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return "invalid"
+	}
+	return endpoint.Scheme + "://" + endpoint.Host
 }

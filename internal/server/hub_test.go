@@ -1,17 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
+	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
 func TestHubAcceptsHelloAndFirstFullSnapshot(t *testing.T) {
@@ -173,15 +176,137 @@ func TestHubDispatchesPushAndNotificationThroughBoundedOutboundSink(t *testing.T
 	}
 }
 
+func TestHubVerboseLogsHandshakeAndSnapshotReasonsWithoutSessionContent(t *testing.T) {
+	logs := &lockedLogBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hub, relayServer := startHubServerWithLogger(t, HubConfig{}, logger)
+
+	invalid := dialRawHubClient(t, relayServer)
+	invalid.WriteFrame(t, relayproto.TypeClientHello, "hello-invalid", relayproto.ClientHello{MachineID: "home-mac", ClientVersion: "test"})
+	_ = invalid.ReadFrame(t)
+	invalid.Close()
+	eventuallyHub(t, func() bool {
+		output := logs.String()
+		return strings.Contains(output, "Relay 客户端握手失败") && strings.Contains(output, "stage=client_hello") &&
+			strings.Contains(output, "error_type=invalid_identity")
+	})
+
+	client := dialRawHubClient(t, relayServer)
+	defer client.Close()
+	client.WriteFrame(t, relayproto.TypeClientHello, "hello", relayproto.ClientHello{UserID: "user-a", MachineID: "home-mac", ClientVersion: "test-version"})
+	if frame := client.ReadFrame(t); frame.Type != relayproto.TypeServerHello {
+		t.Fatalf("server hello = %#v", frame)
+	}
+	client.WriteFrame(t, relayproto.TypeSessionSnapshot, "", relayproto.SessionSnapshot{
+		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "private-panel-title")},
+	})
+	eventuallyHub(t, func() bool {
+		output := logs.String()
+		return strings.Contains(output, "Relay 客户端已就绪") && strings.Contains(output, "client_version=test-version") &&
+			strings.Contains(output, "snapshot_sequence=1") && strings.Contains(output, "session_count=1")
+	})
+	client.WriteFrame(t, relayproto.TypeSessionSnapshot, "", relayproto.SessionSnapshot{
+		Sequence: 2, Sessions: []relayproto.Session{
+			relaySession(1, "pane-1", "occ-1", "private-panel-title"),
+			relaySession(2, "pane-2", "occ-2", "another-private-title"),
+		},
+	})
+	eventuallyHub(t, func() bool {
+		output := logs.String()
+		return strings.Contains(output, "Relay 客户端快照已上报") && strings.Contains(output, "snapshot_sequence=2") &&
+			strings.Contains(output, "previous_session_count=1") && strings.Contains(output, "session_count=2") &&
+			strings.Contains(output, "session_count_changed=true")
+	})
+	client.WriteFrame(t, relayproto.TypeSessionSnapshot, "", relayproto.SessionSnapshot{
+		Sequence: 3, Sessions: []relayproto.Session{
+			relaySession(1, "pane-1", "occ-1", "updated-private-title"),
+			relaySession(2, "pane-2", "occ-2", "another-private-title"),
+		},
+	})
+	eventuallyHub(t, func() bool {
+		output := logs.String()
+		return strings.Contains(output, "snapshot_sequence=3") && strings.Contains(output, "session_count_changed=false")
+	})
+	output := logs.String()
+	for _, forbidden := range []string{"private-panel-title", "updated-private-title", "another-private-title", "user-a"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("logs leaked %q: %s", forbidden, output)
+		}
+	}
+	if !hub.Catalog().HasSessions("user-a") {
+		t.Fatal("snapshot was not applied")
+	}
+}
+
+func TestHubVerboseLogsOutboundEventAndExplicitWeComFailure(t *testing.T) {
+	logs := &lockedLogBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hub, relayServer := startHubServerWithLogger(t, HubConfig{}, logger)
+	if err := hub.SetOutboundSink(hubFailingOutboundSink{err: &wecom.ProtocolError{ErrCode: 93000}}); err != nil {
+		t.Fatal(err)
+	}
+	client := dialReadyHubClient(t, relayServer, "user-a", "home-mac")
+	defer client.Close()
+	eventuallyHub(t, func() bool { return hub.Catalog().HasSessions("user-a") })
+	client.WriteFrame(t, relayproto.TypeNotification, "", relayproto.Notification{
+		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"},
+		Content: "private-terminal-output",
+	})
+	eventuallyHub(t, func() bool {
+		output := logs.String()
+		return strings.Contains(output, "Relay 客户端上报已接收") && strings.Contains(output, "event_type=notification") &&
+			strings.Contains(output, "Relay 出站消息发送失败") && strings.Contains(output, "error_type=wecom_protocol") &&
+			strings.Contains(output, "error_code=93000") && strings.Contains(output, "machine_id=home-mac") &&
+			strings.Contains(output, "pane_id=pane-1") && strings.Contains(output, "local_index=1")
+	})
+	if output := logs.String(); strings.Contains(output, "private-terminal-output") || strings.Contains(output, "user-a") {
+		t.Fatalf("logs leaked content or userid: %s", output)
+	}
+}
+
 func startHubServer(t *testing.T, config HubConfig) (*ClientHub, *httptest.Server) {
 	t.Helper()
-	hub, err := NewClientHub(NewSessionCatalog(), config, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+	return startHubServerWithLogger(t, config, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+}
+
+func startHubServerWithLogger(t *testing.T, config HubConfig, logger *slog.Logger) (*ClientHub, *httptest.Server) {
+	t.Helper()
+	hub, err := NewClientHub(NewSessionCatalog(), config, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewTLSServer(hub)
 	t.Cleanup(server.Close)
 	return hub, server
+}
+
+type hubFailingOutboundSink struct {
+	err error
+}
+
+func (sink hubFailingOutboundSink) SendPush(context.Context, string, relayproto.ExecutePush) error {
+	return sink.err
+}
+
+func (sink hubFailingOutboundSink) SendNotification(context.Context, string, string, relayproto.Notification) error {
+	return sink.err
+}
+
+type lockedLogBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (buffer *lockedLogBuffer) Write(data []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.Write(data)
+}
+
+func (buffer *lockedLogBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.String()
 }
 
 type hubTestClient struct {

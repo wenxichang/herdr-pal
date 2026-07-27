@@ -321,8 +321,10 @@ pane.agent_status_changed
 - 企业微信 Secret 只在服务端环境变量中；客户端永远不持有。
 - WSS 只提供链路加密。当前客户端可以自行声明 userid，且默认忽略证书验证，因此部署
   必须限制在受信任内网和受控主机。
-- 日志仅记录错误类别、长度、连接 ID、machine_id 和 userid/occupant 摘要，不记录完整
-  Secret、Cookie、prompt 或终端快照。
+- 日志仅记录错误类别、明确原因、长度、连接 ID、machine_id、pane_id 和
+  userid/message/occupant 摘要，不记录完整 Secret、Cookie、prompt 或终端快照。服务端
+  `--verbose` 模式额外记录握手阶段、快照序号与会话数、心跳、交互动作和出站结果。
+  客户端 `log.level=debug` 额外记录 Herdr 恢复阶段、协议版本、Relay 握手、快照上报和请求结果。
 - 外部字符串不能映射成任意 Herdr key；只允许固定按键白名单。
 - 未知用户会话、群聊、未知 pane、失效 occupant、degraded Herdr 和断线客户端都不能
   产生输入。

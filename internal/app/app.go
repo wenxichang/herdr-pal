@@ -23,6 +23,8 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
+	"github.com/wenxichang/herdr-pal/internal/relayclient"
+	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
@@ -829,7 +831,7 @@ func newSlogKeyAuditSink(logger *slog.Logger) slogKeyAuditSink {
 
 func (s slogKeyAuditSink) RecordKeyAudit(audit policy.KeyAudit) {
 	s.logger.Info("显式按键审计",
-		slog.String("user_id", audit.UserID()),
+		slog.String("user_hash", shortHash(audit.UserID())),
 		slog.String("pane_id", audit.PaneID()),
 		slog.String("occupant_hash", audit.OccupantHash()),
 		slog.String("key", audit.Key()),
@@ -1076,6 +1078,10 @@ func safeErrorType(err error) string {
 		return "herdr_protocol"
 	case errors.Is(err, herdr.ErrUnavailable):
 		return "herdr_unavailable"
+	case errors.Is(err, relayproto.ErrProtocolMismatch), errors.Is(err, relayproto.ErrInvalidFrame), errors.Is(err, relayproto.ErrFrameTooLarge):
+		return "relay_protocol"
+	case errors.Is(err, relayclient.ErrUnavailable):
+		return "relay_unavailable"
 	case errors.Is(err, wecom.ErrProtocol):
 		return "wecom_protocol"
 	case errors.Is(err, wecom.ErrUnavailable):

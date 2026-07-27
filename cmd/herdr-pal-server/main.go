@@ -30,9 +30,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 	flags := flag.NewFlagSet("herdr-pal-server", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "服务端 JSON 配置文件路径")
+	verbose := flags.Bool("verbose", false, "输出详细调试日志")
 	showVersion := flags.Bool("version", false, "显示版本")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "用法: herdr-pal-server [-config /path/to/server.json]")
+		fmt.Fprintln(stderr, "用法: herdr-pal-server [-config /path/to/server.json] [--verbose]")
 		fmt.Fprintln(stderr, "      herdr-pal-server --version")
 	}
 	if err := flags.Parse(args); err != nil {
@@ -40,7 +41,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 		flags.Usage()
 		return 2
 	}
-	if flags.NArg() != 0 || *showVersion && *configPath != "" {
+	if flags.NArg() != 0 || *showVersion && (*configPath != "" || *verbose) {
 		flags.Usage()
 		return 2
 	}
@@ -57,7 +58,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 			return 2
 		}
 	}
-	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stderr: stderr})
+	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stderr: stderr, Verbose: *verbose})
 	if err == nil || ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return 0
 	}

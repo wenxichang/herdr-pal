@@ -1322,28 +1322,56 @@ func TestServiceSplitsTerminalReplyAndStopsAfterIMFailure(t *testing.T) {
 		}
 	}
 
-	service, fake = newTestService(t)
+	logs := &lockedLogBuffer{}
+	service, fake = newTestServiceWithLogger(t, slog.New(slog.NewTextHandler(logs, nil)))
 	selectTarget(t, service)
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: strings.Repeat("line\n", 6000)}
 	im = fakeIMFromService(t, service)
-	im.respondErr = errors.New("network")
+	im.respondErr = errors.New("network response failed")
 	_, beforePushes = im.deliveryCounts()
 	service.HandleMessage(context.Background(), incoming("failed-reply", "/con"))
 	if im.pushCount() != beforePushes {
 		t.Fatalf("sent push after response failure: %#v", im.pushes)
 	}
+	output := logs.String()
+	for _, want := range []string{
+		"IM 回复发送失败", "request_hash=" + bridgeShortHash("request-failed-reply"),
+		"part_index=1", "part_count=", "content_length=", "error_type=delivery",
+		"reason=\"network response failed\"",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("首段回复失败日志缺少 %q：\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "line\nline") {
+		t.Fatalf("回复失败日志泄露终端内容：\n%s", output)
+	}
 }
 
 func TestServiceStopsAfterFirstPushFailure(t *testing.T) {
-	service, fake := newTestService(t)
+	logs := &lockedLogBuffer{}
+	service, fake := newTestServiceWithLogger(t, slog.New(slog.NewTextHandler(logs, nil)))
 	selectTarget(t, service)
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: oversizedTerminalText()}
 	im := fakeIMFromService(t, service)
-	im.sendErr = errors.New("network")
+	im.sendErr = errors.New("network push failed")
 	_, beforePushes := im.deliveryCounts()
 	service.HandleMessage(context.Background(), incoming("push-fail", "/con"))
 	if got := im.pushCount() - beforePushes; got != 1 {
 		t.Fatalf("push attempts = %d, want 1", got)
+	}
+	output := logs.String()
+	for _, want := range []string{
+		"IM 后续消息发送失败", "request_hash=" + bridgeShortHash("request-push-fail"),
+		"part_index=2", "part_count=", "content_length=", "error_type=delivery",
+		"reason=\"network push failed\"",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("后续分段失败日志缺少 %q：\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "中文终端内容") {
+		t.Fatalf("后续分段失败日志泄露终端内容：\n%s", output)
 	}
 }
 

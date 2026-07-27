@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -53,12 +54,13 @@ type ClientConfig struct {
 	Logger            *slog.Logger
 }
 
-// String 返回不包含订阅密钥的配置摘要。
+// String 返回不包含订阅密钥、原始机器人标识和用户标识的配置摘要。
 func (config ClientConfig) String() string {
-	return fmt.Sprintf("ClientConfig{Endpoint:%q BotID:%q AllowedUserID:%q}", config.Endpoint, config.BotID, config.AllowedUserID)
+	return fmt.Sprintf("ClientConfig{Endpoint:%q BotHash:%q UserHash:%q}",
+		weComLogEndpoint(config.Endpoint), wecomShortHash(config.BotID), wecomShortHash(config.AllowedUserID))
 }
 
-// GoString 返回不包含订阅密钥的配置摘要。
+// GoString 返回不包含订阅密钥、原始机器人标识和用户标识的配置摘要。
 func (config ClientConfig) GoString() string { return config.String() }
 
 // Client 持续维护一条已订阅的企业微信智能机器人长连接。
@@ -85,15 +87,16 @@ type Client struct {
 	closeOnce  sync.Once
 }
 
-// String 返回不包含订阅密钥的客户端摘要。
+// String 返回不包含订阅密钥、原始机器人标识和用户标识的客户端摘要。
 func (c *Client) String() string {
 	if c == nil {
 		return "Client<nil>"
 	}
-	return fmt.Sprintf("Client{Endpoint:%q BotID:%q AllowedUserID:%q}", c.endpoint, c.botID, c.allowedUserID)
+	return fmt.Sprintf("Client{Endpoint:%q BotHash:%q UserHash:%q}",
+		weComLogEndpoint(c.endpoint), wecomShortHash(c.botID), wecomShortHash(c.allowedUserID))
 }
 
-// GoString 返回不包含订阅密钥的客户端摘要。
+// GoString 返回不包含订阅密钥、原始机器人标识和用户标识的客户端摘要。
 func (c *Client) GoString() string { return c.String() }
 
 // NewClient 根据配置创建企业微信智能机器人客户端。
@@ -155,11 +158,13 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.logInfo("企业微信连接中")
+		connectionFields := c.connectionLogFields()
+		c.logInfo("企业微信连接中", connectionFields...)
 		socket, err := c.dial(ctx, c.endpoint)
 		if err != nil {
 			delay := c.backoff.Next()
-			fields := append(weComDialLogFields(err), "retry_delay", delay)
+			fields := append(connectionFields, weComDialLogFields(err)...)
+			fields = append(fields, "retry_delay", delay)
 			c.logWarn("企业微信连接失败", fields...)
 			if err := c.wait(ctx, delay); err != nil {
 				return err
@@ -171,11 +176,11 @@ func (c *Client) Run(ctx context.Context) error {
 			session.finish(ErrUnavailable)
 			session.wait()
 			if errors.Is(err, ErrProtocol) || errors.Is(err, ErrEventQueueFull) {
-				c.logError("企业微信订阅失败", "error_type", wecomErrorType(err))
+				c.logError("企业微信订阅失败", wecomErrorLogFields(err)...)
 				return err
 			}
 			delay := c.backoff.Next()
-			c.logWarn("企业微信订阅暂时失败", "error_type", wecomErrorType(err), "retry_delay", delay)
+			c.logWarn("企业微信订阅暂时失败", append(wecomErrorLogFields(err), "retry_delay", delay)...)
 			if err := c.wait(ctx, delay); err != nil {
 				return err
 			}
@@ -187,17 +192,18 @@ func (c *Client) Run(ctx context.Context) error {
 			session.wait()
 			c.clearIfCurrent(session)
 			if flushErr := session.flushQueued(ctx); flushErr != nil {
+				c.logError("企业微信待处理消息恢复失败", wecomErrorLogFields(flushErr)...)
 				return flushErr
 			}
 			delay := c.backoff.Next()
-			c.logWarn("企业微信会话激活失败", "error_type", "event_queue_full", "retry_delay", delay)
+			c.logWarn("企业微信会话激活失败", append(wecomErrorLogFields(err), "retry_delay", delay)...)
 			if err := c.wait(ctx, delay); err != nil {
 				return err
 			}
 			continue
 		}
 		c.backoff.Reset()
-		c.logInfo("企业微信订阅成功")
+		c.logInfo("企业微信订阅成功", connectionFields...)
 		session.startHeartbeat(c)
 		<-session.done
 		session.wait()
@@ -205,11 +211,13 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.logWarn("企业微信连接已断开", "error_type", wecomErrorType(session.reason()))
+		disconnectedFields := append(connectionFields, wecomErrorLogFields(session.reason())...)
+		c.logWarn("企业微信连接已断开", disconnectedFields...)
 		if errors.Is(session.reason(), ErrProtocol) {
 			return session.reason()
 		}
 		if err := session.flushQueued(ctx); err != nil {
+			c.logError("企业微信待处理消息恢复失败", wecomErrorLogFields(err)...)
 			return err
 		}
 		delay := c.backoff.Next()
@@ -226,6 +234,12 @@ func (c *Client) logInfo(message string, args ...any) {
 	}
 }
 
+func (c *Client) logDebug(message string, args ...any) {
+	if c != nil && c.logger != nil {
+		c.logger.Debug(message, args...)
+	}
+}
+
 func (c *Client) logWarn(message string, args ...any) {
 	if c != nil && c.logger != nil {
 		c.logger.Warn(message, args...)
@@ -236,6 +250,13 @@ func (c *Client) logError(message string, args ...any) {
 	if c != nil && c.logger != nil {
 		c.logger.Error(message, args...)
 	}
+}
+
+func (c *Client) connectionLogFields() []any {
+	if c == nil {
+		return nil
+	}
+	return []any{"endpoint", weComLogEndpoint(c.endpoint), "bot_hash", wecomShortHash(c.botID)}
 }
 
 func wecomErrorType(err error) string {
@@ -253,6 +274,42 @@ func wecomErrorType(err error) string {
 	}
 }
 
+func wecomErrorLogFields(err error) []any {
+	fields := []any{"error_type", wecomErrorType(err), "reason", safeWeComErrorReason(err)}
+	var protocolError *ProtocolError
+	if errors.As(err, &protocolError) && protocolError.ErrCode != 0 {
+		fields = append(fields, "error_code", protocolError.ErrCode)
+	}
+	return fields
+}
+
+func safeWeComErrorReason(err error) string {
+	switch {
+	case err == nil:
+		return "未提供断开原因"
+	case errors.Is(err, ErrEventQueueFull):
+		return "企业微信入站事件队列已满"
+	case errors.Is(err, ErrProtocol):
+		return "企业微信返回协议或业务错误"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "企业微信请求等待响应超时"
+	case errors.Is(err, context.Canceled):
+		return "企业微信操作上下文已取消"
+	case errors.Is(err, ErrUnavailable):
+		return "企业微信 WebSocket 连接不可用"
+	default:
+		reason := strings.NewReplacer("\r", " ", "\n", " ", "\x00", "").Replace(strings.ToValidUTF8(err.Error(), "�"))
+		reason = strings.TrimSpace(reason)
+		if reason == "" {
+			return "企业微信操作失败但未提供具体原因"
+		}
+		if len(reason) > logFieldByteLimit {
+			reason = reason[:logFieldByteLimit] + "…"
+		}
+		return reason
+	}
+}
+
 func (c *Client) heartbeat(session *session) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
@@ -264,6 +321,7 @@ func (c *Client) heartbeat(session *session) {
 			requestID := c.requestID()
 			payload, err := EncodePing(requestID)
 			if err != nil {
+				c.logWarn("企业微信心跳编码失败", wecomErrorLogFields(err)...)
 				session.finish(ErrUnavailable)
 				return
 			}
@@ -271,9 +329,11 @@ func (c *Client) heartbeat(session *session) {
 			err = session.request(ctx, requestID, payload)
 			cancel()
 			if err != nil {
+				c.logWarn("企业微信心跳失败", append([]any{"request_hash", wecomShortHash(requestID)}, wecomErrorLogFields(err)...)...)
 				session.finish(ErrUnavailable)
 				return
 			}
+			c.logDebug("企业微信心跳成功", "request_hash", wecomShortHash(requestID))
 		}
 	}
 }
@@ -380,6 +440,9 @@ func productionDial(ctx context.Context, endpoint string) (Socket, error) {
 		HTTPClient: &http.Client{Transport: weComWebSocketTransport{base: http.DefaultTransport}},
 	})
 	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
 		return nil, newWeComDialError(err, response)
 	}
 	return connection, nil
@@ -410,9 +473,18 @@ func newWeComDialError(cause error, response *http.Response) error {
 		return &weComDialError{kind: "handshake", statusCode: response.StatusCode, cause: cause}
 	}
 	kind := "transport"
+	var dnsError *net.DNSError
+	var networkError net.Error
+	message := strings.ToLower(fmt.Sprint(cause))
 	if errors.Is(cause, context.Canceled) {
 		kind = "context_canceled"
 	} else if errors.Is(cause, context.DeadlineExceeded) {
+		kind = "timeout"
+	} else if errors.As(cause, &dnsError) {
+		kind = "dns"
+	} else if strings.Contains(message, "tls:") || strings.Contains(message, "x509:") || strings.Contains(message, "certificate") {
+		kind = "tls"
+	} else if errors.As(cause, &networkError) && networkError.Timeout() {
 		kind = "timeout"
 	}
 	return &weComDialError{kind: kind, cause: cause}
@@ -421,13 +493,32 @@ func newWeComDialError(cause error, response *http.Response) error {
 func weComDialLogFields(err error) []any {
 	var dialErr *weComDialError
 	if !errors.As(err, &dialErr) {
-		return []any{"error_type", "transport"}
+		return []any{"error_type", "transport", "reason", safeWeComErrorReason(err)}
 	}
-	fields := []any{"error_type", dialErr.kind}
+	reason := safeWeComErrorReason(dialErr.cause)
+	switch dialErr.kind {
+	case "handshake":
+		if dialErr.cause == nil {
+			reason = "企业微信 WebSocket 握手被 HTTP 服务拒绝"
+		}
+	case "context_canceled":
+		reason = "企业微信连接操作已取消"
+	case "timeout":
+		reason = "企业微信连接超时"
+	}
+	fields := []any{"error_type", dialErr.kind, "reason", reason}
 	if dialErr.statusCode > 0 {
 		fields = append(fields, "http_status", dialErr.statusCode)
 	}
 	return fields
+}
+
+func weComLogEndpoint(raw string) string {
+	endpoint, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return "invalid-endpoint"
+	}
+	return endpoint.Scheme + "://" + endpoint.Host
 }
 
 type weComWebSocketTransport struct {
@@ -575,23 +666,51 @@ func (s *session) readLoop() {
 	for {
 		messageType, data, err := s.socket.Read(s.ctx)
 		if err != nil {
+			if s.logger != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Warn("企业微信 WebSocket 读取失败", wecomErrorLogFields(err)...)
+			}
 			s.finish(ErrUnavailable)
 			return
 		}
 		if messageType != websocket.MessageText {
+			if s.logger != nil {
+				s.logger.Warn("企业微信 WebSocket 消息类型无效", "error_type", "invalid_message_type", "reason", "企业微信连接只接受文本帧", "message_type", messageType)
+			}
 			s.finish(ErrUnavailable)
 			return
 		}
 		frame, err := DecodeFrame(data)
 		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("企业微信消息解析失败", wecomErrorLogFields(err)...)
+			}
 			s.finish(err)
 			return
 		}
 		switch frame.Kind {
 		case FrameResponse:
-			s.pending.resolve(*frame.Response)
+			matched := s.pending.resolve(*frame.Response)
+			if s.logger != nil {
+				if matched {
+					s.logger.Debug("企业微信请求响应已接收", "request_hash", wecomShortHash(frame.Response.Headers.RequestID), "error_code", frame.Response.ErrCode)
+				} else {
+					s.logger.Warn("企业微信请求响应未匹配", "request_hash", wecomShortHash(frame.Response.Headers.RequestID), "error_code", frame.Response.ErrCode, "error_type", "unmatched_request", "reason", "响应没有对应的在途请求")
+				}
+			}
 		case FrameIncomingText:
+			if s.logger != nil {
+				s.logger.Debug("企业微信文本消息已接收",
+					"user_hash", wecomShortHash(frame.IncomingText.UserID),
+					"message_hash", wecomShortHash(frame.IncomingText.MessageID),
+					"request_hash", wecomShortHash(frame.IncomingText.RequestID),
+					"chat_type", frame.IncomingText.ChatType,
+					"content_bytes", len([]byte(frame.IncomingText.Content)),
+				)
+			}
 			if err := s.enqueue(*frame.IncomingText); err != nil {
+				if s.logger != nil {
+					s.logger.Warn("企业微信文本消息入队失败", append([]any{"user_hash", wecomShortHash(frame.IncomingText.UserID), "message_hash", wecomShortHash(frame.IncomingText.MessageID)}, wecomErrorLogFields(err)...)...)
+				}
 				s.finish(err)
 				return
 			}
@@ -602,9 +721,13 @@ func (s *session) readLoop() {
 					"chat_type", frame.Unsupported.ChatType,
 					"user_hash", wecomShortHash(frame.Unsupported.UserID),
 					"message_hash", wecomShortHash(frame.Unsupported.MessageID),
+					"reason", "当前版本只支持企业微信文本单聊消息",
 				)
 			}
 		case FrameDisconnected:
+			if s.logger != nil {
+				s.logger.Warn("企业微信服务端要求断开连接", "error_type", "remote_disconnect", "reason", "收到企业微信 disconnected_event")
+			}
 			s.finish(ErrUnavailable)
 			return
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ type clientConnection struct {
 	id     string
 	key    ClientKey
 	socket *websocket.Conn
+	logger *slog.Logger
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -30,16 +32,17 @@ type clientConnection struct {
 	outboundDone  chan struct{}
 	ready         atomic.Bool
 	lastPong      atomic.Int64
+	sessionCount  atomic.Int64
 
 	pendingMu  sync.Mutex
 	pending    map[string]pendingRequest
 	maxPending int
 }
 
-func newClientConnection(parent context.Context, id string, key ClientKey, socket *websocket.Conn, sendCapacity, maxPending int) *clientConnection {
+func newClientConnection(parent context.Context, id string, key ClientKey, socket *websocket.Conn, sendCapacity, maxPending int, logger *slog.Logger) *clientConnection {
 	ctx, cancel := context.WithCancel(parent)
 	connection := &clientConnection{
-		id: id, key: key, socket: socket, ctx: ctx, cancel: cancel,
+		id: id, key: key, socket: socket, logger: logger, ctx: ctx, cancel: cancel,
 		sendQueue: make(chan relayproto.Frame, sendCapacity), writerDone: make(chan struct{}),
 		outboundQueue: make(chan relayproto.Frame, sendCapacity), outboundDone: make(chan struct{}),
 		pending: make(map[string]pendingRequest), maxPending: maxPending,
@@ -57,10 +60,18 @@ func (connection *clientConnection) runWriter() {
 		case frame := <-connection.sendQueue:
 			encoded, err := relayproto.Encode(frame)
 			if err != nil {
+				if connection.logger != nil {
+					args := append(connectionLogArgs(connection), "event_type", frame.Type, "stage", "encode_frame")
+					connection.logger.Warn("Relay 发送队列帧编码失败", append(args, serverErrorLogArgs(err)...)...)
+				}
 				connection.cancel()
 				return
 			}
 			if err := connection.socket.Write(connection.ctx, websocket.MessageText, encoded); err != nil {
+				if connection.logger != nil {
+					args := append(connectionLogArgs(connection), "event_type", frame.Type, "stage", "write_frame")
+					connection.logger.Warn("Relay WebSocket 帧发送失败", append(args, serverErrorLogArgs(err)...)...)
+				}
 				connection.cancel()
 				return
 			}

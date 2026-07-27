@@ -379,7 +379,10 @@ func (d *notificationDispatcher) logStatusDeliveryFailure(task *notificationTask
 		return
 	}
 	d.logger.Warn("Agent 状态通知发送失败", append(
-		statusTransitionLogArgs(task.transition), "error_type", notificationDeliveryErrorType(err), "retry_delay", delay,
+		statusTransitionLogArgs(task.transition),
+		"error_type", notificationDeliveryErrorType(err),
+		"reason", safeNotificationErrorReason(err),
+		"retry_delay", delay,
 	)...)
 }
 
@@ -397,7 +400,11 @@ func (d *notificationDispatcher) logPermanentNotificationFailure(task *notificat
 	switch task.kind {
 	case notificationTaskStatus:
 		d.logger.Warn("Agent 状态通知发送已停止", append(
-			statusTransitionLogArgs(task.transition), "reason", "permanent_error", "error_type", errorType, "retryable", false,
+			statusTransitionLogArgs(task.transition),
+			"reason", "permanent_error",
+			"error_type", errorType,
+			"error_reason", safeNotificationErrorReason(err),
+			"retryable", false,
 		)...)
 	case notificationTaskInvalidated:
 		d.logger.Warn("Agent 目标失效通知发送已停止",
@@ -405,6 +412,7 @@ func (d *notificationDispatcher) logPermanentNotificationFailure(task *notificat
 			"occupant_hash", bridgeShortHash(task.target.OccupantKey),
 			"agent", task.target.Agent,
 			"error_type", errorType,
+			"error_reason", safeNotificationErrorReason(err),
 			"retryable", false,
 		)
 	}
@@ -425,6 +433,19 @@ func notificationDeliveryErrorType(err error) string {
 	default:
 		return "delivery"
 	}
+}
+
+func safeNotificationErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	reason := strings.Join(strings.Fields(err.Error()), " ")
+	const maxRunes = 512
+	runes := []rune(reason)
+	if len(runes) > maxRunes {
+		reason = string(runes[:maxRunes]) + "..."
+	}
+	return reason
 }
 
 func (d *notificationDispatcher) signal() {

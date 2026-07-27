@@ -905,13 +905,26 @@ func (s *Service) reply(ctx context.Context, requestID, content string) {
 		parts = []string{"操作未完成，请稍后重试。"}
 	}
 	if err := s.im.RespondMarkdown(ctx, requestID, parts[0]); err != nil {
+		s.logIMDeliveryFailure("IM 回复发送失败", requestID, 1, len(parts), len(parts[0]), err)
 		return
 	}
-	for _, part := range parts[1:] {
+	for index, part := range parts[1:] {
 		if err := s.im.SendMarkdown(ctx, part); err != nil {
+			s.logIMDeliveryFailure("IM 后续消息发送失败", requestID, index+2, len(parts), len(part), err)
 			return
 		}
 	}
+}
+
+func (s *Service) logIMDeliveryFailure(message, requestID string, partIndex, partCount, contentLength int, err error) {
+	s.logger.Warn(message,
+		"request_hash", bridgeShortHash(requestID),
+		"part_index", partIndex,
+		"part_count", partCount,
+		"content_length", contentLength,
+		"error_type", notificationDeliveryErrorType(err),
+		"reason", safeNotificationErrorReason(err),
+	)
 }
 
 const unavailableMessage = "Herdr 暂不可用，操作未执行，请稍后重试。"

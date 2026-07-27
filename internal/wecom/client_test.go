@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -402,7 +403,7 @@ func TestClientAllowsReceiveOnlyDiscoveryWithoutAllowedUser(t *testing.T) {
 
 func TestClientLogsConnectionLifecycleAndUnsupportedCallbacksWithoutSensitiveValues(t *testing.T) {
 	var logs lockedBuffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	socket := newFakeSocket()
 	ctx, cancel := context.WithCancel(context.Background())
 	client, err := NewClient(ClientConfig{
@@ -419,18 +420,25 @@ func TestClientLogsConnectionLifecycleAndUnsupportedCallbacksWithoutSensitiveVal
 	}
 	done := runClient(t, client, ctx)
 	completeSubscribe(t, client, socket)
+	socket.push(textCallbackJSON("callback-text"))
+	select {
+	case <-client.Events():
+	case <-time.After(time.Second):
+		t.Fatal("文本消息未进入事件流")
+	}
+	waitForLog(t, &logs, "企业微信文本消息已接收")
 	socket.push([]byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":"unsupported-1"},"body":{"msgid":"message-sensitive","aibotid":"bot-sensitive","chattype":"single","from":{"userid":"raw-user-sensitive"},"msgtype":"image"}}`))
 	waitForLog(t, &logs, "企业微信不支持的消息类型已忽略")
 	socket.push([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-1"},"body":{"msgid":"event-message-1","create_time":1720000000,"aibotid":"bot-sensitive","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`))
 	awaitDone(t, done)
 
 	output := logs.String()
-	for _, want := range []string{"企业微信连接中", "企业微信订阅成功", "企业微信不支持的消息类型已忽略", "企业微信连接已断开"} {
+	for _, want := range []string{"企业微信连接中", "企业微信订阅成功", "企业微信文本消息已接收", "content_bytes=3", "企业微信不支持的消息类型已忽略", "企业微信连接已断开", "reason="} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("日志缺少 %q：%q", want, output)
 		}
 	}
-	for _, forbidden := range []string{"secret-sensitive", "raw-user-sensitive", "message-sensitive"} {
+	for _, forbidden := range []string{"secret-sensitive", "raw-user-sensitive", "message-sensitive", "/ls"} {
 		if strings.Contains(output, forbidden) {
 			t.Fatalf("日志泄露敏感值 %q：%q", forbidden, output)
 		}
@@ -457,13 +465,83 @@ func TestClientLogsSafeHandshakeFailureDetails(t *testing.T) {
 		t.Fatalf("Run() error = %v, want context canceled", err)
 	}
 	output := logs.String()
-	for _, want := range []string{"企业微信连接失败", "error_type=handshake", "http_status=404"} {
+	for _, want := range []string{"企业微信连接失败", "error_type=handshake", "http_status=404", "reason="} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("日志缺少 %q：%q", want, output)
 		}
 	}
 	if strings.Contains(output, "secret-sensitive") {
 		t.Fatalf("日志泄露订阅密钥：%q", output)
+	}
+}
+
+func TestClientLogsDNSDialFailureWithEndpointAndCauseWithoutSensitiveValues(t *testing.T) {
+	var logs lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	client, err := NewClient(ClientConfig{
+		Endpoint: "wss://account:password@open.work.weixin.qq.com/cgi-bin/ai_bot/ws?token=private-query",
+		BotID:    "bot-sensitive", Secret: "secret-sensitive", AllowedUserID: "user-1",
+		Dial: func(context.Context, string) (Socket, error) {
+			return nil, newWeComDialError(&net.DNSError{Err: "no such host", Name: "open.work.weixin.qq.com"}, nil)
+		},
+		Logger: logger,
+		Wait:   func(ctx context.Context, _ time.Duration) error { return context.Canceled },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context canceled", err)
+	}
+	output := logs.String()
+	for _, want := range []string{
+		"企业微信连接中", "endpoint=wss://open.work.weixin.qq.com", "bot_hash=",
+		"企业微信连接失败", "error_type=dns", "no such host", "retry_delay=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("日志缺少 %q：%q", want, output)
+		}
+	}
+	for _, forbidden := range []string{"bot-sensitive", "secret-sensitive", "account", "password", "private-query"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("日志泄露 %q：%q", forbidden, output)
+		}
+	}
+}
+
+func TestNewWeComDialErrorClassifiesConnectionFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		cause      error
+		response   *http.Response
+		wantKind   string
+		wantStatus int
+	}{
+		{name: "context canceled", cause: context.Canceled, wantKind: "context_canceled"},
+		{name: "deadline exceeded", cause: context.DeadlineExceeded, wantKind: "timeout"},
+		{name: "dns", cause: &net.DNSError{Err: "no such host", Name: "example.invalid"}, wantKind: "dns"},
+		{name: "tls", cause: errors.New("tls: failed to verify certificate"), wantKind: "tls"},
+		{name: "network timeout", cause: timeoutNetworkError{}, wantKind: "timeout"},
+		{name: "transport", cause: errors.New("connection refused"), wantKind: "transport"},
+		{name: "handshake", cause: errors.New("unexpected status"), response: &http.Response{StatusCode: http.StatusForbidden}, wantKind: "handshake", wantStatus: http.StatusForbidden},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := newWeComDialError(test.cause, test.response)
+			var dialErr *weComDialError
+			if !errors.As(err, &dialErr) {
+				t.Fatalf("newWeComDialError() = %T, want *weComDialError", err)
+			}
+			if dialErr.kind != test.wantKind || dialErr.statusCode != test.wantStatus {
+				t.Fatalf("dial error = {kind:%q status:%d}, want {kind:%q status:%d}", dialErr.kind, dialErr.statusCode, test.wantKind, test.wantStatus)
+			}
+			if !errors.Is(err, test.cause) {
+				t.Fatalf("newWeComDialError() does not wrap cause %v", test.cause)
+			}
+		})
 	}
 }
 
@@ -490,16 +568,30 @@ func TestClientCancellationDoesNotLogReconnect(t *testing.T) {
 	}
 }
 
-func TestClientFormattingNeverLeaksSecret(t *testing.T) {
-	secret := "format-secret"
-	config := ClientConfig{Endpoint: "ws://example.test", BotID: "bot", Secret: secret, AllowedUserID: "user"}
+func TestClientFormattingNeverLeaksCredentials(t *testing.T) {
+	const (
+		secret = "format-secret"
+		botID  = "format-bot-sensitive"
+		userID = "format-user-sensitive"
+	)
+	config := ClientConfig{
+		Endpoint: "wss://account:password@example.test/ws?access_token=private-query",
+		BotID:    botID, Secret: secret, AllowedUserID: userID,
+	}
 	client, err := NewClient(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, value := range []string{fmt.Sprint(config), fmt.Sprintf("%+v", config), fmt.Sprintf("%#v", config), fmt.Sprint(client), fmt.Sprintf("%+v", client), fmt.Sprintf("%#v", client)} {
-		if strings.Contains(value, secret) {
-			t.Fatalf("formatted value leaked secret: %s", value)
+		for _, sensitive := range []string{secret, botID, userID, "account", "password", "private-query"} {
+			if strings.Contains(value, sensitive) {
+				t.Fatalf("formatted value leaked %q: %s", sensitive, value)
+			}
+		}
+		for _, want := range []string{"Endpoint:\"wss://example.test\"", "BotHash:\"", "UserHash:\""} {
+			if !strings.Contains(value, want) {
+				t.Fatalf("formatted value missing %q: %s", want, value)
+			}
 		}
 	}
 }
@@ -772,6 +864,12 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 func (function roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
 }
+
+type timeoutNetworkError struct{}
+
+func (timeoutNetworkError) Error() string   { return "network timeout" }
+func (timeoutNetworkError) Timeout() bool   { return true }
+func (timeoutNetworkError) Temporary() bool { return true }
 
 func newFakeSocket() *fakeSocket {
 	return &fakeSocket{reads: make(chan fakeRead, 16), writes: make(chan []byte, 32), closed: make(chan struct{})}

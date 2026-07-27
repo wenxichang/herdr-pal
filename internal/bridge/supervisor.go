@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,26 @@ const (
 
 // ErrInvalidSupervisorDependency 表示 Supervisor 缺少必需依赖或依赖关系不一致。
 var ErrInvalidSupervisorDependency = errors.New("Supervisor 依赖无效")
+
+type supervisorStageError struct {
+	stage string
+	err   error
+}
+
+func (err *supervisorStageError) Error() string { return err.err.Error() }
+
+func (err *supervisorStageError) Unwrap() error { return err.err }
+
+func withSupervisorStage(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var staged *supervisorStageError
+	if errors.As(err, &staged) {
+		return err
+	}
+	return &supervisorStageError{stage: stage, err: err}
+}
 
 // ManagedHerdr 是状态监督所需的 Herdr 公共 API 能力。
 type ManagedHerdr interface {
@@ -186,6 +207,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 		client, err := s.factory.Connect(runContext)
 		if err != nil {
+			err = withSupervisorStage("connect", err)
 			s.degrade()
 			if runErr := supervisorRunError(parentContext, runContext, nil); runErr != nil {
 				return runErr
@@ -196,6 +218,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			continue
 		}
 		if err := client.CheckCompatible(runContext); err != nil {
+			err = withSupervisorStage("check_compatible", err)
 			s.degrade()
 			if runErr := supervisorRunError(parentContext, runContext, nil); runErr != nil {
 				return runErr
@@ -246,6 +269,15 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 	epoch := dispatcher.BeginEpoch()
 	s.notifier.Reset()
 	s.service.SetHerdr(client)
+	s.logger.Info("Herdr 已就绪",
+		"herdr_version", baseline.Version,
+		"herdr_protocol", baseline.Protocol,
+		"workspace_count", len(baseline.Workspaces),
+		"tab_count", len(baseline.Tabs),
+		"pane_count", len(baseline.Panes),
+		"agent_count", len(baseline.Agents),
+		"session_count", len(statusPlan.identities),
+	)
 	defer dispatcher.EndEpoch(epoch)
 
 	cycleContext, cancelCycle := context.WithCancel(ctx)
@@ -262,10 +294,10 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 	finish := func(err error) (bool, error) {
 		return !s.now().Before(healthyStarted.Add(s.stableWindow)), err
 	}
-	refreshSnapshot := func() error {
+	refreshSnapshot := func(stage string) error {
 		discovery, err := s.snapshot(ctx, client)
 		if err != nil {
-			return err
+			return withSupervisorStage(stage, err)
 		}
 		rebuilds := 0
 		status, statusPlan, discovery, rebuilds, err = s.reconcileStatusSubscriptions(
@@ -273,7 +305,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 			func() { statusGeneration++ },
 		)
 		if err != nil {
-			return err
+			return withSupervisorStage("reconcile_status_subscriptions", err)
 		}
 		var changes session.ChangeSet
 		if rebuilds == 0 {
@@ -283,17 +315,27 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 		}
 		for _, target := range changes.RemovedTargets {
 			if err := dispatcher.EnqueueInvalidated(target); err != nil {
-				return err
+				return withSupervisorStage("notification_invalidation_queue", err)
 			}
 		}
 		for _, target := range changes.ReplacedTargets {
 			if err := dispatcher.EnqueueInvalidated(target); err != nil {
-				return err
+				return withSupervisorStage("notification_invalidation_queue", err)
 			}
 		}
 		if rebuilds > 0 && status != nil {
 			startSupervisorReader(cycleContext, &readers, status, supervisorStreamStatus, statusGeneration, messages)
 		}
+		s.logger.Debug("Herdr 会话快照已刷新",
+			"stage", stage,
+			"herdr_version", discovery.Version,
+			"herdr_protocol", discovery.Protocol,
+			"workspace_count", len(discovery.Workspaces),
+			"tab_count", len(discovery.Tabs),
+			"pane_count", len(discovery.Panes),
+			"agent_count", len(discovery.Agents),
+			"subscription_rebuilds", rebuilds,
+		)
 		return nil
 	}
 
@@ -316,7 +358,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 		case <-ctx.Done():
 			return finish(ctx.Err())
 		case <-snapshotTicker.C:
-			if err := refreshSnapshot(); err != nil {
+			if err := refreshSnapshot("periodic_snapshot"); err != nil {
 				return finish(err)
 			}
 		case message := <-messages:
@@ -326,7 +368,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 			switch message.kind {
 			case supervisorStreamLifecycle:
 				if message.err != nil {
-					return finish(message.err)
+					return finish(withSupervisorStage("lifecycle_stream", message.err))
 				}
 				if !isLifecycleEvent(message.event.Kind) {
 					continue
@@ -341,12 +383,15 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 					continue
 				}
 				if message.err != nil {
-					return finish(message.err)
+					return finish(withSupervisorStage("status_stream", message.err))
 				}
 				event, err := herdr.DecodeAgentStatusEvent(message.event)
 				if err != nil {
-					s.logger.Error("Agent 状态事件解析失败", "error_type", "protocol")
-					return finish(err)
+					s.logger.Error("Agent 状态事件解析失败",
+						"error_type", supervisorHerdrErrorType(err),
+						"reason", safeSupervisorReason(err),
+					)
+					return finish(withSupervisorStage("status_event_decode", err))
 				}
 				// ApplyStatus 只在 Registry 自身锁内更新状态字段；occupant、选择与 Panel 的
 				// 复合变化仍统一由 Service.ReplaceSnapshot 串行处理。
@@ -373,7 +418,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 						"current_status", event.AgentStatus,
 						"error_type", "registry",
 					)
-					return finish(err)
+					return finish(withSupervisorStage("status_event_apply", err))
 				}
 				if transition.Previous == transition.Current {
 					s.logger.Debug("Agent 重复状态事件已忽略", statusTransitionLogArgs(transition)...)
@@ -385,9 +430,11 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 				)...)
 				if err := dispatcher.EnqueueStatus(epoch, transition); err != nil {
 					s.logger.Error("Agent 状态通知入队失败", append(
-						statusTransitionLogArgs(transition), "error_type", "queue",
+						statusTransitionLogArgs(transition),
+						"error_type", supervisorHerdrErrorType(err),
+						"reason", safeSupervisorReason(err),
 					)...)
-					return finish(err)
+					return finish(withSupervisorStage("status_notification_queue", err))
 				}
 			case supervisorDebounceElapsed:
 				if message.generation != debounceGeneration {
@@ -397,7 +444,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 					debounceCancel()
 				}
 				debounceCancel = nil
-				if err := refreshSnapshot(); err != nil {
+				if err := refreshSnapshot("lifecycle_snapshot"); err != nil {
 					return finish(err)
 				}
 			}
@@ -425,11 +472,11 @@ func statusTransitionLogArgs(transition session.Transition) []any {
 func (s *Supervisor) prepareSubscriptions(ctx context.Context, client ManagedHerdr) (lifecycle herdr.SubscriptionStream, status herdr.SubscriptionStream, statusPlan statusSubscriptionPlan, baseline herdr.Snapshot, err error) {
 	discovery, err := s.snapshot(ctx, client)
 	if err != nil {
-		return nil, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, err
+		return nil, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, withSupervisorStage("discovery_snapshot", err)
 	}
 	lifecycle, err = client.Subscribe(ctx, herdr.LifecycleSubscriptions())
 	if err != nil {
-		return nil, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, err
+		return nil, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, withSupervisorStage("lifecycle_subscribe", err)
 	}
 	cleanup := true
 	defer func() {
@@ -445,15 +492,15 @@ func (s *Supervisor) prepareSubscriptions(ctx context.Context, client ManagedHer
 	// 权威 snapshot 用于覆盖 discovery 与订阅确认之间的状态变化。
 	status, err = subscribeStatus(ctx, client, statusPlan.specs)
 	if err != nil {
-		return lifecycle, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, err
+		return lifecycle, nil, statusSubscriptionPlan{}, herdr.Snapshot{}, withSupervisorStage("status_subscribe", err)
 	}
 	baseline, err = s.snapshot(ctx, client)
 	if err != nil {
-		return lifecycle, status, statusPlan, herdr.Snapshot{}, err
+		return lifecycle, status, statusPlan, herdr.Snapshot{}, withSupervisorStage("baseline_snapshot", err)
 	}
 	status, statusPlan, baseline, _, err = s.reconcileStatusSubscriptions(ctx, client, status, statusPlan, baseline, nil)
 	if err != nil {
-		return lifecycle, status, statusPlan, herdr.Snapshot{}, err
+		return lifecycle, status, statusPlan, herdr.Snapshot{}, withSupervisorStage("reconcile_status_subscriptions", err)
 	}
 	cleanup = false
 	return lifecycle, status, statusPlan, baseline, nil
@@ -484,12 +531,12 @@ func (s *Supervisor) reconcileStatusSubscriptions(
 		var err error
 		status, err = subscribeStatus(ctx, client, statusPlan.specs)
 		if err != nil {
-			return status, statusPlan, herdr.Snapshot{}, rebuilds, err
+			return status, statusPlan, herdr.Snapshot{}, rebuilds, withSupervisorStage("status_resubscribe", err)
 		}
 		rebuilds++
 		snapshot, err = s.snapshot(ctx, client)
 		if err != nil {
-			return status, statusPlan, herdr.Snapshot{}, rebuilds, err
+			return status, statusPlan, herdr.Snapshot{}, rebuilds, withSupervisorStage("reconciled_snapshot", err)
 		}
 	}
 }
@@ -500,7 +547,7 @@ func (s *Supervisor) snapshot(ctx context.Context, client ManagedHerdr) (herdr.S
 		return herdr.Snapshot{}, err
 	}
 	if snapshot.Protocol != herdr.RequiredProtocol {
-		return herdr.Snapshot{}, fmt.Errorf("%w: expected %d, got %d", herdr.ErrProtocolMismatch, herdr.RequiredProtocol, snapshot.Protocol)
+		return herdr.Snapshot{}, fmt.Errorf("%w: version %s, expected %d, got %d", herdr.ErrProtocolMismatch, snapshot.Version, herdr.RequiredProtocol, snapshot.Protocol)
 	}
 	return snapshot, nil
 }
@@ -568,10 +615,60 @@ func (s *Supervisor) waitRetry(ctx context.Context, delay time.Duration) error {
 }
 
 func (s *Supervisor) waitCycleRetry(ctx context.Context, cycleErr error) error {
+	var delay time.Duration
 	if errors.Is(cycleErr, herdr.ErrProtocolMismatch) {
-		return s.waitRetry(ctx, s.protocolProbeInterval)
+		delay = s.protocolProbeInterval
+	} else {
+		delay = s.backoff.Next()
 	}
-	return s.waitRetry(ctx, s.backoff.Next())
+	stage := "healthy_cycle"
+	var staged *supervisorStageError
+	if errors.As(cycleErr, &staged) && staged.stage != "" {
+		stage = staged.stage
+	}
+	s.logger.Warn("Herdr 连接周期失败",
+		"stage", stage,
+		"error_type", supervisorHerdrErrorType(cycleErr),
+		"reason", safeSupervisorReason(cycleErr),
+		"retry_delay", delay,
+	)
+	return s.waitRetry(ctx, delay)
+}
+
+func supervisorHerdrErrorType(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, herdr.ErrProtocolMismatch):
+		return "protocol_mismatch"
+	case errors.Is(err, herdr.ErrFrameTooLarge):
+		return "frame_too_large"
+	case errors.Is(err, herdr.ErrProtocol):
+		return "protocol"
+	case errors.Is(err, herdr.ErrUnavailable):
+		return "unavailable"
+	case errors.Is(err, ErrNotificationQueueFull):
+		return "notification_queue_full"
+	default:
+		return "runtime_error"
+	}
+}
+
+func safeSupervisorReason(err error) string {
+	if err == nil {
+		return "未提供错误原因"
+	}
+	reason := strings.NewReplacer("\r", " ", "\n", " ", "\x00", "").Replace(strings.ToValidUTF8(err.Error(), "�"))
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return "未提供错误原因"
+	}
+	if len(reason) > 512 {
+		reason = reason[:512] + "…"
+	}
+	return reason
 }
 
 type supervisorMessageKind uint8

@@ -120,7 +120,7 @@ func (c *Client) CheckCompatible(ctx context.Context) error {
 		return protocolError("pong 响应缺少 protocol")
 	}
 	if *result.Protocol != RequiredProtocol {
-		return fmt.Errorf("%w: expected %d, got %d", ErrProtocolMismatch, RequiredProtocol, *result.Protocol)
+		return fmt.Errorf("%w: version %s, expected %d, got %d", ErrProtocolMismatch, *result.Version, RequiredProtocol, *result.Protocol)
 	}
 	return nil
 }

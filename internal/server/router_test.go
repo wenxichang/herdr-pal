@@ -16,6 +16,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
+	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
 func TestRouterHandlesUserIDWithoutOnlineClient(t *testing.T) {
@@ -26,6 +27,53 @@ func TestRouterHandlesUserIDWithoutOnlineClient(t *testing.T) {
 	}
 	if relay.CallCount() != 0 {
 		t.Fatal("/userid should not reach relay")
+	}
+}
+
+func TestRouterVerboseLogsInteractionWithoutMessageOrUserContent(t *testing.T) {
+	router, _, _ := selectedRouterHarness(t)
+	logs := &lockedLogBuffer{}
+	router.logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	router.Handle(context.Background(), routerMessage("private-request-id", "private-message-id", "user-a", "private prompt content"))
+
+	output := logs.String()
+	for _, want := range []string{
+		"企业微信交互已接收",
+		"action=execute",
+		"content_bytes=22",
+		"企业微信交互路由成功",
+		"machine_id=home-mac",
+		"pane_id=pane-1",
+		"企业微信回复发送成功",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
+	}
+	for _, forbidden := range []string{"private prompt content", "private-request-id", "private-message-id", "user-a"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("logs leaked %q: %s", forbidden, output)
+		}
+	}
+}
+
+func TestRouterVerboseLogsExplicitWeComReplyFailure(t *testing.T) {
+	router, _, _ := newRouterHarness(t)
+	logs := &lockedLogBuffer{}
+	router.logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	router.gateway = failingRouterGateway{err: &wecom.ProtocolError{ErrCode: 93000}}
+
+	router.Handle(context.Background(), routerMessage("request-failure", "message-failure", "user-a", "/help"))
+
+	output := logs.String()
+	for _, want := range []string{"企业微信首段回复失败", "error_type=wecom_protocol", "error_code=93000", "reason="} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
+	}
+	if strings.Contains(output, "user-a") {
+		t.Fatalf("logs leaked userid: %s", output)
 	}
 }
 
@@ -802,6 +850,18 @@ func routerMessage(requestID, messageID, userID, content string) im.IncomingText
 type routerGateway struct {
 	mu      sync.Mutex
 	replies []string
+}
+
+type failingRouterGateway struct {
+	err error
+}
+
+func (gateway failingRouterGateway) RespondMarkdown(context.Context, string, string) error {
+	return gateway.err
+}
+
+func (gateway failingRouterGateway) SendMarkdownTo(context.Context, string, string) error {
+	return gateway.err
 }
 
 func (gateway *routerGateway) RespondMarkdown(_ context.Context, _ string, content string) error {

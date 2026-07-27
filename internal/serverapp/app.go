@@ -32,6 +32,7 @@ type Options struct {
 	ConfigPath string
 	Getenv     func(string) string
 	Stderr     io.Writer
+	Verbose    bool
 }
 
 // Run 启动唯一企业微信连接和 Relay TLS 监听，直到 context 取消或关键组件失败。
@@ -51,7 +52,7 @@ func Run(ctx context.Context, options Options) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	logger, err := newLogger(stderr, loaded.Log.Level)
+	logger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, loaded.WeCom.Secret)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
@@ -107,8 +108,8 @@ func Run(ctx context.Context, options Options) error {
 	}
 	httpServer := &http.Server{Handler: hub, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second}
 	tlsListener := tls.NewListener(listener, tlsConfig)
-	logger.Info("Herdr Pal Server 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "listen", loaded.Server.Listen)
-	return runServerComponents(ctx, weComClient, router, httpServer, tlsListener)
+	logger.Info("Herdr Pal Server 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "listen", loaded.Server.Listen, "verbose", options.Verbose)
+	return runServerComponents(ctx, weComClient, router, httpServer, tlsListener, logger)
 }
 
 func buildRelayURLHint(addrHint, listen string) (string, error) {
@@ -157,27 +158,32 @@ type weComRuntime interface {
 	Events() <-chan im.IncomingText
 }
 
-func runServerComponents(ctx context.Context, weCom weComRuntime, router *server.ConversationRouter, httpServer *http.Server, listener net.Listener) error {
+type serverComponentResult struct {
+	component string
+	err       error
+}
+
+func runServerComponents(ctx context.Context, weCom weComRuntime, router *server.ConversationRouter, httpServer *http.Server, listener net.Listener, logger *slog.Logger) error {
 	runContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan error, 3)
-	go func() { results <- weCom.Run(runContext) }()
+	results := make(chan serverComponentResult, 3)
+	go func() { results <- serverComponentResult{component: "wecom_connection", err: weCom.Run(runContext)} }()
 	go func() {
 		for {
 			select {
 			case <-runContext.Done():
-				results <- runContext.Err()
+				results <- serverComponentResult{component: "wecom_event_loop", err: runContext.Err()}
 				return
 			case message, ok := <-weCom.Events():
 				if !ok {
-					results <- errors.New("企业微信事件流已关闭")
+					results <- serverComponentResult{component: "wecom_event_loop", err: errors.New("企业微信事件流已关闭")}
 					return
 				}
 				router.Handle(runContext, message)
 			}
 		}
 	}()
-	go func() { results <- httpServer.Serve(listener) }()
+	go func() { results <- serverComponentResult{component: "relay_http", err: httpServer.Serve(listener)} }()
 	first := <-results
 	cancel()
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -193,13 +199,34 @@ func runServerComponents(ctx context.Context, weCom weComRuntime, router *server
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if errors.Is(first, http.ErrServerClosed) || errors.Is(first, context.Canceled) {
+	if errors.Is(first.err, http.ErrServerClosed) || errors.Is(first.err, context.Canceled) {
 		return nil
 	}
-	return first
+	if first.err == nil {
+		first.err = errors.New("组件未提供错误即退出")
+	}
+	if logger != nil {
+		logger.Error("服务端组件异常退出", "component", first.component, "error_type", "component_exit", "reason", safeRuntimeReason(first.err))
+	}
+	return fmt.Errorf("%s: %w", first.component, first.err)
 }
 
-func newLogger(writer io.Writer, level string) (*slog.Logger, error) {
+func safeRuntimeReason(err error) string {
+	if err == nil {
+		return "组件未提供退出原因"
+	}
+	reason := strings.NewReplacer("\r", " ", "\n", " ", "\x00", "").Replace(strings.ToValidUTF8(err.Error(), "�"))
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return "组件未提供退出原因"
+	}
+	if len(reason) > 240 {
+		reason = reason[:240] + "…"
+	}
+	return reason
+}
+
+func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) (*slog.Logger, error) {
 	var minimum slog.Level
 	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "", "info":
@@ -213,7 +240,40 @@ func newLogger(writer io.Writer, level string) (*slog.Logger, error) {
 	default:
 		return nil, fmt.Errorf("无效日志级别")
 	}
-	return slog.New(slog.NewTextHandler(writer, &slog.HandlerOptions{Level: minimum})), nil
+	if verbose {
+		minimum = slog.LevelDebug
+	}
+	return slog.New(slog.NewTextHandler(redactingWriter{destination: writer, secrets: compactSecrets(secrets)}, &slog.HandlerOptions{Level: minimum})), nil
+}
+
+type redactingWriter struct {
+	destination io.Writer
+	secrets     []string
+}
+
+func (writer redactingWriter) Write(data []byte) (int, error) {
+	redacted := string(data)
+	for _, secret := range writer.secrets {
+		redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
+	}
+	if writer.destination == nil {
+		return len(data), nil
+	}
+	_, err := io.WriteString(writer.destination, redacted)
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func compactSecrets(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func shortHash(value string) string {

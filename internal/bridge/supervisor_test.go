@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -95,6 +96,34 @@ func TestSupervisorLogsIgnoredUnknownPaneStatusEvent(t *testing.T) {
 	if messages := harness.im.Messages(); len(messages) != 0 {
 		t.Fatalf("未知 pane 状态事件发送了通知：%#v", messages)
 	}
+}
+
+func TestSupervisorLogsMalformedStatusEventReason(t *testing.T) {
+	lifecycle := newSupervisorStream()
+	status := newSupervisorStream()
+	client := newSupervisorClient(supervisorSnapshot(
+		supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
+	))
+	client.lifecycleStreams = []*supervisorStream{lifecycle}
+	client.statusStreams = []*supervisorStream{status}
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{client}, slog.New(slog.NewTextHandler(logs, nil)))
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorSubscribe(t, client)
+	awaitSupervisorCondition(t, "状态监督基线", func() bool { return serviceAvailable(harness.service) })
+
+	status.Emit(herdr.Event{Kind: "pane.agent_status_changed", Data: json.RawMessage(`{"pane_id":`)})
+	retry := awaitSupervisorWait(t, harness.waiter)
+	line := logLineContaining(logs.String(), "Agent 状态事件解析失败")
+	for _, want := range []string{"error_type=protocol", "reason="} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("状态事件解析失败日志缺少 %q：\n%s", want, logs.String())
+		}
+	}
+	retry.Release()
 }
 
 func TestSupervisorConnectsChecksSnapshotsAndBuildsBaselineSubscriptions(t *testing.T) {
@@ -363,7 +392,8 @@ func TestSupervisorNotificationQueueFullIsFatalAndClosesCycle(t *testing.T) {
 	))
 	client.lifecycleStreams = []*supervisorStream{lifecycle}
 	client.statusStreams = []*supervisorStream{status}
-	harness := newSupervisorHarness(t, []*supervisorClient{client})
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{client}, slog.New(slog.NewTextHandler(logs, nil)))
 	im := newGatedNotifierIM()
 	harness.supervisor.notifier = mustNotifierWithGetter(t, im, matchingSupervisorAgent, harness.reader.ReadRecent)
 	harness.supervisor.notificationQueueCapacity = 1
@@ -394,6 +424,11 @@ func TestSupervisorNotificationQueueFullIsFatalAndClosesCycle(t *testing.T) {
 	}
 	if harness.factory.ConnectCount() != 1 || harness.backoff.NextCount() != 0 || len(harness.waiter.requests) != 0 {
 		t.Fatalf("队列满后发生重连：connect=%d backoff=%d waits=%d", harness.factory.ConnectCount(), harness.backoff.NextCount(), len(harness.waiter.requests))
+	}
+	for _, want := range []string{"Agent 状态通知入队失败", "error_type=notification_queue_full", "reason=主动通知队列已满"} {
+		if output := logs.String(); !strings.Contains(output, want) {
+			t.Fatalf("队列满日志缺少 %q：\n%s", want, output)
+		}
 	}
 }
 
@@ -775,21 +810,33 @@ func TestSupervisorCurrentStreamEndDegradesAndReconnectsFromFreshBaseline(t *tes
 
 func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 	first := newSupervisorClient()
-	first.checkErr = herdr.ErrProtocolMismatch
+	first.checkErr = fmt.Errorf("%w: version 0.6.0, expected 17, got 14", herdr.ErrProtocolMismatch)
 	second := newSupervisorClient()
-	second.checkErr = herdr.ErrProtocolMismatch
+	second.checkErr = fmt.Errorf("%w: version 0.8.0, expected 17, got 18", herdr.ErrProtocolMismatch)
 	lifecycle := newSupervisorStream()
 	status := newSupervisorStream()
 	compatible := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
 	compatible.lifecycleStreams = []*supervisorStream{lifecycle}
 	compatible.statusStreams = []*supervisorStream{status}
-	harness := newSupervisorHarness(t, []*supervisorClient{first, second, compatible})
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{first, second, compatible}, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})).With("machine_id", "home-mac"))
 
 	cancel, result := runSupervisor(t, harness.supervisor)
 	defer cancelAndAwaitSupervisor(t, cancel, result)
 	firstWait := awaitSupervisorWait(t, harness.waiter)
 	if firstWait.delay != 30*time.Second {
 		t.Fatalf("首次协议不匹配探测间隔 = %v，期望 30s", firstWait.delay)
+	}
+	for _, want := range []string{
+		"Herdr 连接周期失败",
+		"stage=check_compatible",
+		"error_type=protocol_mismatch",
+		"reason=\"Herdr 协议版本不匹配: version 0.6.0, expected 17, got 14\"",
+		"retry_delay=30s",
+	} {
+		if output := logs.String(); !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
 	}
 	if first.SnapshotCount() != 0 || first.SubscribeCount() != 0 {
 		t.Fatalf("首次协议不匹配后仍调用业务 API：snapshot=%d subscribe=%d", first.SnapshotCount(), first.SubscribeCount())
@@ -811,10 +858,41 @@ func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 	secondWait.Release()
 	awaitSupervisorSubscribe(t, compatible)
 	awaitSupervisorSubscribe(t, compatible)
-	awaitSupervisorCondition(t, "协议恢复基线", func() bool { return serviceAvailable(harness.service) })
+	awaitSupervisorCondition(t, "协议恢复基线", func() bool {
+		return serviceAvailable(harness.service) && strings.Contains(logs.String(), "Herdr 已就绪")
+	})
 	if compatible.SnapshotCount() != 2 || compatible.SubscribeCount() != 2 {
 		t.Fatalf("协议恢复后未建立健康周期：available=%v snapshot=%d subscribe=%d", serviceAvailable(harness.service), compatible.SnapshotCount(), compatible.SubscribeCount())
 	}
+	for _, want := range []string{"Herdr 已就绪", "herdr_version=0.1.0", "herdr_protocol=17", "pane_count=1", "machine_id=home-mac"} {
+		if output := logs.String(); !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
+	}
+}
+
+func TestSupervisorLogsSnapshotFailureStageReasonAndRetry(t *testing.T) {
+	client := newSupervisorClient()
+	client.snapshots = []supervisorSnapshotResult{{err: fmt.Errorf("%w: dial unix /tmp/herdr.sock: connection refused", herdr.ErrUnavailable)}}
+	logs := &lockedLogBuffer{}
+	harness := newSupervisorHarnessWithLogger(t, []*supervisorClient{client}, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})).With("machine_id", "home-mac"))
+
+	cancel, result := runSupervisor(t, harness.supervisor)
+	defer cancelAndAwaitSupervisor(t, cancel, result)
+	retry := awaitSupervisorWait(t, harness.waiter)
+
+	for _, want := range []string{
+		"Herdr 连接周期失败",
+		"stage=discovery_snapshot",
+		"error_type=unavailable",
+		"reason=\"Herdr 不可用: dial unix /tmp/herdr.sock: connection refused\"",
+		"retry_delay=1s",
+	} {
+		if output := logs.String(); !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
+	}
+	retry.Release()
 }
 
 func TestSupervisorRejectsProtocolMismatchFromAnyInitialSnapshot(t *testing.T) {
@@ -1421,6 +1499,15 @@ func (b *lockedLogBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.content.String()
+}
+
+func logLineContaining(output, marker string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, marker) {
+			return line
+		}
+	}
+	return ""
 }
 
 func (l *supervisorCallLog) Add(entry string) {

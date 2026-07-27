@@ -31,7 +31,10 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 - Relay 客户端自动重连、变化时即时快照、30 秒校准快照和本地 Bridge 执行。
 - Herdr protocol 17 门禁、快照、生命周期订阅、pane 级状态订阅和重连恢复。
 - 100 行分页、状态确认 prompt、一次性 Enter 恢复、受限按键、通知和消息幂等。
-- 结构化安全日志、进程锁、SIGINT/SIGTERM 和有界优雅退出。
+- 结构化安全日志、进程锁、SIGINT/SIGTERM 和有界优雅退出。服务端可使用 `--verbose`
+  临时启用 debug 日志，诊断 Relay 握手、快照、心跳、企微交互与出站转发；错误日志包含
+  明确的 `error_type` 和 `reason`。客户端可通过 `log.level=debug` 记录 Herdr 连接阶段、
+  协议版本、快照数量、Relay 握手、会话上报和交互结果。
 - fake Herdr、fake 企业微信、Relay 协议测试和多用户多机器端到端测试。
 
 ## 2. 固定产品决策
@@ -243,7 +246,8 @@ go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 - Bot Secret 只存在于 `herdr-pal-server` 环境变量，不进入客户端配置。
 - Relay 当前没有客户端证书、共享 token 或服务端 userid 鉴权；`skip_verify` 默认开启。
   这是一项明确的受信任内网假设，不适合互联网部署。
-- 日志不记录 Secret、Cookie、完整 prompt 或终端快照；userid 使用 hash，机器标识可见。
+- 日志不记录 Secret、Cookie、完整 prompt 或终端快照；userid、message id 和 occupant
+  使用 hash，机器标识、pane id、会话数量、内容字节数和安全错误码可见。
 - 不允许 IM 调用 `server.stop`、`pane.close`、任意 `pane.send_input` 或自动审批。
 
 后续优先评估：Relay 客户端认证和证书 pinning、跨重启 StateStore、可靠通知队列、服务

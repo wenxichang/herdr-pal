@@ -22,6 +22,8 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/interactive"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
+	"github.com/wenxichang/herdr-pal/internal/relayclient"
+	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
@@ -1028,7 +1030,7 @@ func TestAssembleBridgeRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) 
 	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
 		t.Fatalf("audit log is not one JSON record: %v; output=%q", err, output.String())
 	}
-	if record["msg"] != "显式按键审计" || record["user_id"] != "user-sensitive" ||
+	if record["msg"] != "显式按键审计" || record["user_hash"] != shortHash("user-sensitive") || record["user_id"] != nil ||
 		record["pane_id"] != "pane-1" || record["key"] != "enter" || record["result"] != "sent" {
 		t.Fatalf("audit log fields = %#v", record)
 	}
@@ -1036,7 +1038,7 @@ func TestAssembleBridgeRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) 
 	if !ok || len(occupantHash) != 64 || record["at"] == nil {
 		t.Fatalf("audit log occupant/time = %#v/%#v", record["occupant_hash"], record["at"])
 	}
-	for _, sensitive := range []string{"secret-sensitive", "bot-sensitive", "recent terminal"} {
+	for _, sensitive := range []string{"user-sensitive", "secret-sensitive", "bot-sensitive", "recent terminal"} {
 		if strings.Contains(output.String(), sensitive) {
 			t.Fatalf("audit log leaked %q: %q", sensitive, output.String())
 		}
@@ -2016,6 +2018,8 @@ func TestSafeErrorTypeUsesFixedSemanticCategories(t *testing.T) {
 		{name: "通知队列", err: bridge.ErrNotificationQueueFull, want: "notification_queue_full"},
 		{name: "Herdr 协议", err: herdr.ErrProtocolMismatch, want: "herdr_protocol"},
 		{name: "Herdr 不可用", err: herdr.ErrUnavailable, want: "herdr_unavailable"},
+		{name: "Relay 协议", err: relayproto.ErrProtocolMismatch, want: "relay_protocol"},
+		{name: "Relay 不可用", err: relayclient.ErrUnavailable, want: "relay_unavailable"},
 		{name: "企业微信协议", err: wecom.ErrProtocol, want: "wecom_protocol"},
 		{name: "企业微信不可用", err: wecom.ErrUnavailable, want: "wecom_unavailable"},
 		{name: "其它错误", err: errors.New("secret"), want: "runtime_error"},
@@ -2026,6 +2030,103 @@ func TestSafeErrorTypeUsesFixedSemanticCategories(t *testing.T) {
 				t.Fatalf("safeErrorType() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRunRelayComponentsIdentifiesFailingComponent(t *testing.T) {
+	tests := []struct {
+		name         string
+		failedName   string
+		failedRun    func(context.Context) error
+		secondaryRun func(context.Context) error
+		invoke       func(context.Context, func(context.Context) error, func(context.Context) error) (error, <-chan struct{})
+	}{
+		{
+			name:       "Relay 连接失败",
+			failedName: "relay_connection",
+			failedRun:  func(context.Context) error { return errors.New("relay dial failed") },
+			secondaryRun: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			invoke: func(ctx context.Context, failed, secondary func(context.Context) error) (error, <-chan struct{}) {
+				return runRelayComponents(ctx, failed, secondary, time.Second)
+			},
+		},
+		{
+			name:       "Herdr 监督器失败",
+			failedName: "herdr_supervisor",
+			failedRun:  func(context.Context) error { return errors.New("snapshot failed") },
+			secondaryRun: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			invoke: func(ctx context.Context, failed, secondary func(context.Context) error) (error, <-chan struct{}) {
+				return runRelayComponents(ctx, secondary, failed, time.Second)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err, componentsDone := test.invoke(context.Background(), test.failedRun, test.secondaryRun)
+			if componentsDone != nil {
+				t.Fatal("组件已及时退出，componentsDone 应为 nil")
+			}
+			if err == nil || !strings.Contains(err.Error(), "failed") {
+				t.Fatalf("runRelayComponents() error = %v", err)
+			}
+			if got := relayComponentName(err); got != test.failedName {
+				t.Fatalf("relayComponentName() = %q, want %q", got, test.failedName)
+			}
+		})
+	}
+}
+
+func TestRunRelayComponentsRetainsRootErrorOnShutdownTimeout(t *testing.T) {
+	fatal := errors.New("relay dial failed")
+	release := make(chan struct{})
+	err, componentsDone := runRelayComponents(
+		context.Background(),
+		func(context.Context) error { return fatal },
+		func(context.Context) error {
+			<-release
+			return nil
+		},
+		10*time.Millisecond,
+	)
+	if !errors.Is(err, fatal) || !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("runRelayComponents() error = %v, want fatal joined with ErrShutdownTimeout", err)
+	}
+	if got := relayComponentName(err); got != "relay_connection" {
+		t.Fatalf("relayComponentName() = %q, want relay_connection", got)
+	}
+	if componentsDone == nil {
+		t.Fatal("退出超时时应返回组件完成通知")
+	}
+	close(release)
+	select {
+	case <-componentsDone:
+	case <-time.After(time.Second):
+		t.Fatal("释放组件后 componentsDone 未关闭")
+	}
+}
+
+func TestSafeRelayRuntimeReasonRedactsUserIDAndEndpointDetails(t *testing.T) {
+	const (
+		userID   = "user-sensitive"
+		endpoint = "wss://account:password@relay.internal:9443/ws?access_token=private-query"
+	)
+	err := fmt.Errorf("relay_connection 运行失败: userid=%s endpoint=%s: connection refused\nretrying", userID, endpoint)
+	reason := safeRelayRuntimeReason(err, userID, endpoint)
+	for _, sensitive := range []string{userID, "account", "password", "private-query"} {
+		if strings.Contains(reason, sensitive) {
+			t.Fatalf("安全错误原因泄露 %q：%q", sensitive, reason)
+		}
+	}
+	for _, want := range []string{"relay_connection", "wss://relay.internal:9443", "connection refused retrying"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("安全错误原因缺少 %q：%q", want, reason)
+		}
 	}
 }
 

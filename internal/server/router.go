@@ -257,15 +257,22 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 		return
 	}
 	if message.ChatType != "single" || strings.TrimSpace(message.UserID) == "" {
-		router.logger.Warn("企业微信消息被服务端拒绝", "chat_type", message.ChatType, "user_hash", routerHash(message.UserID))
+		errorType := "unsupported_chat_type"
+		reason := "服务端只处理企业微信单聊消息"
+		if strings.TrimSpace(message.UserID) == "" {
+			errorType = "missing_user_id"
+			reason = "企业微信消息缺少用户标识"
+		}
+		router.logger.Warn("企业微信消息被服务端拒绝", "chat_type", safeLogValue(message.ChatType), "user_hash", routerHash(message.UserID), "error_type", errorType, "reason", reason)
 		return
 	}
 	if strings.TrimSpace(message.MessageID) == "" {
+		router.logger.Warn("企业微信消息被服务端拒绝", "user_hash", routerHash(message.UserID), "error_type", "missing_message_id", "reason", "企业微信消息缺少幂等标识")
 		router.reply(ctx, message, "消息标识缺失，未执行任何操作。")
 		return
 	}
 	if !router.deduper.AddIfNew(message.MessageID) {
-		router.logger.Info("企业微信重复消息已忽略", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID))
+		router.logger.Info("企业微信重复消息已忽略", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "reason", "消息幂等标识已处理")
 		return
 	}
 	err := router.executor.Submit(ctx, message.UserID, func(taskContext context.Context) error {
@@ -273,15 +280,17 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 		return nil
 	})
 	if errors.Is(err, ErrUserQueueFull) {
+		router.logger.Warn("企业微信消息排队失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
 		router.reply(ctx, message, "当前用户输入队列已满，请稍后重试。")
 	} else if err != nil && ctx.Err() == nil {
-		router.logger.Warn("用户消息执行失败", "user_hash", routerHash(message.UserID), "error_type", "executor")
+		router.logger.Warn("用户消息执行失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
 	}
 }
 
 func (router *ConversationRouter) handleAuthorized(ctx context.Context, message im.IncomingText) {
 	action, err := parseServerAction(message.Content)
 	if err != nil {
+		router.logger.Warn("企业微信交互解析失败", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "content_bytes", len([]byte(message.Content)), "error_type", "invalid_action", "reason", safeServerErrorReason(err))
 		if !router.catalog.HasSessions(message.UserID) {
 			router.reply(ctx, message, noAvailableSessionsMessage)
 			return
@@ -289,8 +298,10 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		router.reply(ctx, message, err.Error())
 		return
 	}
+	router.logger.Debug("企业微信交互已接收", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "target_index", action.index, "switch_after", action.switchAfter, "content_bytes", len([]byte(message.Content)))
 	router.activity.Touch(message.UserID, router.now())
 	if action.kind != serverActionUserID && action.kind != serverActionHelp && !router.catalog.HasSessions(message.UserID) {
+		router.logger.Info("企业微信交互未路由", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "error_type", "no_sessions", "reason", "当前用户没有在线且可用的 Relay 会话")
 		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
 	}
@@ -313,6 +324,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 func (router *ConversationRouter) handleList(ctx context.Context, message im.IncomingText) {
 	entries := router.catalog.CreateNumberedSnapshot(message.UserID)
 	if len(entries) == 0 {
+		router.logger.Info("企业微信会话列表为空", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "error_type", "no_sessions", "reason", "当前用户没有在线且可选择的 Agent")
 		router.reply(ctx, message, "当前没有在线且可选择的 Agent。")
 		return
 	}
@@ -336,12 +348,14 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)), safeRouterLabel(panel.AgentStatusLabel(herdr.AgentStatus(entry.Session.Status))))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
+	router.logger.Debug("企业微信会话列表已生成", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "session_count", len(entries), "has_selection", selectedErr == nil)
 	router.reply(ctx, message, content.String())
 }
 
 func (router *ConversationRouter) handleSelect(ctx context.Context, message im.IncomingText, index int) {
 	entry, err := router.catalog.ResolveNumbered(message.UserID, index)
 	if err != nil {
+		router.logInteractionError(message, "select", "resolve_numbered", relayproto.SessionRef{}, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
@@ -349,10 +363,12 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	err = router.relay.Select(requestContext, message.UserID, entry.Ref)
 	cancel()
 	if err != nil {
+		router.logInteractionError(message, "select", "relay_select", entry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
 	if err := router.catalog.SetSelection(message.UserID, entry.Ref); err != nil {
+		router.logInteractionError(message, "select", "set_selection", entry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
@@ -362,12 +378,14 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
 	if err != nil {
 		cancel()
+		router.logInteractionError(message, "select", "read_console", entry.Ref, err)
 		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(err))
 		return
 	}
 	entry, err = router.rebindSelectedExecution(requestContext, message.UserID, entry, result)
 	cancel()
 	if err != nil {
+		router.logInteractionError(message, "select", "rebind_selection", entry.Ref, err)
 		router.reply(ctx, message, "已选择目标，但"+safeRouterError(err))
 		return
 	}
@@ -377,15 +395,18 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	}
 	decorated, decorateErr := router.decorateTerminalContent(message.UserID, entry, content)
 	if decorateErr != nil {
+		router.logInteractionError(message, "select", "decorate_console", entry.Ref, decorateErr)
 		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(decorateErr))
 		return
 	}
+	router.logInteractionSuccess(message, "select", entry.Ref)
 	router.reply(ctx, message, decorated)
 }
 
 func (router *ConversationRouter) handleExecute(ctx context.Context, message im.IncomingText) {
 	entry, err := router.catalog.Selected(message.UserID)
 	if err != nil {
+		router.logInteractionError(message, "execute", "resolve_selection", relayproto.SessionRef{}, err)
 		router.reply(ctx, message, "尚未选择 Agent，请先执行 /ls 和 /N。")
 		return
 	}
@@ -393,6 +414,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, message)
 	if err != nil {
 		cancel()
+		router.logInteractionError(message, "execute", "relay_execute", entry.Ref, err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			router.reply(ctx, message, "操作可能已经提交，请先检查目标会话；服务端不会自动重试。")
 			return
@@ -403,6 +425,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 	entry, err = router.rebindSelectedExecution(requestContext, message.UserID, entry, result)
 	cancel()
 	if err != nil {
+		router.logInteractionError(message, "execute", "rebind_selection", entry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
@@ -412,15 +435,18 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 	}
 	decorated, decorateErr := router.decorateTerminalContent(message.UserID, entry, content)
 	if decorateErr != nil {
+		router.logInteractionError(message, "execute", "decorate_response", entry.Ref, decorateErr)
 		router.reply(ctx, message, safeRouterError(decorateErr))
 		return
 	}
+	router.logInteractionSuccess(message, "execute", entry.Ref)
 	router.reply(ctx, message, decorated)
 }
 
 func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, message im.IncomingText, action serverAction) {
 	entry, err := router.catalog.ResolveNumbered(message.UserID, action.index)
 	if err != nil {
+		router.logInteractionError(message, "directed_execute", "resolve_numbered", relayproto.SessionRef{}, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
@@ -431,6 +457,7 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, directedMessage)
 	if err != nil {
 		cancel()
+		router.logInteractionError(message, "directed_execute", "relay_execute", entry.Ref, err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			router.reply(ctx, message, "操作可能已经提交，但未切换当前会话；请先检查目标会话。")
 			return
@@ -443,12 +470,14 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 		if action.switchAfter {
 			if err := router.catalog.SetSelectionWhenAvailable(requestContext, message.UserID, *result.SelectedTarget); err != nil {
 				cancel()
+				router.logInteractionError(message, "directed_execute", "set_replacement_selection", *result.SelectedTarget, err)
 				router.reply(ctx, message, "操作已执行，但切换当前会话失败："+safeRouterError(err))
 				return
 			}
 		} else if selectedErr == nil && sameSessionRef(selectedBefore.Ref, entry.Ref) {
 			if err := router.catalog.RebindSelection(requestContext, message.UserID, entry.Ref, *result.SelectedTarget); err != nil {
 				cancel()
+				router.logInteractionError(message, "directed_execute", "rebind_current_selection", *result.SelectedTarget, err)
 				router.reply(ctx, message, "操作已执行，但当前会话更新失败："+safeRouterError(err))
 				return
 			}
@@ -456,12 +485,14 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 		finalEntry, err = router.catalog.WaitForTarget(requestContext, message.UserID, *result.SelectedTarget)
 		if err != nil {
 			cancel()
+			router.logInteractionError(message, "directed_execute", "wait_replacement_target", *result.SelectedTarget, err)
 			router.reply(ctx, message, "操作已执行，但目标会话更新失败："+safeRouterError(err))
 			return
 		}
 	} else if action.switchAfter {
 		if err := router.catalog.SetSelection(message.UserID, entry.Ref); err != nil {
 			cancel()
+			router.logInteractionError(message, "directed_execute", "set_selection", entry.Ref, err)
 			router.reply(ctx, message, "操作已执行，但切换当前会话失败："+safeRouterError(err))
 			return
 		}
@@ -473,9 +504,11 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	}
 	decorated, err := router.decorateTerminalContent(message.UserID, finalEntry, content)
 	if err != nil {
+		router.logInteractionError(message, "directed_execute", "decorate_response", finalEntry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
+	router.logInteractionSuccess(message, "directed_execute", finalEntry.Ref)
 	router.reply(ctx, message, decorated)
 }
 
@@ -630,15 +663,34 @@ func (router *ConversationRouter) reply(ctx context.Context, message im.Incoming
 		parts = []string{"回复内容无效。"}
 	}
 	if err := router.gateway.RespondMarkdown(ctx, message.RequestID, parts[0]); err != nil {
-		router.logger.Warn("企业微信首段回复失败", "user_hash", routerHash(message.UserID), "error_type", "gateway")
+		args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", 1, "part_count", len(parts), "content_bytes", len([]byte(parts[0]))}
+		router.logger.Warn("企业微信首段回复失败", append(args, serverErrorLogArgs(err)...)...)
 		return
 	}
-	for _, part := range parts[1:] {
+	router.logger.Debug("企业微信回复分段发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", 1, "part_count", len(parts), "content_bytes", len([]byte(parts[0])))
+	for index, part := range parts[1:] {
 		if err := router.gateway.SendMarkdownTo(ctx, message.UserID, part); err != nil {
-			router.logger.Warn("企业微信后续回复失败", "user_hash", routerHash(message.UserID), "error_type", "gateway")
+			args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", index + 2, "part_count", len(parts), "content_bytes", len([]byte(part))}
+			router.logger.Warn("企业微信后续回复失败", append(args, serverErrorLogArgs(err)...)...)
 			return
 		}
+		router.logger.Debug("企业微信回复分段发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", index+2, "part_count", len(parts), "content_bytes", len([]byte(part)))
 	}
+	router.logger.Debug("企业微信回复发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_count", len(parts), "content_bytes", len([]byte(content)))
+}
+
+func (router *ConversationRouter) logInteractionError(message im.IncomingText, action, stage string, target relayproto.SessionRef, err error) {
+	args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", action, "stage", stage}
+	if target.MachineID != "" || target.PaneID != "" || target.LocalIndex != 0 {
+		args = append(args, targetLogArgs(target)...)
+	}
+	router.logger.Warn("企业微信交互路由失败", append(args, serverErrorLogArgs(err)...)...)
+}
+
+func (router *ConversationRouter) logInteractionSuccess(message im.IncomingText, action string, target relayproto.SessionRef) {
+	args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", action}
+	args = append(args, targetLogArgs(target)...)
+	router.logger.Debug("企业微信交互路由成功", args...)
 }
 
 func safeRouterError(err error) string {

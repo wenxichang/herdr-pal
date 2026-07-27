@@ -49,6 +49,17 @@ func TestRunServerParsesConfigAndVersion(t *testing.T) {
 	if code != 0 || got.ConfigPath != "/tmp/server.json" {
 		t.Fatalf("run() = %d, options %#v", code, got)
 	}
+
+	stdout.Reset()
+	stderr.Reset()
+	var gotVerbose serverapp.Options
+	code = run(context.Background(), []string{"--verbose", "-config", "/tmp/server.json"}, &stdout, &stderr, func(_ context.Context, options serverapp.Options) error {
+		gotVerbose = options
+		return nil
+	})
+	if code != 0 || !gotVerbose.Verbose || gotVerbose.ConfigPath != "/tmp/server.json" {
+		t.Fatalf("verbose run() = %d, options %#v", code, gotVerbose)
+	}
 }
 
 func TestRunServerMapsConfigAndRuntimeErrors(t *testing.T) {

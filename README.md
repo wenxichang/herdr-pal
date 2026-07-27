@@ -124,6 +124,17 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 ./dist/herdr-pal-server
 ```
 
+需要排查连接、会话上报或企微消息转发问题时，使用详细日志模式：
+
+```sh
+./dist/herdr-pal-server --verbose
+```
+
+`--verbose` 会把服务端日志级别临时提升为 `debug`，记录 Relay 握手阶段、客户端版本、快照
+序号和会话数量、心跳、企微交互动作、路由目标、消息分段及错误码。日志只记录消息长度和
+userid/message/occupant 的摘要，不记录 prompt、终端快照正文或完整 userid；当前 Bot Secret
+即使出现在底层错误中也会替换为 `[REDACTED]`。
+
 未指定 `-config` 时，服务端默认读取：
 
 ```text
@@ -305,9 +316,25 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 服务端和客户端默认把日志写到 stderr，不会自动创建 `herdr-pal.log`。需要保存日志时：
 
 ```sh
-./dist/herdr-pal-server 2>&1 | tee herdr-pal-server.log
+./dist/herdr-pal-server --verbose 2>&1 | tee herdr-pal-server.log
 ./dist/herdr-pal 2>&1 | tee herdr-pal.log
 ```
+
+服务端默认记录启动、连接和异常等运行信息；`--verbose` 额外记录客户端快照上报、心跳、
+企业微信入站交互和出站发送结果。每条错误日志都包含 `error_type` 和 `reason`，企业微信
+协议错误还会包含 `error_code`。
+
+客户端默认记录 Herdr 协议版本、会话数量、Relay 连接阶段、断开原因和重试间隔。
+需要查看快照上报、心跳、选择和命令执行细节时，把客户端 `config.json` 中的日志级别改为：
+
+```json
+"log": {
+  "level": "debug"
+}
+```
+
+客户端日志会标明 `component`、`stage`、`machine_id`、`pane_id`、连接地址、快照序号、会话数、
+请求哈希及具体错误原因。不记录原始 userid、URL 查询参数、消息正文或终端内容。
 
 ### 提示配置错误
 

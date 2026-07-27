@@ -80,7 +80,8 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	readCalls = herdrServer.WaitCallCount(t, "agent.read", 3)
 	assertCallParams(t, readCalls[2], map[string]any{"target": "pane-1", "lines": float64(100)})
 	waitForConsoleOutput(t, application.stderr, 0, "显式按键审计", func(output string) bool {
-		return strings.Contains(output, "user_id=interactive-local") &&
+		return strings.Contains(output, "user_hash=") &&
+			!strings.Contains(output, "interactive-local") &&
 			strings.Contains(output, "pane_id=pane-1") &&
 			strings.Contains(output, "key=space") &&
 			strings.Contains(output, "result=sent")
