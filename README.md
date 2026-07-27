@@ -165,7 +165,7 @@ cp config.example.json ~/.config/herdr-pal/config.json
   "relay": {
     "url": "wss://服务端地址:9443",
     "userid": "通过 /userid 获取的值",
-    "machine_id": "home-mac",
+    "machine_id": "",
     "skip_verify": true
   },
   "herdr": {
@@ -182,7 +182,9 @@ cp config.example.json ~/.config/herdr-pal/config.json
 
 - `url` 必须使用 `wss://`，地址指向 `herdr-pal-server`。
 - `userid` 原样填写机器人返回的值。
-- `machine_id` 是企业微信中显示的机器名称，同一用户的每台机器应使用不同值。
+- `machine_id` 是企业微信中显示的机器标识，同一用户的每台机器应使用不同值；留空时自动
+  使用当前机器的系统 hostname。需要更易识别的名称时，可自行填写由英文字母、数字、点、
+  下划线或连字符组成的标识。
 - 使用服务端自动生成的自签名证书时保持 `skip_verify: true`。
 - 默认 Herdr session 下，`session` 和 `socket_path` 都留空。
 - 使用命名 Herdr session 时填写 `session`；只有自动探测失败时才手工填写
@@ -298,7 +300,7 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 
 - 检查默认配置文件是否存在且 JSON 格式正确。
 - 服务端确认已设置 `HERDR_PAL_WECOM_SECRET`。
-- 客户端确认 `url`、`userid` 和 `machine_id` 已填写。
+- 客户端确认 `url` 和 `userid` 已填写；`machine_id` 可以留空并使用系统 hostname。
 
 服务端会同时打印配置文件路径和具体原因，例如：
 

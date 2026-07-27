@@ -40,6 +40,8 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 - 用户范围：不在 Herdr Pal 中配置用户白名单；企业微信应用可见范围是入口边界，只处理
   单聊。
 - 客户端身份：用户把机器人 `/userid` 返回的完整值原样写入客户端配置。
+- 机器标识：客户端 `machine_id` 可以显式配置；留空时使用系统 hostname，并继续执行 Relay
+  身份格式校验。
 - 机器唯一性：`(userid, machine_id)` 是在线唯一键；后来建立的重复连接被拒绝。
 - 多用户命名：不同用户可以使用相同 `machine_id`。
 - 在线目录：客户端断线或心跳超时后立即移除机器和全部会话，不保留离线目录。
@@ -66,7 +68,8 @@ Herdr Pal 已从单用户、客户端直连企业微信的原型演进为多用�
 
 ### 3.2 客户端启动
 
-1. `config.LoadClient` 严格校验 `wss://`、userid 和 machine_id。
+1. `config.LoadClient` 严格校验 `wss://` 和 userid；machine_id 留空时先使用系统 hostname，
+   再执行 Relay 身份格式校验。
 2. 解析本机 Herdr Socket，获取对应 Socket 的进程锁。
 3. 启动 `EventSupervisor`，按最新 `session.snapshot` 接管本机会话。
 4. 建立 Relay WSS，发送 `client_hello` 和首个完整 `session_snapshot`。

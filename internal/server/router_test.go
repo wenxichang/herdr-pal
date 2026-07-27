@@ -59,6 +59,8 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"herdr-pal-windows-amd64.exe",
 		`%USERPROFILE%\.config\herdr-pal\config.json`,
 		`"url": "wss://管理员提供的地址:9443"`,
+		`"machine_id": "当前运行herdr的机器标识"`,
+		"留空时使用系统 hostname",
 		"relay.url",
 		"herdr.socket_path",
 		"protocol",
@@ -72,6 +74,9 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		if strings.Contains(help, forbidden) {
 			t.Fatalf("help reply contains server deployment field %q:\n%s", forbidden, help)
 		}
+	}
+	if strings.Contains(help, `"machine_id": "home-mac"`) {
+		t.Fatalf("help reply retained old machine_id example:\n%s", help)
 	}
 	if len(help) > panel.WeComContentLimit {
 		t.Fatalf("help reply size = %d, want at most %d bytes", len(help), panel.WeComContentLimit)

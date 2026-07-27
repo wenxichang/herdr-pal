@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
@@ -53,8 +54,12 @@ func (config RelayConfig) MarshalJSON() ([]byte, error) {
 	}{config.URL, config.UserID, config.MachineID, config.SkipVerify})
 }
 
-// LoadClient 加载并校验 herdr-pal Relay 网络模式配置。
+// LoadClient 加载并校验 herdr-pal Relay 网络模式配置，machine_id 留空时使用系统 hostname。
 func LoadClient(path string) (ClientConfig, error) {
+	return loadClient(path, os.Hostname)
+}
+
+func loadClient(path string, hostname func() (string, error)) (ClientConfig, error) {
 	loaded, err := decodeFile[ClientConfig](path)
 	if err != nil {
 		return ClientConfig{}, err
@@ -62,6 +67,16 @@ func LoadClient(path string) (ClientConfig, error) {
 	endpoint, err := url.Parse(strings.TrimSpace(loaded.Relay.URL))
 	if err != nil || endpoint.Scheme != "wss" || endpoint.Host == "" {
 		return ClientConfig{}, fmt.Errorf("relay.url 必须是有效的 wss:// 地址")
+	}
+	if strings.TrimSpace(loaded.Relay.MachineID) == "" {
+		machineID, err := hostname()
+		if err != nil {
+			return ClientConfig{}, fmt.Errorf("获取系统 hostname: %w", err)
+		}
+		loaded.Relay.MachineID = strings.TrimSpace(machineID)
+		if loaded.Relay.MachineID == "" {
+			return ClientConfig{}, fmt.Errorf("系统 hostname 为空，请配置 relay.machine_id")
+		}
 	}
 	if err := relayproto.ValidateClientHello(relayproto.ClientHello{
 		UserID: loaded.Relay.UserID, MachineID: loaded.Relay.MachineID,

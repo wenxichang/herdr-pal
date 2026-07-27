@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,6 +32,46 @@ func TestLoadClientDefaultsSkipVerifyAndAcceptsExplicitFalse(t *testing.T) {
 	}
 	if loaded.Relay.SkipVerify || loaded.Log.Level != "debug" {
 		t.Fatalf("LoadClient(explicit false) = %#v", loaded)
+	}
+}
+
+func TestLoadClientDefaultsEmptyMachineIDToHostname(t *testing.T) {
+	path := writeConfig(t, `{
+  "relay": {"url": "wss://relay.internal:9443", "userid": "user-1", "machine_id": ""},
+  "herdr": {},
+  "log": {}
+}`)
+	loaded, err := loadClient(path, func() (string, error) { return "workstation-01", nil })
+	if err != nil {
+		t.Fatalf("loadClient() error = %v", err)
+	}
+	if loaded.Relay.MachineID != "workstation-01" {
+		t.Fatalf("loadClient() machine_id = %q, want workstation-01", loaded.Relay.MachineID)
+	}
+}
+
+func TestLoadClientReportsHostnameFallbackErrors(t *testing.T) {
+	path := writeConfig(t, `{
+  "relay": {"url": "wss://relay.internal:9443", "userid": "user-1", "machine_id": ""},
+  "herdr": {},
+  "log": {}
+}`)
+	tests := []struct {
+		name     string
+		hostname func() (string, error)
+		want     string
+	}{
+		{name: "读取失败", hostname: func() (string, error) { return "", errors.New("unavailable") }, want: "获取系统 hostname"},
+		{name: "空 hostname", hostname: func() (string, error) { return " \t ", nil }, want: "系统 hostname 为空"},
+		{name: "非法 hostname", hostname: func() (string, error) { return "invalid host", nil }, want: "relay 身份配置无效"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadClient(path, test.hostname)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("loadClient() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

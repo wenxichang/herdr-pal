@@ -77,7 +77,7 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"  \"relay\": {\n" +
 	"    \"url\": \"" + helpRelayURLToken + "\",\n" +
 	"    \"userid\": \"在机器人中发送 /userid 获取\",\n" +
-	"    \"machine_id\": \"home-mac\",\n" +
+	"    \"machine_id\": \"当前运行herdr的机器标识\",\n" +
 	"    \"skip_verify\": true\n" +
 	"  },\n" +
 	"  \"herdr\": {\n" +
@@ -91,7 +91,7 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"字段说明：\n" +
 	"- `relay.url`：向 Herdr Pal 服务管理员获取\n" +
 	"- `relay.userid`：在机器人单聊中发送 `/userid` 获取\n" +
-	"- `relay.machine_id`：自行设置的机器名称，同一用户的每台机器不能重复\n" +
+	"- `relay.machine_id`：替换为自行设置的机器标识，同一用户的每台机器不能重复；留空时使用系统 hostname\n" +
 	"- `relay.skip_verify`：通常保持 `true`，管理员另有要求时按其说明填写\n" +
 	"- `herdr.session`：默认会话留空；使用命名会话时填写会话名\n" +
 	"- `herdr.socket_path`：通常留空，由程序自动探测\n" +
