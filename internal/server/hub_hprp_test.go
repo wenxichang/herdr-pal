@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,37 @@ func TestHPRPHubRequiresBearerAuthenticationBeforeUpgrade(t *testing.T) {
 	})
 	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("Dial() response = %#v, error = %v, want HTTP 401", response, err)
+	}
+}
+
+func TestHPRPHubLogsSafeAuthenticationContextWithoutTrustingForwardedHeaders(t *testing.T) {
+	logs := &lockedHPRPLogBuffer{}
+	hub, err := NewClientHub(NewSessionCatalog(), staticHPRPVerifier{err: credential.ErrUnauthenticated}, HubConfig{}, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(hub)
+	defer server.Close()
+	header := http.Header{}
+	token := "hpk_12_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	header.Set("Authorization", "Bearer "+token)
+	header.Set("X-Forwarded-For", "203.0.113.99")
+	_, response, dialErr := websocket.Dial(context.Background(), hprpTestURL(server), &websocket.DialOptions{
+		HTTPClient: server.Client(), HTTPHeader: header, Subprotocols: []string{hprp.Subprotocol},
+	})
+	if dialErr == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Dial() response = %#v, error = %v", response, dialErr)
+	}
+	output := logs.String()
+	for _, want := range []string{"HPRP 连接认证失败", "credential_id=12", "source_ip=127.0.0.1", "error_type=unauthenticated"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
+	}
+	for _, forbidden := range []string{token, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "203.0.113.99"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("logs leaked %q: %s", forbidden, output)
+		}
 	}
 }
 
@@ -85,7 +117,7 @@ func TestHPRPHubNegotiatesHelloAndAcknowledgesFirstSnapshot(t *testing.T) {
 func newHPRPTestHub(t *testing.T) *ClientHub {
 	t.Helper()
 	hub, err := NewClientHub(NewSessionCatalog(), staticHPRPVerifier{identity: credential.Identity{
-		CredentialID: "cred-test", PrincipalID: "user-a", MachineID: "home-mac",
+		CredentialID: 1, PrincipalID: "user-a", MachineID: "home-mac",
 	}}, HubConfig{}, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +130,7 @@ type staticHPRPVerifier struct {
 	err      error
 }
 
-func (verifier staticHPRPVerifier) VerifyBearer(_ context.Context, token string) (credential.Identity, error) {
+func (verifier staticHPRPVerifier) VerifyBearer(_ context.Context, token string, _ netip.Addr) (credential.Identity, error) {
 	if verifier.err != nil || token != "test-key" {
 		return credential.Identity{}, credential.ErrUnauthenticated
 	}

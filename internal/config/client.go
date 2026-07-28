@@ -22,7 +22,7 @@ type RelayConfig struct {
 	URL          string `json:"url"`
 	Key          string `json:"key"`
 	SkipVerify   bool   `json:"-"`
-	CredentialID string `json:"-"`
+	CredentialID uint64 `json:"-"`
 }
 
 // UnmarshalJSON 在保持严格字段校验的同时区分未配置和显式 false。

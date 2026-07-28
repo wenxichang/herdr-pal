@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 )
 
 func TestHPRPClientAuthenticatesReportsSnapshotAndExecutesCommand(t *testing.T) {
-	token, record, err := credential.Issue("user-a", "home-mac", time.Now(), bytes.NewReader(make([]byte, 48)))
+	token, record, err := credential.Issue(1, "user-a", "home-mac", []credential.SourceRule{"127.0.0.1", "::1"}, nil, time.Now(), bytes.NewReader(make([]byte, 48)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,8 +153,8 @@ func writeClientHPRPEnvelope(t *testing.T, connection *websocket.Conn, messageTy
 
 type hprpClientVerifier struct{ record credential.Record }
 
-func (verifier hprpClientVerifier) VerifyBearer(_ context.Context, token string) (credential.Identity, error) {
-	return credential.VerifyRecord(verifier.record, token, time.Now())
+func (verifier hprpClientVerifier) VerifyBearer(_ context.Context, token string, source netip.Addr) (credential.Identity, error) {
+	return credential.VerifyRecord(verifier.record, token, time.Now(), source)
 }
 
 func imMessage(messageID, content string) im.IncomingText {

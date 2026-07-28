@@ -4,13 +4,13 @@ package credential
 import (
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -18,78 +18,90 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 )
 
-const issueRandomBytes = 48
+const issueRandomBytes = 32
 
 var (
-	// ErrInvalidRecord 表示凭据身份、摘要或状态记录无效。
+	// ErrInvalidRecord 表示凭据身份、摘要、来源或状态记录无效。
 	ErrInvalidRecord = errors.New("HPRP 凭据记录无效")
 	// ErrInvalidToken 表示 Bearer Key 的公开格式无效。
 	ErrInvalidToken = errors.New("HPRP Bearer Key 格式无效")
-	// ErrUnauthenticated 对外统一表示 Key 不存在、错误、过期或已吊销。
+	// ErrUnauthenticated 对外统一表示 Key 不存在、错误、过期、禁用或来源不符。
 	ErrUnauthenticated = errors.New("HPRP 终端未认证")
 )
-
-var credentialIDPattern = regexp.MustCompile(`^cred-[a-z2-7]{26}$`)
-
-const credentialIDLength = len("cred-") + 26
 
 // Status 是持久化凭据的生命周期状态。
 type Status string
 
 const (
-	StatusActive  Status = "active"
-	StatusRevoked Status = "revoked"
+	StatusEnabled  Status = "enabled"
+	StatusDisabled Status = "disabled"
 )
 
 // Record 是服务端持久化的机器凭据摘要，不包含可直接使用的 Secret。
 type Record struct {
-	CredentialID string     `json:"credential_id"`
-	PrincipalID  string     `json:"principal_id"`
-	MachineID    string     `json:"machine_id"`
-	SecretSHA256 string     `json:"secret_sha256"`
-	Status       Status     `json:"status"`
-	ExpiresAt    *time.Time `json:"expires_at"`
-	CreatedAt    time.Time  `json:"created_at"`
+	CredentialID   uint64       `json:"credential_id"`
+	PrincipalID    string       `json:"principal_id"`
+	MachineID      string       `json:"machine_id"`
+	SecretSHA256   string       `json:"secret_sha256"`
+	Status         Status       `json:"status"`
+	AllowedSources []SourceRule `json:"allowed_sources"`
+	ExpiresAt      *time.Time   `json:"expires_at"`
+	CreatedAt      time.Time    `json:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at"`
 }
 
 // Identity 是 Upgrade 认证成功后提供给 Server 连接状态机的可信身份。
 type Identity struct {
-	CredentialID string
+	CredentialID uint64
 	PrincipalID  string
 	MachineID    string
 }
 
-// Issue 生成一把至少包含 256 位随机 Secret 的机器 Key 及其摘要记录。
-func Issue(principalID, machineID string, now time.Time, random io.Reader) (string, Record, error) {
-	if !validPrincipalID(principalID) || hprp.ValidateMachineID(machineID) != nil || random == nil {
+// Issue 使用已分配的 credential ID 生成至少包含 256 位随机 Secret 的机器 Key 和摘要记录。
+func Issue(credentialID uint64, principalID, machineID string, allowedSources []SourceRule, expiresAt *time.Time, now time.Time, random io.Reader) (string, Record, error) {
+	now = now.UTC()
+	if credentialID == 0 || !validPrincipalID(principalID) || hprp.ValidateMachineID(machineID) != nil || random == nil || now.IsZero() {
 		return "", Record{}, ErrInvalidRecord
+	}
+	if err := validateSourceRules(allowedSources); err != nil {
+		return "", Record{}, ErrInvalidRecord
+	}
+	var normalizedExpiry *time.Time
+	if expiresAt != nil {
+		value := expiresAt.UTC()
+		if !value.After(now) {
+			return "", Record{}, ErrInvalidRecord
+		}
+		normalizedExpiry = &value
 	}
 	randomData := make([]byte, issueRandomBytes)
 	if _, err := io.ReadFull(random, randomData); err != nil {
 		return "", Record{}, fmt.Errorf("%w: 读取安全随机数", ErrInvalidRecord)
 	}
-	credentialID := "cred-" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(randomData[:16]))
-	secret := base64.RawURLEncoding.EncodeToString(randomData[16:])
+	secret := base64.RawURLEncoding.EncodeToString(randomData)
 	digest := sha256.Sum256([]byte(secret))
 	record := Record{
-		CredentialID: credentialID,
-		PrincipalID:  principalID,
-		MachineID:    machineID,
-		SecretSHA256: hex.EncodeToString(digest[:]),
-		Status:       StatusActive,
-		CreatedAt:    now.UTC(),
+		CredentialID:   credentialID,
+		PrincipalID:    principalID,
+		MachineID:      machineID,
+		SecretSHA256:   hex.EncodeToString(digest[:]),
+		Status:         StatusEnabled,
+		AllowedSources: append([]SourceRule(nil), allowedSources...),
+		ExpiresAt:      normalizedExpiry,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
-	return "hpk_" + credentialID + "_" + secret, record, nil
+	return "hpk_" + strconv.FormatUint(credentialID, 10) + "_" + secret, record, nil
 }
 
-// BearerCredentialID 解析 Key 中不敏感的 credential ID，供本地审计和服务端索引使用。
-func BearerCredentialID(token string) (string, error) {
+// BearerCredentialID 解析 Key 中不敏感的十进制 credential ID，供本地审计和服务端索引使用。
+func BearerCredentialID(token string) (uint64, error) {
 	credentialID, _, err := parseToken(token)
 	return credentialID, err
 }
 
-// VerifyRecord 使用常量时间摘要比较验证一条凭据记录。
-func VerifyRecord(record Record, token string, now time.Time) (Identity, error) {
+// VerifyRecord 使用常量时间摘要比较验证凭据、生命周期和真实来源地址。
+func VerifyRecord(record Record, token string, now time.Time, source netip.Addr) (Identity, error) {
 	credentialID, secret, err := parseToken(token)
 	if err != nil || credentialID != record.CredentialID {
 		return Identity{}, ErrUnauthenticated
@@ -103,39 +115,65 @@ func VerifyRecord(record Record, token string, now time.Time) (Identity, error) 
 	}
 	gotDigest := sha256.Sum256([]byte(secret))
 	secretMatches := subtle.ConstantTimeCompare(gotDigest[:], wantDigest) == 1
-	usable := record.Status == StatusActive && (record.ExpiresAt == nil || now.Before(*record.ExpiresAt))
-	if !secretMatches || !usable {
+	usable := record.Status == StatusEnabled && (record.ExpiresAt == nil || now.Before(*record.ExpiresAt))
+	if !secretMatches || !usable || !MatchSource(record.AllowedSources, source) {
 		return Identity{}, ErrUnauthenticated
 	}
 	return Identity{CredentialID: record.CredentialID, PrincipalID: record.PrincipalID, MachineID: record.MachineID}, nil
 }
 
-func parseToken(token string) (string, string, error) {
+func parseToken(token string) (uint64, string, error) {
 	if !strings.HasPrefix(token, "hpk_") {
-		return "", "", ErrInvalidToken
+		return 0, "", ErrInvalidToken
 	}
-	remainder := strings.TrimPrefix(token, "hpk_")
-	if len(remainder) <= credentialIDLength || remainder[credentialIDLength] != '_' {
-		return "", "", ErrInvalidToken
+	credentialText, secret, found := strings.Cut(strings.TrimPrefix(token, "hpk_"), "_")
+	if !found || credentialText == "" || secret == "" {
+		return 0, "", ErrInvalidToken
 	}
-	credentialID := remainder[:credentialIDLength]
-	secret := remainder[credentialIDLength+1:]
+	credentialID, err := strconv.ParseUint(credentialText, 10, 64)
+	if err != nil || credentialID == 0 || strconv.FormatUint(credentialID, 10) != credentialText {
+		return 0, "", ErrInvalidToken
+	}
 	decoded, err := base64.RawURLEncoding.DecodeString(secret)
-	if !credentialIDPattern.MatchString(credentialID) || err != nil || len(decoded) != 32 {
-		return "", "", ErrInvalidToken
+	if err != nil || len(decoded) != issueRandomBytes {
+		return 0, "", ErrInvalidToken
 	}
 	return credentialID, secret, nil
 }
 
 func validateRecord(record Record) error {
-	if !credentialIDPattern.MatchString(record.CredentialID) || !validPrincipalID(record.PrincipalID) ||
-		hprp.ValidateMachineID(record.MachineID) != nil || record.CreatedAt.IsZero() ||
-		(record.Status != StatusActive && record.Status != StatusRevoked) {
+	if record.CredentialID == 0 || !validPrincipalID(record.PrincipalID) || hprp.ValidateMachineID(record.MachineID) != nil ||
+		record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() || record.UpdatedAt.Before(record.CreatedAt) ||
+		(record.Status != StatusEnabled && record.Status != StatusDisabled) {
+		return ErrInvalidRecord
+	}
+	if record.ExpiresAt != nil && !record.ExpiresAt.After(record.CreatedAt) {
+		return ErrInvalidRecord
+	}
+	if err := validateSourceRules(record.AllowedSources); err != nil {
 		return ErrInvalidRecord
 	}
 	digest, err := hex.DecodeString(record.SecretSHA256)
 	if err != nil || len(digest) != sha256.Size {
 		return ErrInvalidRecord
+	}
+	return nil
+}
+
+func validateSourceRules(rules []SourceRule) error {
+	if len(rules) == 0 {
+		return ErrSourceRequired
+	}
+	seen := make(map[SourceRule]struct{}, len(rules))
+	for _, rule := range rules {
+		normalized, err := ParseSourceRule(string(rule))
+		if err != nil || normalized != rule {
+			return ErrSourceInvalid
+		}
+		if _, exists := seen[rule]; exists {
+			return ErrSourceInvalid
+		}
+		seen[rule] = struct{}{}
 	}
 	return nil
 }

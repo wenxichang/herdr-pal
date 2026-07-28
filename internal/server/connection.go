@@ -32,7 +32,7 @@ type notificationRecord struct {
 
 type clientConnection struct {
 	id           string
-	credentialID string
+	credentialID uint64
 	key          ClientKey
 	socket       *websocket.Conn
 	logger       *slog.Logger
@@ -60,7 +60,7 @@ type clientConnection struct {
 	notificationSequence map[hprp.Target]uint64
 }
 
-func newClientConnection(parent context.Context, id, credentialID string, key ClientKey, socket *websocket.Conn, sendCapacity, maxPending int, logger *slog.Logger) *clientConnection {
+func newClientConnection(parent context.Context, id string, credentialID uint64, key ClientKey, socket *websocket.Conn, sendCapacity, maxPending int, logger *slog.Logger) *clientConnection {
 	ctx, cancel := context.WithCancel(parent)
 	return &clientConnection{
 		id: id, credentialID: credentialID, key: key, socket: socket, logger: logger, ctx: ctx, cancel: cancel,

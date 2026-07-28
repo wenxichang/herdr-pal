@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -129,7 +130,7 @@ type integrationVerifier struct {
 	identities map[string]credential.Identity
 }
 
-func (verifier integrationVerifier) VerifyBearer(_ context.Context, token string) (credential.Identity, error) {
+func (verifier integrationVerifier) VerifyBearer(_ context.Context, token string, _ netip.Addr) (credential.Identity, error) {
 	identity, ok := verifier.identities[token]
 	if !ok {
 		return credential.Identity{}, credential.ErrUnauthenticated
@@ -139,7 +140,7 @@ func (verifier integrationVerifier) VerifyBearer(_ context.Context, token string
 
 func issueIntegrationKey(t *testing.T, principalID, machineID string, fill byte) (string, credential.Identity) {
 	t.Helper()
-	token, record, err := credential.Issue(principalID, machineID, time.Unix(1, 0), bytes.NewReader(bytes.Repeat([]byte{fill}, 48)))
+	token, record, err := credential.Issue(1, principalID, machineID, []credential.SourceRule{"127.0.0.1", "::1"}, nil, time.Unix(1, 0), bytes.NewReader(bytes.Repeat([]byte{fill}, 48)))
 	if err != nil {
 		t.Fatal(err)
 	}

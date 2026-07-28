@@ -133,7 +133,7 @@ func TestLoadServerRequiresListenSecretAndCertificatePair(t *testing.T) {
 
 func testRelayKey(t *testing.T) string {
 	t.Helper()
-	token, _, err := credential.Issue("user", "machine", time.Unix(1, 0), bytes.NewReader(bytes.Repeat([]byte{0x31}, 48)))
+	token, _, err := credential.Issue(1, "user", "machine", []credential.SourceRule{"127.0.0.1"}, nil, time.Unix(1, 0), bytes.NewReader(bytes.Repeat([]byte{0x31}, 48)))
 	if err != nil {
 		t.Fatalf("credential.Issue() error = %v", err)
 	}

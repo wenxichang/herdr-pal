@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,7 +96,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		return fmt.Errorf("创建 Relay 客户端: %w", err)
 	}
 	registry := &session.Registry{}
-	guard, err := policy.NewGuard(loaded.Relay.CredentialID)
+	guard, err := policy.NewGuard(strconv.FormatUint(loaded.Relay.CredentialID, 10))
 	if err != nil {
 		return fmt.Errorf("创建输入策略: %w", err)
 	}

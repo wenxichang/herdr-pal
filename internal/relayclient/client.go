@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,7 +76,7 @@ func withRelayStage(stage string, err error) error {
 type Config struct {
 	URL              string
 	Key              string
-	CredentialID     string
+	CredentialID     uint64
 	SkipVerify       bool
 	Version          string
 	PollInterval     time.Duration
@@ -154,7 +155,7 @@ func New(config Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: Key 格式无效", ErrInvalidConfig)
 	}
-	if strings.TrimSpace(config.CredentialID) != "" && config.CredentialID != credentialID {
+	if config.CredentialID != 0 && config.CredentialID != credentialID {
 		return nil, fmt.Errorf("%w: credential_id 与 Key 不匹配", ErrInvalidConfig)
 	}
 	if config.PollInterval <= 0 {
@@ -503,7 +504,7 @@ func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelo
 	client.executionMu.Unlock()
 
 	message := im.IncomingText{
-		RequestID: envelope.ID, MessageID: command.IdempotencyKey, UserID: client.config.CredentialID,
+		RequestID: envelope.ID, MessageID: command.IdempotencyKey, UserID: strconv.FormatUint(client.config.CredentialID, 10),
 		ChatType: "single", Content: command.Content.Text,
 	}
 	client.localExecutor().HandleMessage(current.ctx, message)

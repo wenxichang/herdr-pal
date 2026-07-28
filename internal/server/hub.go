@@ -121,7 +121,17 @@ func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	identity, err := credential.VerifyRequest(request, hub.verifier)
 	if err != nil {
-		hub.logger.Warn("HPRP 连接认证失败", "stage", "authorization", "error_type", "unauthenticated", "reason", "Bearer Key 无效、过期或已吊销")
+		args := []any{"stage", "authorization", "error_type", "unauthenticated", "reason", "Bearer Key 无效、禁用、过期或来源不符"}
+		parts := strings.Fields(request.Header.Get("Authorization"))
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			if credentialID, parseErr := credential.BearerCredentialID(parts[1]); parseErr == nil {
+				args = append(args, "credential_id", credentialID)
+			}
+		}
+		if source, sourceErr := credential.RequestSourceAddr(request); sourceErr == nil {
+			args = append(args, "source_ip", source.String())
+		}
+		hub.logger.Warn("HPRP 连接认证失败", args...)
 		writer.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(writer, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -129,7 +139,7 @@ func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	key := ClientKey{UserID: identity.PrincipalID, MachineID: identity.MachineID}
 	connectionID := randomHubID()
 	if _, err := hub.catalog.Attach(connectionID, key); err != nil {
-		args := []any{"stage", "reserve_identity", "credential_id", safeLogValue(identity.CredentialID), "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID)}
+		args := []any{"stage", "reserve_identity", "credential_id", identity.CredentialID, "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID)}
 		hub.logger.Warn("HPRP 客户端连接被拒绝", append(args, serverErrorLogArgs(err)...)...)
 		status := http.StatusConflict
 		if !errors.Is(err, ErrDuplicateClient) {
@@ -147,7 +157,7 @@ func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 
 	socket, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{hprp.Subprotocol}})
 	if err != nil {
-		hub.logger.Warn("HPRP WebSocket 升级失败", append([]any{"stage", "websocket_upgrade", "credential_id", safeLogValue(identity.CredentialID)}, serverErrorLogArgs(err)...)...)
+		hub.logger.Warn("HPRP WebSocket 升级失败", append([]any{"stage", "websocket_upgrade", "credential_id", identity.CredentialID}, serverErrorLogArgs(err)...)...)
 		return
 	}
 	if socket.Subprotocol() != hprp.Subprotocol {
@@ -245,7 +255,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 		err = hprp.ValidateClientHello(hello)
 	}
 	if err != nil {
-		hub.logger.Warn("HPRP 客户端握手失败", append([]any{"stage", "hello.client", "credential_id", safeLogValue(identity.CredentialID), "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID)}, serverErrorLogArgs(err)...)...)
+		hub.logger.Warn("HPRP 客户端握手失败", append([]any{"stage", "hello.client", "credential_id", identity.CredentialID, "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID)}, serverErrorLogArgs(err)...)...)
 		hub.writeProtocolError(socket, helloEnvelope.ID, hprp.CodeProtocolInvalidMessage, "hello.client 无效", true)
 		_ = socket.Close(websocket.StatusPolicyViolation, "invalid hello")
 		hub.catalog.Detach(connectionID)
@@ -284,7 +294,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 	connection.ready.Store(true)
 	connection.sessionCount.Store(int64(len(firstSnapshot.Sessions)))
 	hub.logger.Info("HPRP 客户端已就绪",
-		"credential_id", safeLogValue(identity.CredentialID), "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID),
+		"credential_id", identity.CredentialID, "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID),
 		"connection_id", connectionID, "client_name", safeLogValue(hello.Implementation.Name), "client_version", safeLogValue(hello.Implementation.Version),
 		"snapshot_sequence", firstSnapshot.Sequence, "session_count", len(firstSnapshot.Sessions))
 
@@ -546,7 +556,7 @@ func (hub *ClientHub) remove(connection *clientConnection) {
 	}
 	hub.mu.Unlock()
 	hub.catalog.Detach(connection.id)
-	hub.logger.Info("HPRP 客户端已移除", "credential_id", safeLogValue(connection.credentialID), "user_hash", routerHash(connection.key.UserID), "machine_id", safeLogValue(connection.key.MachineID), "connection_id", connection.id, "reason", "连接生命周期结束，机器及会话已从在线目录移除")
+	hub.logger.Info("HPRP 客户端已移除", "credential_id", connection.credentialID, "user_hash", routerHash(connection.key.UserID), "machine_id", safeLogValue(connection.key.MachineID), "connection_id", connection.id, "reason", "连接生命周期结束，机器及会话已从在线目录移除")
 }
 
 func (hub *ClientHub) writeProtocolError(socket *websocket.Conn, replyTo string, code hprp.ErrorCode, message string, closeConnection bool) {

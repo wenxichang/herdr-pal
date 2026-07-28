@@ -473,7 +473,7 @@ func relayClientTestKey(t *testing.T) string {
 
 func relayClientTestCredential(t *testing.T) (string, credential.Record) {
 	t.Helper()
-	token, record, err := credential.Issue("user-a", "home-mac", time.Unix(1, 0), bytes.NewReader(make([]byte, 48)))
+	token, record, err := credential.Issue(1, "user-a", "home-mac", []credential.SourceRule{"127.0.0.1", "::1"}, nil, time.Unix(1, 0), bytes.NewReader(make([]byte, 48)))
 	if err != nil {
 		t.Fatal(err)
 	}

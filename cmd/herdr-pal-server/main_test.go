@@ -62,28 +62,13 @@ func TestRunServerParsesConfigAndVersion(t *testing.T) {
 	}
 }
 
-func TestRunServerParsesKeyIssueCommand(t *testing.T) {
+func TestRunServerRejectsLegacyKeyIssueCommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	var got serverapp.Options
-	code := run(context.Background(), []string{
-		"key", "issue", "-config", "/tmp/server.json", "-principal-id", "user-a", "-machine-id", "office-pc",
-	}, &stdout, &stderr, func(_ context.Context, options serverapp.Options) error {
-		got = options
-		return nil
-	})
-	if code != 0 || got.ConfigPath != "/tmp/server.json" || got.KeyIssue == nil ||
-		got.KeyIssue.PrincipalID != "user-a" || got.KeyIssue.MachineID != "office-pc" || got.Stdout != &stdout {
-		t.Fatalf("run(key issue) = %d, options %#v, stderr %q", code, got, stderr.String())
-	}
-}
-
-func TestRunServerRejectsIncompleteKeyIssueCommand(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"key", "issue", "-principal-id", "user-a"}, &stdout, &stderr, func(context.Context, serverapp.Options) error {
+	code := run(context.Background(), []string{"key", "issue", "-principal-id", "user-a", "-machine-id", "office-pc"}, &stdout, &stderr, func(context.Context, serverapp.Options) error {
 		t.Fatal("executor should not be called")
 		return nil
 	})
-	if code != 2 || !strings.Contains(stderr.String(), "machine-id") {
+	if code != 2 || !strings.Contains(stderr.String(), "hp-cli key issue") {
 		t.Fatalf("run(key issue) = %d, stderr %q", code, stderr.String())
 	}
 }

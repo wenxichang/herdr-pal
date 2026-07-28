@@ -251,7 +251,7 @@ func TestHPRPHubLogsOutboundFailureWithoutLeakingContentOrPrincipal(t *testing.T
 func startHPRPHubServer(t *testing.T, config HubConfig, logger *slog.Logger) (*ClientHub, *httptest.Server) {
 	t.Helper()
 	hub, err := NewClientHub(NewSessionCatalog(), staticHPRPVerifier{identity: credential.Identity{
-		CredentialID: "cred-test", PrincipalID: "user-a", MachineID: "home-mac",
+		CredentialID: 1, PrincipalID: "user-a", MachineID: "home-mac",
 	}}, config, logger)
 	if err != nil {
 		t.Fatal(err)
