@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/config"
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
@@ -31,14 +32,25 @@ var ErrConfig = errors.New("服务端配置错误")
 type Options struct {
 	ConfigPath string
 	Getenv     func(string) string
+	Stdout     io.Writer
 	Stderr     io.Writer
 	Verbose    bool
+	KeyIssue   *KeyIssueOptions
+}
+
+// KeyIssueOptions 是服务端管理命令签发一台机器 Key 所需的身份参数。
+type KeyIssueOptions struct {
+	PrincipalID string
+	MachineID   string
 }
 
 // Run 启动唯一企业微信连接和 Relay TLS 监听，直到 context 取消或关键组件失败。
 func Run(ctx context.Context, options Options) error {
 	if ctx == nil || strings.TrimSpace(options.ConfigPath) == "" {
 		return fmt.Errorf("%w: 缺少启动参数", ErrConfig)
+	}
+	if options.KeyIssue != nil {
+		return issueMachineKey(ctx, options)
 	}
 	getenv := options.Getenv
 	if getenv == nil {
@@ -110,6 +122,35 @@ func Run(ctx context.Context, options Options) error {
 	tlsListener := tls.NewListener(listener, tlsConfig)
 	logger.Info("Herdr Pal Server 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "listen", loaded.Server.Listen, "verbose", options.Verbose)
 	return runServerComponents(ctx, weComClient, router, httpServer, tlsListener, logger)
+}
+
+func issueMachineKey(ctx context.Context, options Options) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if options.KeyIssue == nil || strings.TrimSpace(options.KeyIssue.PrincipalID) == "" || strings.TrimSpace(options.KeyIssue.MachineID) == "" {
+		return fmt.Errorf("%w: Key 签发身份无效", ErrConfig)
+	}
+	loaded, err := config.LoadServerAdmin(options.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	store, err := credential.LoadStore(loaded.Server.CredentialsFile)
+	if err != nil {
+		return fmt.Errorf("加载 HPRP 凭据存储: %w", err)
+	}
+	token, _, err := store.Issue(strings.TrimSpace(options.KeyIssue.PrincipalID), strings.TrimSpace(options.KeyIssue.MachineID))
+	if err != nil {
+		return fmt.Errorf("签发 HPRP 机器 Key: %w", err)
+	}
+	stdout := options.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if _, err := fmt.Fprintln(stdout, token); err != nil {
+		return fmt.Errorf("输出 HPRP 机器 Key: %w", err)
+	}
+	return nil
 }
 
 func buildRelayURLHint(addrHint, listen string) (string, error) {

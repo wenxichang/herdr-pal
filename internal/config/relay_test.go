@@ -1,15 +1,19 @@
 package config
 
 import (
-	"errors"
+	"bytes"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/wenxichang/herdr-pal/internal/credential"
 )
 
 func TestLoadClientDefaultsSkipVerifyAndAcceptsExplicitFalse(t *testing.T) {
+	key := testRelayKey(t)
 	defaultPath := writeConfig(t, `{
-  "relay": {"url": "wss://relay.internal:9443", "userid": "user-1", "machine_id": "home-mac"},
+  "relay": {"url": "wss://relay.internal:9443", "key": "`+key+`"},
   "herdr": {},
   "log": {}
 }`)
@@ -17,12 +21,12 @@ func TestLoadClientDefaultsSkipVerifyAndAcceptsExplicitFalse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadClient() error = %v", err)
 	}
-	if !loaded.Relay.SkipVerify || loaded.Log.Level != "info" {
+	if !loaded.Relay.SkipVerify || loaded.Log.Level != "info" || loaded.Relay.Key != key {
 		t.Fatalf("LoadClient() = %#v", loaded)
 	}
 
 	strictPath := writeConfig(t, `{
-  "relay": {"url": "wss://relay.internal:9443", "userid": "user-1", "machine_id": "home-mac", "skip_verify": false},
+  "relay": {"url": "wss://relay.internal:9443", "key": "`+key+`", "skip_verify": false},
   "herdr": {},
   "log": {"level": "debug"}
 }`)
@@ -35,51 +39,25 @@ func TestLoadClientDefaultsSkipVerifyAndAcceptsExplicitFalse(t *testing.T) {
 	}
 }
 
-func TestLoadClientDefaultsEmptyMachineIDToHostname(t *testing.T) {
-	path := writeConfig(t, `{
-  "relay": {"url": "wss://relay.internal:9443", "userid": "user-1", "machine_id": ""},
+func TestLoadClientRejectsMissingOrMalformedKey(t *testing.T) {
+	for _, key := range []string{"", "plain-secret", "hpk_bad"} {
+		path := writeConfig(t, `{
+  "relay": {"url": "wss://relay.internal:9443", "key": "`+key+`"},
   "herdr": {},
   "log": {}
 }`)
-	loaded, err := loadClient(path, func() (string, error) { return "workstation-01", nil })
-	if err != nil {
-		t.Fatalf("loadClient() error = %v", err)
-	}
-	if loaded.Relay.MachineID != "workstation-01" {
-		t.Fatalf("loadClient() machine_id = %q, want workstation-01", loaded.Relay.MachineID)
+		if _, err := LoadClient(path); err == nil || !strings.Contains(err.Error(), "relay.key") {
+			t.Fatalf("LoadClient(%q) error = %v, want relay.key", key, err)
+		}
 	}
 }
 
-func TestLoadClientReportsHostnameFallbackErrors(t *testing.T) {
-	path := writeConfig(t, `{
-  "relay": {"url": "wss://relay.internal:9443", "userid": "user-1", "machine_id": ""},
-  "herdr": {},
-  "log": {}
-}`)
-	tests := []struct {
-		name     string
-		hostname func() (string, error)
-		want     string
-	}{
-		{name: "读取失败", hostname: func() (string, error) { return "", errors.New("unavailable") }, want: "获取系统 hostname"},
-		{name: "空 hostname", hostname: func() (string, error) { return " \t ", nil }, want: "系统 hostname 为空"},
-		{name: "非法 hostname", hostname: func() (string, error) { return "invalid host", nil }, want: "relay 身份配置无效"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := loadClient(path, test.hostname)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("loadClient() error = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestLoadClientRejectsPlainWSOldWeComAndUnknownNestedField(t *testing.T) {
+func TestLoadClientRejectsPlainWSLegacyIdentityAndUnknownNestedField(t *testing.T) {
+	key := testRelayKey(t)
 	tests := []string{
-		`{"relay":{"url":"ws://relay:9443","userid":"user","machine_id":"machine"},"herdr":{},"log":{}}`,
-		`{"wecom":{"bot_id":"old"},"relay":{"url":"wss://relay:9443","userid":"user","machine_id":"machine"},"herdr":{},"log":{}}`,
-		`{"relay":{"url":"wss://relay:9443","userid":"user","machine_id":"machine","unknown":true},"herdr":{},"log":{}}`,
+		`{"relay":{"url":"ws://relay:9443","key":"` + key + `"},"herdr":{},"log":{}}`,
+		`{"relay":{"url":"wss://relay:9443","key":"` + key + `","userid":"user","machine_id":"machine"},"herdr":{},"log":{}}`,
+		`{"relay":{"url":"wss://relay:9443","key":"` + key + `","unknown":true},"herdr":{},"log":{}}`,
 	}
 	for _, raw := range tests {
 		if _, err := LoadClient(writeConfig(t, raw)); err == nil {
@@ -88,7 +66,7 @@ func TestLoadClientRejectsPlainWSOldWeComAndUnknownNestedField(t *testing.T) {
 	}
 }
 
-func TestLoadServerReadsSecretAndDefaultsStateDirectory(t *testing.T) {
+func TestLoadServerReadsSecretAndDefaultsCredentialPath(t *testing.T) {
 	path := writeConfig(t, `{
 	  "wecom": {"bot_id": "bot-1"},
 	  "server": {"listen": "127.0.0.1:9443", "addr_hint": "10.1.3.4"},
@@ -106,11 +84,26 @@ func TestLoadServerReadsSecretAndDefaultsStateDirectory(t *testing.T) {
 	if loaded.WeCom.BotID != "bot-1" || loaded.WeCom.Secret != "secret-value" || loaded.Server.Listen != "127.0.0.1:9443" {
 		t.Fatalf("LoadServer() = %#v", loaded)
 	}
-	if loaded.Server.AddrHint != "10.1.3.4" {
-		t.Fatalf("LoadServer() addr_hint = %q, want 10.1.3.4", loaded.Server.AddrHint)
-	}
 	if filepath.Base(loaded.Server.StateDir) != "herdr-pal-server" || loaded.Log.Level != "info" {
 		t.Fatalf("LoadServer() defaults = %#v", loaded)
+	}
+	if loaded.Server.CredentialsFile != filepath.Join(loaded.Server.StateDir, "credentials.json") {
+		t.Fatalf("credentials_file = %q, want under %q", loaded.Server.CredentialsFile, loaded.Server.StateDir)
+	}
+}
+
+func TestLoadServerAdminDoesNotRequireWeComSecret(t *testing.T) {
+	path := writeConfig(t, `{
+	  "wecom": {"bot_id": ""},
+	  "server": {"state_dir": "`+filepath.ToSlash(t.TempDir())+`"},
+	  "log": {}
+	}`)
+	loaded, err := LoadServerAdmin(path)
+	if err != nil {
+		t.Fatalf("LoadServerAdmin() error = %v", err)
+	}
+	if filepath.Base(loaded.Server.CredentialsFile) != "credentials.json" {
+		t.Fatalf("LoadServerAdmin() = %#v", loaded.Server)
 	}
 }
 
@@ -136,4 +129,13 @@ func TestLoadServerRequiresListenSecretAndCertificatePair(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testRelayKey(t *testing.T) string {
+	t.Helper()
+	token, _, err := credential.Issue("user", "machine", time.Unix(1, 0), bytes.NewReader(bytes.Repeat([]byte{0x31}, 48)))
+	if err != nil {
+		t.Fatalf("credential.Issue() error = %v", err)
+	}
+	return token
 }

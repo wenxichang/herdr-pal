@@ -7,11 +7,43 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
 )
+
+func TestRunIssuesMachineKeyWithoutWeComSecret(t *testing.T) {
+	stateDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configJSON := `{"wecom":{},"server":{"state_dir":"` + filepath.ToSlash(stateDir) + `"},"log":{}}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	var stdout bytes.Buffer
+	err := Run(context.Background(), Options{
+		ConfigPath: configPath, Stdout: &stdout,
+		KeyIssue: &KeyIssueOptions{PrincipalID: "user-a", MachineID: "office-pc"},
+	})
+	if err != nil {
+		t.Fatalf("Run(key issue) error = %v", err)
+	}
+	line := strings.TrimSpace(stdout.String())
+	if !strings.HasPrefix(line, "hpk_") {
+		t.Fatalf("key output = %q", line)
+	}
+	store, err := credential.LoadStore(filepath.Join(stateDir, "credentials.json"))
+	if err != nil {
+		t.Fatalf("LoadStore() error = %v", err)
+	}
+	identity, err := store.VerifyBearer(context.Background(), line)
+	if err != nil || identity.PrincipalID != "user-a" || identity.MachineID != "office-pc" {
+		t.Fatalf("VerifyBearer() = %#v, %v", identity, err)
+	}
+}
 
 func TestBuildRelayURLHintUsesConfiguredAddressAndListenPort(t *testing.T) {
 	got, err := buildRelayURLHint("10.1.3.4", "0.0.0.0:9443")

@@ -22,16 +22,17 @@ type ServerWeComConfig struct {
 
 // ListenerConfig 是 Relay WSS 监听和证书配置。
 type ListenerConfig struct {
-	Listen   string `json:"listen"`
-	AddrHint string `json:"addr_hint"`
-	CertFile string `json:"cert_file"`
-	KeyFile  string `json:"key_file"`
-	StateDir string `json:"state_dir"`
+	Listen          string `json:"listen"`
+	AddrHint        string `json:"addr_hint"`
+	CertFile        string `json:"cert_file"`
+	KeyFile         string `json:"key_file"`
+	StateDir        string `json:"state_dir"`
+	CredentialsFile string `json:"credentials_file"`
 }
 
 // LoadServer 加载服务端配置并从环境读取企业微信 Secret。
 func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
-	loaded, err := decodeFile[ServerConfig](path)
+	loaded, err := LoadServerAdmin(path)
 	if err != nil {
 		return ServerConfig{}, err
 	}
@@ -48,10 +49,14 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 	if strings.TrimSpace(loaded.Server.Listen) == "" {
 		return ServerConfig{}, fmt.Errorf("缺少必填字段 listen")
 	}
-	certConfigured := strings.TrimSpace(loaded.Server.CertFile) != ""
-	keyConfigured := strings.TrimSpace(loaded.Server.KeyFile) != ""
-	if certConfigured != keyConfigured {
-		return ServerConfig{}, fmt.Errorf("cert_file 与 key_file 必须同时配置")
+	return loaded, nil
+}
+
+// LoadServerAdmin 加载不依赖企业微信 Secret 的服务端管理配置。
+func LoadServerAdmin(path string) (ServerConfig, error) {
+	loaded, err := decodeFile[ServerConfig](path)
+	if err != nil {
+		return ServerConfig{}, err
 	}
 	if strings.TrimSpace(loaded.Server.StateDir) == "" {
 		configDir, err := os.UserConfigDir()
@@ -59,6 +64,14 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("获取用户配置目录: %w", err)
 		}
 		loaded.Server.StateDir = filepath.Join(configDir, "herdr-pal-server")
+	}
+	if strings.TrimSpace(loaded.Server.CredentialsFile) == "" {
+		loaded.Server.CredentialsFile = filepath.Join(loaded.Server.StateDir, "credentials.json")
+	}
+	certConfigured := strings.TrimSpace(loaded.Server.CertFile) != ""
+	keyConfigured := strings.TrimSpace(loaded.Server.KeyFile) != ""
+	if certConfigured != keyConfigured {
+		return ServerConfig{}, fmt.Errorf("cert_file 与 key_file 必须同时配置")
 	}
 	if strings.TrimSpace(loaded.Log.Level) == "" {
 		loaded.Log.Level = "info"

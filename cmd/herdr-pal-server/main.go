@@ -27,6 +27,9 @@ func main() {
 type appExecutor func(context.Context, serverapp.Options) error
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute appExecutor) int {
+	if len(args) > 0 && args[0] == "key" {
+		return runKeyCommand(ctx, args[1:], stdout, stderr, execute)
+	}
 	flags := flag.NewFlagSet("herdr-pal-server", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "服务端 JSON 配置文件路径")
@@ -58,7 +61,49 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 			return 2
 		}
 	}
-	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stderr: stderr, Verbose: *verbose})
+	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stdout: stdout, Stderr: stderr, Verbose: *verbose})
+	return finishRun(ctx, err, resolvedConfigPath, stderr)
+}
+
+func runKeyCommand(ctx context.Context, args []string, stdout, stderr io.Writer, execute appExecutor) int {
+	if len(args) == 0 || args[0] != "issue" {
+		fmt.Fprintln(stderr, "用法: herdr-pal-server key issue [-config /path/server.json] -principal-id USERID -machine-id MACHINE")
+		return 2
+	}
+	flags := flag.NewFlagSet("herdr-pal-server key issue", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "", "服务端 JSON 配置文件路径")
+	principalID := flags.String("principal-id", "", "凭据绑定的企业微信 userid")
+	machineID := flags.String("machine-id", "", "凭据绑定的机器标识")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "参数错误，请检查 key issue 命令行参数。")
+		return 2
+	}
+	if strings.TrimSpace(*principalID) == "" {
+		fmt.Fprintln(stderr, "参数错误：缺少 -principal-id。")
+		return 2
+	}
+	if strings.TrimSpace(*machineID) == "" {
+		fmt.Fprintln(stderr, "参数错误：缺少 -machine-id。")
+		return 2
+	}
+	resolvedConfigPath := *configPath
+	if resolvedConfigPath == "" {
+		var err error
+		resolvedConfigPath, err = config.DefaultServerPath()
+		if err != nil {
+			fmt.Fprintln(stderr, "无法确定默认配置文件路径，请显式指定 -config。")
+			return 2
+		}
+	}
+	err := execute(ctx, serverapp.Options{
+		ConfigPath: resolvedConfigPath, Stdout: stdout, Stderr: stderr,
+		KeyIssue: &serverapp.KeyIssueOptions{PrincipalID: strings.TrimSpace(*principalID), MachineID: strings.TrimSpace(*machineID)},
+	})
+	return finishRun(ctx, err, resolvedConfigPath, stderr)
+}
+
+func finishRun(ctx context.Context, err error, resolvedConfigPath string, stderr io.Writer) int {
 	if err == nil || ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return 0
 	}

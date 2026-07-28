@@ -44,6 +44,18 @@ func TestBearerCredentialIDParsesIssuedToken(t *testing.T) {
 	}
 }
 
+func TestBearerCredentialIDAllowsURLSafeUnderscoreInSecret(t *testing.T) {
+	randomData := append(bytes.Repeat([]byte{0x42}, 16), bytes.Repeat([]byte{0xff}, 32)...)
+	token, record, err := Issue("user", "home", time.Now(), bytes.NewReader(randomData))
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	credentialID, err := BearerCredentialID(token)
+	if err != nil || credentialID != record.CredentialID {
+		t.Fatalf("BearerCredentialID() = %q, %v, token %q", credentialID, err, token)
+	}
+}
+
 func TestVerifyRecordRejectsAllUnusableCredentialsAsUnauthenticated(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	token, record, err := Issue("user", "home", now, bytes.NewReader(bytes.Repeat([]byte{0x11}, issueRandomBytes)))

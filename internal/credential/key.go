@@ -31,6 +31,8 @@ var (
 
 var credentialIDPattern = regexp.MustCompile(`^cred-[a-z2-7]{26}$`)
 
+const credentialIDLength = len("cred-") + 26
+
 // Status 是持久化凭据的生命周期状态。
 type Status string
 
@@ -113,12 +115,11 @@ func parseToken(token string) (string, string, error) {
 		return "", "", ErrInvalidToken
 	}
 	remainder := strings.TrimPrefix(token, "hpk_")
-	separator := strings.LastIndexByte(remainder, '_')
-	if separator <= 0 || separator == len(remainder)-1 {
+	if len(remainder) <= credentialIDLength || remainder[credentialIDLength] != '_' {
 		return "", "", ErrInvalidToken
 	}
-	credentialID := remainder[:separator]
-	secret := remainder[separator+1:]
+	credentialID := remainder[:credentialIDLength]
+	secret := remainder[credentialIDLength+1:]
 	decoded, err := base64.RawURLEncoding.DecodeString(secret)
 	if !credentialIDPattern.MatchString(credentialID) || err != nil || len(decoded) != 32 {
 		return "", "", ErrInvalidToken
