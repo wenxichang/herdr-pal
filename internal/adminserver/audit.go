@@ -2,6 +2,7 @@ package adminserver
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -28,6 +29,7 @@ func auditRequest(logger *slog.Logger, peerUID uint32, request adminproto.Reques
 	}
 	if response.Error == nil {
 		fields = append(fields, "outcome", "success")
+		fields = append(fields, auditEffectFields(request.Method, response)...)
 	} else {
 		fields = append(fields, "outcome", "error", "error_code", response.Error.Code)
 	}
@@ -55,11 +57,42 @@ func auditBusyConnection(logger *slog.Logger, connection netPeerUID) {
 }
 
 func auditRequestHash(requestID string) string {
-	if requestID == "" {
+	return auditValueHash(requestID)
+}
+
+func auditValueHash(value string) string {
+	if value == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(requestID))
+	digest := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", digest[:8])
+}
+
+func auditEffectFields(method adminproto.Method, response adminproto.Response) []any {
+	switch method {
+	case adminproto.MethodKeyEnable, adminproto.MethodKeyDisable,
+		adminproto.MethodKeySourceAdd, adminproto.MethodKeySourceRemove, adminproto.MethodKeySourceSet:
+		var result adminproto.CredentialMutationResult
+		if json.Unmarshal(response.Result, &result) == nil {
+			return []any{"disconnected_connections", result.DisconnectedConnections}
+		}
+	case adminproto.MethodKeyDelete:
+		var result adminproto.KeyDeleteResult
+		if json.Unmarshal(response.Result, &result) == nil {
+			return []any{"deleted", result.Deleted, "disconnected_connections", result.DisconnectedConnections}
+		}
+	case adminproto.MethodConnectionDisconnect:
+		var result adminproto.ConnectionDisconnectResult
+		if json.Unmarshal(response.Result, &result) == nil {
+			return []any{"disconnected", result.Disconnected}
+		}
+	case adminproto.MethodServerStop:
+		var result adminproto.ServerStopResult
+		if json.Unmarshal(response.Result, &result) == nil {
+			return []any{"stopping", result.Stopping}
+		}
+	}
+	return nil
 }
 
 func sanitizeAuditTarget(value string) string {

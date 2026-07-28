@@ -77,6 +77,26 @@ func TestAuditRecordsStableErrorCodeWithoutHandlerErrorText(t *testing.T) {
 	}
 }
 
+func TestAuditRecordsSafeMutationEffects(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	response, err := adminproto.NewResultResponse("request-1", adminproto.CredentialMutationResult{DisconnectedConnections: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditRequest(logger, 1000, adminproto.Request{ID: "request-1", Method: adminproto.MethodKeyDisable}, "credential_id=7", response, time.Second)
+	if output := logs.String(); !strings.Contains(output, "disconnected_connections=3") {
+		t.Fatalf("audit logs = %q", output)
+	}
+}
+
+func TestSessionFilterAuditTargetHashesPrincipalID(t *testing.T) {
+	target := sessionFilterAuditTarget(adminproto.SessionListParams{PrincipalID: "sensitive-user-id", MachineID: "home"})
+	if strings.Contains(target, "sensitive-user-id") || !strings.Contains(target, "principal_hash=") || !strings.Contains(target, "machine_id=home") {
+		t.Fatalf("sessionFilterAuditTarget() = %q", target)
+	}
+}
+
 type sensitiveHandlerError string
 
 func (err sensitiveHandlerError) Error() string { return string(err) }

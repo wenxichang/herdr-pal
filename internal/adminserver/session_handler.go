@@ -118,7 +118,7 @@ func validOptionalLabel(value string) bool {
 func sessionFilterAuditTarget(params adminproto.SessionListParams) string {
 	parts := make([]string, 0, 2)
 	if params.PrincipalID != "" {
-		parts = append(parts, "principal_id="+params.PrincipalID)
+		parts = append(parts, "principal_hash="+auditValueHash(params.PrincipalID))
 	}
 	if params.MachineID != "" {
 		parts = append(parts, "machine_id="+params.MachineID)
