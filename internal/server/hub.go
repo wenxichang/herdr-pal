@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -166,7 +167,8 @@ func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	socket.SetReadLimit(hprp.MaxMessageBytes)
 	reserved = false
-	hub.serveConnection(request.Context(), socket, connectionID, identity, key)
+	source, _ := credential.RequestSourceAddr(request)
+	hub.serveConnection(request.Context(), socket, connectionID, identity, key, source)
 }
 
 // Select 复核目标仍存在于已就绪连接；HPRP/1 不发送远端选择消息。
@@ -240,7 +242,7 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 	return RelayExecution{Content: content, SelectedTarget: result.ReplacementTarget}, nil
 }
 
-func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn, connectionID string, identity credential.Identity, key ClientKey) {
+func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn, connectionID string, identity credential.Identity, key ClientKey, source netip.Addr) {
 	helloContext, cancelHello := context.WithTimeout(parent, hub.config.HelloTimeout)
 	helloEnvelope, err := connectionReadEnvelope(helloContext, socket)
 	cancelHello()
@@ -262,7 +264,11 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 		return
 	}
 
-	connection := newClientConnection(parent, connectionID, identity.CredentialID, key, socket, hub.config.SendQueueCapacity, minInt(hub.config.MaxInflight, hello.Limits.MaxInflightCommands), hub.logger)
+	connection := newClientConnection(parent, clientConnectionConfig{
+		ID: connectionID, CredentialID: identity.CredentialID, Key: key, Source: source,
+		Implementation: hello.Implementation, Socket: socket, SendCapacity: hub.config.SendQueueCapacity,
+		MaxPending: minInt(hub.config.MaxInflight, hello.Limits.MaxInflightCommands), Logger: hub.logger,
+	})
 	hub.install(connection)
 	go connection.runWriter()
 	defer connection.close(websocket.StatusNormalClosure, "connection ended")
@@ -292,7 +298,6 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 		return
 	}
 	connection.ready.Store(true)
-	connection.sessionCount.Store(int64(len(firstSnapshot.Sessions)))
 	hub.logger.Info("HPRP 客户端已就绪",
 		"credential_id", identity.CredentialID, "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID),
 		"connection_id", connectionID, "client_name", safeLogValue(hello.Implementation.Name), "client_version", safeLogValue(hello.Implementation.Version),
@@ -330,6 +335,9 @@ func (hub *ClientHub) applySnapshot(connection *clientConnection, envelope hprp.
 	snapshot, err := hprp.DecodePayload[hprp.SessionSnapshot](envelope)
 	if err == nil {
 		err = hub.catalog.ApplySnapshot(connection.id, snapshot)
+		if err == nil {
+			connection.recordSnapshot(snapshot.Sequence, len(snapshot.Sessions), time.Now())
+		}
 	}
 	result := hprp.SnapshotResult{Outcome: hprp.OutcomeOK, AppliedSequence: snapshot.Sequence}
 	if err != nil {
@@ -363,9 +371,6 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 			if err != nil && !errors.Is(err, ErrSnapshotStale) {
 				hub.logger.Warn("HPRP 客户端快照上报失败", append(append(connectionLogArgs(connection), "stage", "session.snapshot", "snapshot_sequence", snapshot.Sequence, "session_count", len(snapshot.Sessions)), serverErrorLogArgs(err)...)...)
 				return
-			}
-			if err == nil {
-				connection.sessionCount.Store(int64(len(snapshot.Sessions)))
 			}
 			hub.logger.Debug("HPRP 客户端快照已处理", append(connectionLogArgs(connection), "snapshot_sequence", snapshot.Sequence, "previous_session_count", previous, "session_count", len(snapshot.Sessions), "applied", err == nil)...)
 		case hprp.TypeCommandResult:
@@ -525,6 +530,7 @@ func (hub *ClientHub) runHeartbeat(connection *clientConnection) {
 				connection.cancel()
 				return
 			}
+			connection.recordHeartbeat(time.Now())
 			hub.logger.Debug("HPRP WebSocket 心跳成功", connectionLogArgs(connection)...)
 		}
 	}

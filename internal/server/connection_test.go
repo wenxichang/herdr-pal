@@ -10,7 +10,7 @@ import (
 )
 
 func TestClientConnectionCorrelatesReplyToWithPendingRequest(t *testing.T) {
-	connection := newClientConnection(context.Background(), "connection-1", 1, ClientKey{UserID: "user-a", MachineID: "home-mac"}, nil, 2, 2, slog.Default())
+	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 2, MaxPending: 2, Logger: slog.Default()})
 	connection.ready.Store(true)
 	request, err := hprp.NewEnvelope(hprp.TypeCommandExecute, "command-1", "", true, hprp.CommandExecute{
 		IdempotencyKey: "message-1",
@@ -55,7 +55,7 @@ func TestClientConnectionCorrelatesReplyToWithPendingRequest(t *testing.T) {
 }
 
 func TestClientConnectionDeduplicatesAndOrdersCommandOutput(t *testing.T) {
-	connection := newClientConnection(context.Background(), "connection-1", 1, ClientKey{UserID: "user-a", MachineID: "home-mac"}, nil, 1, 2, slog.Default())
+	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 1, MaxPending: 2, Logger: slog.Default()})
 	connection.setCapabilities([]string{hprp.CapabilityCommandOutputV1})
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
 	if err := connection.registerCommand("command-1", target, time.Minute); err != nil {
@@ -76,7 +76,7 @@ func TestClientConnectionDeduplicatesAndOrdersCommandOutput(t *testing.T) {
 }
 
 func TestClientConnectionRejectsUnnegotiatedCommandOutput(t *testing.T) {
-	connection := newClientConnection(context.Background(), "connection-1", 1, ClientKey{UserID: "user-a", MachineID: "home-mac"}, nil, 1, 2, slog.Default())
+	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 1, MaxPending: 2, Logger: slog.Default()})
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
 	if err := connection.registerCommand("command-1", target, time.Minute); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestClientConnectionRejectsUnnegotiatedCommandOutput(t *testing.T) {
 }
 
 func TestClientConnectionDeduplicatesAndOrdersNotificationsPerTarget(t *testing.T) {
-	connection := newClientConnection(context.Background(), "connection-1", 1, ClientKey{UserID: "user-a", MachineID: "home-mac"}, nil, 1, 2, slog.Default())
+	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 1, MaxPending: 2, Logger: slog.Default()})
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
 	event := hprp.NotificationEvent{
 		EventKey: "event-1", Sequence: 1, Kind: "agent.status", Target: target,

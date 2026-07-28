@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,7 +47,15 @@ type clientConnection struct {
 	outboundDone  chan struct{}
 	ready         atomic.Bool
 	sessionCount  atomic.Int64
-	capabilities  map[string]struct{}
+
+	metadataMu       sync.RWMutex
+	implementation   hprp.Implementation
+	source           netip.Addr
+	connectedAt      time.Time
+	lastHeartbeatAt  time.Time
+	lastSnapshotAt   time.Time
+	snapshotSequence uint64
+	capabilities     map[string]struct{}
 
 	pendingMu  sync.Mutex
 	pending    map[string]pendingRequest
@@ -60,28 +70,90 @@ type clientConnection struct {
 	notificationSequence map[hprp.Target]uint64
 }
 
-func newClientConnection(parent context.Context, id string, credentialID uint64, key ClientKey, socket *websocket.Conn, sendCapacity, maxPending int, logger *slog.Logger) *clientConnection {
+type clientConnectionConfig struct {
+	ID             string
+	CredentialID   uint64
+	Key            ClientKey
+	Source         netip.Addr
+	Implementation hprp.Implementation
+	Socket         *websocket.Conn
+	SendCapacity   int
+	MaxPending     int
+	Logger         *slog.Logger
+}
+
+func newClientConnection(parent context.Context, config clientConnectionConfig) *clientConnection {
 	ctx, cancel := context.WithCancel(parent)
 	return &clientConnection{
-		id: id, credentialID: credentialID, key: key, socket: socket, logger: logger, ctx: ctx, cancel: cancel,
-		sendQueue: make(chan hprp.Envelope, sendCapacity), writerDone: make(chan struct{}),
-		outboundQueue: make(chan hprp.Envelope, sendCapacity), outboundDone: make(chan struct{}),
-		pending: make(map[string]pendingRequest), maxPending: maxPending,
+		id: config.ID, credentialID: config.CredentialID, key: config.Key, socket: config.Socket, logger: config.Logger, ctx: ctx, cancel: cancel,
+		sendQueue: make(chan hprp.Envelope, config.SendCapacity), writerDone: make(chan struct{}),
+		outboundQueue: make(chan hprp.Envelope, config.SendCapacity), outboundDone: make(chan struct{}),
+		pending: make(map[string]pendingRequest), maxPending: config.MaxPending,
 		commandRoutes: make(map[string]commandRoute), maxCommands: defaultCommandRouteCapacity,
 		notifications: make(map[string]notificationRecord), notificationSequence: make(map[hprp.Target]uint64),
-		capabilities: make(map[string]struct{}),
+		capabilities: make(map[string]struct{}), implementation: config.Implementation, source: normalizeConnectionSource(config.Source), connectedAt: time.Now().UTC(),
 	}
 }
 
 func (connection *clientConnection) setCapabilities(capabilities []string) {
+	connection.metadataMu.Lock()
+	defer connection.metadataMu.Unlock()
 	for _, capability := range capabilities {
 		connection.capabilities[capability] = struct{}{}
 	}
 }
 
 func (connection *clientConnection) supportsCapability(capability string) bool {
+	connection.metadataMu.RLock()
+	defer connection.metadataMu.RUnlock()
 	_, supported := connection.capabilities[capability]
 	return supported
+}
+
+func (connection *clientConnection) recordSnapshot(sequence uint64, sessionCount int, observedAt time.Time) {
+	connection.sessionCount.Store(int64(sessionCount))
+	connection.metadataMu.Lock()
+	connection.snapshotSequence = sequence
+	connection.lastSnapshotAt = observedAt.UTC()
+	connection.metadataMu.Unlock()
+}
+
+func (connection *clientConnection) recordHeartbeat(observedAt time.Time) {
+	connection.metadataMu.Lock()
+	connection.lastHeartbeatAt = observedAt.UTC()
+	connection.metadataMu.Unlock()
+}
+
+func (connection *clientConnection) view() ConnectionView {
+	connection.metadataMu.RLock()
+	capabilities := make([]string, 0, len(connection.capabilities))
+	for capability := range connection.capabilities {
+		capabilities = append(capabilities, capability)
+	}
+	sort.Strings(capabilities)
+	view := ConnectionView{
+		ConnectionID: connection.id, CredentialID: connection.credentialID,
+		PrincipalID: connection.key.UserID, MachineID: connection.key.MachineID,
+		Implementation: connection.implementation, ConnectedAt: connection.connectedAt,
+		LastHeartbeatAt: connection.lastHeartbeatAt, LastSnapshotAt: connection.lastSnapshotAt,
+		SnapshotSequence: connection.snapshotSequence, SessionCount: int(connection.sessionCount.Load()),
+		Capabilities: capabilities, Ready: connection.ready.Load(),
+	}
+	if connection.source.IsValid() {
+		view.SourceIP = connection.source.String()
+	}
+	connection.metadataMu.RUnlock()
+	return view
+}
+
+func normalizeConnectionSource(source netip.Addr) netip.Addr {
+	if !source.IsValid() {
+		return netip.Addr{}
+	}
+	if source.Zone() != "" {
+		source = source.WithZone("")
+	}
+	return source.Unmap()
 }
 
 func (connection *clientConnection) acceptNotification(event hprp.NotificationEvent) bool {
