@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 )
 
 var (
@@ -37,21 +37,21 @@ type ClientKey struct {
 
 // CatalogEntry 是目录中的稳定目标引用和当前展示信息。
 type CatalogEntry struct {
-	Ref     relayproto.SessionRef
-	Session relayproto.Session
+	Ref     hprp.Target
+	Session hprp.Session
 }
 
 type machineState struct {
 	connectionID string
 	sequence     uint64
-	sessions     []relayproto.Session
+	sessions     []hprp.Session
 }
 
 type routingState struct {
-	numbered      []relayproto.SessionRef
+	numbered      []hprp.Target
 	numberedValid bool
-	selected      *relayproto.SessionRef
-	invalidated   *relayproto.SessionRef
+	selected      *hprp.Target
+	invalidated   *hprp.Target
 }
 
 // SessionCatalog 保存所有在线机器的最新完整快照和用户路由状态。
@@ -82,8 +82,8 @@ func (catalog *SessionCatalog) Attach(connectionID string, key ClientKey) (bool,
 	if catalog == nil || strings.TrimSpace(connectionID) == "" {
 		return false, ErrUnknownConnection
 	}
-	if err := relayproto.ValidateClientHello(relayproto.ClientHello{UserID: key.UserID, MachineID: key.MachineID}); err != nil {
-		return false, err
+	if strings.TrimSpace(key.UserID) == "" || hprp.ValidateMachineID(key.MachineID) != nil {
+		return false, hprp.ErrInvalidTarget
 	}
 	catalog.mu.Lock()
 	defer catalog.mu.Unlock()
@@ -101,11 +101,11 @@ func (catalog *SessionCatalog) Attach(connectionID string, key ClientKey) (bool,
 }
 
 // ApplySnapshot 原子应用当前连接的新完整快照。
-func (catalog *SessionCatalog) ApplySnapshot(connectionID string, snapshot relayproto.SessionSnapshot) error {
+func (catalog *SessionCatalog) ApplySnapshot(connectionID string, snapshot hprp.SessionSnapshot) error {
 	if catalog == nil {
 		return ErrUnknownConnection
 	}
-	if err := relayproto.ValidateSnapshot(snapshot); err != nil {
+	if err := hprp.ValidateSessionSnapshot(snapshot); err != nil {
 		return err
 	}
 	catalog.mu.Lock()
@@ -118,11 +118,14 @@ func (catalog *SessionCatalog) ApplySnapshot(connectionID string, snapshot relay
 	if !exists || current.connectionID != connectionID {
 		return ErrUnknownConnection
 	}
-	if snapshot.Sequence <= current.sequence {
+	if snapshot.Sequence == current.sequence {
+		return nil
+	}
+	if snapshot.Sequence < current.sequence {
 		return ErrSnapshotStale
 	}
 	current.sequence = snapshot.Sequence
-	current.sessions = append([]relayproto.Session(nil), snapshot.Sessions...)
+	current.sessions = append([]hprp.Session(nil), snapshot.Sessions...)
 	catalog.machines[key] = current
 	catalog.invalidateChangedSelectionLocked(key.UserID)
 	catalog.signalUpdateLocked()
@@ -196,7 +199,7 @@ func (catalog *SessionCatalog) CreateNumberedSnapshot(userID string) []CatalogEn
 	defer catalog.mu.Unlock()
 	entries := catalog.entriesLocked(userID)
 	routing := catalog.routing[userID]
-	routing.numbered = make([]relayproto.SessionRef, len(entries))
+	routing.numbered = make([]hprp.Target, len(entries))
 	for index := range entries {
 		routing.numbered[index] = entries[index].Ref
 	}
@@ -230,7 +233,7 @@ func (catalog *SessionCatalog) ResolveNumbered(userID string, index int) (Catalo
 //
 // 尚无编号快照或目标未包含在旧快照中时，会按当前在线目录重新建立编号，使展示的 /N
 // 可以立即用于选择该目标。
-func (catalog *SessionCatalog) EnsureNumberedIndex(userID string, target relayproto.SessionRef) (int, error) {
+func (catalog *SessionCatalog) EnsureNumberedIndex(userID string, target hprp.Target) (int, error) {
 	if catalog == nil {
 		return 0, ErrNoListSnapshot
 	}
@@ -246,7 +249,7 @@ func (catalog *SessionCatalog) EnsureNumberedIndex(userID string, target relaypr
 		}
 	}
 	entries := catalog.entriesLocked(userID)
-	routing.numbered = make([]relayproto.SessionRef, len(entries))
+	routing.numbered = make([]hprp.Target, len(entries))
 	for index := range entries {
 		routing.numbered[index] = entries[index].Ref
 	}
@@ -260,7 +263,7 @@ func (catalog *SessionCatalog) EnsureNumberedIndex(userID string, target relaypr
 }
 
 // SetSelection 保存已经由客户端复核成功的当前选择。
-func (catalog *SessionCatalog) SetSelection(userID string, target relayproto.SessionRef) error {
+func (catalog *SessionCatalog) SetSelection(userID string, target hprp.Target) error {
 	if catalog == nil {
 		return ErrTargetChanged
 	}
@@ -280,8 +283,8 @@ func (catalog *SessionCatalog) SetSelection(userID string, target relayproto.Ses
 }
 
 // SetSelectionWhenAvailable 等待目标出现在最新快照中，并把它保存为当前选择。
-func (catalog *SessionCatalog) SetSelectionWhenAvailable(ctx context.Context, userID string, target relayproto.SessionRef) error {
-	if catalog == nil || relayproto.ValidateSessionRef(target) != nil {
+func (catalog *SessionCatalog) SetSelectionWhenAvailable(ctx context.Context, userID string, target hprp.Target) error {
+	if catalog == nil || hprp.ValidateTarget(target) != nil {
 		return ErrTargetChanged
 	}
 	if ctx == nil {
@@ -316,9 +319,9 @@ func (catalog *SessionCatalog) SetSelectionWhenAvailable(ctx context.Context, us
 // RebindSelection 等待客户端确认的新 occupant 出现在目录后，原子更新当前选择。
 //
 // replacement 必须仍位于 expected 的同一机器和 pane；用户已经选择其他目标时不会覆盖。
-func (catalog *SessionCatalog) RebindSelection(ctx context.Context, userID string, expected, replacement relayproto.SessionRef) error {
-	if catalog == nil || relayproto.ValidateSessionRef(expected) != nil || relayproto.ValidateSessionRef(replacement) != nil ||
-		expected.MachineID != replacement.MachineID || expected.PaneID != replacement.PaneID {
+func (catalog *SessionCatalog) RebindSelection(ctx context.Context, userID string, expected, replacement hprp.Target) error {
+	if catalog == nil || hprp.ValidateTarget(expected) != nil || hprp.ValidateTarget(replacement) != nil ||
+		expected.MachineID != replacement.MachineID || expected.SlotID != replacement.SlotID {
 		return ErrTargetChanged
 	}
 	if ctx == nil {
@@ -381,7 +384,7 @@ func (catalog *SessionCatalog) Selected(userID string) (CatalogEntry, error) {
 }
 
 // ResolveTarget 从最新目录复核任意稳定目标，不修改用户编号或选择。
-func (catalog *SessionCatalog) ResolveTarget(userID string, target relayproto.SessionRef) (CatalogEntry, error) {
+func (catalog *SessionCatalog) ResolveTarget(userID string, target hprp.Target) (CatalogEntry, error) {
 	if catalog == nil {
 		return CatalogEntry{}, ErrTargetChanged
 	}
@@ -395,8 +398,8 @@ func (catalog *SessionCatalog) ResolveTarget(userID string, target relayproto.Se
 }
 
 // WaitForTarget 等待稳定目标出现在最新在线目录中，但不修改用户选择。
-func (catalog *SessionCatalog) WaitForTarget(ctx context.Context, userID string, target relayproto.SessionRef) (CatalogEntry, error) {
-	if catalog == nil || relayproto.ValidateSessionRef(target) != nil {
+func (catalog *SessionCatalog) WaitForTarget(ctx context.Context, userID string, target hprp.Target) (CatalogEntry, error) {
+	if catalog == nil || hprp.ValidateTarget(target) != nil {
 		return CatalogEntry{}, ErrTargetChanged
 	}
 	if ctx == nil {
@@ -430,9 +433,8 @@ func (catalog *SessionCatalog) entriesLocked(userID string) []CatalogEntry {
 		}
 		for _, current := range machine.sessions {
 			entries = append(entries, CatalogEntry{
-				Ref: relayproto.SessionRef{
-					MachineID: key.MachineID, LocalIndex: current.LocalIndex,
-					PaneID: current.PaneID, OccupantHash: current.OccupantHash,
+				Ref: hprp.Target{
+					MachineID: key.MachineID, SlotID: current.SlotID, SessionID: current.SessionID,
 				},
 				Session: current,
 			})
@@ -442,26 +444,26 @@ func (catalog *SessionCatalog) entriesLocked(userID string) []CatalogEntry {
 		if entries[left].Ref.MachineID != entries[right].Ref.MachineID {
 			return entries[left].Ref.MachineID < entries[right].Ref.MachineID
 		}
-		if entries[left].Ref.LocalIndex != entries[right].Ref.LocalIndex {
-			return entries[left].Ref.LocalIndex < entries[right].Ref.LocalIndex
+		if entries[left].Session.Display.Index != entries[right].Session.Display.Index {
+			return entries[left].Session.Display.Index < entries[right].Session.Display.Index
 		}
-		if entries[left].Ref.PaneID != entries[right].Ref.PaneID {
-			return entries[left].Ref.PaneID < entries[right].Ref.PaneID
+		if entries[left].Ref.SlotID != entries[right].Ref.SlotID {
+			return entries[left].Ref.SlotID < entries[right].Ref.SlotID
 		}
-		return entries[left].Ref.OccupantHash < entries[right].Ref.OccupantHash
+		return entries[left].Ref.SessionID < entries[right].Ref.SessionID
 	})
 	return entries
 }
 
-func (catalog *SessionCatalog) findEntryLocked(userID string, target relayproto.SessionRef) (CatalogEntry, bool) {
+func (catalog *SessionCatalog) findEntryLocked(userID string, target hprp.Target) (CatalogEntry, bool) {
 	machine, exists := catalog.machines[ClientKey{UserID: userID, MachineID: target.MachineID}]
 	if !exists || machine.sequence == 0 {
 		return CatalogEntry{}, false
 	}
 	for _, current := range machine.sessions {
-		if current.PaneID == target.PaneID && current.OccupantHash == target.OccupantHash {
+		if current.SlotID == target.SlotID && current.SessionID == target.SessionID {
 			return CatalogEntry{
-				Ref:     relayproto.SessionRef{MachineID: target.MachineID, LocalIndex: current.LocalIndex, PaneID: current.PaneID, OccupantHash: current.OccupantHash},
+				Ref:     hprp.Target{MachineID: target.MachineID, SlotID: current.SlotID, SessionID: current.SessionID},
 				Session: current,
 			}, true
 		}
@@ -487,11 +489,11 @@ func (catalog *SessionCatalog) signalUpdateLocked() {
 	catalog.updates = make(chan struct{})
 }
 
-func sameCatalogTarget(left, right relayproto.SessionRef) bool {
-	return left.MachineID == right.MachineID && left.PaneID == right.PaneID && left.OccupantHash == right.OccupantHash
+func sameCatalogTarget(left, right hprp.Target) bool {
+	return left.MachineID == right.MachineID && left.SlotID == right.SlotID && left.SessionID == right.SessionID
 }
 
-func numberedTargetIndex(numbered []relayproto.SessionRef, target relayproto.SessionRef) int {
+func numberedTargetIndex(numbered []hprp.Target, target hprp.Target) int {
 	for index, current := range numbered {
 		if sameCatalogTarget(current, target) {
 			return index + 1

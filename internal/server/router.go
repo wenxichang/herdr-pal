@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -138,7 +139,7 @@ func (router *ConversationRouter) SendPush(ctx context.Context, userID string, p
 	if router == nil || strings.TrimSpace(userID) == "" {
 		return ErrInvalidRouterDependency
 	}
-	entry, err := router.catalog.ResolveTarget(userID, push.Target)
+	entry, err := router.catalog.ResolveTarget(userID, targetFromLegacy(push.Target))
 	if err != nil {
 		return err
 	}
@@ -164,7 +165,7 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 	if router == nil || notification.Target.MachineID != machineID {
 		return ErrTargetChanged
 	}
-	entry, err := router.catalog.ResolveTarget(userID, notification.Target)
+	entry, err := router.catalog.ResolveTarget(userID, targetFromLegacy(notification.Target))
 	if err != nil {
 		return err
 	}
@@ -194,13 +195,13 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 		}
 		return nil
 	}
-	name := entry.Session.DisplayAgent
+	name := entry.Session.Display.DisplayAgent
 	if name == "" {
-		name = entry.Session.Agent
+		name = entry.Session.Display.Agent
 	}
-	header := fmt.Sprintf("[%s/%d] %s", safeRouterLabel(machineID), entry.Ref.LocalIndex, safeRouterLabel(name))
-	if entry.Session.Title != "" {
-		header += " — " + safeRouterLabel(entry.Session.Title)
+	header := fmt.Sprintf("[%s/%d] %s", safeRouterLabel(machineID), entry.Session.Display.Index, safeRouterLabel(name))
+	if entry.Session.Display.Title != "" {
+		header += " — " + safeRouterLabel(entry.Session.Display.Title)
 	}
 	parts := panel.SplitMarkdown(header+"\n"+notification.Content, panel.WeComContentLimit)
 	if len(parts) == 0 {
@@ -336,16 +337,16 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 		if selectedErr == nil && sameSessionRef(selected.Ref, entry.Ref) {
 			marker = "（当前选择）"
 		}
-		name := entry.Session.DisplayAgent
+		name := entry.Session.Display.DisplayAgent
 		if name == "" {
-			name = entry.Session.Agent
+			name = entry.Session.Display.Agent
 		}
-		fmt.Fprintf(&content, "\n%d. [%s/%d] %s", index+1, safeRouterLabel(entry.Ref.MachineID), entry.Ref.LocalIndex, safeRouterLabel(name))
-		if entry.Session.Title != "" {
-			fmt.Fprintf(&content, " — %s", safeRouterLabel(entry.Session.Title))
+		fmt.Fprintf(&content, "\n%d. [%s/%d] %s", index+1, safeRouterLabel(entry.Ref.MachineID), entry.Session.Display.Index, safeRouterLabel(name))
+		if entry.Session.Display.Title != "" {
+			fmt.Fprintf(&content, " — %s", safeRouterLabel(entry.Session.Display.Title))
 		}
 		content.WriteString(marker)
-		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)), safeRouterLabel(panel.AgentStatusLabel(herdr.AgentStatus(entry.Session.Status))))
+		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Display.Workspace, entry.Session.Display.Tab)), safeRouterLabel(panel.AgentStatusLabel(herdr.AgentStatus(hprp.NormalizeStatus(entry.Session.Status)))))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	router.logger.Debug("企业微信会话列表已生成", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "session_count", len(entries), "has_selection", selectedErr == nil)
@@ -355,12 +356,12 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 func (router *ConversationRouter) handleSelect(ctx context.Context, message im.IncomingText, index int) {
 	entry, err := router.catalog.ResolveNumbered(message.UserID, index)
 	if err != nil {
-		router.logInteractionError(message, "select", "resolve_numbered", relayproto.SessionRef{}, err)
+		router.logInteractionError(message, "select", "resolve_numbered", hprp.Target{}, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	err = router.relay.Select(requestContext, message.UserID, entry.Ref)
+	err = router.relay.Select(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index))
 	cancel()
 	if err != nil {
 		router.logInteractionError(message, "select", "relay_select", entry.Ref, err)
@@ -375,7 +376,7 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	consoleMessage := message
 	consoleMessage.Content = "/con"
 	requestContext, cancel = context.WithTimeout(ctx, router.requestTimeout)
-	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
+	result, err := router.relay.Execute(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index), consoleMessage)
 	if err != nil {
 		cancel()
 		router.logInteractionError(message, "select", "read_console", entry.Ref, err)
@@ -406,12 +407,12 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 func (router *ConversationRouter) handleExecute(ctx context.Context, message im.IncomingText) {
 	entry, err := router.catalog.Selected(message.UserID)
 	if err != nil {
-		router.logInteractionError(message, "execute", "resolve_selection", relayproto.SessionRef{}, err)
+		router.logInteractionError(message, "execute", "resolve_selection", hprp.Target{}, err)
 		router.reply(ctx, message, "尚未选择 Agent，请先执行 /ls 和 /N。")
 		return
 	}
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, message)
+	result, err := router.relay.Execute(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index), message)
 	if err != nil {
 		cancel()
 		router.logInteractionError(message, "execute", "relay_execute", entry.Ref, err)
@@ -446,7 +447,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, message im.IncomingText, action serverAction) {
 	entry, err := router.catalog.ResolveNumbered(message.UserID, action.index)
 	if err != nil {
-		router.logInteractionError(message, "directed_execute", "resolve_numbered", relayproto.SessionRef{}, err)
+		router.logInteractionError(message, "directed_execute", "resolve_numbered", hprp.Target{}, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
@@ -454,7 +455,7 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	directedMessage.Content = action.content
 	selectedBefore, selectedErr := router.catalog.Selected(message.UserID)
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, directedMessage)
+	result, err := router.relay.Execute(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index), directedMessage)
 	if err != nil {
 		cancel()
 		router.logInteractionError(message, "directed_execute", "relay_execute", entry.Ref, err)
@@ -467,25 +468,26 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	}
 	finalEntry := entry
 	if result.SelectedTarget != nil {
+		replacement := targetFromLegacy(*result.SelectedTarget)
 		if action.switchAfter {
-			if err := router.catalog.SetSelectionWhenAvailable(requestContext, message.UserID, *result.SelectedTarget); err != nil {
+			if err := router.catalog.SetSelectionWhenAvailable(requestContext, message.UserID, replacement); err != nil {
 				cancel()
-				router.logInteractionError(message, "directed_execute", "set_replacement_selection", *result.SelectedTarget, err)
+				router.logInteractionError(message, "directed_execute", "set_replacement_selection", replacement, err)
 				router.reply(ctx, message, "操作已执行，但切换当前会话失败："+safeRouterError(err))
 				return
 			}
 		} else if selectedErr == nil && sameSessionRef(selectedBefore.Ref, entry.Ref) {
-			if err := router.catalog.RebindSelection(requestContext, message.UserID, entry.Ref, *result.SelectedTarget); err != nil {
+			if err := router.catalog.RebindSelection(requestContext, message.UserID, entry.Ref, replacement); err != nil {
 				cancel()
-				router.logInteractionError(message, "directed_execute", "rebind_current_selection", *result.SelectedTarget, err)
+				router.logInteractionError(message, "directed_execute", "rebind_current_selection", replacement, err)
 				router.reply(ctx, message, "操作已执行，但当前会话更新失败："+safeRouterError(err))
 				return
 			}
 		}
-		finalEntry, err = router.catalog.WaitForTarget(requestContext, message.UserID, *result.SelectedTarget)
+		finalEntry, err = router.catalog.WaitForTarget(requestContext, message.UserID, replacement)
 		if err != nil {
 			cancel()
-			router.logInteractionError(message, "directed_execute", "wait_replacement_target", *result.SelectedTarget, err)
+			router.logInteractionError(message, "directed_execute", "wait_replacement_target", replacement, err)
 			router.reply(ctx, message, "操作已执行，但目标会话更新失败："+safeRouterError(err))
 			return
 		}
@@ -516,10 +518,11 @@ func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, u
 	if result.SelectedTarget == nil {
 		return source, nil
 	}
-	if err := router.catalog.RebindSelection(ctx, userID, source.Ref, *result.SelectedTarget); err != nil {
+	replacement := targetFromLegacy(*result.SelectedTarget)
+	if err := router.catalog.RebindSelection(ctx, userID, source.Ref, replacement); err != nil {
 		return CatalogEntry{}, err
 	}
-	return router.catalog.ResolveTarget(userID, *result.SelectedTarget)
+	return router.catalog.ResolveTarget(userID, replacement)
 }
 
 func (router *ConversationRouter) decorateTerminalContent(userID string, source CatalogEntry, content string) (string, error) {
@@ -530,7 +533,7 @@ func (router *ConversationRouter) decorateTerminalContent(userID string, source 
 	if err != nil {
 		return "", err
 	}
-	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Ref.LocalIndex, listIndex)
+	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Session.Display.Index, listIndex)
 	selected, selectedErr := router.catalog.Selected(userID)
 	if selectedErr == nil && !sameSessionRef(selected.Ref, source.Ref) {
 		warning := fmt.Sprintf("⚠️⚠️⚠️[当前会话] %s, 你的输入将不会发送给当前输出的会话，使用 /%d 切换到当前输出的会话。", catalogTargetLabel(selected), listIndex)
@@ -540,17 +543,17 @@ func (router *ConversationRouter) decorateTerminalContent(userID string, source 
 }
 
 func catalogTargetLabel(entry CatalogEntry) string {
-	workspace := panel.WorkspaceLabel(entry.Session.Workspace, entry.Session.Tab)
-	agent := entry.Session.Agent
+	workspace := panel.WorkspaceLabel(entry.Session.Display.Workspace, entry.Session.Display.Tab)
+	agent := entry.Session.Display.Agent
 	if agent == "" {
-		agent = entry.Session.DisplayAgent
+		agent = entry.Session.Display.DisplayAgent
 	}
 	if agent == "" {
-		agent = entry.Session.PaneID
+		agent = entry.Session.SlotID
 	}
 	return fmt.Sprintf("[%s/%d] %s-%s(%s)",
-		safeRouterLabel(entry.Ref.MachineID), entry.Ref.LocalIndex,
-		safeRouterLabel(workspace), safeRouterLabel(agent), safeRouterLabel(entry.Session.PaneID))
+		safeRouterLabel(entry.Ref.MachineID), entry.Session.Display.Index,
+		safeRouterLabel(workspace), safeRouterLabel(agent), safeRouterLabel(entry.Session.SlotID))
 }
 
 type serverActionKind uint8
@@ -679,15 +682,15 @@ func (router *ConversationRouter) reply(ctx context.Context, message im.Incoming
 	router.logger.Debug("企业微信回复发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_count", len(parts), "content_bytes", len([]byte(content)))
 }
 
-func (router *ConversationRouter) logInteractionError(message im.IncomingText, action, stage string, target relayproto.SessionRef, err error) {
+func (router *ConversationRouter) logInteractionError(message im.IncomingText, action, stage string, target hprp.Target, err error) {
 	args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", action, "stage", stage}
-	if target.MachineID != "" || target.PaneID != "" || target.LocalIndex != 0 {
+	if target.MachineID != "" || target.SlotID != "" || target.SessionID != "" {
 		args = append(args, targetLogArgs(target)...)
 	}
 	router.logger.Warn("企业微信交互路由失败", append(args, serverErrorLogArgs(err)...)...)
 }
 
-func (router *ConversationRouter) logInteractionSuccess(message im.IncomingText, action string, target relayproto.SessionRef) {
+func (router *ConversationRouter) logInteractionSuccess(message im.IncomingText, action string, target hprp.Target) {
 	args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", action}
 	args = append(args, targetLogArgs(target)...)
 	router.logger.Debug("企业微信交互路由成功", args...)
@@ -712,8 +715,8 @@ func safeRouterError(err error) string {
 	}
 }
 
-func sameSessionRef(left, right relayproto.SessionRef) bool {
-	return left.MachineID == right.MachineID && left.PaneID == right.PaneID && left.OccupantHash == right.OccupantHash
+func sameSessionRef(left, right hprp.Target) bool {
+	return left.MachineID == right.MachineID && left.SlotID == right.SlotID && left.SessionID == right.SessionID
 }
 
 func safeRouterLabel(value string) string {

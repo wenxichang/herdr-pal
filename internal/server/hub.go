@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
 )
@@ -122,6 +123,9 @@ func (hub *ClientHub) Select(ctx context.Context, userID string, target relaypro
 	if connection == nil {
 		return ErrClientUnavailable
 	}
+	if _, err := hub.catalog.ResolveTarget(userID, targetFromLegacy(target)); err != nil {
+		return err
+	}
 	frame, err := relayproto.NewFrame(relayproto.TypeSelectRequest, randomHubID(), relayproto.SelectRequest{Target: target})
 	if err != nil {
 		return err
@@ -145,6 +149,9 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target relaypr
 	connection := hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID})
 	if connection == nil {
 		return RelayExecution{}, ErrClientUnavailable
+	}
+	if _, err := hub.catalog.ResolveTarget(userID, targetFromLegacy(target)); err != nil {
+		return RelayExecution{}, err
 	}
 	frame, err := relayproto.NewFrame(relayproto.TypeExecuteRequest, randomHubID(), relayproto.ExecuteRequest{
 		Target: target, MessageID: message.MessageID, UserID: userID, Content: message.Content,
@@ -234,7 +241,7 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 	}
 	firstSnapshot, err := relayproto.DecodePayload[relayproto.SessionSnapshot](firstFrame)
 	if err == nil {
-		err = hub.catalog.ApplySnapshot(connectionID, firstSnapshot)
+		err = hub.catalog.ApplySnapshot(connectionID, snapshotFromLegacy(firstSnapshot))
 	}
 	if err != nil {
 		args := append(connectionLogArgs(connection), "stage", "first_snapshot", "snapshot_sequence", firstSnapshot.Sequence, "session_count", len(firstSnapshot.Sessions))
@@ -272,7 +279,7 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 		case relayproto.TypeSessionSnapshot:
 			snapshot, err := relayproto.DecodePayload[relayproto.SessionSnapshot](frame)
 			if err == nil {
-				err = hub.catalog.ApplySnapshot(connection.id, snapshot)
+				err = hub.catalog.ApplySnapshot(connection.id, snapshotFromLegacy(snapshot))
 			}
 			if err != nil {
 				args := append(connectionLogArgs(connection), "stage", "session_snapshot", "snapshot_sequence", snapshot.Sequence, "session_count", len(snapshot.Sessions))
@@ -338,12 +345,12 @@ func (hub *ClientHub) runOutbound(connection *clientConnection) {
 				continue
 			}
 			var err error
-			var target relayproto.SessionRef
+			var target hprp.Target
 			switch frame.Type {
 			case relayproto.TypeExecutePush:
 				var push relayproto.ExecutePush
 				push, err = relayproto.DecodePayload[relayproto.ExecutePush](frame)
-				target = push.Target
+				target = targetFromLegacy(push.Target)
 				if err == nil && (push.Target.MachineID != connection.key.MachineID || relayproto.ValidateSessionRef(push.Target) != nil) {
 					err = ErrTargetChanged
 				}
@@ -353,7 +360,7 @@ func (hub *ClientHub) runOutbound(connection *clientConnection) {
 			case relayproto.TypeNotification:
 				var notification relayproto.Notification
 				notification, err = relayproto.DecodePayload[relayproto.Notification](frame)
-				target = notification.Target
+				target = targetFromLegacy(notification.Target)
 				if err == nil && notification.Target.MachineID != connection.key.MachineID {
 					err = ErrTargetChanged
 				}

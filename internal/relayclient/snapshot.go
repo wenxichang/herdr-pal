@@ -6,25 +6,42 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
-// BuildSnapshot 将本地稳定排序目标转换为完整 Relay 会话快照。
-func BuildSnapshot(sequence uint64, targets []session.Target) relayproto.SessionSnapshot {
-	sessions := make([]relayproto.Session, len(targets))
+// BuildSnapshot 将本地稳定排序目标转换为完整 HPRP 会话快照。
+func BuildSnapshot(sequence uint64, targets []session.Target) hprp.SessionSnapshot {
+	sessions := make([]hprp.Session, len(targets))
 	for index, target := range targets {
-		sessions[index] = relayproto.Session{
-			LocalIndex: index + 1, PaneID: target.PaneID, TerminalID: target.TerminalID,
-			OccupantHash: target.OccupantKey, Agent: target.Agent, DisplayAgent: target.DisplayAgent,
-			Title: target.Title, Workspace: target.Workspace, Tab: target.Tab, Status: string(target.Status),
+		sessions[index] = hprp.Session{
+			SlotID: target.PaneID, SessionID: target.OccupantKey,
+			Display: hprp.SessionDisplay{
+				Index: index + 1, Agent: target.Agent, DisplayAgent: target.DisplayAgent,
+				Title: target.Title, Workspace: target.Workspace, Tab: target.Tab,
+			},
+			Status: string(target.Status),
 		}
 	}
-	return relayproto.SessionSnapshot{Sequence: sequence, Sessions: sessions}
+	return hprp.SessionSnapshot{Sequence: sequence, Sessions: sessions}
+}
+
+func snapshotToLegacy(snapshot hprp.SessionSnapshot) relayproto.SessionSnapshot {
+	sessions := make([]relayproto.Session, len(snapshot.Sessions))
+	for index, current := range snapshot.Sessions {
+		sessions[index] = relayproto.Session{
+			LocalIndex: current.Display.Index, PaneID: current.SlotID, OccupantHash: current.SessionID,
+			Agent: current.Display.Agent, DisplayAgent: current.Display.DisplayAgent,
+			Workspace: current.Display.Workspace, Tab: current.Display.Tab, Title: current.Display.Title,
+			Status: current.Status,
+		}
+	}
+	return relayproto.SessionSnapshot{Sequence: snapshot.Sequence, Sessions: sessions}
 }
 
 // SnapshotFingerprint 返回忽略 sequence 的快照内容摘要。
-func SnapshotFingerprint(snapshot relayproto.SessionSnapshot) string {
+func SnapshotFingerprint(snapshot hprp.SessionSnapshot) string {
 	encoded, _ := json.Marshal(snapshot.Sessions)
 	digest := sha256.Sum256(encoded)
 	return fmt.Sprintf("%x", digest)

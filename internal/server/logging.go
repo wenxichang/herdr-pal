@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
@@ -104,12 +105,11 @@ func connectionLogArgs(connection *clientConnection) []any {
 	}
 }
 
-func targetLogArgs(target relayproto.SessionRef) []any {
+func targetLogArgs(target hprp.Target) []any {
 	return []any{
 		"machine_id", safeLogValue(target.MachineID),
-		"local_index", target.LocalIndex,
-		"pane_id", safeLogValue(target.PaneID),
-		"occupant_hash", routerHash(target.OccupantHash),
+		"pane_id", safeLogValue(target.SlotID),
+		"occupant_hash", routerHash(target.SessionID),
 	}
 }
 

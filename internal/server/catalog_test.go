@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
 )
 
@@ -26,44 +27,49 @@ func TestCatalogRejectsDuplicateCompositeKeyButAllowsSameMachineForOtherUser(t *
 func TestCatalogAppliesOnlyIncreasingFullSnapshots(t *testing.T) {
 	catalog := NewSessionCatalog()
 	_, _ = catalog.Attach("conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"})
-	first := relayproto.SessionSnapshot{Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "first")}}
+	first := hprp.SessionSnapshot{Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-1", "first")}}
 	if err := catalog.ApplySnapshot("conn-1", first); err != nil {
 		t.Fatalf("ApplySnapshot(first) error = %v", err)
+	}
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "ignored-pane", "ignored-session", "ignored")},
+	}); err != nil {
+		t.Fatalf("ApplySnapshot(idempotent) error = %v", err)
+	}
+	second := hprp.SessionSnapshot{Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-2", "occ-2", "second")}}
+	if err := catalog.ApplySnapshot("conn-1", second); err != nil {
+		t.Fatalf("ApplySnapshot(second) error = %v", err)
 	}
 	if err := catalog.ApplySnapshot("conn-1", first); !errors.Is(err, ErrSnapshotStale) {
 		t.Fatalf("ApplySnapshot(stale) error = %v", err)
 	}
-	second := relayproto.SessionSnapshot{Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-2", "occ-2", "second")}}
-	if err := catalog.ApplySnapshot("conn-1", second); err != nil {
-		t.Fatalf("ApplySnapshot(second) error = %v", err)
-	}
 	entries := catalog.CreateNumberedSnapshot("user-a")
-	if len(entries) != 1 || entries[0].Session.PaneID != "pane-2" || entries[0].Session.Title != "second" {
+	if len(entries) != 1 || entries[0].Session.SlotID != "pane-2" || entries[0].Session.Display.Title != "second" {
 		t.Fatalf("entries = %#v", entries)
 	}
 }
 
 func TestCatalogCreatesStableCrossMachineNumbering(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-z", ClientKey{UserID: "user-a", MachineID: "z-machine"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-z", "occ-z", "Z")},
+	attachSnapshot(t, catalog, "conn-z", ClientKey{UserID: "user-a", MachineID: "z-machine"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-z", "occ-z", "Z")},
 	})
-	attachSnapshot(t, catalog, "conn-a", ClientKey{UserID: "user-a", MachineID: "a-machine"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{
-			relaySession(2, "pane-a2", "occ-a2", "A2"),
-			relaySession(1, "pane-a1", "occ-a1", "A1"),
+	attachSnapshot(t, catalog, "conn-a", ClientKey{UserID: "user-a", MachineID: "a-machine"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(2, "pane-a2", "occ-a2", "A2"),
+			hprpSession(1, "pane-a1", "occ-a1", "A1"),
 		},
 	})
 
 	entries := catalog.CreateNumberedSnapshot("user-a")
-	got := make([]relayproto.SessionRef, len(entries))
+	got := make([]hprp.Target, len(entries))
 	for index := range entries {
 		got[index] = entries[index].Ref
 	}
-	want := []relayproto.SessionRef{
-		{MachineID: "a-machine", LocalIndex: 1, PaneID: "pane-a1", OccupantHash: "occ-a1"},
-		{MachineID: "a-machine", LocalIndex: 2, PaneID: "pane-a2", OccupantHash: "occ-a2"},
-		{MachineID: "z-machine", LocalIndex: 1, PaneID: "pane-z", OccupantHash: "occ-z"},
+	want := []hprp.Target{
+		{MachineID: "a-machine", SlotID: "pane-a1", SessionID: "occ-a1"},
+		{MachineID: "a-machine", SlotID: "pane-a2", SessionID: "occ-a2"},
+		{MachineID: "z-machine", SlotID: "pane-z", SessionID: "occ-z"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("numbering = %#v, want %#v", got, want)
@@ -76,8 +82,8 @@ func TestCatalogCreatesStableCrossMachineNumbering(t *testing.T) {
 
 func TestCatalogDetachInvalidatesNumberingAndSelection(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "title")},
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-1", "title")},
 	})
 	entries := catalog.CreateNumberedSnapshot("user-a")
 	if err := catalog.SetSelection("user-a", entries[0].Ref); err != nil {
@@ -99,15 +105,15 @@ func TestCatalogDetachInvalidatesNumberingAndSelection(t *testing.T) {
 
 func TestCatalogInvalidatesSelectionWhenOccupantChanges(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "title")},
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-1", "title")},
 	})
 	entry := catalog.CreateNumberedSnapshot("user-a")[0]
 	if err := catalog.SetSelection("user-a", entry.Ref); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-		Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-2", "new")},
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-2", "new")},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -121,11 +127,11 @@ func TestCatalogInvalidatesSelectionWhenOccupantChanges(t *testing.T) {
 
 func TestCatalogRebindSelectionWaitsForReplacementSnapshot(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "old")},
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-1", "old")},
 	})
-	oldTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
-	newTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-2"}
+	oldTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
+	newTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-2"}
 	if err := catalog.SetSelection("user-a", oldTarget); err != nil {
 		t.Fatal(err)
 	}
@@ -138,8 +144,8 @@ func TestCatalogRebindSelectionWaitsForReplacementSnapshot(t *testing.T) {
 		t.Fatalf("RebindSelection() returned before snapshot: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-		Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-2", "new")},
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-2", "new")},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -154,15 +160,15 @@ func TestCatalogRebindSelectionWaitsForReplacementSnapshot(t *testing.T) {
 
 func TestCatalogRebindSelectionDoesNotOverwriteNewSelection(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{
-			relaySession(1, "pane-1", "occ-1", "old"),
-			relaySession(2, "pane-2", "occ-other", "other"),
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-1", "old"),
+			hprpSession(2, "pane-2", "occ-other", "other"),
 		},
 	})
-	oldTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
-	newTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-2"}
-	otherTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 2, PaneID: "pane-2", OccupantHash: "occ-other"}
+	oldTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
+	newTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-2"}
+	otherTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "occ-other"}
 	if err := catalog.SetSelection("user-a", oldTarget); err != nil {
 		t.Fatal(err)
 	}
@@ -174,10 +180,10 @@ func TestCatalogRebindSelectionDoesNotOverwriteNewSelection(t *testing.T) {
 	if err := catalog.SetSelection("user-a", otherTarget); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-		Sequence: 2, Sessions: []relayproto.Session{
-			relaySession(1, "pane-1", "occ-2", "new"),
-			relaySession(2, "pane-2", "occ-other", "other"),
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-2", "new"),
+			hprpSession(2, "pane-2", "occ-other", "other"),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -193,14 +199,14 @@ func TestCatalogRebindSelectionDoesNotOverwriteNewSelection(t *testing.T) {
 
 func TestCatalogWaitForTargetDoesNotChangeSelection(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{
-			relaySession(1, "pane-1", "occ-current", "current"),
-			relaySession(2, "pane-2", "occ-old", "old"),
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-current", "current"),
+			hprpSession(2, "pane-2", "occ-old", "old"),
 		},
 	})
-	current := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-current"}
-	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 2, PaneID: "pane-2", OccupantHash: "occ-new"}
+	current := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-current"}
+	replacement := hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "occ-new"}
 	if err := catalog.SetSelection("user-a", current); err != nil {
 		t.Fatal(err)
 	}
@@ -216,10 +222,10 @@ func TestCatalogWaitForTargetDoesNotChangeSelection(t *testing.T) {
 		t.Fatalf("WaitForTarget() returned before snapshot: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-		Sequence: 2, Sessions: []relayproto.Session{
-			relaySession(1, "pane-1", "occ-current", "current"),
-			relaySession(2, "pane-2", "occ-new", "new"),
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-current", "current"),
+			hprpSession(2, "pane-2", "occ-new", "new"),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -235,10 +241,10 @@ func TestCatalogWaitForTargetDoesNotChangeSelection(t *testing.T) {
 
 func TestCatalogSetSelectionWhenAvailableWaitsForSnapshot(t *testing.T) {
 	catalog := NewSessionCatalog()
-	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-old", "old")},
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-old", "old")},
 	})
-	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-new"}
+	replacement := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-new"}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	done := make(chan error, 1)
@@ -248,8 +254,8 @@ func TestCatalogSetSelectionWhenAvailableWaitsForSnapshot(t *testing.T) {
 		t.Fatalf("SetSelectionWhenAvailable() returned before snapshot: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	if err := catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-		Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-new", "new")},
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-new", "new")},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -262,19 +268,36 @@ func TestCatalogSetSelectionWhenAvailableWaitsForSnapshot(t *testing.T) {
 	}
 }
 
-func attachSnapshot(t *testing.T, catalog *SessionCatalog, connectionID string, key ClientKey, snapshot relayproto.SessionSnapshot) {
+func attachSnapshot(t *testing.T, catalog *SessionCatalog, connectionID string, key ClientKey, snapshot any) {
 	t.Helper()
 	if _, err := catalog.Attach(connectionID, key); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.ApplySnapshot(connectionID, snapshot); err != nil {
+	var current hprp.SessionSnapshot
+	switch value := snapshot.(type) {
+	case hprp.SessionSnapshot:
+		current = value
+	case relayproto.SessionSnapshot:
+		current = snapshotFromLegacy(value)
+	default:
+		t.Fatalf("unsupported snapshot type %T", snapshot)
+	}
+	if err := catalog.ApplySnapshot(connectionID, current); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func hprpSession(index int, paneID, occupant, title string) hprp.Session {
+	return hprp.Session{
+		SlotID: paneID, SessionID: occupant,
+		Display: hprp.SessionDisplay{Index: index, Agent: "codex", DisplayAgent: "Codex", Title: title, Workspace: "workspace", Tab: "main"},
+		Status:  "working",
 	}
 }
 
 func relaySession(index int, paneID, occupant, title string) relayproto.Session {
 	return relayproto.Session{
-		LocalIndex: index, PaneID: paneID, TerminalID: "terminal-" + paneID, OccupantHash: occupant,
+		LocalIndex: index, PaneID: paneID, OccupantHash: occupant,
 		Agent: "codex", DisplayAgent: "Codex", Title: title, Workspace: "workspace", Tab: "main", Status: "working",
 	}
 }

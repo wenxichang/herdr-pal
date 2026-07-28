@@ -23,7 +23,7 @@ func TestHubAcceptsHelloAndFirstFullSnapshot(t *testing.T) {
 	defer client.Close()
 	eventuallyHub(t, func() bool {
 		entries := hub.Catalog().CreateNumberedSnapshot("user-a")
-		return len(entries) == 1 && entries[0].Session.Title == "title"
+		return len(entries) == 1 && entries[0].Session.Display.Title == "title"
 	})
 }
 
@@ -257,7 +257,7 @@ func TestHubVerboseLogsOutboundEventAndExplicitWeComFailure(t *testing.T) {
 		return strings.Contains(output, "Relay 客户端上报已接收") && strings.Contains(output, "event_type=notification") &&
 			strings.Contains(output, "Relay 出站消息发送失败") && strings.Contains(output, "error_type=wecom_protocol") &&
 			strings.Contains(output, "error_code=93000") && strings.Contains(output, "machine_id=home-mac") &&
-			strings.Contains(output, "pane_id=pane-1") && strings.Contains(output, "local_index=1")
+			strings.Contains(output, "pane_id=pane-1") && strings.Contains(output, "occupant_hash=")
 	})
 	if output := logs.String(); strings.Contains(output, "private-terminal-output") || strings.Contains(output, "user-a") {
 		t.Fatalf("logs leaked content or userid: %s", output)

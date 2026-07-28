@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -270,8 +271,8 @@ func TestRouterTerminalDecorationRejectsSourceRemovedAfterResolution(t *testing.
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
 		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
 	})
-	entry, err := router.catalog.ResolveTarget("user-a", relayproto.SessionRef{
-		MachineID: "home-mac", LocalIndex: 1, PaneID: "w1:p1", OccupantHash: "occ-1",
+	entry, err := router.catalog.ResolveTarget("user-a", hprp.Target{
+		MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +366,7 @@ func TestRouterDirectedSlashExecutesTargetAndSwitchesAfterSuccess(t *testing.T) 
 	router.Handle(context.Background(), routerMessage("request-directed", "message-directed", "user-a", "/2 继续处理"))
 
 	calls := relay.Calls()
-	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, office.Ref) || calls[0].message.Content != "继续处理" {
+	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(targetFromLegacy(calls[0].target), office.Ref) || calls[0].message.Content != "继续处理" {
 		t.Fatalf("relay calls = %#v", calls)
 	}
 	selected, err := router.catalog.Selected("user-a")
@@ -386,7 +387,7 @@ func TestRouterDirectedHashExecutesTargetWithoutSwitching(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-directed", "message-directed", "user-a", "#2 /con"))
 
 	calls := relay.Calls()
-	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, office.Ref) || calls[0].message.Content != "/con" {
+	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(targetFromLegacy(calls[0].target), office.Ref) || calls[0].message.Content != "/con" {
 		t.Fatalf("relay calls = %#v", calls)
 	}
 	selected, err := router.catalog.Selected("user-a")
@@ -433,11 +434,11 @@ func TestRouterDirectedSlashKeepsSelectionWhenExecutionTimesOut(t *testing.T) {
 
 func TestRouterDirectedSlashSelectsReplacementReturnedByClient(t *testing.T) {
 	router, _, relay, _, office := directedRouterHarness(t)
-	replacement := office.Ref
+	replacement := targetToLegacy(office.Ref, office.Session.Display.Index)
 	replacement.OccupantHash = "occ-office-new"
 	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
-		if err := router.catalog.ApplySnapshot("conn-office", relayproto.SessionSnapshot{
-			Sequence: 2, Sessions: []relayproto.Session{relaySession(2, "pane-office", replacement.OccupantHash, "office-new")},
+		if err := router.catalog.ApplySnapshot("conn-office", hprp.SessionSnapshot{
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(2, "pane-office", replacement.OccupantHash, "office-new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -447,18 +448,18 @@ func TestRouterDirectedSlashSelectsReplacementReturnedByClient(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "/2 /slash clear"))
 
 	selected, err := router.catalog.Selected("user-a")
-	if err != nil || !sameSessionRef(selected.Ref, replacement) {
+	if err != nil || !sameSessionRef(selected.Ref, targetFromLegacy(replacement)) {
 		t.Fatalf("Selected() = %#v, %v, want replacement %#v", selected, err, replacement)
 	}
 }
 
 func TestRouterDirectedHashDoesNotSelectNoncurrentReplacement(t *testing.T) {
 	router, _, relay, home, office := directedRouterHarness(t)
-	replacement := office.Ref
+	replacement := targetToLegacy(office.Ref, office.Session.Display.Index)
 	replacement.OccupantHash = "occ-office-new"
 	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
-		if err := router.catalog.ApplySnapshot("conn-office", relayproto.SessionSnapshot{
-			Sequence: 2, Sessions: []relayproto.Session{relaySession(2, "pane-office", replacement.OccupantHash, "office-new")},
+		if err := router.catalog.ApplySnapshot("conn-office", hprp.SessionSnapshot{
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(2, "pane-office", replacement.OccupantHash, "office-new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -477,8 +478,8 @@ func TestRouterDirectedHashKeepsCurrentLogicalSessionAfterReplacement(t *testing
 	router, _, relay := selectedRouterHarness(t)
 	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-new"}
 	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
-		if err := router.catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-			Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-1", replacement.OccupantHash, "new")},
+		if err := router.catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", replacement.OccupantHash, "new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -488,7 +489,7 @@ func TestRouterDirectedHashKeepsCurrentLogicalSessionAfterReplacement(t *testing
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement-hash-current", "user-a", "#1 /slash clear"))
 
 	selected, err := router.catalog.Selected("user-a")
-	if err != nil || !sameSessionRef(selected.Ref, replacement) {
+	if err != nil || !sameSessionRef(selected.Ref, targetFromLegacy(replacement)) {
 		t.Fatalf("Selected() = %#v, %v, want replacement %#v", selected, err, replacement)
 	}
 }
@@ -497,8 +498,8 @@ func TestRouterCurrentExecutionRebindsReplacementReturnedByClient(t *testing.T) 
 	router, _, relay := selectedRouterHarness(t)
 	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-new"}
 	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
-		if err := router.catalog.ApplySnapshot("conn-1", relayproto.SessionSnapshot{
-			Sequence: 2, Sessions: []relayproto.Session{relaySession(1, "pane-1", replacement.OccupantHash, "new")},
+		if err := router.catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", replacement.OccupantHash, "new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -508,7 +509,7 @@ func TestRouterCurrentExecutionRebindsReplacementReturnedByClient(t *testing.T) 
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "/slash clear"))
 
 	selected, err := router.catalog.Selected("user-a")
-	if err != nil || !sameSessionRef(selected.Ref, replacement) {
+	if err != nil || !sameSessionRef(selected.Ref, targetFromLegacy(replacement)) {
 		t.Fatalf("Selected() = %#v, %v, want replacement %#v", selected, err, replacement)
 	}
 }
@@ -586,7 +587,7 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
 	})
 	entries := router.catalog.CreateNumberedSnapshot("user-a")
-	var selected relayproto.SessionRef
+	var selected hprp.Target
 	for _, entry := range entries {
 		if entry.Ref.MachineID == "office-pc" {
 			selected = entry.Ref
@@ -643,7 +644,7 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
 	})
 	entries := router.catalog.CreateNumberedSnapshot("user-a")
-	var selected relayproto.SessionRef
+	var selected hprp.Target
 	for _, entry := range entries {
 		if entry.Ref.MachineID == "office-pc" {
 			selected = entry.Ref
@@ -686,10 +687,10 @@ func TestRouterUsesBriefBackgroundNoticeWhileUserIsActive(t *testing.T) {
 	now = now.Add(time.Minute)
 
 	err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{
-		Target: office.Ref,
+		Target: targetToLegacy(office.Ref, office.Session.Display.Index),
 		Content: panel.RenderPageWithTotal(session.Target{
-			PaneID: office.Session.PaneID, Agent: office.Session.Agent,
-			Workspace: office.Session.Workspace, Tab: office.Session.Tab,
+			PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
+			Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
 		}, 1, 1, []string{"不应发送的完整后台输出"}),
 	})
 	if err != nil {
@@ -709,12 +710,12 @@ func TestRouterBackgroundNoticeRefreshesActivityWindow(t *testing.T) {
 	router.now = func() time.Time { return now }
 	router.Handle(context.Background(), routerMessage("request-help", "message-help-window", "user-a", "/help"))
 	content := panel.RenderPageWithTotal(session.Target{
-		PaneID: office.Session.PaneID, Agent: office.Session.Agent,
-		Workspace: office.Session.Workspace, Tab: office.Session.Tab,
+		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
+		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
 	}, 1, 1, []string{"后台输出"})
 	notify := func() {
 		t.Helper()
-		if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: office.Ref, Content: content}); err != nil {
+		if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: targetToLegacy(office.Ref, office.Session.Display.Index), Content: content}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -741,10 +742,10 @@ func TestRouterCurrentOutputRefreshesSharedUserActivity(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	router.now = func() time.Time { return now }
 	currentContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: home.Session.PaneID, Agent: home.Session.Agent,
-		Workspace: home.Session.Workspace, Tab: home.Session.Tab,
+		PaneID: home.Session.SlotID, Agent: home.Session.Display.Agent,
+		Workspace: home.Session.Display.Workspace, Tab: home.Session.Display.Tab,
 	}, 1, 1, []string{"当前会话完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{Target: home.Ref, Content: currentContent}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{Target: targetToLegacy(home.Ref, home.Session.Display.Index), Content: currentContent}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gateway.LastReply(), "当前会话完整输出") {
@@ -753,10 +754,10 @@ func TestRouterCurrentOutputRefreshesSharedUserActivity(t *testing.T) {
 
 	now = now.Add(time.Minute)
 	backgroundContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: office.Session.PaneID, Agent: office.Session.Agent,
-		Workspace: office.Session.Workspace, Tab: office.Session.Tab,
+		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
+		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
 	}, 1, 1, []string{"后台完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: office.Ref, Content: backgroundContent}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: targetToLegacy(office.Ref, office.Session.Display.Index), Content: backgroundContent}); err != nil {
 		t.Fatal(err)
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出") || strings.Contains(reply, "后台完整输出") {
@@ -769,10 +770,10 @@ func TestRouterExecutePushStaysFullAndRefreshesActivity(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	router.now = func() time.Time { return now }
 	pushContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: home.Session.PaneID, Agent: home.Session.Agent,
-		Workspace: home.Session.Workspace, Tab: home.Session.Tab,
+		PaneID: home.Session.SlotID, Agent: home.Session.Display.Agent,
+		Workspace: home.Session.Display.Workspace, Tab: home.Session.Display.Tab,
 	}, 1, 1, []string{"必须保留的后续分段"})
-	if err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{Target: home.Ref, Content: pushContent}); err != nil {
+	if err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{Target: targetToLegacy(home.Ref, home.Session.Display.Index), Content: pushContent}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gateway.LastReply(), "必须保留的后续分段") {
@@ -781,10 +782,10 @@ func TestRouterExecutePushStaysFullAndRefreshesActivity(t *testing.T) {
 
 	now = now.Add(time.Minute)
 	backgroundContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: office.Session.PaneID, Agent: office.Session.Agent,
-		Workspace: office.Session.Workspace, Tab: office.Session.Tab,
+		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
+		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
 	}, 1, 1, []string{"不应发送的后台完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: office.Ref, Content: backgroundContent}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: targetToLegacy(office.Ref, office.Session.Display.Index), Content: backgroundContent}); err != nil {
 		t.Fatal(err)
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出") || strings.Contains(reply, "不应发送的后台完整输出") {

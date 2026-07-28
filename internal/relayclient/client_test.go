@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/server"
@@ -105,12 +106,12 @@ func TestClientReportsChangedSnapshotWithoutWaitingForCalibration(t *testing.T) 
 	defer func() { cancel(); <-done }()
 	eventuallyClient(t, func() bool {
 		entries := hub.Catalog().CreateNumberedSnapshot("user-a")
-		return len(entries) == 1 && entries[0].Session.Title == "old"
+		return len(entries) == 1 && entries[0].Session.Display.Title == "old"
 	})
 	executor.SetTitle("new")
 	eventuallyClient(t, func() bool {
 		entries := hub.Catalog().CreateNumberedSnapshot("user-a")
-		return len(entries) == 1 && entries[0].Session.Title == "new"
+		return len(entries) == 1 && entries[0].Session.Display.Title == "new"
 	})
 }
 
@@ -141,7 +142,7 @@ func TestClientVerboseLogsConnectionAndSnapshotDetailsWithoutSensitiveContent(t 
 	executor.SetTitle("private-updated-title")
 	eventuallyClient(t, func() bool {
 		entries := hub.Catalog().CreateNumberedSnapshot("user-a")
-		return len(entries) == 1 && entries[0].Session.Title == "private-updated-title"
+		return len(entries) == 1 && entries[0].Session.Display.Title == "private-updated-title"
 	})
 	eventuallyClient(t, func() bool { return strings.Contains(logs.String(), "snapshot_sequence=2") })
 
@@ -202,7 +203,7 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	eventuallyClient(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
 	oldTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
-	if err := hub.Catalog().SetSelection("user-a", oldTarget); err != nil {
+	if err := hub.Catalog().SetSelection("user-a", hprp.Target{MachineID: oldTarget.MachineID, SlotID: oldTarget.PaneID, SessionID: oldTarget.OccupantHash}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -212,12 +213,14 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 	if err != nil || result.Content != "handled: prompt" || result.SelectedTarget == nil {
 		t.Fatalf("Execute() = %#v, %v", result, err)
 	}
-	if err := hub.Catalog().RebindSelection(context.Background(), "user-a", oldTarget, *result.SelectedTarget); err != nil {
+	if err := hub.Catalog().RebindSelection(context.Background(), "user-a",
+		hprp.Target{MachineID: oldTarget.MachineID, SlotID: oldTarget.PaneID, SessionID: oldTarget.OccupantHash},
+		hprp.Target{MachineID: result.SelectedTarget.MachineID, SlotID: result.SelectedTarget.PaneID, SessionID: result.SelectedTarget.OccupantHash}); err != nil {
 		t.Fatal(err)
 	}
 	eventuallyClient(t, func() bool {
 		selected, selectedErr := hub.Catalog().Selected("user-a")
-		return selectedErr == nil && selected.Ref.OccupantHash == "occ-2"
+		return selectedErr == nil && selected.Ref.SessionID == "occ-2"
 	})
 }
 
@@ -260,7 +263,7 @@ func TestClientUsesReboundTargetForExecutePush(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	eventuallyClient(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
 	oldTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
-	if err := hub.Catalog().SetSelection("user-a", oldTarget); err != nil {
+	if err := hub.Catalog().SetSelection("user-a", hprp.Target{MachineID: oldTarget.MachineID, SlotID: oldTarget.PaneID, SessionID: oldTarget.OccupantHash}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -529,7 +532,7 @@ type resolvingRelayOutboundRecorder struct {
 }
 
 func (recorder *resolvingRelayOutboundRecorder) SendPush(_ context.Context, userID string, push relayproto.ExecutePush) error {
-	_, err := recorder.catalog.ResolveTarget(userID, push.Target)
+	_, err := recorder.catalog.ResolveTarget(userID, hprp.Target{MachineID: push.Target.MachineID, SlotID: push.Target.PaneID, SessionID: push.Target.OccupantHash})
 	recorder.results <- resolvedPush{push: push, err: err}
 	return err
 }

@@ -280,7 +280,7 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 	)
 	sequence := uint64(1)
 	initial := BuildSnapshot(sequence, client.localExecutor().CurrentTargets())
-	if err := current.write(parent, relayproto.TypeSessionSnapshot, "", initial); err != nil {
+	if err := current.write(parent, relayproto.TypeSessionSnapshot, "", snapshotToLegacy(initial)); err != nil {
 		return withRelayStage("initial_snapshot_send", err)
 	}
 	fingerprint := SnapshotFingerprint(initial)
@@ -303,7 +303,7 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 		if !force && !changed {
 			return nil
 		}
-		if err := current.write(parent, relayproto.TypeSessionSnapshot, "", candidate); err != nil {
+		if err := current.write(parent, relayproto.TypeSessionSnapshot, "", snapshotToLegacy(candidate)); err != nil {
 			return withRelayStage("snapshot_send", err)
 		}
 		sequence++
