@@ -8,6 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
 )
@@ -36,10 +37,10 @@ func FormatHuman(writer io.Writer, method adminproto.Method, value any) error {
 		}
 		_, err := fmt.Fprintf(writer,
 			"版本：%s（%s）\nPID：%d\n平台：%s/%s\n运行时间：%s\nHPAP/HPRP：%s / %s\nRelay：%s\nAdmin Socket：%s\n企业微信：%s\nTLS：%s，到期 %s\nDebug：%t（基础级别 %s）\nPrincipal/连接/会话：%d / %d / %d\nKey enabled/disabled/expired：%d / %d / %d\n",
-			result.Version, result.Commit, result.PID, result.GOOS, result.GOARCH,
-			(time.Duration(result.UptimeMS) * time.Millisecond).Round(time.Second), result.HPAP, result.HPRP,
-			result.RelayListen, result.AdminSocket, result.WeCom.State, result.TLS.Mode, formatTime(result.TLS.NotAfter),
-			result.DebugEnabled, result.BaseLogLevel, result.PrincipalCount, result.ConnectionCount, result.SessionCount,
+			safeHuman(result.Version), safeHuman(result.Commit), result.PID, safeHuman(result.GOOS), safeHuman(result.GOARCH),
+			(time.Duration(result.UptimeMS) * time.Millisecond).Round(time.Second), safeHuman(result.HPAP), safeHuman(result.HPRP),
+			safeHuman(result.RelayListen), safeHuman(result.AdminSocket), safeHuman(result.WeCom.State), safeHuman(result.TLS.Mode), formatTime(result.TLS.NotAfter),
+			result.DebugEnabled, safeHuman(result.BaseLogLevel), result.PrincipalCount, result.ConnectionCount, result.SessionCount,
 			result.Credentials.Enabled, result.Credentials.Disabled, result.Credentials.Expired,
 		)
 		return err
@@ -57,7 +58,7 @@ func FormatHuman(writer io.Writer, method adminproto.Method, value any) error {
 		if !ok {
 			return formatTypeError(method)
 		}
-		_, err := fmt.Fprintf(writer, "Debug：%t（基础级别 %s）\n", result.DebugEnabled, result.BaseLogLevel)
+		_, err := fmt.Fprintf(writer, "Debug：%t（基础级别 %s）\n", result.DebugEnabled, safeHuman(result.BaseLogLevel))
 		return err
 	case adminproto.MethodKeyIssue:
 		result, ok := value.(adminproto.KeyIssueResult)
@@ -102,7 +103,7 @@ func FormatHuman(writer io.Writer, method adminproto.Method, value any) error {
 		if !ok {
 			return formatTypeError(method)
 		}
-		_, err := fmt.Fprintf(writer, "Key %d 来源：\n%s\n", result.CredentialID, strings.Join(result.Sources, "\n"))
+		_, err := fmt.Fprintf(writer, "Key %d 来源：\n%s\n", result.CredentialID, strings.Join(safeHumanSlice(result.Sources), "\n"))
 		return err
 	case adminproto.MethodConnectionList:
 		result, ok := value.(adminproto.ConnectionListResult)
@@ -121,7 +122,7 @@ func FormatHuman(writer io.Writer, method adminproto.Method, value any) error {
 		if !ok {
 			return formatTypeError(method)
 		}
-		_, err := fmt.Fprintf(writer, "已断开连接 %s。\n", result.ConnectionID)
+		_, err := fmt.Fprintf(writer, "已断开连接 %s。\n", safeHuman(result.ConnectionID))
 		return err
 	case adminproto.MethodSessionList:
 		result, ok := value.(adminproto.SessionListResult)
@@ -143,7 +144,7 @@ func writeCredentialTable(writer io.Writer, items []adminproto.Credential) error
 		return err
 	}
 	for _, item := range items {
-		if _, err := fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\n", item.CredentialID, item.PrincipalID, item.MachineID, item.Status, strings.Join(item.AllowedSources, ","), formatOptionalTime(item.ExpiresAt)); err != nil {
+		if _, err := fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\n", item.CredentialID, safeHuman(item.PrincipalID), safeHuman(item.MachineID), safeHuman(item.Status), strings.Join(safeHumanSlice(item.AllowedSources), ","), formatOptionalTime(item.ExpiresAt)); err != nil {
 			return err
 		}
 	}
@@ -152,7 +153,7 @@ func writeCredentialTable(writer io.Writer, items []adminproto.Credential) error
 
 func writeCredential(writer io.Writer, item adminproto.Credential) error {
 	_, err := fmt.Fprintf(writer, "ID：%d\nPrincipal：%s\n机器：%s\n状态：%s\n来源：%s\n到期：%s\n创建：%s\n更新：%s\n",
-		item.CredentialID, item.PrincipalID, item.MachineID, item.Status, strings.Join(item.AllowedSources, ", "),
+		item.CredentialID, safeHuman(item.PrincipalID), safeHuman(item.MachineID), safeHuman(item.Status), strings.Join(safeHumanSlice(item.AllowedSources), ", "),
 		formatOptionalTime(item.ExpiresAt), formatTime(item.CreatedAt), formatTime(item.UpdatedAt))
 	return err
 }
@@ -167,7 +168,7 @@ func writeConnectionTable(writer io.Writer, items []adminproto.Connection) error
 		return err
 	}
 	for _, item := range items {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%t\t%d\t%s %s\n", item.ConnectionID, item.PrincipalID, item.MachineID, item.SourceIP, item.Ready, item.SessionCount, item.Implementation.Name, item.Implementation.Version); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%t\t%d\t%s %s\n", safeHuman(item.ConnectionID), safeHuman(item.PrincipalID), safeHuman(item.MachineID), safeHuman(item.SourceIP), item.Ready, item.SessionCount, safeHuman(item.Implementation.Name), safeHuman(item.Implementation.Version)); err != nil {
 			return err
 		}
 	}
@@ -176,10 +177,10 @@ func writeConnectionTable(writer io.Writer, items []adminproto.Connection) error
 
 func writeConnection(writer io.Writer, item adminproto.Connection) error {
 	_, err := fmt.Fprintf(writer, "Connection：%s\nCredential：%d\nPrincipal：%s\n机器：%s\n来源：%s\nPal：%s %s %s/%s\n连接时间：%s\n最近心跳：%s\n最近快照：%s（sequence %d，会话 %d）\nCapabilities：%s\nReady：%t\n",
-		item.ConnectionID, item.CredentialID, item.PrincipalID, item.MachineID, item.SourceIP,
-		item.Implementation.Name, item.Implementation.Version, item.Implementation.OS, item.Implementation.Arch,
+		safeHuman(item.ConnectionID), item.CredentialID, safeHuman(item.PrincipalID), safeHuman(item.MachineID), safeHuman(item.SourceIP),
+		safeHuman(item.Implementation.Name), safeHuman(item.Implementation.Version), safeHuman(item.Implementation.OS), safeHuman(item.Implementation.Arch),
 		formatTime(item.ConnectedAt), formatTime(item.LastHeartbeatAt), formatTime(item.LastSnapshotAt), item.SnapshotSequence, item.SessionCount,
-		strings.Join(item.Capabilities, ", "), item.Ready)
+		strings.Join(safeHumanSlice(item.Capabilities), ", "), item.Ready)
 	return err
 }
 
@@ -197,7 +198,7 @@ func writeSessionTable(writer io.Writer, items []adminproto.Session) error {
 		if agent == "" {
 			agent = item.Agent
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", item.PrincipalID, item.Number, item.Target.MachineID, item.WorkspaceLabel, agent, item.Pane, item.StatusLabel); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", safeHuman(item.PrincipalID), item.Number, safeHuman(item.Target.MachineID), safeHuman(item.WorkspaceLabel), safeHuman(agent), safeHuman(item.Pane), safeHuman(item.StatusLabel)); err != nil {
 			return err
 		}
 	}
@@ -220,4 +221,21 @@ func formatOptionalTime(value *time.Time) string {
 
 func formatTypeError(method adminproto.Method) error {
 	return fmt.Errorf("%s 输出类型无效", method)
+}
+
+func safeHuman(value string) string {
+	return strings.Map(func(character rune) rune {
+		if unicode.IsControl(character) {
+			return '\uFFFD'
+		}
+		return character
+	}, value)
+}
+
+func safeHumanSlice(values []string) []string {
+	result := make([]string, len(values))
+	for index, value := range values {
+		result[index] = safeHuman(value)
+	}
+	return result
 }

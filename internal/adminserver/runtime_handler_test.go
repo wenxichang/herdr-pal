@@ -78,6 +78,27 @@ func TestServerRuntimeHandlerRejectsUnexpectedParams(t *testing.T) {
 	assertKeyError(t, result.Response, adminproto.CodeArgumentInvalid)
 }
 
+func TestServerRuntimeHandlerReleasesStopReservationWhenResponseWriteFails(t *testing.T) {
+	runtime := &fakeRuntimeInspector{}
+	handler, err := NewRuntimeHandler(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := handleRuntimeRequest(t, handler, adminproto.MethodServerStop, adminproto.EmptyParams{})
+	if first.AfterWriteFailure == nil {
+		t.Fatal("server.stop did not provide write failure rollback")
+	}
+	first.AfterWriteFailure()
+	second := handleRuntimeRequest(t, handler, adminproto.MethodServerStop, adminproto.EmptyParams{})
+	if second.Response.Error != nil || second.AfterWrite == nil {
+		t.Fatalf("server.stop remained busy after write failure: %#v", second.Response)
+	}
+	second.AfterWrite()
+	if runtime.stopCalls != 1 {
+		t.Fatalf("stop calls = %d, want 1", runtime.stopCalls)
+	}
+}
+
 func handleRuntimeRequest(t *testing.T, handler *RuntimeHandler, method adminproto.Method, params any) HandleResult {
 	t.Helper()
 	encoded, err := json.Marshal(params)

@@ -40,11 +40,12 @@ type storeFile struct {
 type Store struct {
 	path string
 
-	mu      sync.RWMutex
-	records map[uint64]Record
-	nextID  uint64
-	now     func() time.Time
-	random  io.Reader
+	mu            sync.RWMutex
+	records       map[uint64]Record
+	nextID        uint64
+	now           func() time.Time
+	random        io.Reader
+	syncDirectory func(string) error
 }
 
 // LoadStore 从权限受限的 JSON 文件加载凭据；文件不存在时返回从 ID 1 开始的空存储。
@@ -52,7 +53,10 @@ func LoadStore(path string) (*Store, error) {
 	if filepath.Clean(path) == "." || path == "" {
 		return nil, ErrInvalidRecord
 	}
-	store := &Store{path: path, records: make(map[uint64]Record), nextID: 1, now: time.Now, random: rand.Reader}
+	store := &Store{
+		path: path, records: make(map[uint64]Record), nextID: 1,
+		now: time.Now, random: rand.Reader, syncDirectory: syncStoreDirectory,
+	}
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return store, nil
@@ -352,21 +356,21 @@ func (store *Store) persistRecordsLocked(records map[uint64]Record) error {
 	if err := os.Rename(temporaryPath, store.path); err != nil {
 		return fmt.Errorf("替换凭据文件: %w", err)
 	}
-	if runtime.GOOS != "windows" {
-		directoryHandle, err := os.Open(directory)
-		if err != nil {
-			return fmt.Errorf("打开凭据目录: %w", err)
-		}
-		syncErr := directoryHandle.Sync()
-		closeErr := directoryHandle.Close()
-		if syncErr != nil {
-			return fmt.Errorf("同步凭据目录: %w", syncErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("关闭凭据目录: %w", closeErr)
-		}
+	if runtime.GOOS != "windows" && store.syncDirectory != nil {
+		// rename 是文件与内存共同提交点；其后的目录同步只增强崩溃耐久性，不能把已提交变更伪装成回滚。
+		_ = store.syncDirectory(directory)
 	}
 	return nil
+}
+
+func syncStoreDirectory(directory string) error {
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	syncErr := directoryHandle.Sync()
+	closeErr := directoryHandle.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
 func sortedRecords(records map[uint64]Record) []Record {

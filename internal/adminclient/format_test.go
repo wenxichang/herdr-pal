@@ -70,3 +70,28 @@ func TestFormatHumanPrintsTokenOnlyForIssueResult(t *testing.T) {
 		t.Fatalf("show output leaked token: %q", showOutput.String())
 	}
 }
+
+func TestFormatHumanSanitizesControlCharactersFromRuntimeData(t *testing.T) {
+	value := adminproto.SessionListResult{Items: []adminproto.Session{{
+		PrincipalID:    "user\x1b[31m",
+		Number:         1,
+		Target:         adminproto.SessionTarget{MachineID: "home"},
+		WorkspaceLabel: "workspace\troot\nnext",
+		DisplayAgent:   "Codex\rAgent",
+		Pane:           "w1:p1",
+		StatusLabel:    "done\x00",
+	}}}
+	var output bytes.Buffer
+	if err := FormatHuman(&output, adminproto.MethodSessionList, value); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if strings.ContainsAny(got, "\x00\x1b\r\t") || strings.Contains(got, "workspace\n") {
+		t.Fatalf("FormatHuman() retained terminal controls: %q", got)
+	}
+	for _, want := range []string{"user�[31m", "workspace�root�next", "Codex�Agent", "done�"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("FormatHuman() = %q, want sanitized %q", got, want)
+		}
+	}
+}

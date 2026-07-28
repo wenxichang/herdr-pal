@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/hprp"
@@ -179,5 +180,13 @@ func validateSourceRules(rules []SourceRule) error {
 }
 
 func validPrincipalID(value string) bool {
-	return strings.TrimSpace(value) != "" && utf8.ValidString(value) && len(value) <= hprp.MaxLabelBytes
+	if value == "" || strings.TrimSpace(value) != value || !utf8.ValidString(value) || len(value) > hprp.MaxLabelBytes {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }

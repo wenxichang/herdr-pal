@@ -191,6 +191,27 @@ func TestStorePersistenceFailureRollsBackMemory(t *testing.T) {
 	}
 }
 
+func TestStorePostRenameDirectorySyncFailureKeepsDiskAndMemoryCommitted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store := loadStoreForTest(t, path)
+	record := issueStoreRecord(t, store, "machine")
+	store.syncDirectory = func(string) error { return errors.New("directory sync unavailable") }
+
+	disabled, err := store.Disable(record.CredentialID)
+	if err != nil || disabled.Status != StatusDisabled {
+		t.Fatalf("Disable() = %#v, %v", disabled, err)
+	}
+	shown, err := store.Show(record.CredentialID)
+	if err != nil || shown.Status != StatusDisabled {
+		t.Fatalf("Show() after committed rename = %#v, %v", shown, err)
+	}
+	reloaded := loadStoreForTest(t, path)
+	reloadedRecord, err := reloaded.Show(record.CredentialID)
+	if err != nil || reloadedRecord.Status != StatusDisabled {
+		t.Fatalf("reloaded record after committed rename = %#v, %v", reloadedRecord, err)
+	}
+}
+
 func TestLoadStoreRejectsBroadPermissionsOldFormatAndDuplicateID(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		path := filepath.Join(t.TempDir(), "credentials.json")

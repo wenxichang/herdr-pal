@@ -113,6 +113,9 @@ func TestIssueRejectsInvalidRecordInputs(t *testing.T) {
 	}{
 		{name: "zero id", id: 0, principal: "user", machine: "home", sources: []SourceRule{"127.0.0.1"}, expiresAt: &future},
 		{name: "empty principal", id: 1, machine: "home", sources: []SourceRule{"127.0.0.1"}, expiresAt: &future},
+		{name: "principal with leading space", id: 1, principal: " user", machine: "home", sources: []SourceRule{"127.0.0.1"}, expiresAt: &future},
+		{name: "principal with trailing space", id: 1, principal: "user ", machine: "home", sources: []SourceRule{"127.0.0.1"}, expiresAt: &future},
+		{name: "principal with control", id: 1, principal: "user\nother", machine: "home", sources: []SourceRule{"127.0.0.1"}, expiresAt: &future},
 		{name: "bad machine", id: 1, principal: "user", machine: "bad machine", sources: []SourceRule{"127.0.0.1"}, expiresAt: &future},
 		{name: "empty sources", id: 1, principal: "user", machine: "home", expiresAt: &future},
 		{name: "noncanonical source", id: 1, principal: "user", machine: "home", sources: []SourceRule{"192.168.1.42/24"}, expiresAt: &future},

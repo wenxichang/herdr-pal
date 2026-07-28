@@ -63,6 +63,7 @@ func (handler *RuntimeHandler) Handle(_ context.Context, request adminproto.Requ
 			return HandleResult{}, err
 		}
 		result.AfterWrite = func() { handler.runtime.RequestStop() }
+		result.AfterWriteFailure = func() { handler.stopping.Store(false) }
 		return result, nil
 	default:
 		return HandleResult{}, errInvalidRuntimeHandler

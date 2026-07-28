@@ -34,11 +34,12 @@ func (handler HandlerFunc) Handle(ctx context.Context, request adminproto.Reques
 	return handler(ctx, request)
 }
 
-// HandleResult 包含唯一响应、可审计目标和响应写完后才允许执行的动作。
+// HandleResult 包含唯一响应、可审计目标，以及响应写入成功或失败后的互斥动作。
 type HandleResult struct {
-	Response    adminproto.Response
-	AuditTarget string
-	AfterWrite  func()
+	Response          adminproto.Response
+	AuditTarget       string
+	AfterWrite        func()
+	AfterWriteFailure func()
 }
 
 // ServerConfig 指定 HPAP 请求处理器、审计日志和连接资源限制。
@@ -177,10 +178,16 @@ func (server *Server) serveConnection(ctx context.Context, connection net.Conn) 
 		}
 		written, fallback, writeErr := server.writeResponse(connection, writer, request.ID, result.Response)
 		if writeErr != nil {
+			if result.AfterWriteFailure != nil {
+				runAfterWrite(server.logger, request, result.AfterWriteFailure)
+			}
 			auditRequest(server.logger, peerUID, request, result.AuditTarget, internalErrorResponse(request.ID), time.Since(startedAt))
 			return
 		}
 		auditRequest(server.logger, peerUID, request, result.AuditTarget, written, time.Since(startedAt))
+		if fallback && result.AfterWriteFailure != nil {
+			runAfterWrite(server.logger, request, result.AfterWriteFailure)
+		}
 		if result.AfterWrite != nil && handlerErr == nil && !fallback {
 			action := result.AfterWrite
 			go runAfterWrite(server.logger, request, action)

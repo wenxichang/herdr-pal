@@ -164,6 +164,36 @@ func TestAdminServerCorrelatesProtocolErrorAndRunsActionAfterWrite(t *testing.T)
 	}
 }
 
+func TestAdminServerRunsWriteFailureRollbackWithoutRunningSuccessAction(t *testing.T) {
+	rollback := make(chan struct{}, 1)
+	var success atomic.Bool
+	server := newTestAdminServer(t, HandlerFunc(func(_ context.Context, request adminproto.Request) (HandleResult, error) {
+		response, err := adminproto.NewResultResponse(request.ID, struct{}{})
+		return HandleResult{
+			Response:          response,
+			AfterWrite:        func() { success.Store(true) },
+			AfterWriteFailure: func() { rollback <- struct{}{} },
+		}, err
+	}))
+	serverSide, clientSide := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.serveConnection(context.Background(), &failWriteConn{Conn: withPeerUID(serverSide, 1000)})
+		close(done)
+	}()
+	writeAdminRequest(t, clientSide, adminproto.Request{Protocol: adminproto.Protocol, ID: "req-fail", Method: adminproto.MethodServerStop})
+	select {
+	case <-rollback:
+	case <-time.After(time.Second):
+		t.Fatal("write failure rollback did not run")
+	}
+	if success.Load() {
+		t.Fatal("AfterWrite ran after response write failure")
+	}
+	clientSide.Close()
+	awaitSignal(t, done, "write failure connection")
+}
+
 func TestAdminServerClosesOversizedFrameAndBoundsOversizedResponse(t *testing.T) {
 	t.Run("request", func(t *testing.T) {
 		var handlerCalled atomic.Bool
@@ -312,6 +342,12 @@ func (connection *peerUIDWrapper) PeerUID() uint32 { return connection.uid }
 type writeTrackingConn struct {
 	net.Conn
 	completed *atomic.Bool
+}
+
+type failWriteConn struct{ net.Conn }
+
+func (connection *failWriteConn) Write([]byte) (int, error) {
+	return 0, errors.New("forced write failure")
 }
 
 func (connection *writeTrackingConn) Write(data []byte) (int, error) {
