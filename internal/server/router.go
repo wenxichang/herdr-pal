@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
@@ -343,7 +342,7 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 			fmt.Fprintf(&content, " — %s", safeRouterLabel(entry.Session.Display.Title))
 		}
 		content.WriteString(marker)
-		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Display.Workspace, entry.Session.Display.Tab)), safeRouterLabel(panel.AgentStatusLabel(herdr.AgentStatus(hprp.NormalizeStatus(entry.Session.Status)))))
+		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Display.Workspace, entry.Session.Display.Tab)), safeRouterLabel(panel.AgentStatusLabelValue(hprp.NormalizeStatus(entry.Session.Status))))
 	}
 	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
 	router.logger.Debug("企业微信会话列表已生成", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "session_count", len(entries), "has_selection", selectedErr == nil)
