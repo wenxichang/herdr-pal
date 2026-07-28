@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,6 +118,101 @@ func TestHPRPClientReportsUnknownRequiredMessageBeforeDisconnect(t *testing.T) {
 		t.Fatal("client did not report unknown required message")
 	}
 	<-done
+}
+
+func TestHPRPClientRejectsInvalidServerHelloBeforeSnapshot(t *testing.T) {
+	var attempts atomic.Int32
+	var snapshots atomic.Int32
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{hprp.Subprotocol}})
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		hello, err := readClientHPRPEnvelopeResult(request.Context(), connection)
+		if err != nil {
+			return
+		}
+		attempts.Add(1)
+		if err := writeClientHPRPEnvelopeResult(request.Context(), connection, hprp.TypeHelloServer, "hello-invalid", hello.ID, hprp.ServerHello{
+			ConnectionID: "connection-1", MachineID: "bad machine", Capabilities: []string{}, Features: map[string]hprp.FeatureOffer{},
+			Limits: hprp.ServerLimits{
+				MaxMessageBytes: hprp.MaxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: 1,
+				MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes, IdempotencyWindowMS: 600_000,
+			},
+			Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
+		}); err != nil {
+			return
+		}
+		readContext, cancel := context.WithTimeout(request.Context(), 100*time.Millisecond)
+		defer cancel()
+		messageType, data, readErr := connection.Read(readContext)
+		if readErr == nil && messageType == websocket.MessageText {
+			envelope, decodeErr := hprp.Decode(data)
+			if decodeErr == nil && envelope.Type == hprp.TypeSessionSnapshot {
+				snapshots.Add(1)
+			}
+		}
+	})
+	relayServer := httptest.NewTLSServer(handler)
+	defer relayServer.Close()
+	token := relayClientTestKey(t)
+	logs := &relayLockedLogBuffer{}
+	client, err := New(Config{
+		URL: "wss" + strings.TrimPrefix(relayServer.URL, "https") + "?access_token=private-query", Key: token, SkipVerify: true,
+		Version: "test", PollInterval: time.Hour, SnapshotInterval: time.Hour,
+		BackoffMin: time.Millisecond, BackoffMax: time.Millisecond,
+		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetExecutor(&fakeExecutor{}); err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = client.Run(runContext)
+	if attempts.Load() == 0 {
+		t.Fatal("client did not reach hello.server")
+	}
+	if snapshots.Load() != 0 {
+		t.Fatalf("client sent %d snapshots after invalid hello.server", snapshots.Load())
+	}
+	output := logs.String()
+	for _, want := range []string{"stage=hello.server_decode", "error_type=protocol"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("logs = %q, want %q", output, want)
+		}
+	}
+	for _, forbidden := range []string{token, "user-a", "private-query"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("logs leaked %q: %s", forbidden, output)
+		}
+	}
+}
+
+func readClientHPRPEnvelopeResult(ctx context.Context, connection *websocket.Conn) (hprp.Envelope, error) {
+	messageType, data, err := connection.Read(ctx)
+	if err != nil {
+		return hprp.Envelope{}, err
+	}
+	if messageType != websocket.MessageText {
+		return hprp.Envelope{}, hprp.ErrInvalidMessage
+	}
+	return hprp.Decode(data)
+}
+
+func writeClientHPRPEnvelopeResult(ctx context.Context, connection *websocket.Conn, messageType hprp.Type, id, replyTo string, payload any) error {
+	envelope, err := hprp.NewEnvelope(messageType, id, replyTo, false, payload)
+	if err != nil {
+		return err
+	}
+	encoded, err := hprp.Encode(envelope)
+	if err != nil {
+		return err
+	}
+	return connection.Write(ctx, websocket.MessageText, encoded)
 }
 
 func readClientHPRPEnvelope(t *testing.T, connection *websocket.Conn) hprp.Envelope {

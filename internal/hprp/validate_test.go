@@ -26,6 +26,28 @@ func TestValidateClientHelloRejectsInvalidExtensionName(t *testing.T) {
 	}
 }
 
+func TestValidateServerHelloRejectsInvalidIdentityCapabilitiesAndLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ServerHello)
+	}{
+		{name: "empty connection", mutate: func(hello *ServerHello) { hello.ConnectionID = "" }},
+		{name: "invalid machine", mutate: func(hello *ServerHello) { hello.MachineID = "bad machine" }},
+		{name: "unversioned capability", mutate: func(hello *ServerHello) { hello.Capabilities = []string{"command.output"} }},
+		{name: "zero message limit", mutate: func(hello *ServerHello) { hello.Limits.MaxMessageBytes = 0 }},
+		{name: "zero heartbeat", mutate: func(hello *ServerHello) { hello.Heartbeat.IdleTimeoutMS = 0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hello := validServerHello()
+			test.mutate(&hello)
+			if err := ValidateServerHello(hello); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("ValidateServerHello() error = %v, want ErrInvalidMessage", err)
+			}
+		})
+	}
+}
+
 func TestValidateTargetRequiresAllStableIdentities(t *testing.T) {
 	valid := Target{MachineID: "office-pc", SlotID: "w1:p1", SessionID: "session-1"}
 	if err := ValidateTarget(valid); err != nil {
@@ -140,5 +162,17 @@ func validClientHello() ClientHello {
 			MaxInflightFeatures:    4,
 			IdempotencyWindowMS:    600000,
 		},
+	}
+}
+
+func validServerHello() ServerHello {
+	return ServerHello{
+		ConnectionID: "connection-1", MachineID: "home-mac",
+		Capabilities: []string{CapabilityCommandOutputV1}, Features: map[string]FeatureOffer{},
+		Limits: ServerLimits{
+			MaxMessageBytes: MaxMessageBytes, MaxSessions: MaxSessions, MaxInflightCommands: 1,
+			MaxInflightFeatures: 0, MaxOutputBytes: MaxContentBytes, IdempotencyWindowMS: 600_000,
+		},
+		Heartbeat: HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
 	}
 }
