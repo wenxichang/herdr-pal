@@ -23,10 +23,12 @@ Relay Protocol 3；正式实现应通过独立端点、显式配置或迁移窗�
 - 在断线、重连、重复投递和执行结果不确定时保持保守、可诊断的行为。
 - 允许第三方实现 Pal 或 Server，并能通过公开测试验证互操作性。
 - 认证、路由、终端文本和状态通知具有清晰边界。
+- 允许以用户功能为单位增加扩展，由 Pal 吸收 Herdr API 和实现版本差异。
 
 ### 2.2 非目标
 
 - HPRP 不暴露 Herdr 本地 Socket，也不替代 Herdr 公共本地 API。
+- HPRP 不提供任意 Herdr `{method, params}` 透传，也不逐项复制 Herdr Socket 方法。
 - HPRP 不把终端快照定义为结构化 LLM 消息或完整对话历史。
 - HPRP 不定义 IM 平台 webhook、用户领钥页面、计费或组织管理接口。
 - HPRP 不提供自动审批权限请求的能力。
@@ -51,31 +53,80 @@ Sec-WebSocket-Protocol: herdr-pal-relay.v2, herdr-pal-relay.v1
 
 ### 3.2 主版本内扩展
 
-双方在 hello 中交换 capability，仅允许使用交集中的可选能力。Capability 名称
-带有不可变版本，例如：
+双方在 hello 中交换技术 capability 和用户 feature。Capability 表示协议机制，Feature
+表示用户可以直接发起并观察结果的功能。两者都必须经过协商后才能使用。
+
+技术 Capability 名称带有不可变版本，例如：
 
 ```text
 session.delta.v1
 notification.ack.v1
 command.output.v1
+feature.invoke.v1
+blob.reference.v1
 ```
 
-`.v2` 表示新能力，不得改变 `.v1` 的语义。实现停止支持某项可选能力时，可以不再
-声明它，但同一主版本的基础能力不得删除。
+用户 Feature 同样使用带版本的名字，例如：
+
+```text
+agent.interact.v1
+terminal.inspect.v1
+workspace.prepare.v1
+task.monitor.v1
+```
+
+Capability 和 Feature 名称都使用小写点分段，并以 `.vN` 结尾；`N` 是从 1 开始的正
+整数。去掉版本后缀后的名称称为 family，例如 `workspace.prepare`。
+
+`.v2` 表示新版本，不得改变 `.v1` 的语义。对于同一 family 的技术 Capability 或用户
+Feature，Pal 可以同时声明多个版本；Server 必须选择双方支持的最高版本，并且只返回
+最终选择的一个版本。`.v2` 必须是自包含合同，不得要求对端同时启用 `.v1`。语义独立、
+可以同时使用的能力必须使用不同 family，不能仅靠版本号表达组合关系。
+
+实现停止支持某项可选能力或 Feature 时，可以不再声明它，但同一主版本的基础能力不得
+删除。某个 Feature 没有共同版本时，只禁用该 Feature，不影响 HPRP 基础连接和其他
+Feature。
 
 以下属于兼容变更：
 
 - 增加可选字段；
 - 增加稳定错误码；
 - 增加需要协商的消息类型或 capability；
+- 增加新的独立 Feature；
+- 在 Feature 参数中增加默认关闭或需要显式协商的可选模式；
 - 增加未知时可以降级为 `unknown` 的枚举值。
 
 以下变更必须提升 HPRP 主版本：
 
 - 修改已有字段、错误码或消息的语义；
 - 增加所有实现都必须理解的新必填字段；
+- 改变已有结果消息允许的 `outcome` 集合；
 - 改变认证、安全、消息顺序或幂等保证；
 - 删除或弱化当前主版本的基础能力。
+
+### 3.3 Feature Package
+
+每个公开 Feature 必须作为独立、不可变的 Feature Package 发布。Package 至少定义：
+
+- Feature family、版本和用户目标；
+- 输入、结果和事件的 JSON Schema；
+- 可用目标类型和目标失效语义；
+- 明确的成功条件和用户可观察结果；
+- 幂等窗口、重试和结果不确定语义；
+- 是否可取消，以及取消后的最终状态；
+- 输出、事件、并发和数据量限制；
+- Feature 不可用或版本不相交时的降级行为。
+
+Feature 的合同只描述用户意图和可观察结果。Pal 是领域适配器，可以把一次 Feature
+调用展开为任意数量的 Herdr snapshot、read、prompt、wait、keys 或其他公共 API 调用。
+底层调用顺序、Herdr protocol 版本、重试和兼容分支都不得成为 HPRP 对端依赖。
+
+参考实现中的 Pal 是独立 sidecar，只通过 Herdr 公共本地 Socket API、CLI 和公开 Schema
+完成编排。Feature Package 不得要求访问 Herdr 私有 TUI socket、内部状态或未公开模块。
+
+Pal 只有在当前 Herdr 环境中能够完整实现某个 Feature 合同时，才能声明支持该 Feature。
+以后从多次 Herdr 调用改为一个原子调用，不需要提升 Feature 版本；只有输入、输出、
+成功条件或其他用户可观察语义发生不兼容变化时，才发布新版本。
 
 ## 4. 传输与编码
 
@@ -86,6 +137,11 @@ command.output.v1
 - 接收方必须忽略未知的可选字段；发送方只能发送规范字段或已经协商的扩展字段。
 - 消息大小、快照会话数、并发请求数和输出分段大小由 `hello.server` 公布上限。
 - 超过服务端硬限制的消息必须拒绝，不能通过截断后继续解释。
+
+HPRP/1 的普通 JSON 消息适合文本和小型结构化数据。需要传输文件、图片或大型日志的
+Feature 不得绕过帧大小限制，也不应把大对象直接内嵌为无界 base64。此类能力应协商
+独立的 `blob.reference.v1` 等技术 capability，由 HPRP 消息携带对象标识、大小、摘要和
+内容类型，具体数据通过该 capability 定义的有界分块或独立数据通道传输。
 
 连接应同时使用 WebSocket ping/pong 和应用侧 watchdog。任一方长时间收不到有效帧或
 pong 时都应主动断开，避免服务端保留已经失效的机器会话。
@@ -110,13 +166,18 @@ pong 时都应主动断开，避免服务端保留已经失效的机器会话。
 - `protocol`：固定为当前连接选择的协议，例如 `HPRP/1`。
 - `type`：小写点分名称，发布后语义不得改变。
 - `id`：发送方生成的非空唯一消息标识；在其幂等和审计窗口内不得复用。
-- `reply_to`：响应消息引用原请求 `id`，非响应消息省略。
+- `reply_to`：响应消息引用原请求 `id`；与请求关联的进度或输出事件也可以引用该请求。
+  不关联其他消息时省略。
 - `must_understand`：可选布尔值，默认 `false`。未知消息类型在其为 `false` 时忽略，
   为 `true` 时返回错误。
 - `payload`：始终为 JSON object；无参数消息也使用空 object。
 
 HPRP 遵循“宽容读取、严格写入”：未知可选字段不得导致失败，但缺少基础必填字段、
 字段类型错误或违反当前状态机必须被明确拒绝。
+
+所有期待响应的可选扩展请求必须设置 `must_understand: true`。未知的必需请求必须立即
+返回 `protocol.required_extension_unsupported`，不能静默忽略并等待发送方超时。仅供
+观察、丢失后可由快照恢复的可选事件可以使用默认值 `false`。
 
 ## 6. 终端凭据认证
 
@@ -188,10 +249,25 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
       "os": "linux",
       "arch": "amd64"
     },
-    "capabilities": ["command.output.v1"],
+    "capabilities": ["command.output.v1", "feature.invoke.v1"],
+    "features": {
+      "terminal.inspect.v1": {
+        "parameters": {
+          "max_lines": 500,
+          "supports_paging": true
+        }
+      },
+      "workspace.prepare.v1": {
+        "parameters": {
+          "supported_agents": ["codex", "claude"],
+          "supports_worktree": true
+        }
+      }
+    },
     "limits": {
       "max_receive_message_bytes": 1048576,
       "max_inflight_commands": 8,
+      "max_inflight_features": 4,
       "idempotency_window_ms": 600000
     },
     "diagnostics": {
@@ -215,11 +291,26 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
   "payload": {
     "connection_id": "conn-01J...",
     "machine_id": "office-pc",
-    "capabilities": ["command.output.v1"],
+    "capabilities": ["command.output.v1", "feature.invoke.v1"],
+    "features": {
+      "terminal.inspect.v1": {
+        "parameters": {
+          "max_lines": 300,
+          "supports_paging": true
+        }
+      },
+      "workspace.prepare.v1": {
+        "parameters": {
+          "supported_agents": ["codex"],
+          "supports_worktree": true
+        }
+      }
+    },
     "limits": {
       "max_message_bytes": 1048576,
       "max_sessions": 256,
       "max_inflight_commands": 8,
+      "max_inflight_features": 4,
       "max_output_bytes": 262144,
       "idempotency_window_ms": 600000
     },
@@ -231,9 +322,18 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
 }
 ```
 
-返回的 capability 是双方能力交集，`limits` 是结合双方声明和服务端策略计算出的
-连接有效限制。客户端必须遵守服务端返回的有效值。`idempotency_window_ms` 表示 Pal
-承诺识别重复 `idempotency_key` 的最短窗口，服务端不得假定更长的保护时间。
+返回的 capability 是双方技术能力交集；`features` 对每个 family 只包含最终选择的最高
+共同版本。Feature 参数是结合 Pal 实际能力、Server 实现和服务端策略计算出的有效值，
+只能描述用户层功能和限制，禁止列出 Herdr Socket 方法或内部调用步骤。
+
+Feature Package 必须为每个可协商参数定义类型、默认值和合并规则。未知参数必须忽略，
+缺失参数使用 Package 默认值；`hello.server` 只返回本连接实际生效的参数。hello 完成后，
+本连接的 capability、Feature 版本和参数保持不变；运行时能力变化必须断线重连并重新
+协商，除非未来另行协商专用的动态更新 capability。
+
+`limits` 是连接级有效限制。客户端必须遵守服务端返回的值。
+`idempotency_window_ms` 表示 Pal 承诺识别重复 `idempotency_key` 的最短窗口，服务端
+不得假定更长的保护时间。
 
 ### 7.2 初始同步
 
@@ -338,6 +438,10 @@ HPRP/1 的恢复机制。
 继续负责需要访问本地 Herdr 或终端状态的命令。终端按键仍必须经过 Pal 的策略检查，
 协议不会把普通 prompt 自动提升为审批或高风险操作。
 
+`command.execute` 是 HPRP/1 基础 Agent 交互的专用消息，不是未来 Feature 的通用 RPC
+入口。新增用户功能不应继续向该消息加入与文本交互无关的参数，而应使用第 11 节的
+Feature 调用模型。
+
 Pal 返回一次 `command.result`：
 
 ```json
@@ -395,7 +499,162 @@ Pal 只能通过 `command.result` 返回当前命令的同步结果。
 服务端只允许自动接受同一 `machine_id` 和同一 `slot_id` 的替换目标。其他变化返回
 `target.session_changed`，不能自动改选。
 
-## 11. 状态与终端通知
+## 11. 用户 Feature 调用
+
+双方协商 `feature.invoke.v1`，并且 hello 已选择具体 Feature 版本后，Server 可以使用
+`feature.invoke` 发起用户功能：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "feature.invoke",
+  "id": "feature-42",
+  "must_understand": true,
+  "payload": {
+    "feature": "workspace.prepare.v1",
+    "idempotency_key": "im-message-01J...",
+    "target": {
+      "machine_id": "office-pc"
+    },
+    "input": {
+      "repository": "herdr-pal",
+      "branch": "feature-x",
+      "agent": "codex"
+    }
+  }
+}
+```
+
+- `feature` 必须是 hello 最终选择的 Feature 版本。
+- `target` 的具体结构由 Feature Package 定义，可以引用机器、稳定 Agent 会话或该
+  Feature 自己定义的用户层资源。
+- `input` 必须通过对应 Feature Package 的 JSON Schema 校验。
+- Server 不得在 `input` 中发送 Herdr method、原始 Socket 请求或要求 Pal 按指定的
+  Herdr 调用顺序执行。
+- Pal 必须先完成 Feature 的前置条件检查，再开始产生本地副作用。
+
+### 11.1 Feature 结果
+
+每个 `feature.invoke` 必须产生且只产生一个最终 `feature.result`：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "feature.result",
+  "id": "feature-result-42",
+  "reply_to": "feature-42",
+  "payload": {
+    "feature": "workspace.prepare.v1",
+    "outcome": "ok",
+    "result": {
+      "content": {
+        "type": "text/plain",
+        "text": "工作区与 Agent 已准备完成。"
+      },
+      "data": {
+        "workspace": "herdr-pal/feature-x"
+      },
+      "observed_state": {}
+    }
+  }
+}
+```
+
+基础 `outcome` 为：
+
+- `ok`：Feature 定义的用户目标已经达到；
+- `rejected`：前置条件、目标或策略校验失败，Feature 未开始执行；
+- `failed`：已确定用户目标没有达到；可能已经产生的局部效果必须通过
+  `observed_state` 或 Feature 定义的数据字段说明；
+- `cancelled`：Pal 已确认停止后续执行；不表示已经撤销此前产生的效果；
+- `indeterminate`：Pal 无法确认用户目标或局部效果的最终状态。
+
+`result.data` 和 `observed_state` 的结构由 Feature Package 定义。实现不得用
+`indeterminate` 掩盖已知的部分状态，也不得把“部分步骤成功”错误报告为完整 `ok`。
+
+### 11.2 Feature 事件
+
+Feature 执行期间可以发送零条或多条 `feature.event`：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "feature.event",
+  "id": "feature-event-42-1",
+  "reply_to": "feature-42",
+  "payload": {
+    "feature": "workspace.prepare.v1",
+    "sequence": 1,
+    "kind": "progress",
+    "content": {
+      "type": "text/plain",
+      "text": "正在启动 Agent。"
+    },
+    "data": {}
+  }
+}
+```
+
+- `sequence` 在单次 Feature 调用内从 1 开始严格递增，用于排序和去重。
+- `kind`、`content` 和 `data` 的具体语义由 Feature Package 定义。
+- Feature Package 可以定义 `accepted`、`progress`、`output`、`attention` 等事件，
+  但不能把事件当作最终结果。
+- `feature.result` 是与原始 `feature.invoke` 关联的最后一条消息；发送最终结果后禁止
+  继续发送该调用的事件。
+- Feature 事件不能阻塞 heartbeat、取消请求或其他调用的最终结果。
+
+### 11.3 Feature 取消
+
+Server 使用 `feature.cancel` 请求停止仍在执行的调用：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "feature.cancel",
+  "id": "feature-cancel-42",
+  "must_understand": true,
+  "payload": {
+    "invocation_id": "feature-42"
+  }
+}
+```
+
+Pal 必须为每个取消请求返回且只返回一个 `feature.cancel.result`，其 `reply_to` 引用
+`feature.cancel` 的 `id`：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "feature.cancel.result",
+  "id": "feature-cancel-result-42",
+  "reply_to": "feature-cancel-42",
+  "payload": {
+    "outcome": "ok"
+  }
+}
+```
+
+取消结果只允许 `ok`、`rejected` 和 `failed`。`outcome: ok` 只表示取消请求已被接受，
+不代表本地效果已经回滚。Pal 停止继续执行新的步骤后，仍必须为原始
+`feature.invoke` 发送最终 `feature.result`；确认停止时使用 `cancelled`，无法确认时使用
+`indeterminate`。取消与完成发生竞态时，如果原调用已经产生最终结果，取消结果必须为
+`rejected` 并使用 `feature.not_running`，不得改写原调用结果。
+
+Feature Package 必须明确是否可取消、哪些阶段可以停止，以及取消后如何描述已经产生的
+用户可观察状态。已经完成、未知或不可取消的调用必须返回稳定 Feature 错误码。
+
+### 11.4 Feature 幂等与恢复
+
+`idempotency_key` 标识一次用户功能调用，而不是某个 Herdr Socket 请求。Pal 展开出的
+多个本地操作共享同一个幂等边界：
+
+- 幂等窗口内收到相同 Key 和等价输入时，Pal 必须返回原调用、继续原调用或返回原结果；
+- 相同 Key 但 Feature、目标或输入不同，必须返回冲突错误；
+- Pal 不得因传输重试重新执行已经完成的底层步骤；
+- Pal 重启或 Herdr 断线后，如果无法恢复或核实本地效果，必须返回 `indeterminate`；
+- Feature Package 可以定义可核实的恢复步骤，但不能承诺 Herdr 本身没有提供的事务性。
+
+## 12. 状态与终端通知
 
 Pal 使用 `notification.event` 上报 Agent 状态变化和需要用户关注的终端文本：
 
@@ -432,7 +691,7 @@ Pal 使用 `notification.event` 上报 Agent 状态变化和需要用户关注�
 - HPRP/1 基础通知采用连接在线期间的尽力投递，不提供断线后的离线回放。
 - 双方协商 `notification.ack.v1` 后，可以使用相同 `event_key` 确认和重试。
 
-## 12. 统一结果与错误模型
+## 13. 统一结果与错误模型
 
 失败结果使用稳定机器码和可选展示信息：
 
@@ -455,6 +714,8 @@ Pal 使用 `notification.event` 上报 Agent 状态变化和需要用户关注�
 ```
 
 - 程序只能根据 `code`、`outcome`、`retryable` 和可选 `retry_after_ms` 决策。
+- 每种结果消息只能使用其消息规范明确列出的 `outcome` 子集；接收方不得把未知值推断为
+  成功。Feature 的 `cancelled` 不自动扩展到其他结果消息。
 - `message` 只用于日志和用户展示，可以本地化，禁止解析其文本决定行为。
 - `details` 是可选扩展 object，未知字段必须忽略。
 - 未知错误码按 `outcome` 保守处理；不得默认重试。
@@ -476,6 +737,12 @@ command.unsupported
 command.denied
 command.timeout
 command.execution_failed
+feature.unsupported
+feature.invalid_input
+feature.idempotency_conflict
+feature.not_cancellable
+feature.not_running
+feature.execution_failed
 server.busy
 server.internal
 ```
@@ -484,19 +751,23 @@ server.internal
 发送无法理解的必需消息属于连接级错误。服务端应在可以安全解析信封时先发送
 `protocol.error`，随后使用合适的 WebSocket close code 关闭连接。
 
-## 13. 顺序、背压与恢复
+## 14. 顺序、背压与恢复
 
 - WebSocket 保证单连接内帧顺序，但业务处理可以并发；响应必须通过 `reply_to` 关联。
 - hello 协商得到 `max_inflight_commands`，超过限制时返回 `server.busy`，不能无限
   排队。
-- 输出和通知队列必须有界；任何队列溢出都要产生可诊断错误或指标，禁止静默丢弃
-  命令结果。
-- heartbeat、关闭帧和请求结果优先于大块终端输出。
+- hello 协商得到 `max_inflight_features`，执行中的 Feature 在发送最终结果前持续占用一个
+  名额；取消请求不得被该限制阻塞。
+- 输出、Feature 事件和通知队列必须有界；任何队列溢出都要产生可诊断错误或指标，
+  禁止静默丢弃最终结果。
+- heartbeat、关闭帧、取消请求和最终结果优先于大块终端输出或进度事件。
 - 断线时所有未完成请求进入 `indeterminate`，除非实现能够证明其尚未执行。
 - 重连创建新 `connection_id`，重新执行 hello 和完整会话快照。
 - Server 不把旧连接的选择、快照序号或在途命令直接移植到新连接。
+- Feature Package 可以在相同 `idempotency_key` 下定义重连恢复，但 Server 不能假定所有
+  Feature 都支持恢复。
 
-## 14. 安全边界
+## 15. 安全边界
 
 - 所有部署必须使用加密的 WSS；证书信任策略属于产品部署配置，不参与 HPRP 消息
   兼容性判断。
@@ -506,17 +777,19 @@ server.internal
 - 日志不得包含完整凭据、Cookie 或未经处理的大段敏感终端内容。
 - 服务端只能向 Key 所属用户和机器的连接路由命令。
 - Pal 必须继续执行本地 PolicyGuard；服务器发来的内容不是自动授权。
-- 未绑定目标、已经变化的 `session_id` 和未知命令动作默认拒绝。
+- 未绑定目标、已经变化的 `session_id`、未协商 Feature 和未知用户功能默认拒绝。
+- Pal 不得提供绕过 Feature Package 校验的原始 Herdr RPC、任意 Socket method 或内部
+  调试入口。
 
-## 15. 公开制品与一致性测试
+## 16. 公开制品与一致性测试
 
 HPRP/1 发布时应同时提供：
 
 - 中文规范正文及明确版本号；
 - 核心消息 JSON Schema；
-- 错误码和 capability 注册表；
+- 错误码、技术 capability 和 Feature Package 注册表；
 - 合法与非法消息的固定测试向量；
-- hello、快照、命令、会话替换、断线重连的状态机测试轨迹；
+- hello、快照、命令、Feature、会话替换、取消和断线重连的状态机测试轨迹；
 - 不依赖 Herdr 和 IM 网络的内存参考客户端与服务端；
 - 跨版本兼容测试矩阵。
 
@@ -525,6 +798,12 @@ HPRP/1 发布时应同时提供：
 - 未知可选字段被忽略；
 - 未知可选消息不导致断线；
 - 未协商 capability 不会被使用；
+- 同一 Feature family 只选择最高共同版本；
+- 未协商 Feature 不会被调用，Feature 参数只包含用户功能限制；
+- Feature 输入通过对应 Package Schema 校验；
+- 相同 Feature 幂等键不会重复展开底层操作；
+- Feature 事件有序且最终结果后不再产生事件；
+- 取消只停止后续执行，不会被误报为已撤销已有效果；
 - 重复消息、重复结果和重复通知能够去重；
 - 过期快照和基准不一致增量触发明确错误；
 - 目标会话替换后旧命令不会误发；
@@ -534,15 +813,18 @@ HPRP/1 发布时应同时提供：
 任何实现只要通过 HPRP/1 基础一致性测试，就应该能够与其他合规 HPRP/1 实现建立
 连接。可选扩展不一致时必须降级，不能影响基础会话上报和命令执行。
 
-## 16. 标准治理
+## 17. 标准治理
 
 - HPRP 主版本规范一经发布即保持不可变；勘误只能澄清，不得改变线上语义。
-- 错误码、消息类型和 capability 由公开注册表管理，新增项需要说明降级行为。
+- 错误码、消息类型、技术 capability 和 Feature Package 由公开注册表管理，新增项需要
+  说明降级行为。
+- Feature Package 必须以用户目标命名，不得使用 Herdr Socket method 列表充当 Feature
+  合同。底层适配说明可以放在参考实现文档中，但不是 HPRP 规范的一部分。
 - 第三方私有扩展应使用明确的厂商命名空间，禁止占用公共名称。
 - 实验性能力不得在未协商时发送，也不得成为同一主版本的隐含必需依赖。
 - 参考实现的缺陷不能自动改变规范；如需改变规范性行为，应发布新主版本。
 
-## 17. 实施边界
+## 18. 实施边界
 
 后续实施应按以下独立模块推进：
 
@@ -551,6 +833,7 @@ HPRP/1 发布时应同时提供：
 - `connection`：状态机、heartbeat、能力协商和背压；
 - `catalog`：完整快照、稳定目标和会话替换；
 - `command`：请求关联、幂等、结果和分段输出；
+- `feature`：Feature 协商、Schema 校验、调用编排、事件、取消和恢复；
 - `notification`：状态事件、去重和可选确认；
 - `conformance`：测试向量、fake client/server 和跨版本验证。
 
