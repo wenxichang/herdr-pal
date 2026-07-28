@@ -35,14 +35,19 @@ build_binary() {
 
 build_binary dist/herdr-pal ./cmd/herdr-pal
 build_binary dist/herdr-pal-server ./cmd/herdr-pal-server
+build_binary dist/hp-cli ./cmd/hp-cli
 build_binary dist/herdr-pal-darwin-amd64 ./cmd/herdr-pal darwin amd64
 build_binary dist/herdr-pal-server-darwin-amd64 ./cmd/herdr-pal-server darwin amd64
+build_binary dist/hp-cli-darwin-amd64 ./cmd/hp-cli darwin amd64
 build_binary dist/herdr-pal-darwin-arm64 ./cmd/herdr-pal darwin arm64
 build_binary dist/herdr-pal-server-darwin-arm64 ./cmd/herdr-pal-server darwin arm64
+build_binary dist/hp-cli-darwin-arm64 ./cmd/hp-cli darwin arm64
 build_binary dist/herdr-pal-linux-amd64 ./cmd/herdr-pal linux amd64
 build_binary dist/herdr-pal-server-linux-amd64 ./cmd/herdr-pal-server linux amd64
+build_binary dist/hp-cli-linux-amd64 ./cmd/hp-cli linux amd64
 build_binary dist/herdr-pal-linux-arm64 ./cmd/herdr-pal linux arm64
 build_binary dist/herdr-pal-server-linux-arm64 ./cmd/herdr-pal-server linux arm64
+build_binary dist/hp-cli-linux-arm64 ./cmd/hp-cli linux arm64
 build_binary dist/herdr-pal-windows-amd64.exe ./cmd/herdr-pal windows amd64
 
 write_checksums() {
@@ -51,12 +56,16 @@ write_checksums() {
 		set -- \
 			herdr-pal-darwin-amd64 \
 			herdr-pal-server-darwin-amd64 \
+			hp-cli-darwin-amd64 \
 			herdr-pal-darwin-arm64 \
 			herdr-pal-server-darwin-arm64 \
+			hp-cli-darwin-arm64 \
 			herdr-pal-linux-amd64 \
 			herdr-pal-server-linux-amd64 \
+			hp-cli-linux-amd64 \
 			herdr-pal-linux-arm64 \
 			herdr-pal-server-linux-arm64 \
+			hp-cli-linux-arm64 \
 			herdr-pal-windows-amd64.exe
 		if command -v sha256sum >/dev/null 2>&1; then
 			sha256sum "$@" > SHA256SUMS

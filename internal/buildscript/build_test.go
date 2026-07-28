@@ -65,12 +65,16 @@ exit 0
 	}{
 		{name: "herdr-pal-darwin-amd64", goos: "darwin", goarch: "amd64"},
 		{name: "herdr-pal-server-darwin-amd64", goos: "darwin", goarch: "amd64"},
+		{name: "hp-cli-darwin-amd64", goos: "darwin", goarch: "amd64"},
 		{name: "herdr-pal-darwin-arm64", goos: "darwin", goarch: "arm64"},
 		{name: "herdr-pal-server-darwin-arm64", goos: "darwin", goarch: "arm64"},
+		{name: "hp-cli-darwin-arm64", goos: "darwin", goarch: "arm64"},
 		{name: "herdr-pal-linux-amd64", goos: "linux", goarch: "amd64"},
 		{name: "herdr-pal-server-linux-amd64", goos: "linux", goarch: "amd64"},
+		{name: "hp-cli-linux-amd64", goos: "linux", goarch: "amd64"},
 		{name: "herdr-pal-linux-arm64", goos: "linux", goarch: "arm64"},
 		{name: "herdr-pal-server-linux-arm64", goos: "linux", goarch: "arm64"},
+		{name: "hp-cli-linux-arm64", goos: "linux", goarch: "arm64"},
 		{name: "herdr-pal-windows-amd64.exe", goos: "windows", goarch: "amd64"},
 	}
 	for _, target := range targets {
@@ -78,7 +82,7 @@ exit 0
 			t.Errorf("missing build output %s: %v", target.name, err)
 		}
 	}
-	for _, name := range []string{"herdr-pal", "herdr-pal-server"} {
+	for _, name := range []string{"herdr-pal", "herdr-pal-server", "hp-cli"} {
 		if _, err := os.Stat(filepath.Join(temporaryRoot, "dist", name)); err != nil {
 			t.Errorf("missing native convenience output %s: %v", name, err)
 		}
