@@ -56,6 +56,16 @@ func TestDecodeRequestRejectsInvalidJSONAndEnvelope(t *testing.T) {
 	}
 }
 
+func TestDecodeRequestPreservesCorrelatableEnvelopeOnSemanticError(t *testing.T) {
+	request, err := DecodeRequest([]byte(`{"protocol":"HPAP/2","id":"req-version","method":"server.status"}`))
+	if !IsCode(err, CodeProtocolUnsupportedVersion) {
+		t.Fatalf("DecodeRequest() error = %v", err)
+	}
+	if request.ID != "req-version" || request.Method != MethodServerStatus {
+		t.Fatalf("DecodeRequest() request = %#v", request)
+	}
+}
+
 func TestDecodeParamsRejectsUnknownDuplicateAndTrailingFields(t *testing.T) {
 	tests := []string{
 		`{"credential_id":1,"unknown":true}`,

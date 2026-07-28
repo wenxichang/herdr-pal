@@ -20,13 +20,13 @@ func DecodeRequest(data []byte) (Request, error) {
 		return Request{}, err
 	}
 	if request.Protocol != Protocol {
-		return Request{}, newCodecError(CodeProtocolUnsupportedVersion, "不支持的 HPAP 协议版本", nil)
+		return request, newCodecError(CodeProtocolUnsupportedVersion, "不支持的 HPAP 协议版本", nil)
 	}
 	if err := validateRequestID(request.ID); err != nil {
-		return Request{}, err
+		return request, err
 	}
 	if !IsKnownMethod(request.Method) {
-		return Request{}, newCodecError(CodeProtocolUnsupportedMethod, "不支持的 HPAP 方法", nil)
+		return request, newCodecError(CodeProtocolUnsupportedMethod, "不支持的 HPAP 方法", nil)
 	}
 	return request, nil
 }
