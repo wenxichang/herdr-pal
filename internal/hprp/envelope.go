@@ -39,11 +39,6 @@ var messageTypePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$
 // Type 是发布后语义不可改变的小写点分消息类型。
 type Type string
 
-const (
-	// TypeHelloClient 是 Pal 发出的连接协商首帧。
-	TypeHelloClient Type = "hello.client"
-)
-
 // Envelope 是所有 HPRP/1 WebSocket 文本消息的公共信封。
 type Envelope struct {
 	Protocol       string          `json:"protocol"`
