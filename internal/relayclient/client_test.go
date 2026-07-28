@@ -1,6 +1,7 @@
 package relayclient
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -10,10 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/server"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
@@ -21,7 +22,7 @@ import (
 func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 	hub, relayServer := startRelayClientHub(t)
 	logs := &relayLockedLogBuffer{}
-	outbound := &relayOutboundRecorder{pushes: make(chan relayproto.ExecutePush, 1)}
+	outbound := &relayOutboundRecorder{pushes: make(chan hprp.CommandOutput, 1)}
 	if err := hub.SetOutboundSink(outbound); err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +31,7 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 		DisplayAgent: "Codex", Title: "title", Status: herdr.AgentStatusIdle, Workspace: "workspace", Tab: "main",
 	}}, pushContent: "later"}
 	client, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
@@ -49,7 +50,7 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 		<-done
 	}()
 	eventuallyClient(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
-	target := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
 	if err := hub.Select(context.Background(), "user-a", target); err != nil {
 		t.Fatalf("Select() error = %v", err)
 	}
@@ -62,17 +63,17 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 	}
 	select {
 	case push := <-outbound.pushes:
-		if push.Content != "later" || push.Target != target {
+		if push.Content.Text != "later" || push.Target != target || !push.Final {
 			t.Fatalf("push = %#v, want target %#v", push, target)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("missing execute push")
 	}
-	eventuallyClient(t, func() bool { return strings.Contains(logs.String(), "Relay 执行请求已处理") })
+	eventuallyClient(t, func() bool { return strings.Contains(logs.String(), "HPRP 命令已处理") })
 	output := logs.String()
 	for _, want := range []string{
-		"Relay 选择请求已处理", "Relay 执行请求已处理", "pane_id=pane-1",
-		"local_index=1", "request_hash=", "message_hash=", "content_length=6", "result=success",
+		"HPRP 命令已处理", "pane_id=pane-1",
+		"request_hash=", "message_hash=", "content_length=6", "result=success",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("交互日志缺少 %q：\n%s", want, output)
@@ -85,11 +86,46 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 	}
 }
 
+func TestClientReplaysCompletedCommandWithoutRepeatingLocalSideEffects(t *testing.T) {
+	hub, relayServer := startRelayClientHub(t)
+	executor := &fakeExecutor{targets: []session.Target{{
+		PaneID: "pane-1", OccupantKey: "occ-1", Agent: "codex", Status: herdr.AgentStatusIdle,
+	}}}
+	client, err := New(Config{
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
+		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
+		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.sink = client
+	if err := client.SetExecutor(executor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	eventuallyClient(t, func() bool { return hub.Catalog().HasSessions("user-a") })
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
+	message := im.IncomingText{MessageID: "same-message", UserID: "user-a", Content: "prompt"}
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := hub.Execute(context.Background(), "user-a", target, message)
+		if err != nil || result.Content != "handled: prompt" {
+			t.Fatalf("Execute(%d) = %#v, %v", attempt, result, err)
+		}
+	}
+	if got := executor.HandleCount(); got != 1 {
+		t.Fatalf("local handle count = %d, want 1", got)
+	}
+}
+
 func TestClientReportsChangedSnapshotWithoutWaitingForCalibration(t *testing.T) {
 	hub, relayServer := startRelayClientHub(t)
 	executor := &fakeExecutor{targets: []session.Target{{PaneID: "pane-1", TerminalID: "terminal-1", OccupantKey: "occ-1", Title: "old", Status: herdr.AgentStatusIdle}}}
 	client, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
 	})
@@ -123,7 +159,7 @@ func TestClientVerboseLogsConnectionAndSnapshotDetailsWithoutSensitiveContent(t 
 	}}}
 	logs := &relayLockedLogBuffer{}
 	client, err := New(Config{
-		URL: relayClientURL(relayServer) + "?access_token=private-query", UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer) + "?access_token=private-query", Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "test-version", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
@@ -148,15 +184,15 @@ func TestClientVerboseLogsConnectionAndSnapshotDetailsWithoutSensitiveContent(t 
 
 	output := logs.String()
 	for _, want := range []string{
-		"Relay 连接中",
+		"HPRP 连接中",
 		"endpoint=",
 		"machine_id=home-mac",
-		"Relay 握手成功",
+		"HPRP 握手成功",
 		"connection_id=",
-		"snapshot_interval=30s",
-		"Relay 连接成功",
+		"snapshot_interval=1h0m0s",
+		"HPRP 连接成功",
 		"session_count=1",
-		"Relay 会话快照已上报",
+		"HPRP 会话快照已确认",
 		"snapshot_sequence=2",
 		"previous_session_count=1",
 		"changed=true",
@@ -186,7 +222,7 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 		rebindOnHandle: &rebound,
 	}
 	client, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
 	})
@@ -202,8 +238,8 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 	go func() { done <- client.Run(ctx) }()
 	defer func() { cancel(); <-done }()
 	eventuallyClient(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
-	oldTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
-	if err := hub.Catalog().SetSelection("user-a", hprp.Target{MachineID: oldTarget.MachineID, SlotID: oldTarget.PaneID, SessionID: oldTarget.OccupantHash}); err != nil {
+	oldTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
+	if err := hub.Catalog().SetSelection("user-a", oldTarget); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,9 +249,7 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 	if err != nil || result.Content != "handled: prompt" || result.SelectedTarget == nil {
 		t.Fatalf("Execute() = %#v, %v", result, err)
 	}
-	if err := hub.Catalog().RebindSelection(context.Background(), "user-a",
-		hprp.Target{MachineID: oldTarget.MachineID, SlotID: oldTarget.PaneID, SessionID: oldTarget.OccupantHash},
-		hprp.Target{MachineID: result.SelectedTarget.MachineID, SlotID: result.SelectedTarget.PaneID, SessionID: result.SelectedTarget.OccupantHash}); err != nil {
+	if err := hub.Catalog().RebindSelection(context.Background(), "user-a", oldTarget, *result.SelectedTarget); err != nil {
 		t.Fatal(err)
 	}
 	eventuallyClient(t, func() bool {
@@ -246,7 +280,7 @@ func TestClientUsesReboundTargetForExecutePush(t *testing.T) {
 		pushContent:    "later",
 	}
 	client, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
 	})
@@ -262,8 +296,8 @@ func TestClientUsesReboundTargetForExecutePush(t *testing.T) {
 	go func() { done <- client.Run(ctx) }()
 	defer func() { cancel(); <-done }()
 	eventuallyClient(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
-	oldTarget := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-1"}
-	if err := hub.Catalog().SetSelection("user-a", hprp.Target{MachineID: oldTarget.MachineID, SlotID: oldTarget.PaneID, SessionID: oldTarget.OccupantHash}); err != nil {
+	oldTarget := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
+	if err := hub.Catalog().SetSelection("user-a", oldTarget); err != nil {
 		t.Fatal(err)
 	}
 
@@ -277,7 +311,7 @@ func TestClientUsesReboundTargetForExecutePush(t *testing.T) {
 		if result.err != nil {
 			t.Fatalf("push target was not present in catalog: %v", result.err)
 		}
-		if result.push.Target.OccupantHash != "occ-2" {
+		if result.push.Target.SessionID != "occ-2" {
 			t.Fatalf("push target = %#v, want rebound occupant", result.push.Target)
 		}
 	case <-time.After(time.Second):
@@ -290,7 +324,7 @@ func TestClientStrictTLSDoesNotTrustAutoTestCertificate(t *testing.T) {
 	executor := &fakeExecutor{}
 	logs := &relayLockedLogBuffer{}
 	client, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: false,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: false,
 		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		BackoffMin: time.Millisecond, BackoffMax: 2 * time.Millisecond,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -310,7 +344,7 @@ func TestClientStrictTLSDoesNotTrustAutoTestCertificate(t *testing.T) {
 		t.Fatal("strict TLS client unexpectedly connected")
 	}
 	output := logs.String()
-	for _, want := range []string{"Relay 连接已断开", "stage=dial", "error_type=tls", "reason=", "retry_delay="} {
+	for _, want := range []string{"HPRP 连接已断开", "stage=dial", "error_type=tls", "reason=", "retry_delay="} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("logs = %q, want %q", output, want)
 		}
@@ -324,7 +358,7 @@ func TestClientLogsServerProtocolRejectionCodeAndMessage(t *testing.T) {
 	hub, relayServer := startRelayClientHub(t)
 	firstExecutor := &fakeExecutor{}
 	first, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "first", PollInterval: time.Hour, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
 	})
@@ -342,7 +376,7 @@ func TestClientLogsServerProtocolRejectionCodeAndMessage(t *testing.T) {
 
 	logs := &relayLockedLogBuffer{}
 	second, err := New(Config{
-		URL: relayClientURL(relayServer), UserID: "user-a", MachineID: "home-mac", SkipVerify: true,
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
 		Version: "second", PollInterval: time.Hour, SnapshotInterval: time.Hour,
 		BackoffMin: time.Millisecond, BackoffMax: 2 * time.Millisecond,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -359,12 +393,10 @@ func TestClientLogsServerProtocolRejectionCodeAndMessage(t *testing.T) {
 
 	output := logs.String()
 	for _, want := range []string{
-		"Relay 连接已断开",
-		"stage=server_hello",
-		"error_type=protocol_error",
-		"error_code=duplicate_client",
-		"server_message=客户端连接被拒绝",
-		"close_connection=true",
+		"HPRP 连接已断开",
+		"stage=dial",
+		"error_type=http_status",
+		"status_code=409",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("logs = %q, want %q", output, want)
@@ -381,19 +413,32 @@ func TestRelayErrorTypeHandlesMissingError(t *testing.T) {
 	}
 }
 
+func TestClientSessionTracksNegotiatedCapabilities(t *testing.T) {
+	session := &clientSession{}
+	if session.supportsCapability(hprp.CapabilityCommandOutputV1) {
+		t.Fatal("command.output.v1 should be disabled before hello.server")
+	}
+	session.setCapabilities([]string{hprp.CapabilityCommandOutputV1})
+	if !session.supportsCapability(hprp.CapabilityCommandOutputV1) {
+		t.Fatal("command.output.v1 was not enabled after negotiation")
+	}
+}
+
 func TestRelayErrorLogArgsRedactsUserIDAndEndpointDetails(t *testing.T) {
 	const (
 		userID = "user-sensitive"
 		rawURL = "wss://account:password@relay.internal:9443/ws?access_token=private-query"
 	)
-	err := withRelayStage("server_hello", relayproto.NewProtocolError("denied", "拒绝用户 user-sensitive: "+rawURL, true))
+	err := withRelayStage("hello.server", &remoteProtocolError{payload: hprp.ProtocolError{
+		Error: hprp.Error{Code: hprp.CodeCommandDenied, Message: "拒绝 Key user-sensitive: " + rawURL}, Close: true,
+	}})
 	output := slogArgsString(relayErrorLogArgs(err, rawURL, userID))
 	for _, sensitive := range []string{userID, "account", "password", "private-query"} {
 		if strings.Contains(output, sensitive) {
 			t.Fatalf("Relay 错误日志参数泄露 %q：%s", sensitive, output)
 		}
 	}
-	for _, want := range []string{"stage server_hello", "error_code denied", "wss://relay.internal:9443"} {
+	for _, want := range []string{"stage hello.server", "error_code command.denied", "wss://relay.internal:9443"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("Relay 错误日志参数缺少 %q：%s", want, output)
 		}
@@ -410,13 +455,29 @@ func slogArgsString(args []any) string {
 
 func startRelayClientHub(t *testing.T) (*server.ClientHub, *httptest.Server) {
 	t.Helper()
-	hub, err := server.NewClientHub(server.NewSessionCatalog(), server.HubConfig{}, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
+	_, record := relayClientTestCredential(t)
+	hub, err := server.NewClientHub(server.NewSessionCatalog(), hprpClientVerifier{record: record}, server.HubConfig{}, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	relayServer := httptest.NewTLSServer(hub)
 	t.Cleanup(relayServer.Close)
 	return hub, relayServer
+}
+
+func relayClientTestKey(t *testing.T) string {
+	t.Helper()
+	token, _ := relayClientTestCredential(t)
+	return token
+}
+
+func relayClientTestCredential(t *testing.T) (string, credential.Record) {
+	t.Helper()
+	token, record, err := credential.Issue("user-a", "home-mac", time.Unix(1, 0), bytes.NewReader(make([]byte, 48)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token, record
 }
 
 func relayClientURL(relayServer *httptest.Server) string {
@@ -426,10 +487,16 @@ func relayClientURL(relayServer *httptest.Server) string {
 type fakeExecutor struct {
 	mu             sync.Mutex
 	targets        []session.Target
-	selected       relayproto.SessionRef
+	selected       fakeSelection
 	sink           im.ReplySink
 	pushContent    string
 	rebindOnHandle *session.Target
+	handleCount    int
+}
+
+type fakeSelection struct {
+	PaneID       string
+	OccupantHash string
 }
 
 func (executor *fakeExecutor) CurrentTargets() []session.Target {
@@ -452,9 +519,9 @@ func (executor *fakeExecutor) SelectedTarget() (session.Target, error) {
 func (executor *fakeExecutor) SelectTarget(paneID, occupantHash string) error {
 	executor.mu.Lock()
 	defer executor.mu.Unlock()
-	for index, target := range executor.targets {
+	for _, target := range executor.targets {
 		if target.PaneID == paneID && target.OccupantKey == occupantHash {
-			executor.selected = relayproto.SessionRef{LocalIndex: index + 1, PaneID: paneID, OccupantHash: occupantHash}
+			executor.selected = fakeSelection{PaneID: paneID, OccupantHash: occupantHash}
 			return nil
 		}
 	}
@@ -463,10 +530,11 @@ func (executor *fakeExecutor) SelectTarget(paneID, occupantHash string) error {
 
 func (executor *fakeExecutor) HandleMessage(ctx context.Context, message im.IncomingText) {
 	executor.mu.Lock()
+	executor.handleCount++
 	if executor.rebindOnHandle != nil {
 		rebound := *executor.rebindOnHandle
 		executor.targets[0] = rebound
-		executor.selected = relayproto.SessionRef{LocalIndex: 1, PaneID: rebound.PaneID, OccupantHash: rebound.OccupantKey}
+		executor.selected = fakeSelection{PaneID: rebound.PaneID, OccupantHash: rebound.OccupantKey}
 	}
 	executor.mu.Unlock()
 	_ = executor.sink.RespondMarkdown(ctx, message.RequestID, "handled: "+message.Content)
@@ -475,7 +543,13 @@ func (executor *fakeExecutor) HandleMessage(ctx context.Context, message im.Inco
 	}
 }
 
-func (executor *fakeExecutor) Selected() relayproto.SessionRef {
+func (executor *fakeExecutor) HandleCount() int {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.handleCount
+}
+
+func (executor *fakeExecutor) Selected() fakeSelection {
 	executor.mu.Lock()
 	defer executor.mu.Unlock()
 	return executor.selected
@@ -509,20 +583,20 @@ func (buffer *relayLockedLogBuffer) String() string {
 }
 
 type relayOutboundRecorder struct {
-	pushes chan relayproto.ExecutePush
+	pushes chan hprp.CommandOutput
 }
 
-func (recorder *relayOutboundRecorder) SendPush(_ context.Context, _ string, push relayproto.ExecutePush) error {
+func (recorder *relayOutboundRecorder) SendCommandOutput(_ context.Context, _ string, push hprp.CommandOutput) error {
 	recorder.pushes <- push
 	return nil
 }
 
-func (*relayOutboundRecorder) SendNotification(context.Context, string, string, relayproto.Notification) error {
+func (*relayOutboundRecorder) SendNotification(context.Context, string, string, hprp.NotificationEvent) error {
 	return nil
 }
 
 type resolvedPush struct {
-	push relayproto.ExecutePush
+	push hprp.CommandOutput
 	err  error
 }
 
@@ -531,13 +605,13 @@ type resolvingRelayOutboundRecorder struct {
 	results chan resolvedPush
 }
 
-func (recorder *resolvingRelayOutboundRecorder) SendPush(_ context.Context, userID string, push relayproto.ExecutePush) error {
-	_, err := recorder.catalog.ResolveTarget(userID, hprp.Target{MachineID: push.Target.MachineID, SlotID: push.Target.PaneID, SessionID: push.Target.OccupantHash})
+func (recorder *resolvingRelayOutboundRecorder) SendCommandOutput(_ context.Context, userID string, push hprp.CommandOutput) error {
+	_, err := recorder.catalog.ResolveTarget(userID, push.Target)
 	recorder.results <- resolvedPush{push: push, err: err}
 	return err
 }
 
-func (*resolvingRelayOutboundRecorder) SendNotification(context.Context, string, string, relayproto.Notification) error {
+func (*resolvingRelayOutboundRecorder) SendNotification(context.Context, string, string, hprp.NotificationEvent) error {
 	return nil
 }
 

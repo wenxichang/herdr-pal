@@ -18,6 +18,7 @@ herdr-pal-server
 - `herdr-pal-server` 连接企业微信机器人，一套机器人只运行一个服务端。
 - 每台运行 Herdr 的机器启动一个 `herdr-pal` 客户端。
 - 一个用户可以接入多台机器，并在同一个企业微信单聊中切换会话。
+- Pal 与 Server 使用公开的 HPRP/1 协议；每台机器使用一把由服务端签发的独立 Key。
 - `herdr-pal -i` 可以脱离企业微信，在本机终端中直接操作 Herdr Agent。
 
 ## 使用前准备
@@ -105,7 +106,8 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
     "addr_hint": "10.1.3.4",
     "cert_file": "",
     "key_file": "",
-    "state_dir": ""
+    "state_dir": "",
+    "credentials_file": ""
   },
   "log": {
     "level": "info"
@@ -131,9 +133,9 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 ```
 
 `--verbose` 会把服务端日志级别临时提升为 `debug`，记录 Relay 握手阶段、客户端版本、快照
-序号和会话数量、心跳、企微交互动作、路由目标、消息分段及错误码。日志只记录消息长度和
-userid/message/occupant 的摘要，不记录 prompt、终端快照正文或完整 userid；当前 Bot Secret
-即使出现在底层错误中也会替换为 `[REDACTED]`。
+序号和会话数量、心跳、企微交互动作、路由目标、消息分段及错误码。日志只记录消息长度、
+credential ID，以及用户/message/session 的摘要，不记录 prompt、终端快照正文、完整用户 ID
+或机器 Key；当前 Bot Secret 即使出现在底层错误中也会替换为 `[REDACTED]`。
 
 未指定 `-config` 时，服务端默认读取：
 
@@ -150,7 +152,10 @@ userid/message/occupant 的摘要，不记录 prompt、终端快照正文或完�
 证书路径留空时，服务端会自动生成自签名证书。首版面向受信任内网使用，不要直接暴露到
 互联网。
 
-## 第三步：获取企业微信 userid
+`credentials_file` 留空时默认使用 `state_dir/credentials.json`；服务端只保存 Key 摘要，
+不会保存可直接连接的明文 Key。
+
+## 第三步：获取用户 ID 并签发机器 Key
 
 服务端成功连接企业微信后，在自己的机器人单聊中发送：
 
@@ -158,7 +163,17 @@ userid/message/occupant 的摘要，不记录 prompt、终端快照正文或完�
 /userid
 ```
 
-机器人会返回当前企业微信用户的完整 `userid`。复制该值，下一步填写到客户端配置中。
+机器人会返回当前企业微信用户 ID。把它交给服务端管理员，并为每台接入机器确定一个易识别
+且在该用户下不重复的机器标识，例如 `office-pc`。管理员在服务端执行：
+
+```sh
+./dist/herdr-pal-server key issue \
+  -principal-id '企业微信返回的用户 ID' \
+  -machine-id 'office-pc'
+```
+
+命令只在签发时输出一次 `hpk_...` Key。请通过安全渠道交给对应机器，不要写入聊天记录、
+日志或 Git。不同用户可以使用相同机器标识；同一用户的每台机器必须使用独立 Key。
 
 ## 第四步：启动每台客户端
 
@@ -175,8 +190,7 @@ cp config.example.json ~/.config/herdr-pal/config.json
 {
   "relay": {
     "url": "wss://服务端地址:9443",
-    "userid": "通过 /userid 获取的值",
-    "machine_id": "",
+    "key": "管理员签发的 hpk_ 机器 Key",
     "skip_verify": true
   },
   "herdr": {
@@ -192,10 +206,8 @@ cp config.example.json ~/.config/herdr-pal/config.json
 配置说明：
 
 - `url` 必须使用 `wss://`，地址指向 `herdr-pal-server`。
-- `userid` 原样填写机器人返回的值。
-- `machine_id` 是企业微信中显示的机器标识，同一用户的每台机器应使用不同值；留空时自动
-  使用当前机器的系统 hostname。需要更易识别的名称时，可自行填写由英文字母、数字、点、
-  下划线或连字符组成的标识。
+- `key` 填写管理员为当前机器签发的完整 `hpk_...` Key。用户和机器身份都由该 Key 绑定，
+  客户端不能自行声明或覆盖。
 - 使用服务端自动生成的自签名证书时保持 `skip_verify: true`。
 - 默认 Herdr session 下，`session` 和 `socket_path` 都留空。
 - 使用命名 Herdr session 时填写 `session`；只有自动探测失败时才手工填写
@@ -232,7 +244,7 @@ Windows 默认配置文件是 `%USERPROFILE%\.config\herdr-pal\config.json`。He
 ./dist/herdr-pal -config /绝对路径/client.json
 ```
 
-同一 `userid + machine_id` 同时只能有一个客户端连接；重复连接会被拒绝。
+同一用户、同一机器标识同时只能有一个客户端连接；重复连接会收到 HTTP `409` 并被拒绝。
 
 ## 第五步：开始使用
 
@@ -253,7 +265,7 @@ Windows 默认配置文件是 `%USERPROFILE%\.config\herdr-pal\config.json`。He
 
 | 输入 | 作用 |
 | --- | --- |
-| `/userid` | 查看自己的企业微信 userid |
+| `/userid` | 查看自己的企业微信用户 ID，供管理员签发机器 Key |
 | `/ls` | 查看当前用户的全部在线 Agent |
 | `/1`、`/sel 1` | 选择列表中的第 1 个会话并显示最近输出 |
 | `/1 内容` | 在第 1 个会话执行内容，成功后切换到该会话 |
@@ -333,14 +345,15 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 }
 ```
 
-客户端日志会标明 `component`、`stage`、`machine_id`、`pane_id`、连接地址、快照序号、会话数、
-请求哈希及具体错误原因。不记录原始 userid、URL 查询参数、消息正文或终端内容。
+客户端日志会标明 `component`、`stage`、`credential_id`、`machine_id`、`pane_id`、连接地址、
+快照序号、会话数、请求哈希及具体错误原因。不记录完整 Key、原始用户 ID、URL 查询参数、
+消息正文或终端内容。
 
 ### 提示配置错误
 
 - 检查默认配置文件是否存在且 JSON 格式正确。
 - 服务端确认已设置 `HERDR_PAL_WECOM_SECRET`。
-- 客户端确认 `url` 和 `userid` 已填写；`machine_id` 可以留空并使用系统 hostname。
+- 客户端确认 `url` 和管理员签发的 `key` 已填写。
 
 服务端会同时打印配置文件路径和具体原因，例如：
 
@@ -368,7 +381,8 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 - 确认目标机器上的 Herdr 正在运行。
 - 检查 `herdr status server --json` 是否显示 protocol 17。
 - 查看客户端日志是否已经连接 Relay，并成功上报会话。
-- 确认客户端配置的 `userid` 与机器人 `/userid` 返回值完全一致。
+- 确认管理员签发 Key 时使用的用户 ID 与机器人 `/userid` 返回值完全一致。
+- 确认客户端使用的是为当前机器签发的完整 Key，且服务端凭据文件没有被覆盖。
 - 新建或启动 Agent 后，客户端最长约 10 秒会主动刷新 Herdr 会话并上报；随后重新执行
   `/ls`。
 
@@ -376,7 +390,8 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 
 - 确认 `relay.url` 使用 `wss://`，地址和端口可从客户端机器访问。
 - 使用自动证书时确认 `skip_verify` 为 `true`。
-- 检查同一用户是否已经有相同 `machine_id` 的客户端在线。
+- 若日志显示 HTTP `409`，检查同一用户是否已有相同机器标识的客户端在线。
+- 若日志显示 HTTP `401`，Key 无效、已过期、已吊销，或服务端读取了错误的凭据文件。
 
 ### Herdr Socket 自动探测失败
 
@@ -395,6 +410,7 @@ marker 路径，并尝试连接对应的 Named Pipe。
 
 - 只在受信任内网部署当前版本。
 - 不要把 Bot Secret、Cookie 或用户凭据提交到仓库。
+- 每台机器使用独立 Key；机器停用时应吊销或移除对应凭据。
 - Herdr Pal 不会自动批准权限请求。
 - Relay 断线期间不会缓存或补发旧任务。
 
@@ -418,4 +434,5 @@ marker 路径，并尝试连接对应的 Named Pipe。
 - [Bridge 架构](docs/BRIDGE_ARCHITECTURE.md)
 - [Herdr API 审计](docs/HERDR_API_AUDIT.md)
 - [维护交接](docs/HANDOFF_CONTEXT.md)
+- [HPRP/1 协议设计](docs/HPRP_PROTOCOL_DESIGN.md)
 - [Windows AMD64 支持](docs/WINDOWS_AMD64_SUPPORT.md)

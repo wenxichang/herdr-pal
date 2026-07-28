@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -21,7 +23,13 @@ import (
 func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	catalog := server.NewSessionCatalog()
-	hub, err := server.NewClientHub(catalog, server.HubConfig{}, logger)
+	homeAKey, homeAIdentity := issueIntegrationKey(t, "user-a", "home-mac", 1)
+	officeAKey, officeAIdentity := issueIntegrationKey(t, "user-a", "office-pc", 2)
+	homeBKey, homeBIdentity := issueIntegrationKey(t, "user-b", "home-mac", 3)
+	verifier := integrationVerifier{identities: map[string]credential.Identity{
+		homeAKey: homeAIdentity, officeAKey: officeAIdentity, homeBKey: homeBIdentity,
+	}}
+	hub, err := server.NewClientHub(catalog, verifier, server.HubConfig{}, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,9 +49,9 @@ func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 	defer relayServer.Close()
 	endpoint := "wss" + strings.TrimPrefix(relayServer.URL, "https")
 
-	homeA := startIntegrationRelayClient(t, endpoint, "user-a", "home-mac", "A 的任务")
-	officeA := startIntegrationRelayClient(t, endpoint, "user-a", "office-pc", "办公室任务")
-	homeB := startIntegrationRelayClient(t, endpoint, "user-b", "home-mac", "B 的任务")
+	homeA := startIntegrationRelayClient(t, endpoint, homeAKey, "home-mac", "A 的任务")
+	officeA := startIntegrationRelayClient(t, endpoint, officeAKey, "office-pc", "办公室任务")
+	homeB := startIntegrationRelayClient(t, endpoint, homeBKey, "home-mac", "B 的任务")
 	defer homeA.Stop(t)
 	defer officeA.Stop(t)
 	defer homeB.Stop(t)
@@ -60,7 +68,10 @@ func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 	}
 	router.Handle(context.Background(), relayIncoming("select-a", "user-a", "/1"))
 	router.Handle(context.Background(), relayIncoming("prompt-a", "user-a", "只发给 A 的 home"))
-	eventuallyRelay(t, func() bool { return homeA.Executor.LastPrompt() == "只发给 A 的 home" })
+	eventuallyRelayWithDetails(t, func() bool { return homeA.Executor.LastPrompt() == "只发给 A 的 home" }, func() string {
+		return "home=" + homeA.Executor.LastPrompt() + ", office=" + officeA.Executor.LastPrompt() + ", user-b=" + homeB.Executor.LastPrompt() +
+			", select-reply=" + gateway.Reply("request-select-a") + ", prompt-reply=" + gateway.Reply("request-prompt-a")
+	})
 	if officeA.Executor.LastPrompt() != "" || homeB.Executor.LastPrompt() != "" {
 		t.Fatalf("prompt crossed target: office=%q user-b=%q", officeA.Executor.LastPrompt(), homeB.Executor.LastPrompt())
 	}
@@ -88,10 +99,10 @@ type integrationRelayClient struct {
 	done     chan error
 }
 
-func startIntegrationRelayClient(t *testing.T, endpoint, userID, machineID, title string) *integrationRelayClient {
+func startIntegrationRelayClient(t *testing.T, endpoint, key, machineID, title string) *integrationRelayClient {
 	t.Helper()
 	client, err := relayclient.New(relayclient.Config{
-		URL: endpoint, UserID: userID, MachineID: machineID, SkipVerify: true, Version: "integration",
+		URL: endpoint, Key: key, SkipVerify: true, Version: "integration",
 		PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -112,6 +123,27 @@ func startIntegrationRelayClient(t *testing.T, endpoint, userID, machineID, titl
 	done := make(chan error, 1)
 	go func() { done <- client.Run(ctx) }()
 	return &integrationRelayClient{Client: client, Executor: executor, cancel: cancel, done: done}
+}
+
+type integrationVerifier struct {
+	identities map[string]credential.Identity
+}
+
+func (verifier integrationVerifier) VerifyBearer(_ context.Context, token string) (credential.Identity, error) {
+	identity, ok := verifier.identities[token]
+	if !ok {
+		return credential.Identity{}, credential.ErrUnauthenticated
+	}
+	return identity, nil
+}
+
+func issueIntegrationKey(t *testing.T, principalID, machineID string, fill byte) (string, credential.Identity) {
+	t.Helper()
+	token, record, err := credential.Issue(principalID, machineID, time.Unix(1, 0), bytes.NewReader(bytes.Repeat([]byte{fill}, 48)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token, credential.Identity{CredentialID: record.CredentialID, PrincipalID: principalID, MachineID: machineID}
 }
 
 func (client *integrationRelayClient) Stop(t *testing.T) {
@@ -209,6 +241,10 @@ func relayIncoming(id, userID, content string) im.IncomingText {
 }
 
 func eventuallyRelay(t *testing.T, condition func() bool) {
+	eventuallyRelayWithDetails(t, condition, func() string { return "" })
+}
+
+func eventuallyRelayWithDetails(t *testing.T, condition func() bool, details func() string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -217,5 +253,5 @@ func eventuallyRelay(t *testing.T, condition func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("Relay integration condition was not satisfied")
+	t.Fatalf("Relay integration condition was not satisfied: %s", details())
 }

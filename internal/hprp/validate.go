@@ -146,6 +146,17 @@ func ValidateCommandResult(result CommandResult) error {
 	return validateResultError(result.Outcome, result.Error)
 }
 
+// ValidateCommandExecute 校验基础命令的幂等键、稳定目标和文本内容。
+func ValidateCommandExecute(command CommandExecute) error {
+	if !validRequiredLabel(command.IdempotencyKey) {
+		return fmt.Errorf("%w: idempotency_key 无效", ErrInvalidMessage)
+	}
+	if err := ValidateTarget(command.Target); err != nil {
+		return err
+	}
+	return validateTextContent(command.Content)
+}
+
 // ValidateCommandOutput 校验有序命令输出及其稳定来源。
 func ValidateCommandOutput(output CommandOutput) error {
 	if output.Sequence == 0 {
@@ -155,6 +166,17 @@ func ValidateCommandOutput(output CommandOutput) error {
 		return err
 	}
 	return validateTextContent(output.Content)
+}
+
+// ValidateNotificationEvent 校验主动通知的幂等键、顺序、类型、目标和文本内容。
+func ValidateNotificationEvent(event NotificationEvent) error {
+	if !validRequiredLabel(event.EventKey) || event.Sequence == 0 || !validRequiredLabel(event.Kind) {
+		return fmt.Errorf("%w: notification event 元数据无效", ErrInvalidMessage)
+	}
+	if err := ValidateTarget(event.Target); err != nil {
+		return err
+	}
+	return validateTextContent(event.Content)
 }
 
 // ValidateFeatureResult 校验 Feature 版本和通用最终 outcome。

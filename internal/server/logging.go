@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/hprp"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
@@ -60,20 +59,16 @@ func serverErrorType(err error) string {
 		return "wecom_protocol"
 	case errors.Is(err, wecom.ErrUnavailable):
 		return "wecom_unavailable"
-	case errors.Is(err, relayproto.ErrProtocolMismatch):
+	case errors.Is(err, hprp.ErrProtocolMismatch):
 		return "protocol_mismatch"
-	case errors.Is(err, relayproto.ErrFrameTooLarge):
-		return "frame_too_large"
-	case errors.Is(err, relayproto.ErrInvalidIdentity):
-		return "invalid_identity"
-	case errors.Is(err, relayproto.ErrInvalidSnapshot):
+	case errors.Is(err, hprp.ErrMessageTooLarge):
+		return "message_too_large"
+	case errors.Is(err, hprp.ErrInvalidSnapshot):
 		return "invalid_snapshot"
-	case errors.Is(err, relayproto.ErrInvalidTarget):
+	case errors.Is(err, hprp.ErrInvalidTarget):
 		return "invalid_target"
-	case errors.Is(err, relayproto.ErrLimitExceeded):
-		return "limit_exceeded"
-	case errors.Is(err, relayproto.ErrInvalidFrame):
-		return "invalid_frame"
+	case errors.Is(err, hprp.ErrInvalidMessage), errors.Is(err, hprp.ErrDuplicateField):
+		return "invalid_message"
 	default:
 		return "runtime_error"
 	}

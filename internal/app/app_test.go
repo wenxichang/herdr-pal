@@ -20,10 +20,10 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/interactive"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/relayclient"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
@@ -2018,7 +2018,7 @@ func TestSafeErrorTypeUsesFixedSemanticCategories(t *testing.T) {
 		{name: "通知队列", err: bridge.ErrNotificationQueueFull, want: "notification_queue_full"},
 		{name: "Herdr 协议", err: herdr.ErrProtocolMismatch, want: "herdr_protocol"},
 		{name: "Herdr 不可用", err: herdr.ErrUnavailable, want: "herdr_unavailable"},
-		{name: "Relay 协议", err: relayproto.ErrProtocolMismatch, want: "relay_protocol"},
+		{name: "Relay 协议", err: hprp.ErrProtocolMismatch, want: "relay_protocol"},
 		{name: "Relay 不可用", err: relayclient.ErrUnavailable, want: "relay_unavailable"},
 		{name: "企业微信协议", err: wecom.ErrProtocol, want: "wecom_protocol"},
 		{name: "企业微信不可用", err: wecom.ErrUnavailable, want: "wecom_unavailable"},

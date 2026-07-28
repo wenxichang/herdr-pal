@@ -12,29 +12,49 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
 var (
 	// ErrInvalidConfig 表示 Relay 客户端配置无效。
 	ErrInvalidConfig = errors.New("Relay 客户端配置无效")
-	// ErrUnavailable 表示当前没有可写的 Relay 连接。
-	ErrUnavailable = errors.New("Relay 连接不可用")
+	// ErrUnavailable 表示当前没有可写的 HPRP 连接。
+	ErrUnavailable = errors.New("HPRP 连接不可用")
 	// ErrInvalidExecutor 表示本地执行器缺失或重复设置。
 	ErrInvalidExecutor = errors.New("Relay 本地执行器无效")
+)
+
+const (
+	defaultPollInterval        = 250 * time.Millisecond
+	defaultSnapshotInterval    = 30 * time.Second
+	defaultSnapshotAckTimeout  = 20 * time.Second
+	defaultIdempotencyWindow   = 10 * time.Minute
+	defaultIdempotencyCapacity = 1024
 )
 
 type relayStageError struct {
 	stage string
 	err   error
 }
+
+type relayHTTPStatusError struct {
+	statusCode int
+	err        error
+}
+
+func (err *relayHTTPStatusError) Error() string { return err.err.Error() }
+
+func (err *relayHTTPStatusError) Unwrap() error { return err.err }
 
 func (err *relayStageError) Error() string { return err.err.Error() }
 
@@ -51,13 +71,11 @@ func withRelayStage(stage string, err error) error {
 	return &relayStageError{stage: stage, err: err}
 }
 
-const defaultPollInterval = 250 * time.Millisecond
-
-// Config 是 Relay 客户端连接和快照上报配置。
+// Config 是 Pal 的 HPRP/1 连接和快照上报配置。
 type Config struct {
 	URL              string
-	UserID           string
-	MachineID        string
+	Key              string
+	CredentialID     string
 	SkipVerify       bool
 	Version          string
 	PollInterval     time.Duration
@@ -67,7 +85,7 @@ type Config struct {
 	Logger           *slog.Logger
 }
 
-// Executor 是 Relay 请求所需的本地 Bridge 能力。
+// Executor 是 HPRP 命令所需的本地 Bridge 能力。
 type Executor interface {
 	CurrentTargets() []session.Target
 	SelectedTarget() (session.Target, error)
@@ -75,7 +93,7 @@ type Executor interface {
 	HandleMessage(ctx context.Context, message im.IncomingText)
 }
 
-// Client 维护 Relay WSS、执行服务端请求并实现 Bridge 消息 sink。
+// Client 维护 HPRP/1 WSS、执行服务端命令并实现 Bridge 消息 sink。
 type Client struct {
 	config Config
 	logger *slog.Logger
@@ -89,37 +107,72 @@ type Client struct {
 
 	executionMu     sync.Mutex
 	activeRequestID string
-	activeTarget    relayproto.SessionRef
+	activeTarget    hprp.Target
+	activeCommand   hprp.CommandExecute
+	activeOutputs   []string
+	activeResult    *hprp.CommandResult
+
+	notificationSequence atomic.Uint64
+	resultCache          *commandResultCache
+}
+
+type clientPendingRequest struct {
+	expected hprp.Type
+	result   chan hprp.Envelope
 }
 
 type clientSession struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	connection       *websocket.Conn
+	machineID        string
+	capabilities     map[string]struct{}
 	snapshotRequests chan chan error
 	writeMu          sync.Mutex
+	pendingMu        sync.Mutex
+	pending          map[string]clientPendingRequest
 }
 
-// New 创建尚未启动的 Relay 客户端；Run 前必须设置 Executor。
+type remoteProtocolError struct {
+	payload hprp.ProtocolError
+}
+
+func (err *remoteProtocolError) Error() string {
+	if err == nil {
+		return "HPRP 远端协议错误"
+	}
+	return fmt.Sprintf("HPRP 远端协议错误: %s", err.payload.Error.Code)
+}
+
+// New 创建尚未启动的 HPRP 客户端；Run 前必须设置 Executor。
 func New(config Config) (*Client, error) {
 	endpoint, err := url.Parse(strings.TrimSpace(config.URL))
 	if err != nil || endpoint.Scheme != "wss" || endpoint.Host == "" {
 		return nil, fmt.Errorf("%w: URL 必须是 wss://", ErrInvalidConfig)
 	}
-	if err := relayproto.ValidateClientHello(relayproto.ClientHello{UserID: config.UserID, MachineID: config.MachineID, ClientVersion: config.Version}); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	credentialID, err := credential.BearerCredentialID(strings.TrimSpace(config.Key))
+	if err != nil {
+		return nil, fmt.Errorf("%w: Key 格式无效", ErrInvalidConfig)
+	}
+	if strings.TrimSpace(config.CredentialID) != "" && config.CredentialID != credentialID {
+		return nil, fmt.Errorf("%w: credential_id 与 Key 不匹配", ErrInvalidConfig)
 	}
 	if config.PollInterval <= 0 {
 		config.PollInterval = defaultPollInterval
 	}
 	if config.SnapshotInterval <= 0 {
-		config.SnapshotInterval = 30 * time.Second
+		config.SnapshotInterval = defaultSnapshotInterval
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
 	config.URL = endpoint.String()
-	return &Client{config: config, logger: config.Logger}, nil
+	config.Key = strings.TrimSpace(config.Key)
+	config.CredentialID = credentialID
+	return &Client{
+		config: config, logger: config.Logger,
+		resultCache: newCommandResultCache(defaultIdempotencyCapacity, defaultIdempotencyWindow, time.Now),
+	}, nil
 }
 
 // SetExecutor 设置本地 Bridge 执行器；只能在 Run 前成功调用一次。
@@ -136,7 +189,7 @@ func (client *Client) SetExecutor(executor Executor) error {
 	return nil
 }
 
-// Run 持续维护 Relay 连接，直到 context 取消。
+// Run 持续维护 HPRP/1 连接，直到 context 取消。
 func (client *Client) Run(ctx context.Context) error {
 	if client == nil || ctx == nil {
 		return ErrInvalidConfig
@@ -153,147 +206,180 @@ func (client *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		client.logger.Info("Relay 连接中", "machine_id", client.config.MachineID, "endpoint", relayLogEndpoint(client.config.URL), "skip_verify", client.config.SkipVerify)
+		client.logger.Info("HPRP 连接中", "credential_id", client.config.CredentialID, "endpoint", relayLogEndpoint(client.config.URL), "skip_verify", client.config.SkipVerify)
 		err := client.runSession(ctx, backoff.Reset)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		delay := backoff.Next()
-		args := []any{"machine_id", client.config.MachineID, "endpoint", relayLogEndpoint(client.config.URL)}
-		args = append(args, relayErrorLogArgs(err, client.config.URL, client.config.UserID)...)
+		args := []any{"credential_id", client.config.CredentialID, "endpoint", relayLogEndpoint(client.config.URL)}
+		args = append(args, relayErrorLogArgs(err, client.config.URL, client.config.Key)...)
 		args = append(args, "retry_delay", delay)
-		client.logger.Warn("Relay 连接已断开", args...)
+		client.logger.Warn("HPRP 连接已断开", args...)
 		if err := waitReconnect(ctx, delay); err != nil {
 			return err
 		}
 	}
 }
 
-// RespondMarkdown 把 Bridge 首段回复写成 execute_response。
+// RespondMarkdown 把 Bridge 首段回复写成 command.result。
 func (client *Client) RespondMarkdown(ctx context.Context, requestID, content string) error {
-	response := relayproto.ExecuteResponse{Content: content}
 	client.executionMu.Lock()
-	activeRequestID := client.activeRequestID
-	activeTarget := client.activeTarget
-	client.executionMu.Unlock()
-	if activeRequestID == requestID {
-		if selected, err := client.selectedSessionRef(); err == nil &&
-			selected.MachineID == activeTarget.MachineID && selected.PaneID == activeTarget.PaneID &&
-			selected.OccupantHash != activeTarget.OccupantHash {
-			response.SelectedTarget = &selected
-			client.executionMu.Lock()
-			if client.activeRequestID == requestID && client.activeTarget == activeTarget {
-				client.activeTarget = selected
-			}
-			client.executionMu.Unlock()
-			if err := client.reportCurrentSnapshot(ctx); err != nil {
-				return err
-			}
-		}
-	}
-	return client.writeCurrent(ctx, relayproto.TypeExecuteResponse, requestID, response)
-}
-
-// SendMarkdown 把当前执行产生的后续分段写成 execute_push。
-func (client *Client) SendMarkdown(ctx context.Context, content string) error {
-	client.executionMu.Lock()
-	requestID := client.activeRequestID
-	target := client.activeTarget
-	client.executionMu.Unlock()
-	if requestID == "" {
+	if client.activeRequestID != requestID || requestID == "" {
+		client.executionMu.Unlock()
 		return ErrUnavailable
 	}
-	return client.writeCurrent(ctx, relayproto.TypeExecutePush, requestID, relayproto.ExecutePush{Target: target, Content: content})
+	activeTarget := client.activeTarget
+	client.executionMu.Unlock()
+
+	result := hprp.CommandResult{
+		Outcome: hprp.OutcomeOK,
+		Content: &hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
+	}
+	if selected, err := client.selectedTarget(); err == nil && selected.MachineID == activeTarget.MachineID &&
+		selected.SlotID == activeTarget.SlotID && selected.SessionID != activeTarget.SessionID {
+		if err := client.reportCurrentSnapshot(ctx); err != nil {
+			return err
+		}
+		result.ReplacementTarget = &selected
+		client.executionMu.Lock()
+		if client.activeRequestID == requestID && client.activeTarget == activeTarget {
+			client.activeTarget = selected
+		}
+		client.executionMu.Unlock()
+	}
+	client.executionMu.Lock()
+	if client.activeRequestID == requestID {
+		resultCopy := result
+		client.activeResult = &resultCopy
+		client.executionMu.Unlock()
+		return nil
+	}
+	client.executionMu.Unlock()
+	return ErrUnavailable
+}
+
+// SendMarkdown 缓冲当前命令的后续输出，在本地处理结束后按 HPRP 顺序发送。
+func (client *Client) SendMarkdown(_ context.Context, content string) error {
+	client.executionMu.Lock()
+	defer client.executionMu.Unlock()
+	if client.activeRequestID == "" {
+		return ErrUnavailable
+	}
+	client.activeOutputs = append(client.activeOutputs, content)
+	return nil
 }
 
 // SendNotification 发送携带稳定本机目标的主动通知；断线时直接失败且不缓存。
 func (client *Client) SendNotification(ctx context.Context, target im.NotificationTarget, content string) error {
-	localIndex := 0
-	for index, current := range client.localExecutor().CurrentTargets() {
-		if current.PaneID == target.PaneID && current.OccupantKey == target.OccupantHash {
-			localIndex = index + 1
-			break
-		}
+	current := client.currentSession()
+	if current == nil {
+		return ErrUnavailable
 	}
-	if localIndex == 0 {
-		return session.ErrListSnapshotExpired
+	if _, err := client.resolveLocalTarget(current.machineID, target.PaneID, target.OccupantHash); err != nil {
+		return err
 	}
-	ref := relayproto.SessionRef{
-		MachineID: client.config.MachineID, LocalIndex: localIndex,
-		PaneID: target.PaneID, OccupantHash: target.OccupantHash,
+	sequence := client.notificationSequence.Add(1)
+	notification := hprp.NotificationEvent{
+		EventKey: randomClientID(),
+		Sequence: sequence, Kind: "agent.status",
+		Target:  hprp.Target{MachineID: current.machineID, SlotID: target.PaneID, SessionID: target.OccupantHash},
+		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
 	}
-	return client.writeCurrent(ctx, relayproto.TypeNotification, "", relayproto.Notification{Target: ref, Content: content})
+	return current.write(ctx, hprp.TypeNotificationEvent, randomClientID(), "", false, notification)
 }
 
 func (client *Client) runSession(parent context.Context, onReady func()) error {
-	connection, response, err := websocket.Dial(parent, client.config.URL, &websocket.DialOptions{HTTPClient: client.httpClient()})
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+client.config.Key)
+	connection, response, err := websocket.Dial(parent, client.config.URL, &websocket.DialOptions{
+		HTTPClient: client.httpClient(), HTTPHeader: header, Subprotocols: []string{hprp.Subprotocol},
+	})
 	if err != nil && response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
 	if err != nil {
+		if response != nil {
+			err = &relayHTTPStatusError{statusCode: response.StatusCode, err: err}
+		}
 		return withRelayStage("dial", err)
 	}
-	connection.SetReadLimit(relayproto.MaxFrameBytes)
+	if connection.Subprotocol() != hprp.Subprotocol {
+		_ = connection.Close(websocket.StatusPolicyViolation, "HPRP subprotocol missing")
+		return withRelayStage("subprotocol", fmt.Errorf("%w: 服务端未选择 %s", ErrInvalidConfig, hprp.Subprotocol))
+	}
+	connection.SetReadLimit(hprp.MaxMessageBytes)
 	sessionContext, cancelSession := context.WithCancel(parent)
 	current := &clientSession{
 		ctx: sessionContext, cancel: cancelSession, connection: connection,
-		snapshotRequests: make(chan chan error),
+		snapshotRequests: make(chan chan error), pending: make(map[string]clientPendingRequest),
 	}
-	client.setCurrent(current)
-	defer client.clearCurrent(current)
 	defer current.close()
 
 	helloID := randomClientID()
-	if err := current.write(parent, relayproto.TypeClientHello, helloID, relayproto.ClientHello{
-		UserID: client.config.UserID, MachineID: client.config.MachineID, ClientVersion: client.config.Version,
+	if err := current.write(parent, hprp.TypeHelloClient, helloID, "", true, hprp.ClientHello{
+		Implementation: hprp.Implementation{Name: "herdr-pal", Version: client.config.Version, OS: runtime.GOOS, Arch: runtime.GOARCH},
+		Capabilities:   []string{hprp.CapabilityCommandOutputV1}, Features: map[string]hprp.FeatureOffer{},
+		Limits: hprp.ClientLimits{
+			MaxReceiveMessageBytes: hprp.MaxMessageBytes, MaxInflightCommands: 1, MaxInflightFeatures: 0,
+			IdempotencyWindowMS: defaultIdempotencyWindow.Milliseconds(),
+		},
 	}); err != nil {
-		return withRelayStage("client_hello_send", err)
+		return withRelayStage("hello.client_send", err)
 	}
-	helloFrame, err := current.read(parent)
+	helloEnvelope, err := current.read(parent)
 	if err != nil {
-		return withRelayStage("server_hello_read", err)
+		return withRelayStage("hello.server_read", err)
 	}
-	if helloFrame.Type == relayproto.TypeProtocolError {
-		return withRelayStage("server_hello", decodeRelayProtocolError(helloFrame))
+	if helloEnvelope.Type == hprp.TypeProtocolError {
+		return withRelayStage("hello.server", decodeHPRPProtocolError(helloEnvelope))
 	}
-	if helloFrame.Type != relayproto.TypeServerHello {
-		return withRelayStage("server_hello", fmt.Errorf("%w: 缺少 server_hello，收到 %s", ErrInvalidConfig, helloFrame.Type))
+	if helloEnvelope.Type != hprp.TypeHelloServer || helloEnvelope.ReplyTo != helloID {
+		return withRelayStage("hello.server", fmt.Errorf("%w: hello.server 关联无效", ErrInvalidConfig))
 	}
-	serverHello, err := relayproto.DecodePayload[relayproto.ServerHello](helloFrame)
-	if err != nil || serverHello.ConnectionID == "" {
-		if err == nil {
-			err = fmt.Errorf("%w: server_hello 缺少 connection_id", ErrInvalidConfig)
-		}
-		return withRelayStage("server_hello_decode", err)
+	serverHello, err := hprp.DecodePayload[hprp.ServerHello](helloEnvelope)
+	if err == nil {
+		err = hprp.ValidateServerHello(serverHello)
 	}
-	snapshotInterval := client.config.SnapshotInterval
-	if serverHello.SnapshotIntervalSecs > 0 {
-		snapshotInterval = time.Duration(serverHello.SnapshotIntervalSecs) * time.Second
+	if err != nil {
+		return withRelayStage("hello.server_decode", err)
 	}
-	client.logger.Info("Relay 握手成功",
-		"machine_id", client.config.MachineID,
-		"endpoint", relayLogEndpoint(client.config.URL),
-		"connection_id", serverHello.ConnectionID,
-		"heartbeat_interval", time.Duration(serverHello.HeartbeatIntervalSecs)*time.Second,
-		"heartbeat_timeout", time.Duration(serverHello.HeartbeatTimeoutSecs)*time.Second,
-		"snapshot_interval", snapshotInterval,
+	current.machineID = serverHello.MachineID
+	current.setCapabilities(serverHello.Capabilities)
+	client.logger.Info("HPRP 握手成功",
+		"credential_id", client.config.CredentialID, "machine_id", current.machineID,
+		"endpoint", relayLogEndpoint(client.config.URL), "connection_id", serverHello.ConnectionID,
+		"heartbeat_interval", time.Duration(serverHello.Heartbeat.PingIntervalMS)*time.Millisecond,
+		"heartbeat_timeout", time.Duration(serverHello.Heartbeat.IdleTimeoutMS)*time.Millisecond,
+		"snapshot_interval", client.config.SnapshotInterval,
 	)
+
 	sequence := uint64(1)
 	initial := BuildSnapshot(sequence, client.localExecutor().CurrentTargets())
-	if err := current.write(parent, relayproto.TypeSessionSnapshot, "", snapshotToLegacy(initial)); err != nil {
+	initialID := randomClientID()
+	if err := current.write(parent, hprp.TypeSessionSnapshot, initialID, "", true, initial); err != nil {
 		return withRelayStage("initial_snapshot_send", err)
 	}
+	snapshotEnvelope, err := current.read(parent)
+	if err != nil {
+		return withRelayStage("initial_snapshot_result", err)
+	}
+	if err := validateSnapshotAcknowledgement(snapshotEnvelope, initialID, initial.Sequence); err != nil {
+		return withRelayStage("initial_snapshot_result", err)
+	}
 	fingerprint := SnapshotFingerprint(initial)
+	readResult := make(chan error, 1)
+	go func() { readResult <- client.readLoop(current) }()
+	client.setCurrent(current)
+	defer client.clearCurrent(current)
 	if onReady != nil {
 		onReady()
 	}
-	client.logger.Info("Relay 连接成功", "machine_id", client.config.MachineID, "endpoint", relayLogEndpoint(client.config.URL), "connection_id", serverHello.ConnectionID, "snapshot_sequence", initial.Sequence, "session_count", len(initial.Sessions))
+	client.logger.Info("HPRP 连接成功", "credential_id", client.config.CredentialID, "machine_id", current.machineID, "endpoint", relayLogEndpoint(client.config.URL), "connection_id", serverHello.ConnectionID, "snapshot_sequence", initial.Sequence, "session_count", len(initial.Sessions))
 
-	readResult := make(chan error, 1)
-	go func() { readResult <- client.readLoop(current) }()
 	pollTicker := time.NewTicker(client.config.PollInterval)
 	defer pollTicker.Stop()
-	calibrationTicker := time.NewTicker(snapshotInterval)
+	calibrationTicker := time.NewTicker(client.config.SnapshotInterval)
 	defer calibrationTicker.Stop()
 	previousSessionCount := len(initial.Sessions)
 	sendSnapshot := func(force bool, trigger string) error {
@@ -303,20 +389,22 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 		if !force && !changed {
 			return nil
 		}
-		if err := current.write(parent, relayproto.TypeSessionSnapshot, "", snapshotToLegacy(candidate)); err != nil {
+		requestContext, cancel := context.WithTimeout(parent, defaultSnapshotAckTimeout)
+		snapshotID := randomClientID()
+		response, err := current.request(requestContext, hprp.TypeSessionSnapshot, snapshotID, candidate, hprp.TypeSessionSnapshotResult)
+		cancel()
+		if err != nil {
 			return withRelayStage("snapshot_send", err)
+		}
+		if err := validateSnapshotAcknowledgement(response, snapshotID, candidate.Sequence); err != nil {
+			return withRelayStage("snapshot_result", err)
 		}
 		sequence++
 		fingerprint = candidateFingerprint
-		client.logger.Debug("Relay 会话快照已上报",
-			"machine_id", client.config.MachineID,
-			"connection_id", serverHello.ConnectionID,
-			"trigger", trigger,
-			"snapshot_sequence", candidate.Sequence,
-			"previous_session_count", previousSessionCount,
-			"session_count", len(candidate.Sessions),
-			"changed", changed,
-			"forced", force,
+		client.logger.Debug("HPRP 会话快照已确认",
+			"credential_id", client.config.CredentialID, "machine_id", current.machineID, "connection_id", serverHello.ConnectionID,
+			"trigger", trigger, "snapshot_sequence", candidate.Sequence, "previous_session_count", previousSessionCount,
+			"session_count", len(candidate.Sessions), "changed", changed, "forced", force,
 		)
 		previousSessionCount = len(candidate.Sessions)
 		return nil
@@ -347,120 +435,170 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 
 func (client *Client) readLoop(current *clientSession) error {
 	for {
-		frame, err := current.read(current.ctx)
+		envelope, err := current.read(current.ctx)
 		if err != nil {
 			return err
 		}
-		switch frame.Type {
-		case relayproto.TypeSelectRequest:
-			client.logger.Debug("Relay 选择请求已接收", "machine_id", client.config.MachineID, "request_hash", relayLogHash(frame.RequestID))
-			if err := client.handleSelect(current, frame); err != nil {
-				return withRelayStage("select_request", err)
+		switch envelope.Type {
+		case hprp.TypeSessionSnapshotResult:
+			if !current.deliver(envelope) {
+				return fmt.Errorf("%w: 未匹配的 session.snapshot.result", hprp.ErrInvalidMessage)
 			}
-		case relayproto.TypeExecuteRequest:
-			client.logger.Debug("Relay 执行请求已接收", "machine_id", client.config.MachineID, "request_hash", relayLogHash(frame.RequestID))
-			if err := client.handleExecute(current, frame); err != nil {
-				return withRelayStage("execute_request", err)
-			}
-		case relayproto.TypePing:
-			heartbeat, err := relayproto.DecodePayload[relayproto.Heartbeat](frame)
-			if err != nil {
-				return withRelayStage("heartbeat_decode", err)
-			}
-			if err := current.write(current.ctx, relayproto.TypePong, frame.RequestID, heartbeat); err != nil {
-				return withRelayStage("heartbeat_pong_send", err)
-			}
-			client.logger.Debug("Relay 心跳已响应", "machine_id", client.config.MachineID, "request_hash", relayLogHash(frame.RequestID))
-		case relayproto.TypeProtocolError:
-			return withRelayStage("protocol_error", decodeRelayProtocolError(frame))
+		case hprp.TypeCommandExecute:
+			go client.handleCommand(current, envelope)
+		case hprp.TypeProtocolError:
+			return decodeHPRPProtocolError(envelope)
 		default:
-			return withRelayStage("unexpected_frame", fmt.Errorf("%w: 服务端帧类型 %s", relayproto.ErrInvalidFrame, frame.Type))
+			if envelope.MustUnderstand {
+				_ = current.write(current.ctx, hprp.TypeProtocolError, randomClientID(), envelope.ID, false, hprp.ProtocolError{
+					Error: hprp.Error{
+						Code: hprp.CodeProtocolRequiredExtensionUnsupported, Message: "消息类型不受支持", Retryable: false,
+					},
+					Close: true,
+				})
+				return fmt.Errorf("%w: 不支持的必需消息 %s", hprp.ErrInvalidMessage, envelope.Type)
+			}
+			client.logger.Debug("HPRP 未知可选消息已忽略", "credential_id", client.config.CredentialID, "machine_id", current.machineID, "event_type", envelope.Type)
 		}
 	}
 }
 
-func (client *Client) handleSelect(current *clientSession, frame relayproto.Frame) error {
-	request, err := relayproto.DecodePayload[relayproto.SelectRequest](frame)
+func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelope) {
+	command, err := hprp.DecodePayload[hprp.CommandExecute](envelope)
+	if err == nil {
+		err = hprp.ValidateCommandExecute(command)
+	}
 	if err != nil {
-		return err
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false, rejectedCommand(hprp.CodeProtocolInvalidMessage, "命令格式无效"))
+		return
 	}
-	result := relayproto.SelectResult{OK: true}
-	resultName := "success"
-	if request.Target.MachineID != client.config.MachineID {
-		result = relayproto.SelectResult{Code: relayproto.CodeTargetNotFound, Message: "目标机器不匹配"}
-		resultName = string(relayproto.CodeTargetNotFound)
-	} else if err := client.localExecutor().SelectTarget(request.Target.PaneID, request.Target.OccupantHash); err != nil {
-		result = relayproto.SelectResult{Code: relayproto.CodeTargetChanged, Message: "目标 occupant 已变化"}
-		resultName = string(relayproto.CodeTargetChanged)
+	switch cached, state := client.resultCache.Lookup(command); state {
+	case commandCacheHit:
+		client.writeCachedCommand(current, envelope.ID, cached)
+		client.logCommandResult(envelope.ID, command, "idempotent_replay")
+		return
+	case commandCacheConflict:
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false,
+			rejectedCommand(hprp.CodeCommandIdempotencyConflict, "幂等键已用于其他命令"))
+		client.logCommandResult(envelope.ID, command, "idempotency_conflict")
+		return
 	}
-	if err := current.write(current.ctx, relayproto.TypeSelectResult, frame.RequestID, result); err != nil {
-		return err
+	if command.Target.MachineID != current.machineID || client.localExecutor().SelectTarget(command.Target.SlotID, command.Target.SessionID) != nil {
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false, rejectedCommand(hprp.CodeTargetSessionChanged, "目标 Agent 已变化"))
+		client.logCommandResult(envelope.ID, command, "target_changed")
+		return
 	}
-	client.logger.Debug("Relay 选择请求已处理",
-		"machine_id", client.config.MachineID,
-		"request_hash", relayLogHash(frame.RequestID),
-		"target_machine", request.Target.MachineID,
-		"local_index", request.Target.LocalIndex,
-		"pane_id", request.Target.PaneID,
-		"occupant_hash", relayLogHash(request.Target.OccupantHash),
-		"result", resultName,
-	)
-	return nil
-}
+	client.executionMu.Lock()
+	if client.activeRequestID != "" {
+		client.executionMu.Unlock()
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false, rejectedCommand(hprp.CodeServerBusy, "本地命令正在执行"))
+		client.logCommandResult(envelope.ID, command, "busy")
+		return
+	}
+	client.activeRequestID = envelope.ID
+	client.activeTarget = command.Target
+	client.activeCommand = command
+	client.activeOutputs = nil
+	client.activeResult = nil
+	client.executionMu.Unlock()
 
-func (client *Client) handleExecute(current *clientSession, frame relayproto.Frame) error {
-	request, err := relayproto.DecodePayload[relayproto.ExecuteRequest](frame)
-	if err != nil {
-		return err
-	}
-	if request.Target.MachineID != client.config.MachineID || client.localExecutor().SelectTarget(request.Target.PaneID, request.Target.OccupantHash) != nil {
-		if err := current.write(current.ctx, relayproto.TypeExecuteResponse, frame.RequestID, relayproto.ExecuteResponse{Content: "目标 Agent 已变化，请重新执行 /ls 和 /N。"}); err != nil {
-			return err
-		}
-		client.logExecuteResult(frame.RequestID, request, "target_changed")
-		return nil
-	}
 	message := im.IncomingText{
-		RequestID: frame.RequestID, MessageID: request.MessageID, UserID: request.UserID,
-		ChatType: "single", Content: request.Content,
+		RequestID: envelope.ID, MessageID: command.IdempotencyKey, UserID: client.config.CredentialID,
+		ChatType: "single", Content: command.Content.Text,
 	}
-	client.executionMu.Lock()
-	client.activeRequestID = frame.RequestID
-	client.activeTarget = request.Target
-	client.executionMu.Unlock()
 	client.localExecutor().HandleMessage(current.ctx, message)
-	client.executionMu.Lock()
-	if client.activeRequestID == frame.RequestID {
-		client.activeRequestID = ""
-		client.activeTarget = relayproto.SessionRef{}
-	}
-	client.executionMu.Unlock()
-	client.logExecuteResult(frame.RequestID, request, "success")
-	return nil
+	client.finishCommand(current, envelope.ID)
+	client.logCommandResult(envelope.ID, command, "success")
 }
 
-func (client *Client) logExecuteResult(requestID string, request relayproto.ExecuteRequest, result string) {
-	client.logger.Debug("Relay 执行请求已处理",
-		"machine_id", client.config.MachineID,
-		"request_hash", relayLogHash(requestID),
-		"message_hash", relayLogHash(request.MessageID),
-		"target_machine", request.Target.MachineID,
-		"local_index", request.Target.LocalIndex,
-		"pane_id", request.Target.PaneID,
-		"occupant_hash", relayLogHash(request.Target.OccupantHash),
-		"content_length", len(request.Content),
-		"result", result,
+func (client *Client) finishCommand(current *clientSession, requestID string) {
+	client.executionMu.Lock()
+	if client.activeRequestID != requestID {
+		client.executionMu.Unlock()
+		return
+	}
+	target := client.activeTarget
+	command := client.activeCommand
+	outputs := append([]string(nil), client.activeOutputs...)
+	result := client.activeResult
+	client.activeRequestID = ""
+	client.activeTarget = hprp.Target{}
+	client.activeCommand = hprp.CommandExecute{}
+	client.activeOutputs = nil
+	client.activeResult = nil
+	client.executionMu.Unlock()
+	if result == nil {
+		failed := hprp.CommandResult{
+			Outcome: hprp.OutcomeFailed,
+			Error:   &hprp.Error{Code: hprp.CodeCommandExecutionFailed, Message: "本地命令未返回结果", Retryable: false},
+		}
+		client.resultCache.Store(command, cachedCommandResult{result: failed})
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), requestID, false, failed)
+		return
+	}
+	client.resultCache.Store(command, cachedCommandResult{result: *result, outputs: outputs})
+	if err := current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), requestID, false, *result); err != nil {
+		return
+	}
+	if !current.supportsCapability(hprp.CapabilityCommandOutputV1) {
+		return
+	}
+	for index, output := range outputs {
+		if err := current.write(current.ctx, hprp.TypeCommandOutput, randomClientID(), requestID, false, hprp.CommandOutput{
+			Target: target, Sequence: uint64(index + 1), Final: index == len(outputs)-1,
+			Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: output},
+		}); err != nil {
+			return
+		}
+	}
+}
+
+func (client *Client) writeCachedCommand(current *clientSession, requestID string, cached cachedCommandResult) {
+	if err := current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), requestID, false, cached.result); err != nil {
+		return
+	}
+	if !current.supportsCapability(hprp.CapabilityCommandOutputV1) {
+		return
+	}
+	target := cached.command.Target
+	if cached.result.ReplacementTarget != nil {
+		target = *cached.result.ReplacementTarget
+	}
+	for index, output := range cached.outputs {
+		if err := current.write(current.ctx, hprp.TypeCommandOutput, randomClientID(), requestID, false, hprp.CommandOutput{
+			Target: target, Sequence: uint64(index + 1), Final: index == len(cached.outputs)-1,
+			Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: output},
+		}); err != nil {
+			return
+		}
+	}
+}
+
+func (client *Client) logCommandResult(requestID string, command hprp.CommandExecute, result string) {
+	client.logger.Debug("HPRP 命令已处理",
+		"credential_id", client.config.CredentialID,
+		"request_hash", relayLogHash(requestID), "message_hash", relayLogHash(command.IdempotencyKey),
+		"target_machine", command.Target.MachineID, "pane_id", command.Target.SlotID,
+		"session_hash", relayLogHash(command.Target.SessionID), "content_length", len(command.Content.Text), "result", result,
 	)
 }
 
-func (client *Client) writeCurrent(ctx context.Context, frameType relayproto.Type, requestID string, payload any) error {
-	client.currentMu.RLock()
-	current := client.current
-	client.currentMu.RUnlock()
+func rejectedCommand(code hprp.ErrorCode, message string) hprp.CommandResult {
+	return hprp.CommandResult{Outcome: hprp.OutcomeRejected, Error: &hprp.Error{Code: code, Message: message, Retryable: false}}
+}
+
+func (client *Client) writeCurrent(ctx context.Context, messageType hprp.Type, id, replyTo string, mustUnderstand bool, payload any) error {
+	current := client.currentSession()
 	if current == nil {
 		return ErrUnavailable
 	}
-	return current.write(ctx, frameType, requestID, payload)
+	return current.write(ctx, messageType, id, replyTo, mustUnderstand, payload)
+}
+
+func (client *Client) currentSession() *clientSession {
+	client.currentMu.RLock()
+	defer client.currentMu.RUnlock()
+	return client.current
 }
 
 func (client *Client) localExecutor() Executor {
@@ -469,27 +607,29 @@ func (client *Client) localExecutor() Executor {
 	return client.executor
 }
 
-func (client *Client) selectedSessionRef() (relayproto.SessionRef, error) {
-	executor := client.localExecutor()
-	selected, err := executor.SelectedTarget()
-	if err != nil {
-		return relayproto.SessionRef{}, err
+func (client *Client) selectedTarget() (hprp.Target, error) {
+	current := client.currentSession()
+	if current == nil {
+		return hprp.Target{}, ErrUnavailable
 	}
-	for index, current := range executor.CurrentTargets() {
-		if current.PaneID == selected.PaneID && current.OccupantKey == selected.OccupantKey {
-			return relayproto.SessionRef{
-				MachineID: client.config.MachineID, LocalIndex: index + 1,
-				PaneID: selected.PaneID, OccupantHash: selected.OccupantKey,
-			}, nil
+	selected, err := client.localExecutor().SelectedTarget()
+	if err != nil {
+		return hprp.Target{}, err
+	}
+	return client.resolveLocalTarget(current.machineID, selected.PaneID, selected.OccupantKey)
+}
+
+func (client *Client) resolveLocalTarget(machineID, paneID, sessionID string) (hprp.Target, error) {
+	for _, current := range client.localExecutor().CurrentTargets() {
+		if current.PaneID == paneID && current.OccupantKey == sessionID {
+			return hprp.Target{MachineID: machineID, SlotID: paneID, SessionID: sessionID}, nil
 		}
 	}
-	return relayproto.SessionRef{}, session.ErrListSnapshotExpired
+	return hprp.Target{}, session.ErrListSnapshotExpired
 }
 
 func (client *Client) reportCurrentSnapshot(ctx context.Context) error {
-	client.currentMu.RLock()
-	current := client.current
-	client.currentMu.RUnlock()
+	current := client.currentSession()
 	if current == nil {
 		return ErrUnavailable
 	}
@@ -535,12 +675,12 @@ func (client *Client) httpClient() *http.Client {
 	return &http.Client{Transport: transport}
 }
 
-func (current *clientSession) write(ctx context.Context, frameType relayproto.Type, requestID string, payload any) error {
-	frame, err := relayproto.NewFrame(frameType, requestID, payload)
+func (current *clientSession) write(ctx context.Context, messageType hprp.Type, id, replyTo string, mustUnderstand bool, payload any) error {
+	envelope, err := hprp.NewEnvelope(messageType, id, replyTo, mustUnderstand, payload)
 	if err != nil {
 		return err
 	}
-	encoded, err := relayproto.Encode(frame)
+	encoded, err := hprp.Encode(envelope)
 	if err != nil {
 		return err
 	}
@@ -552,20 +692,105 @@ func (current *clientSession) write(ctx context.Context, frameType relayproto.Ty
 	return current.connection.Write(ctx, websocket.MessageText, encoded)
 }
 
-func (current *clientSession) read(ctx context.Context) (relayproto.Frame, error) {
+func (current *clientSession) setCapabilities(capabilities []string) {
+	current.capabilities = make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		current.capabilities[capability] = struct{}{}
+	}
+}
+
+func (current *clientSession) supportsCapability(capability string) bool {
+	_, supported := current.capabilities[capability]
+	return supported
+}
+
+func (current *clientSession) request(ctx context.Context, messageType hprp.Type, id string, payload any, expected hprp.Type) (hprp.Envelope, error) {
+	pending := clientPendingRequest{expected: expected, result: make(chan hprp.Envelope, 1)}
+	current.pendingMu.Lock()
+	if _, exists := current.pending[id]; exists {
+		current.pendingMu.Unlock()
+		return hprp.Envelope{}, hprp.ErrInvalidMessage
+	}
+	current.pending[id] = pending
+	current.pendingMu.Unlock()
+	defer current.removePending(id)
+	if err := current.write(ctx, messageType, id, "", true, payload); err != nil {
+		return hprp.Envelope{}, err
+	}
+	select {
+	case response := <-pending.result:
+		return response, nil
+	case <-ctx.Done():
+		return hprp.Envelope{}, ctx.Err()
+	case <-current.ctx.Done():
+		return hprp.Envelope{}, ErrUnavailable
+	}
+}
+
+func (current *clientSession) deliver(envelope hprp.Envelope) bool {
+	if envelope.ReplyTo == "" {
+		return false
+	}
+	current.pendingMu.Lock()
+	pending, exists := current.pending[envelope.ReplyTo]
+	if !exists || pending.expected != envelope.Type {
+		current.pendingMu.Unlock()
+		return false
+	}
+	delete(current.pending, envelope.ReplyTo)
+	current.pendingMu.Unlock()
+	pending.result <- envelope
+	return true
+}
+
+func (current *clientSession) removePending(id string) {
+	current.pendingMu.Lock()
+	delete(current.pending, id)
+	current.pendingMu.Unlock()
+}
+
+func (current *clientSession) read(ctx context.Context) (hprp.Envelope, error) {
 	messageType, data, err := current.connection.Read(ctx)
 	if err != nil {
-		return relayproto.Frame{}, err
+		return hprp.Envelope{}, err
 	}
 	if messageType != websocket.MessageText {
-		return relayproto.Frame{}, relayproto.ErrInvalidFrame
+		return hprp.Envelope{}, hprp.ErrInvalidMessage
 	}
-	return relayproto.Decode(data)
+	return hprp.Decode(data)
 }
 
 func (current *clientSession) close() {
 	current.cancel()
 	_ = current.connection.Close(websocket.StatusNormalClosure, "client session ended")
+}
+
+func validateSnapshotAcknowledgement(envelope hprp.Envelope, requestID string, sequence uint64) error {
+	if envelope.Type == hprp.TypeProtocolError {
+		return decodeHPRPProtocolError(envelope)
+	}
+	if envelope.Type != hprp.TypeSessionSnapshotResult || envelope.ReplyTo != requestID {
+		return fmt.Errorf("%w: session.snapshot.result 关联无效", hprp.ErrInvalidMessage)
+	}
+	result, err := hprp.DecodePayload[hprp.SnapshotResult](envelope)
+	if err != nil {
+		return err
+	}
+	if result.Outcome != hprp.OutcomeOK || result.AppliedSequence != sequence || result.Error != nil {
+		if result.Error != nil {
+			return fmt.Errorf("HPRP 快照被拒绝: %s", result.Error.Code)
+		}
+		return fmt.Errorf("%w: 快照未确认", hprp.ErrInvalidMessage)
+	}
+	return nil
+}
+
+func decodeHPRPProtocolError(envelope hprp.Envelope) error {
+	payload, err := hprp.DecodePayload[hprp.ProtocolError](envelope)
+	if err != nil {
+		return err
+	}
+	return &remoteProtocolError{payload: payload}
 }
 
 func randomClientID() string {
@@ -588,9 +813,11 @@ func relayErrorType(err error) string {
 		return "tls"
 	case relayDNSError(err):
 		return "dns"
+	case relayHTTPStatus(err) != 0:
+		return "http_status"
 	case relayProtocolError(err) != nil:
 		return "protocol_error"
-	case errors.Is(err, relayproto.ErrProtocolMismatch), errors.Is(err, relayproto.ErrInvalidFrame):
+	case errors.Is(err, hprp.ErrProtocolMismatch), errors.Is(err, hprp.ErrInvalidMessage), errors.Is(err, hprp.ErrMessageTooLarge):
 		return "protocol"
 	case websocket.CloseStatus(err) != -1:
 		return "remote_close"
@@ -599,18 +826,21 @@ func relayErrorType(err error) string {
 	}
 }
 
-func relayErrorLogArgs(err error, rawURL, userID string) []any {
+func relayErrorLogArgs(err error, rawURL, secret string) []any {
 	stage := "session"
 	var staged *relayStageError
 	if errors.As(err, &staged) && staged.stage != "" {
 		stage = staged.stage
 	}
-	args := []any{"stage", stage, "error_type", relayErrorType(err), "reason", safeRelayReason(err, rawURL, userID)}
+	args := []any{"stage", stage, "error_type", relayErrorType(err), "reason", safeRelayReason(err, rawURL, secret)}
 	if protocolError := relayProtocolError(err); protocolError != nil {
-		args = append(args, "error_code", protocolError.Code, "close_connection", protocolError.Close)
-		if message := safeRelayLogValue(redactRelaySensitive(protocolError.Message, rawURL, userID), 240); message != "" {
+		args = append(args, "error_code", protocolError.payload.Error.Code, "close_connection", protocolError.payload.Close)
+		if message := safeRelayLogValue(redactRelaySensitive(protocolError.payload.Error.Message, rawURL, secret), 240); message != "" {
 			args = append(args, "server_message", message)
 		}
+	}
+	if statusCode := relayHTTPStatus(err); statusCode != 0 {
+		args = append(args, "status_code", statusCode)
 	}
 	if status := websocket.CloseStatus(err); status != -1 {
 		args = append(args, "close_status", status)
@@ -618,20 +848,20 @@ func relayErrorLogArgs(err error, rawURL, userID string) []any {
 	return args
 }
 
-func decodeRelayProtocolError(frame relayproto.Frame) error {
-	payload, err := relayproto.DecodePayload[relayproto.ProtocolErrorPayload](frame)
-	if err != nil {
-		return err
-	}
-	return relayproto.NewProtocolError(payload.Code, payload.Message, payload.Close)
-}
-
-func relayProtocolError(err error) *relayproto.ProtocolError {
-	var protocolError *relayproto.ProtocolError
+func relayProtocolError(err error) *remoteProtocolError {
+	var protocolError *remoteProtocolError
 	if errors.As(err, &protocolError) {
 		return protocolError
 	}
 	return nil
+}
+
+func relayHTTPStatus(err error) int {
+	var statusError *relayHTTPStatusError
+	if errors.As(err, &statusError) {
+		return statusError.statusCode
+	}
+	return 0
 }
 
 func relayTLSError(err error) bool {
@@ -647,16 +877,16 @@ func relayDNSError(err error) bool {
 	return errors.As(err, &dnsError)
 }
 
-func safeRelayReason(err error, rawURL, userID string) string {
+func safeRelayReason(err error, rawURL, secret string) string {
 	if err == nil {
 		return "未提供断开原因"
 	}
-	return safeRelayLogValue(redactRelaySensitive(err.Error(), rawURL, userID), 512)
+	return safeRelayLogValue(redactRelaySensitive(err.Error(), rawURL, secret), 512)
 }
 
-func redactRelaySensitive(value, rawURL, userID string) string {
-	if userID = strings.TrimSpace(userID); userID != "" {
-		value = strings.ReplaceAll(value, userID, "[userid]")
+func redactRelaySensitive(value, rawURL, secret string) string {
+	if secret = strings.TrimSpace(secret); secret != "" {
+		value = strings.ReplaceAll(value, secret, "[relay-key]")
 	}
 	if rawURL != "" {
 		value = strings.ReplaceAll(value, rawURL, relayLogEndpoint(rawURL))

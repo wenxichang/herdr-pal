@@ -18,13 +18,13 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/interactive"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/relayclient"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
@@ -1078,7 +1078,7 @@ func safeErrorType(err error) string {
 		return "herdr_protocol"
 	case errors.Is(err, herdr.ErrUnavailable):
 		return "herdr_unavailable"
-	case errors.Is(err, relayproto.ErrProtocolMismatch), errors.Is(err, relayproto.ErrInvalidFrame), errors.Is(err, relayproto.ErrFrameTooLarge):
+	case errors.Is(err, hprp.ErrProtocolMismatch), errors.Is(err, hprp.ErrInvalidMessage), errors.Is(err, hprp.ErrMessageTooLarge):
 		return "relay_protocol"
 	case errors.Is(err, relayclient.ErrUnavailable):
 		return "relay_unavailable"

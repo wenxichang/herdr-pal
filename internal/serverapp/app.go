@@ -91,8 +91,12 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("创建企业微信客户端: %w", err)
 	}
+	credentialStore, err := credential.LoadStore(loaded.Server.CredentialsFile)
+	if err != nil {
+		return fmt.Errorf("加载 HPRP 凭据存储: %w", err)
+	}
 	catalog := server.NewSessionCatalog()
-	hub, err := server.NewClientHub(catalog, server.HubConfig{}, logger)
+	hub, err := server.NewClientHub(catalog, credentialStore, server.HubConfig{}, logger)
 	if err != nil {
 		return err
 	}

@@ -76,6 +76,59 @@ func TestValidateResultOutcomeUsesMessageSubset(t *testing.T) {
 	}
 }
 
+func TestValidateCommandExecuteRequiresStableTargetIdempotencyAndText(t *testing.T) {
+	valid := CommandExecute{
+		IdempotencyKey: "message-1",
+		Target:         Target{MachineID: "office-pc", SlotID: "w1:p1", SessionID: "session-1"},
+		Content:        TextContent{Type: ContentTypeText, Text: "继续处理"},
+	}
+	if err := ValidateCommandExecute(valid); err != nil {
+		t.Fatalf("ValidateCommandExecute() error = %v", err)
+	}
+	invalidKey := valid
+	invalidKey.IdempotencyKey = ""
+	if err := ValidateCommandExecute(invalidKey); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("invalid idempotency error = %v", err)
+	}
+	invalidTarget := valid
+	invalidTarget.Target.SessionID = ""
+	if err := ValidateCommandExecute(invalidTarget); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("invalid target error = %v", err)
+	}
+	invalidContent := valid
+	invalidContent.Content.Type = "text/html"
+	if err := ValidateCommandExecute(invalidContent); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("invalid content error = %v", err)
+	}
+}
+
+func TestValidateNotificationEventRequiresIdentityOrderingAndTarget(t *testing.T) {
+	valid := NotificationEvent{
+		EventKey: "event-1", Sequence: 1, Kind: "agent.status",
+		Target:  Target{MachineID: "office-pc", SlotID: "w1:p1", SessionID: "session-1"},
+		Content: TextContent{Type: ContentTypeText, Text: "Agent 已完成"},
+	}
+	if err := ValidateNotificationEvent(valid); err != nil {
+		t.Fatalf("ValidateNotificationEvent() error = %v", err)
+	}
+	for _, mutate := range []func(*NotificationEvent){
+		func(event *NotificationEvent) { event.EventKey = "" },
+		func(event *NotificationEvent) { event.Sequence = 0 },
+		func(event *NotificationEvent) { event.Kind = "" },
+	} {
+		invalid := valid
+		mutate(&invalid)
+		if err := ValidateNotificationEvent(invalid); !errors.Is(err, ErrInvalidMessage) {
+			t.Fatalf("ValidateNotificationEvent(%#v) error = %v", invalid, err)
+		}
+	}
+	invalidTarget := valid
+	invalidTarget.Target.MachineID = ""
+	if err := ValidateNotificationEvent(invalidTarget); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("invalid target error = %v", err)
+	}
+}
+
 func validClientHello() ClientHello {
 	return ClientHello{
 		Implementation: Implementation{Name: "herdr-pal", Version: "0.2.0", OS: "linux", Arch: "amd64"},

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/hprp"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 )
 
 func TestCatalogRejectsDuplicateCompositeKeyButAllowsSameMachineForOtherUser(t *testing.T) {
@@ -268,21 +267,12 @@ func TestCatalogSetSelectionWhenAvailableWaitsForSnapshot(t *testing.T) {
 	}
 }
 
-func attachSnapshot(t *testing.T, catalog *SessionCatalog, connectionID string, key ClientKey, snapshot any) {
+func attachSnapshot(t *testing.T, catalog *SessionCatalog, connectionID string, key ClientKey, snapshot hprp.SessionSnapshot) {
 	t.Helper()
 	if _, err := catalog.Attach(connectionID, key); err != nil {
 		t.Fatal(err)
 	}
-	var current hprp.SessionSnapshot
-	switch value := snapshot.(type) {
-	case hprp.SessionSnapshot:
-		current = value
-	case relayproto.SessionSnapshot:
-		current = snapshotFromLegacy(value)
-	default:
-		t.Fatalf("unsupported snapshot type %T", snapshot)
-	}
-	if err := catalog.ApplySnapshot(connectionID, current); err != nil {
+	if err := catalog.ApplySnapshot(connectionID, snapshot); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -295,9 +285,6 @@ func hprpSession(index int, paneID, occupant, title string) hprp.Session {
 	}
 }
 
-func relaySession(index int, paneID, occupant, title string) relayproto.Session {
-	return relayproto.Session{
-		LocalIndex: index, PaneID: paneID, OccupantHash: occupant,
-		Agent: "codex", DisplayAgent: "Codex", Title: title, Workspace: "workspace", Tab: "main", Status: "working",
-	}
+func relaySession(index int, paneID, occupant, title string) hprp.Session {
+	return hprpSession(index, paneID, occupant, title)
 }

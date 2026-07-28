@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/wenxichang/herdr-pal/internal/hprp"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
@@ -25,19 +24,6 @@ func BuildSnapshot(sequence uint64, targets []session.Target) hprp.SessionSnapsh
 		}
 	}
 	return hprp.SessionSnapshot{Sequence: sequence, Sessions: sessions}
-}
-
-func snapshotToLegacy(snapshot hprp.SessionSnapshot) relayproto.SessionSnapshot {
-	sessions := make([]relayproto.Session, len(snapshot.Sessions))
-	for index, current := range snapshot.Sessions {
-		sessions[index] = relayproto.Session{
-			LocalIndex: current.Display.Index, PaneID: current.SlotID, OccupantHash: current.SessionID,
-			Agent: current.Display.Agent, DisplayAgent: current.Display.DisplayAgent,
-			Workspace: current.Display.Workspace, Tab: current.Display.Tab, Title: current.Display.Title,
-			Status: current.Status,
-		}
-	}
-	return relayproto.SessionSnapshot{Sequence: snapshot.Sequence, Sessions: sessions}
 }
 
 // SnapshotFingerprint 返回忽略 sequence 的快照内容摘要。

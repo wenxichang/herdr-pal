@@ -15,7 +15,6 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 	"github.com/wenxichang/herdr-pal/internal/session"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
@@ -80,8 +79,8 @@ func TestRouterVerboseLogsExplicitWeComReplyFailure(t *testing.T) {
 
 func TestRouterExplainsHowToConnectWhenNoSessions(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-empty", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{Sequence: 1})
-	want := "当前没有可用会话，使用/userid 获取用户id，并配置接入herdr-pal，使用/help获取内置命令帮助"
+	attachSnapshot(t, router.catalog, "conn-empty", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{Sequence: 1})
+	want := "当前没有可用会话，使用/userid 获取用户 ID，并联系管理员签发机器 Key 后配置 herdr-pal；使用/help获取内置命令帮助"
 	for index, content := range []string{"/ls", "/1", "/con", "继续处理"} {
 		router.Handle(context.Background(), routerMessage(
 			"request-empty-"+strconv.Itoa(index), "message-empty-"+strconv.Itoa(index), "user-a", content,
@@ -111,9 +110,11 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"herdr-pal-windows-amd64.exe",
 		`%USERPROFILE%\.config\herdr-pal\config.json`,
 		`"url": "wss://管理员提供的地址:9443"`,
-		`"machine_id": "当前运行herdr的机器标识"`,
-		"留空时使用系统 hostname",
+		`"key": "管理员签发的 hpk_ 机器 Key"`,
+		"每台机器使用独立 Key",
+		"把返回值交给管理员",
 		"relay.url",
+		"relay.key",
 		"herdr.socket_path",
 		"protocol",
 		"17",
@@ -127,8 +128,10 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 			t.Fatalf("help reply contains server deployment field %q:\n%s", forbidden, help)
 		}
 	}
-	if strings.Contains(help, `"machine_id": "home-mac"`) {
-		t.Fatalf("help reply retained old machine_id example:\n%s", help)
+	for _, forbidden := range []string{`"userid":`, `"machine_id":`} {
+		if strings.Contains(help, forbidden) {
+			t.Fatalf("help reply retained self-claimed identity field %q:\n%s", forbidden, help)
+		}
 	}
 	if len(help) > panel.WeComContentLimit {
 		t.Fatalf("help reply size = %d, want at most %d bytes", len(help), panel.WeComContentLimit)
@@ -152,11 +155,11 @@ func TestRouterHelpUsesConfiguredRelayURL(t *testing.T) {
 
 func TestRouterListsMachinesWithTitleWorkspaceTabAndStatus(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1,
-		Sessions: []relayproto.Session{{
-			LocalIndex: 1, PaneID: "pane-1", TerminalID: "terminal-1", OccupantHash: "occ-1",
-			Agent: "codex", DisplayAgent: "Codex", Title: "实现 Relay", Workspace: "herdr-pal", Tab: "main", Status: "working",
+		Sessions: []hprp.Session{{
+			SlotID: "pane-1", SessionID: "occ-1", Status: "working",
+			Display: hprp.SessionDisplay{Index: 1, Agent: "codex", DisplayAgent: "Codex", Title: "实现 Relay", Workspace: "herdr-pal", Tab: "main"},
 		}},
 	})
 	router.Handle(context.Background(), routerMessage("request-1", "message-1", "user-a", "/ls"))
@@ -174,12 +177,12 @@ func TestRouterListsMachinesWithTitleWorkspaceTabAndStatus(t *testing.T) {
 func TestRouterListDisplaysEmojiForEveryAgentStatus(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
 	statuses := []string{"done", "working", "blocked", "idle", "unknown"}
-	sessions := make([]relayproto.Session, len(statuses))
+	sessions := make([]hprp.Session, len(statuses))
 	for index, status := range statuses {
 		sessions[index] = relaySession(index+1, fmt.Sprintf("pane-%d", index+1), fmt.Sprintf("occ-%d", index+1), status)
 		sessions[index].Status = status
 	}
-	attachSnapshot(t, router.catalog, "conn-status", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
+	attachSnapshot(t, router.catalog, "conn-status", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1, Sessions: sessions,
 	})
 
@@ -195,8 +198,8 @@ func TestRouterListDisplaysEmojiForEveryAgentStatus(t *testing.T) {
 
 func TestRouterSelectsStableTargetBeforeForwardingInput(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "title")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "occ-1", "title")},
 	})
 	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
 	router.Handle(context.Background(), routerMessage("request-select", "message-select", "user-a", "/1"))
@@ -207,7 +210,7 @@ func TestRouterSelectsStableTargetBeforeForwardingInput(t *testing.T) {
 		t.Fatalf("relay calls = %#v", calls)
 	}
 	for _, call := range calls {
-		if call.userID != "user-a" || call.target.MachineID != "home-mac" || call.target.PaneID != "pane-1" || call.target.OccupantHash != "occ-1" {
+		if call.userID != "user-a" || call.target.MachineID != "home-mac" || call.target.SlotID != "pane-1" || call.target.SessionID != "occ-1" {
 			t.Fatalf("relay call = %#v", call)
 		}
 	}
@@ -218,8 +221,8 @@ func TestRouterSelectsStableTargetBeforeForwardingInput(t *testing.T) {
 
 func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-1", "Panel标题")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "Panel标题")},
 	})
 	relay.executeReply.Content = panel.RenderPageWithTotal(session.Target{
 		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "Panel标题",
@@ -241,16 +244,17 @@ func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
 
 func TestRouterTerminalNotificationCreatesNumberedSnapshotWhenListWasNotRequested(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w1:p1", "occ-1", "后台任务")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(2, "w1:p1", "occ-1", "后台任务")},
 	})
 	content := panel.RenderPageWithTotal(session.Target{
 		PaneID: "w1:p1", Agent: "codex", Workspace: "workspace", Tab: "main",
 	}, 1, 1, []string{"自动编号输出"})
 
-	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
-		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 2, PaneID: "w1:p1", OccupantHash: "occ-1"},
-		Content: content,
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", hprp.NotificationEvent{
+		EventKey: "event-auto", Sequence: 1, Kind: "agent.status",
+		Target:  hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"},
+		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -261,15 +265,15 @@ func TestRouterTerminalNotificationCreatesNumberedSnapshotWhenListWasNotRequeste
 
 	router.Handle(context.Background(), routerMessage("request-select-auto", "message-select-auto", "user-a", "/1"))
 	calls := relay.Calls()
-	if len(calls) != 2 || calls[0].kind != "select" || calls[0].target.PaneID != "w1:p1" || calls[1].kind != "execute" {
+	if len(calls) != 2 || calls[0].kind != "select" || calls[0].target.SlotID != "w1:p1" || calls[1].kind != "execute" {
 		t.Fatalf("automatic numbered snapshot calls = %#v", calls)
 	}
 }
 
 func TestRouterTerminalDecorationRejectsSourceRemovedAfterResolution(t *testing.T) {
 	router, _, _ := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
 	})
 	entry, err := router.catalog.ResolveTarget("user-a", hprp.Target{
 		MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1",
@@ -289,8 +293,8 @@ func TestRouterTerminalDecorationRejectsSourceRemovedAfterResolution(t *testing.
 
 func TestRouterDoesNotStoreSelectionWhenClientRejectsTarget(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "title")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "occ-1", "title")},
 	})
 	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
 	relay.selectErr = ErrTargetChanged
@@ -366,7 +370,7 @@ func TestRouterDirectedSlashExecutesTargetAndSwitchesAfterSuccess(t *testing.T) 
 	router.Handle(context.Background(), routerMessage("request-directed", "message-directed", "user-a", "/2 继续处理"))
 
 	calls := relay.Calls()
-	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(targetFromLegacy(calls[0].target), office.Ref) || calls[0].message.Content != "继续处理" {
+	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, office.Ref) || calls[0].message.Content != "继续处理" {
 		t.Fatalf("relay calls = %#v", calls)
 	}
 	selected, err := router.catalog.Selected("user-a")
@@ -387,7 +391,7 @@ func TestRouterDirectedHashExecutesTargetWithoutSwitching(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-directed", "message-directed", "user-a", "#2 /con"))
 
 	calls := relay.Calls()
-	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(targetFromLegacy(calls[0].target), office.Ref) || calls[0].message.Content != "/con" {
+	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, office.Ref) || calls[0].message.Content != "/con" {
 		t.Fatalf("relay calls = %#v", calls)
 	}
 	selected, err := router.catalog.Selected("user-a")
@@ -398,7 +402,7 @@ func TestRouterDirectedHashExecutesTargetWithoutSwitching(t *testing.T) {
 
 func TestRouterDirectedSlashKeepsSelectionWhenExecutionFails(t *testing.T) {
 	router, gateway, relay, home, _ := directedRouterHarness(t)
-	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
+	relay.execute = func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error) {
 		return RelayExecution{}, ErrTargetChanged
 	}
 
@@ -416,7 +420,7 @@ func TestRouterDirectedSlashKeepsSelectionWhenExecutionFails(t *testing.T) {
 func TestRouterDirectedSlashKeepsSelectionWhenExecutionTimesOut(t *testing.T) {
 	router, gateway, relay, home, _ := directedRouterHarness(t)
 	router.requestTimeout = 10 * time.Millisecond
-	relay.execute = func(ctx context.Context, _ string, _ relayproto.SessionRef, _ im.IncomingText) (RelayExecution, error) {
+	relay.execute = func(ctx context.Context, _ string, _ hprp.Target, _ im.IncomingText) (RelayExecution, error) {
 		<-ctx.Done()
 		return RelayExecution{}, ctx.Err()
 	}
@@ -434,11 +438,11 @@ func TestRouterDirectedSlashKeepsSelectionWhenExecutionTimesOut(t *testing.T) {
 
 func TestRouterDirectedSlashSelectsReplacementReturnedByClient(t *testing.T) {
 	router, _, relay, _, office := directedRouterHarness(t)
-	replacement := targetToLegacy(office.Ref, office.Session.Display.Index)
-	replacement.OccupantHash = "occ-office-new"
-	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
+	replacement := office.Ref
+	replacement.SessionID = "occ-office-new"
+	relay.execute = func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error) {
 		if err := router.catalog.ApplySnapshot("conn-office", hprp.SessionSnapshot{
-			Sequence: 2, Sessions: []hprp.Session{hprpSession(2, "pane-office", replacement.OccupantHash, "office-new")},
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(2, "pane-office", replacement.SessionID, "office-new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -448,18 +452,18 @@ func TestRouterDirectedSlashSelectsReplacementReturnedByClient(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "/2 /slash clear"))
 
 	selected, err := router.catalog.Selected("user-a")
-	if err != nil || !sameSessionRef(selected.Ref, targetFromLegacy(replacement)) {
+	if err != nil || !sameSessionRef(selected.Ref, replacement) {
 		t.Fatalf("Selected() = %#v, %v, want replacement %#v", selected, err, replacement)
 	}
 }
 
 func TestRouterDirectedHashDoesNotSelectNoncurrentReplacement(t *testing.T) {
 	router, _, relay, home, office := directedRouterHarness(t)
-	replacement := targetToLegacy(office.Ref, office.Session.Display.Index)
-	replacement.OccupantHash = "occ-office-new"
-	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
+	replacement := office.Ref
+	replacement.SessionID = "occ-office-new"
+	relay.execute = func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error) {
 		if err := router.catalog.ApplySnapshot("conn-office", hprp.SessionSnapshot{
-			Sequence: 2, Sessions: []hprp.Session{hprpSession(2, "pane-office", replacement.OccupantHash, "office-new")},
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(2, "pane-office", replacement.SessionID, "office-new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -476,10 +480,10 @@ func TestRouterDirectedHashDoesNotSelectNoncurrentReplacement(t *testing.T) {
 
 func TestRouterDirectedHashKeepsCurrentLogicalSessionAfterReplacement(t *testing.T) {
 	router, _, relay := selectedRouterHarness(t)
-	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-new"}
-	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
+	replacement := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-new"}
+	relay.execute = func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error) {
 		if err := router.catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
-			Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", replacement.OccupantHash, "new")},
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", replacement.SessionID, "new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -489,17 +493,17 @@ func TestRouterDirectedHashKeepsCurrentLogicalSessionAfterReplacement(t *testing
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement-hash-current", "user-a", "#1 /slash clear"))
 
 	selected, err := router.catalog.Selected("user-a")
-	if err != nil || !sameSessionRef(selected.Ref, targetFromLegacy(replacement)) {
+	if err != nil || !sameSessionRef(selected.Ref, replacement) {
 		t.Fatalf("Selected() = %#v, %v, want replacement %#v", selected, err, replacement)
 	}
 }
 
 func TestRouterCurrentExecutionRebindsReplacementReturnedByClient(t *testing.T) {
 	router, _, relay := selectedRouterHarness(t)
-	replacement := relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "occ-new"}
-	relay.execute = func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error) {
+	replacement := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-new"}
+	relay.execute = func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error) {
 		if err := router.catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
-			Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", replacement.OccupantHash, "new")},
+			Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", replacement.SessionID, "new")},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -509,7 +513,7 @@ func TestRouterCurrentExecutionRebindsReplacementReturnedByClient(t *testing.T) 
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "/slash clear"))
 
 	selected, err := router.catalog.Selected("user-a")
-	if err != nil || !sameSessionRef(selected.Ref, targetFromLegacy(replacement)) {
+	if err != nil || !sameSessionRef(selected.Ref, replacement) {
 		t.Fatalf("Selected() = %#v, %v, want replacement %#v", selected, err, replacement)
 	}
 }
@@ -533,7 +537,7 @@ func TestRouterRejectsGroupAndDuplicateMessagesBeforeRelay(t *testing.T) {
 func TestRouterExecuteTimeoutDoesNotRetry(t *testing.T) {
 	router, gateway, relay := selectedRouterHarness(t)
 	router.requestTimeout = 10 * time.Millisecond
-	relay.execute = func(ctx context.Context, _ string, _ relayproto.SessionRef, _ im.IncomingText) (RelayExecution, error) {
+	relay.execute = func(ctx context.Context, _ string, _ hprp.Target, _ im.IncomingText) (RelayExecution, error) {
 		<-ctx.Done()
 		return RelayExecution{}, ctx.Err()
 	}
@@ -548,23 +552,18 @@ func TestRouterExecuteTimeoutDoesNotRetry(t *testing.T) {
 
 func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "office-pc"}, hprp.SessionSnapshot{
 		Sequence: 1,
-		Sessions: []relayproto.Session{{
-			LocalIndex: 2, PaneID: "pane-1", TerminalID: "terminal-1", OccupantHash: "occ-1",
-			Agent: "claude", DisplayAgent: "Claude", Title: "修复登录", Workspace: "backend", Tab: "debug", Status: "blocked",
+		Sessions: []hprp.Session{{
+			SlotID: "pane-1", SessionID: "occ-1", Status: "blocked",
+			Display: hprp.SessionDisplay{Index: 2, Agent: "claude", DisplayAgent: "Claude", Title: "修复登录", Workspace: "backend", Tab: "debug"},
 		}},
 	})
-	if err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{
-		Target:  relayproto.SessionRef{MachineID: "office-pc", LocalIndex: 2, PaneID: "pane-1", OccupantHash: "occ-1"},
-		Content: "后续分段",
-	}); err != nil {
-		t.Fatalf("SendPush() error = %v", err)
+	target := hprp.Target{MachineID: "office-pc", SlotID: "pane-1", SessionID: "occ-1"}
+	if err := router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(target, "后续分段")); err != nil {
+		t.Fatalf("SendCommandOutput() error = %v", err)
 	}
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{
-		Target:  relayproto.SessionRef{MachineID: "office-pc", LocalIndex: 2, PaneID: "pane-1", OccupantHash: "occ-1"},
-		Content: "Agent 已阻塞，需要你的处理。",
-	}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(target, "Agent 已阻塞，需要你的处理。")); err != nil {
 		t.Fatalf("SendNotification() error = %v", err)
 	}
 	replies := gateway.Replies()
@@ -580,11 +579,11 @@ func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
 
 func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
 	})
-	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
+	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
 	})
 	entries := router.catalog.CreateNumberedSnapshot("user-a")
 	var selected hprp.Target
@@ -601,12 +600,8 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 		Workspace: "workspace", Tab: "main",
 	}, 1, 2, []string{"后续终端分段"})
 
-	err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{
-		Target: relayproto.SessionRef{
-			MachineID: "home-mac", LocalIndex: 1, PaneID: "w1:p1", OccupantHash: "occ-home",
-		},
-		Content: content,
-	})
+	err := router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(
+		hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-home"}, content))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,13 +618,11 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 
 func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "new-occ", "title")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "new-occ", "title")},
 	})
-	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
-		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "pane-1", OccupantHash: "old-occ"},
-		Content: "stale",
-	})
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", routerNotification(
+		hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "old-occ"}, "stale"))
 	if !errors.Is(err, ErrTargetChanged) || gateway.ReplyCount() != 0 {
 		t.Fatalf("SendNotification() = %v, replies %d", err, gateway.ReplyCount())
 	}
@@ -637,11 +630,11 @@ func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
 
 func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
 	})
-	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
+	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(2, "w2:p2", "occ-office", "当前任务")},
 	})
 	entries := router.catalog.CreateNumberedSnapshot("user-a")
 	var selected hprp.Target
@@ -658,10 +651,8 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 		Workspace: "workspace", Tab: "main",
 	}, 1, 1, []string{"后台输出"})
 
-	err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{
-		Target:  relayproto.SessionRef{MachineID: "home-mac", LocalIndex: 1, PaneID: "w1:p1", OccupantHash: "occ-home"},
-		Content: content,
-	})
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", routerNotification(
+		hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-home"}, content))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,13 +677,11 @@ func TestRouterUsesBriefBackgroundNoticeWhileUserIsActive(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-help", "message-help-active", "user-a", "/help"))
 	now = now.Add(time.Minute)
 
-	err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{
-		Target: targetToLegacy(office.Ref, office.Session.Display.Index),
-		Content: panel.RenderPageWithTotal(session.Target{
+	err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref,
+		panel.RenderPageWithTotal(session.Target{
 			PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
 			Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
-		}, 1, 1, []string{"不应发送的完整后台输出"}),
-	})
+		}, 1, 1, []string{"不应发送的完整后台输出"})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,7 +704,7 @@ func TestRouterBackgroundNoticeRefreshesActivityWindow(t *testing.T) {
 	}, 1, 1, []string{"后台输出"})
 	notify := func() {
 		t.Helper()
-		if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: targetToLegacy(office.Ref, office.Session.Display.Index), Content: content}); err != nil {
+		if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref, content)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -745,7 +734,7 @@ func TestRouterCurrentOutputRefreshesSharedUserActivity(t *testing.T) {
 		PaneID: home.Session.SlotID, Agent: home.Session.Display.Agent,
 		Workspace: home.Session.Display.Workspace, Tab: home.Session.Display.Tab,
 	}, 1, 1, []string{"当前会话完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "home-mac", relayproto.Notification{Target: targetToLegacy(home.Ref, home.Session.Display.Index), Content: currentContent}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "home-mac", routerNotification(home.Ref, currentContent)); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gateway.LastReply(), "当前会话完整输出") {
@@ -757,7 +746,7 @@ func TestRouterCurrentOutputRefreshesSharedUserActivity(t *testing.T) {
 		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
 		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
 	}, 1, 1, []string{"后台完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: targetToLegacy(office.Ref, office.Session.Display.Index), Content: backgroundContent}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref, backgroundContent)); err != nil {
 		t.Fatal(err)
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出") || strings.Contains(reply, "后台完整输出") {
@@ -773,7 +762,7 @@ func TestRouterExecutePushStaysFullAndRefreshesActivity(t *testing.T) {
 		PaneID: home.Session.SlotID, Agent: home.Session.Display.Agent,
 		Workspace: home.Session.Display.Workspace, Tab: home.Session.Display.Tab,
 	}, 1, 1, []string{"必须保留的后续分段"})
-	if err := router.SendPush(context.Background(), "user-a", relayproto.ExecutePush{Target: targetToLegacy(home.Ref, home.Session.Display.Index), Content: pushContent}); err != nil {
+	if err := router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(home.Ref, pushContent)); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gateway.LastReply(), "必须保留的后续分段") {
@@ -785,7 +774,7 @@ func TestRouterExecutePushStaysFullAndRefreshesActivity(t *testing.T) {
 		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
 		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
 	}, 1, 1, []string{"不应发送的后台完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", relayproto.Notification{Target: targetToLegacy(office.Ref, office.Session.Display.Index), Content: backgroundContent}); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref, backgroundContent)); err != nil {
 		t.Fatal(err)
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出") || strings.Contains(reply, "不应发送的后台完整输出") {
@@ -815,8 +804,8 @@ func newRouterHarnessWithConfig(t *testing.T, config ConversationRouterConfig) (
 func selectedRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *routerRelay) {
 	t.Helper()
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-1", "occ-1", "title")},
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "occ-1", "title")},
 	})
 	entry := router.catalog.CreateNumberedSnapshot("user-a")[0]
 	if err := router.catalog.SetSelection("user-a", entry.Ref); err != nil {
@@ -828,11 +817,11 @@ func selectedRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *
 func directedRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *routerRelay, CatalogEntry, CatalogEntry) {
 	t.Helper()
 	router, gateway, relay := newRouterHarness(t)
-	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(1, "pane-home", "occ-home", "home")},
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-home", "occ-home", "home")},
 	})
-	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, relayproto.SessionSnapshot{
-		Sequence: 1, Sessions: []relayproto.Session{relaySession(2, "pane-office", "occ-office", "office")},
+	attachSnapshot(t, router.catalog, "conn-office", ClientKey{UserID: "user-a", MachineID: "office-pc"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(2, "pane-office", "occ-office", "office")},
 	})
 	entries := router.catalog.CreateNumberedSnapshot("user-a")
 	if len(entries) != 2 || entries[0].Ref.MachineID != "home-mac" || entries[1].Ref.MachineID != "office-pc" {
@@ -846,6 +835,20 @@ func directedRouterHarness(t *testing.T) (*ConversationRouter, *routerGateway, *
 
 func routerMessage(requestID, messageID, userID, content string) im.IncomingText {
 	return im.IncomingText{RequestID: requestID, MessageID: messageID, UserID: userID, ChatType: "single", Content: content}
+}
+
+func routerCommandOutput(target hprp.Target, content string) hprp.CommandOutput {
+	return hprp.CommandOutput{
+		Target: target, Sequence: 1,
+		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
+	}
+}
+
+func routerNotification(target hprp.Target, content string) hprp.NotificationEvent {
+	return hprp.NotificationEvent{
+		EventKey: "event-" + target.MachineID + "-" + target.SlotID, Sequence: 1, Kind: "agent.status", Target: target,
+		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
+	}
 }
 
 type routerGateway struct {
@@ -903,7 +906,7 @@ func (gateway *routerGateway) Replies() []string {
 type routerRelayCall struct {
 	kind    string
 	userID  string
-	target  relayproto.SessionRef
+	target  hprp.Target
 	message im.IncomingText
 }
 
@@ -912,17 +915,17 @@ type routerRelay struct {
 	calls        []routerRelayCall
 	selectErr    error
 	executeReply RelayExecution
-	execute      func(context.Context, string, relayproto.SessionRef, im.IncomingText) (RelayExecution, error)
+	execute      func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error)
 }
 
-func (relay *routerRelay) Select(_ context.Context, userID string, target relayproto.SessionRef) error {
+func (relay *routerRelay) Select(_ context.Context, userID string, target hprp.Target) error {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
 	relay.calls = append(relay.calls, routerRelayCall{kind: "select", userID: userID, target: target})
 	return relay.selectErr
 }
 
-func (relay *routerRelay) Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (RelayExecution, error) {
+func (relay *routerRelay) Execute(ctx context.Context, userID string, target hprp.Target, message im.IncomingText) (RelayExecution, error) {
 	relay.mu.Lock()
 	relay.calls = append(relay.calls, routerRelayCall{kind: "execute", userID: userID, target: target, message: message})
 	execute := relay.execute
@@ -945,3 +948,5 @@ func (relay *routerRelay) CallCount() int { return len(relay.Calls()) }
 type testDiscardWriter struct{}
 
 func (testDiscardWriter) Write(data []byte) (int, error) { return len(data), nil }
+
+type lockedLogBuffer = lockedHPRPLogBuffer

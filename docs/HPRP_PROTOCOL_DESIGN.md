@@ -5,9 +5,9 @@
 本文定义 Herdr Pal Relay Protocol（HPRP）的首个公开协议设计。它用于连接
 Herdr Pal 客户端与多租户 Relay Server，使两端能够独立发布、升级和替换实现。
 
-首个公开主版本命名为 `HPRP/1`。该版本不承诺兼容 Herdr Pal 当前内部使用的
-Relay Protocol 3；正式实现应通过独立端点、显式配置或迁移窗口完成切换，不能把
-两套协议混在同一条连接中。
+首个公开主版本命名为 `HPRP/1`。Herdr Pal 参考实现已经切换到该协议，不再包含内部
+Relay Protocol 3 的运行时兼容分支。旧 Pal 必须与旧 Server 配套使用，不能把两套协议
+混在同一条连接中。
 
 本文使用“必须”“禁止”“应该”“可以”表达规范性要求，其含义遵循
 [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174.html)。WebSocket 和 JSON 分别遵循
@@ -473,6 +473,32 @@ Pal 返回一次 `command.result`：
 一段设置 `final: true`。长输出不能阻塞 heartbeat 或其他命令结果。未协商该能力时，
 Pal 只能通过 `command.result` 返回当前命令的同步结果。
 
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "command.output",
+  "id": "output-42-1",
+  "reply_to": "command-42",
+  "payload": {
+    "target": {
+      "machine_id": "office-pc",
+      "slot_id": "w1:p1",
+      "session_id": "session-opaque-id"
+    },
+    "sequence": 1,
+    "final": true,
+    "content": {
+      "type": "text/plain",
+      "text": "终端后续输出"
+    }
+  }
+}
+```
+
+`reply_to` 必须引用原始 `command.execute` 的 `id`。`target` 必须与该命令当前有效目标一致；
+发生第 10.1 节的合法会话替换后，后续输出使用已经确认的替换目标。首段序号为 1，之后
+必须连续递增。重复分段可以忽略，跳号、未知命令、过期命令或目标不一致必须拒绝。
+
 服务端不得因超时或 `indeterminate` 自动创建新命令重试。需要安全重发时必须继续
 使用原 `idempotency_key`；Pal 应在 hello 确认的幂等窗口内返回原结果或继续同一
 执行，而不是重复产生副作用。超过该窗口后，服务端必须把重发视为可能产生重复
@@ -672,7 +698,6 @@ Pal 使用 `notification.event` 上报 Agent 状态变化和需要用户关注�
     },
     "kind": "agent.status",
     "sequence": 89,
-    "status": "blocked",
     "content": {
       "type": "text/plain",
       "text": "终端最近输出"
@@ -735,6 +760,7 @@ target.session_changed
 target.not_ready
 command.unsupported
 command.denied
+command.idempotency_conflict
 command.timeout
 command.execution_failed
 feature.unsupported
@@ -837,5 +863,6 @@ HPRP/1 发布时应同时提供：
 - `notification`：状态事件、去重和可选确认；
 - `conformance`：测试向量、fake client/server 和跨版本验证。
 
-当前内部 Relay Protocol 3 应保持冻结，仅用于迁移期间兼容既有 Pal。HPRP/1 使用新的
-类型和连接状态机实现，不在旧结构上继续堆叠条件分支。
+Herdr Pal 参考实现中的 Server 与 Pal 已统一使用 HPRP/1，并删除旧 `relayproto` 运行时
+实现。后续兼容性改动必须遵守第 3 节：主版本内只增加可选字段、协商能力、Feature 或稳定
+错误码；不兼容变更发布新的 WebSocket 子协议和 HPRP 主版本。

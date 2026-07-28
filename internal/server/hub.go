@@ -8,13 +8,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 )
 
 var (
@@ -26,14 +27,21 @@ var (
 )
 
 const (
-	defaultHelloTimeout         = 10 * time.Second
-	defaultFirstSnapshotTimeout = 10 * time.Second
-	defaultHubHeartbeatInterval = 10 * time.Second
-	defaultHubHeartbeatTimeout  = 30 * time.Second
-	defaultSnapshotInterval     = 30 * time.Second
-	defaultHubSendCapacity      = 128
-	defaultHubMaxInflight       = 128
+	defaultHelloTimeout               = 10 * time.Second
+	defaultFirstSnapshotTimeout       = 10 * time.Second
+	defaultHubHeartbeatInterval       = 20 * time.Second
+	defaultHubHeartbeatTimeout        = 60 * time.Second
+	defaultSnapshotInterval           = 30 * time.Second
+	defaultHubSendCapacity            = 128
+	defaultHubMaxInflight             = 128
+	defaultCommandRouteTTL            = 10 * time.Minute
+	defaultCommandRouteCapacity       = 4096
+	defaultNotificationDedupeCapacity = 4096
+	defaultNotificationDedupeTTL      = 10 * time.Minute
+	defaultIdempotencyWindow          = 10 * time.Minute
 )
+
+var serverCapabilities = []string{hprp.CapabilityCommandOutputV1}
 
 // HubConfig 是服务端连接状态机的时间和资源限制。
 type HubConfig struct {
@@ -46,11 +54,12 @@ type HubConfig struct {
 	MaxInflight          int
 }
 
-// ClientHub 接受 Relay WSS 连接并把请求路由到当前在线机器。
+// ClientHub 接受 HPRP/1 WSS 连接并把请求路由到当前在线机器。
 type ClientHub struct {
-	catalog *SessionCatalog
-	config  HubConfig
-	logger  *slog.Logger
+	catalog  *SessionCatalog
+	verifier credential.Verifier
+	config   HubConfig
+	logger   *slog.Logger
 
 	mu      sync.RWMutex
 	clients map[ClientKey]*clientConnection
@@ -59,19 +68,19 @@ type ClientHub struct {
 	outbound   HubOutboundSink
 }
 
-// HubOutboundSink 接收客户端后续分段和结构化主动通知。
+// HubOutboundSink 接收 Pal 主动发送的命令输出和通知事件。
 type HubOutboundSink interface {
-	SendPush(ctx context.Context, userID string, push relayproto.ExecutePush) error
-	SendNotification(ctx context.Context, userID, machineID string, notification relayproto.Notification) error
+	SendCommandOutput(ctx context.Context, userID string, output hprp.CommandOutput) error
+	SendNotification(ctx context.Context, userID, machineID string, notification hprp.NotificationEvent) error
 }
 
-// NewClientHub 创建空的 Relay WSS 连接中心。
-func NewClientHub(catalog *SessionCatalog, config HubConfig, logger *slog.Logger) (*ClientHub, error) {
-	if catalog == nil || logger == nil {
+// NewClientHub 创建需要 Bearer 凭据验证的 HPRP/1 连接中心。
+func NewClientHub(catalog *SessionCatalog, verifier credential.Verifier, config HubConfig, logger *slog.Logger) (*ClientHub, error) {
+	if catalog == nil || verifier == nil || logger == nil {
 		return nil, ErrInvalidHubDependency
 	}
 	config = normalizedHubConfig(config)
-	return &ClientHub{catalog: catalog, config: config, logger: logger, clients: make(map[ClientKey]*clientConnection)}, nil
+	return &ClientHub{catalog: catalog, verifier: verifier, config: config, logger: logger, clients: make(map[ClientKey]*clientConnection)}, nil
 }
 
 // Catalog 返回 Hub 使用的在线目录。
@@ -96,161 +105,188 @@ func (hub *ClientHub) SetOutboundSink(sink HubOutboundSink) error {
 	return nil
 }
 
-// ServeHTTP 接受一条只允许 TLS 的 Relay WebSocket 连接。
+// ServeHTTP 在 Upgrade 前完成 TLS、子协议、Bearer Key 和机器唯一连接校验。
 func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if hub == nil || request.TLS == nil {
 		if hub != nil {
-			hub.logger.Warn("Relay 连接被拒绝", "stage", "tls_upgrade", "error_type", "tls_required", "reason", "Relay 只接受 TLS 连接")
+			hub.logger.Warn("HPRP 连接被拒绝", "stage", "tls_upgrade", "error_type", "tls_required", "reason", "HPRP/1 只接受 TLS 连接")
 		}
-		http.Error(writer, "Relay requires TLS", http.StatusUpgradeRequired)
+		http.Error(writer, "HPRP requires TLS", http.StatusUpgradeRequired)
 		return
 	}
-	socket, err := websocket.Accept(writer, request, nil)
+	if !requestOffersSubprotocol(request, hprp.Subprotocol) {
+		hub.logger.Warn("HPRP 连接被拒绝", "stage", "subprotocol", "error_type", "subprotocol_required", "reason", "客户端未声明 HPRP/1 WebSocket 子协议")
+		http.Error(writer, "HPRP subprotocol required", http.StatusUpgradeRequired)
+		return
+	}
+	identity, err := credential.VerifyRequest(request, hub.verifier)
 	if err != nil {
-		hub.logger.Warn("Relay WebSocket 升级失败", append([]any{"stage", "websocket_upgrade"}, serverErrorLogArgs(err)...)...)
+		hub.logger.Warn("HPRP 连接认证失败", "stage", "authorization", "error_type", "unauthenticated", "reason", "Bearer Key 无效、过期或已吊销")
+		writer.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(writer, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	socket.SetReadLimit(relayproto.MaxFrameBytes)
-	hub.serveConnection(request.Context(), socket)
+	key := ClientKey{UserID: identity.PrincipalID, MachineID: identity.MachineID}
+	connectionID := randomHubID()
+	if _, err := hub.catalog.Attach(connectionID, key); err != nil {
+		args := []any{"stage", "reserve_identity", "credential_id", safeLogValue(identity.CredentialID), "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID)}
+		hub.logger.Warn("HPRP 客户端连接被拒绝", append(args, serverErrorLogArgs(err)...)...)
+		status := http.StatusConflict
+		if !errors.Is(err, ErrDuplicateClient) {
+			status = http.StatusForbidden
+		}
+		http.Error(writer, http.StatusText(status), status)
+		return
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			hub.catalog.Detach(connectionID)
+		}
+	}()
+
+	socket, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{hprp.Subprotocol}})
+	if err != nil {
+		hub.logger.Warn("HPRP WebSocket 升级失败", append([]any{"stage", "websocket_upgrade", "credential_id", safeLogValue(identity.CredentialID)}, serverErrorLogArgs(err)...)...)
+		return
+	}
+	if socket.Subprotocol() != hprp.Subprotocol {
+		_ = socket.Close(websocket.StatusPolicyViolation, "HPRP subprotocol required")
+		return
+	}
+	socket.SetReadLimit(hprp.MaxMessageBytes)
+	reserved = false
+	hub.serveConnection(request.Context(), socket, connectionID, identity, key)
 }
 
-// Select 向目标机器发送稳定目标复核请求。
-func (hub *ClientHub) Select(ctx context.Context, userID string, target relayproto.SessionRef) error {
-	if err := relayproto.ValidateSessionRef(target); err != nil {
+// Select 复核目标仍存在于已就绪连接；HPRP/1 不发送远端选择消息。
+func (hub *ClientHub) Select(_ context.Context, userID string, target hprp.Target) error {
+	if hprp.ValidateTarget(target) != nil || target.MachineID == "" {
 		return ErrTargetChanged
 	}
-	connection := hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID})
-	if connection == nil {
+	if hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID}) == nil {
 		return ErrClientUnavailable
 	}
-	if _, err := hub.catalog.ResolveTarget(userID, targetFromLegacy(target)); err != nil {
-		return err
-	}
-	frame, err := relayproto.NewFrame(relayproto.TypeSelectRequest, randomHubID(), relayproto.SelectRequest{Target: target})
-	if err != nil {
-		return err
-	}
-	response, err := connection.request(ctx, frame, relayproto.TypeSelectResult)
-	if err != nil {
-		return err
-	}
-	result, err := relayproto.DecodePayload[relayproto.SelectResult](response)
-	if err != nil {
-		return err
-	}
-	return mapSelectResult(result)
+	_, err := hub.catalog.ResolveTarget(userID, target)
+	return err
 }
 
-// Execute 向目标机器转发一条用户输入并等待首段回复。
-func (hub *ClientHub) Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (RelayExecution, error) {
-	if err := relayproto.ValidateSessionRef(target); err != nil {
+// Execute 发送 HPRP command.execute 并等待唯一 command.result。
+func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Target, message im.IncomingText) (RelayExecution, error) {
+	if hprp.ValidateTarget(target) != nil || strings.TrimSpace(message.MessageID) == "" {
 		return RelayExecution{}, ErrTargetChanged
 	}
 	connection := hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID})
 	if connection == nil {
 		return RelayExecution{}, ErrClientUnavailable
 	}
-	if _, err := hub.catalog.ResolveTarget(userID, targetFromLegacy(target)); err != nil {
+	if _, err := hub.catalog.ResolveTarget(userID, target); err != nil {
 		return RelayExecution{}, err
 	}
-	frame, err := relayproto.NewFrame(relayproto.TypeExecuteRequest, randomHubID(), relayproto.ExecuteRequest{
-		Target: target, MessageID: message.MessageID, UserID: userID, Content: message.Content,
-	})
-	if err != nil {
+	commandID := randomHubID()
+	if err := connection.registerCommand(commandID, target, defaultCommandRouteTTL); err != nil {
 		return RelayExecution{}, err
 	}
-	response, err := connection.request(ctx, frame, relayproto.TypeExecuteResponse)
-	if err != nil {
-		return RelayExecution{}, err
-	}
-	result, err := relayproto.DecodePayload[relayproto.ExecuteResponse](response)
-	if err != nil {
-		return RelayExecution{}, err
-	}
-	if result.SelectedTarget != nil {
-		if err := relayproto.ValidateSessionRef(*result.SelectedTarget); err != nil ||
-			result.SelectedTarget.MachineID != target.MachineID || result.SelectedTarget.PaneID != target.PaneID {
-			return RelayExecution{}, ErrTargetChanged
+	keepRoute := false
+	defer func() {
+		if !keepRoute {
+			connection.removeCommand(commandID)
 		}
+	}()
+	command := hprp.CommandExecute{
+		IdempotencyKey: message.MessageID,
+		Target:         target,
+		Content:        hprp.TextContent{Type: hprp.ContentTypeText, Text: message.Content},
 	}
-	return RelayExecution{Content: result.Content, SelectedTarget: result.SelectedTarget}, nil
+	if err := hprp.ValidateCommandExecute(command); err != nil {
+		return RelayExecution{}, err
+	}
+	envelope, err := hprp.NewEnvelope(hprp.TypeCommandExecute, commandID, "", true, command)
+	if err != nil {
+		return RelayExecution{}, err
+	}
+	response, err := connection.request(ctx, envelope, hprp.TypeCommandResult)
+	if err != nil {
+		return RelayExecution{}, err
+	}
+	result, err := hprp.DecodePayload[hprp.CommandResult](response)
+	if err == nil {
+		err = hprp.ValidateCommandResult(result)
+	}
+	if err != nil {
+		return RelayExecution{}, err
+	}
+	if result.ReplacementTarget != nil && (result.ReplacementTarget.MachineID != target.MachineID || result.ReplacementTarget.SlotID != target.SlotID) {
+		return RelayExecution{}, ErrTargetChanged
+	}
+	if result.Outcome != hprp.OutcomeOK {
+		return RelayExecution{}, mapCommandFailure(result)
+	}
+	keepRoute = true
+	content := ""
+	if result.Content != nil {
+		content = result.Content.Text
+	}
+	return RelayExecution{Content: content, SelectedTarget: result.ReplacementTarget}, nil
 }
 
-func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn) {
+func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn, connectionID string, identity credential.Identity, key ClientKey) {
 	helloContext, cancelHello := context.WithTimeout(parent, hub.config.HelloTimeout)
-	helloFrame, err := connectionReadFrame(helloContext, socket)
+	helloEnvelope, err := connectionReadEnvelope(helloContext, socket)
 	cancelHello()
-	if err == nil && helloFrame.Type != relayproto.TypeClientHello {
-		err = fmt.Errorf("%w: 首帧类型为 %s", relayproto.ErrInvalidFrame, helloFrame.Type)
+	if err == nil && (helloEnvelope.Type != hprp.TypeHelloClient || helloEnvelope.ReplyTo != "") {
+		err = fmt.Errorf("%w: 首条消息必须是 hello.client", hprp.ErrInvalidMessage)
 	}
-	if err != nil {
-		hub.logger.Warn("Relay 客户端握手失败", append([]any{"stage", "client_hello"}, serverErrorLogArgs(err)...)...)
-		hub.writeProtocolError(socket, relayproto.CodeInvalidFrame, "首帧必须是 client_hello", true)
-		_ = socket.Close(websocket.StatusPolicyViolation, "invalid hello")
-		return
-	}
-	hello, err := relayproto.DecodePayload[relayproto.ClientHello](helloFrame)
+	var hello hprp.ClientHello
 	if err == nil {
-		err = relayproto.ValidateClientHello(hello)
+		hello, err = hprp.DecodePayload[hprp.ClientHello](helloEnvelope)
+	}
+	if err == nil {
+		err = hprp.ValidateClientHello(hello)
 	}
 	if err != nil {
-		hub.logger.Warn("Relay 客户端握手失败", append([]any{"stage", "client_hello"}, serverErrorLogArgs(err)...)...)
-		hub.writeProtocolError(socket, relayproto.CodeInvalidIdentity, "客户端身份无效", true)
-		_ = socket.Close(websocket.StatusPolicyViolation, "invalid identity")
+		hub.logger.Warn("HPRP 客户端握手失败", append([]any{"stage", "hello.client", "credential_id", safeLogValue(identity.CredentialID), "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID)}, serverErrorLogArgs(err)...)...)
+		hub.writeProtocolError(socket, helloEnvelope.ID, hprp.CodeProtocolInvalidMessage, "hello.client 无效", true)
+		_ = socket.Close(websocket.StatusPolicyViolation, "invalid hello")
+		hub.catalog.Detach(connectionID)
 		return
 	}
-	key := ClientKey{UserID: hello.UserID, MachineID: hello.MachineID}
-	connectionID := randomHubID()
-	if _, err := hub.catalog.Attach(connectionID, key); err != nil {
-		args := []any{"stage", "catalog_attach", "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID), "client_version", safeLogValue(hello.ClientVersion)}
-		hub.logger.Warn("Relay 客户端连接被拒绝", append(args, serverErrorLogArgs(err)...)...)
-		code := relayproto.CodeInvalidIdentity
-		if errors.Is(err, ErrDuplicateClient) {
-			code = relayproto.CodeDuplicateClient
-		}
-		hub.writeProtocolError(socket, code, "客户端连接被拒绝", true)
-		_ = socket.Close(websocket.StatusPolicyViolation, "client rejected")
-		return
-	}
-	connection := newClientConnection(parent, connectionID, key, socket, hub.config.SendQueueCapacity, hub.config.MaxInflight, hub.logger)
+
+	connection := newClientConnection(parent, connectionID, identity.CredentialID, key, socket, hub.config.SendQueueCapacity, minInt(hub.config.MaxInflight, hello.Limits.MaxInflightCommands), hub.logger)
 	hub.install(connection)
-	hub.logger.Info("Relay 客户端已连接", "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID), "connection_id", connectionID, "client_version", safeLogValue(hello.ClientVersion))
 	go connection.runWriter()
 	defer connection.close(websocket.StatusNormalClosure, "connection ended")
 	defer hub.remove(connection)
 
-	serverHello, _ := relayproto.NewFrame(relayproto.TypeServerHello, helloFrame.RequestID, relayproto.ServerHello{
-		ConnectionID:          connectionID,
-		HeartbeatIntervalSecs: durationSeconds(hub.config.HeartbeatInterval),
-		HeartbeatTimeoutSecs:  durationSeconds(hub.config.HeartbeatTimeout),
-		SnapshotIntervalSecs:  durationSeconds(hub.config.SnapshotInterval),
-	})
-	if err := connection.send(parent, serverHello); err != nil {
-		hub.logger.Warn("Relay 服务端握手响应失败", append(append(connectionLogArgs(connection), "stage", "server_hello"), serverErrorLogArgs(err)...)...)
+	serverHello := hub.negotiateHello(connectionID, key.MachineID, hello)
+	connection.setCapabilities(serverHello.Capabilities)
+	helloResponse, _ := hprp.NewEnvelope(hprp.TypeHelloServer, randomHubID(), helloEnvelope.ID, false, serverHello)
+	if err := connection.send(parent, helloResponse); err != nil {
+		hub.logger.Warn("HPRP 服务端握手响应失败", append(append(connectionLogArgs(connection), "stage", "hello.server"), serverErrorLogArgs(err)...)...)
 		return
 	}
+
 	firstContext, cancelFirst := context.WithTimeout(connection.ctx, hub.config.FirstSnapshotTimeout)
-	firstFrame, err := connectionReadFrame(firstContext, socket)
+	firstEnvelope, err := connectionReadEnvelope(firstContext, socket)
 	cancelFirst()
-	if err == nil && firstFrame.Type != relayproto.TypeSessionSnapshot {
-		err = fmt.Errorf("%w: 首次上报类型为 %s", relayproto.ErrInvalidFrame, firstFrame.Type)
+	if err == nil && (firstEnvelope.Type != hprp.TypeSessionSnapshot || firstEnvelope.ReplyTo != "") {
+		err = fmt.Errorf("%w: hello 后必须发送完整 session.snapshot", hprp.ErrInvalidMessage)
 	}
 	if err != nil {
-		hub.logger.Warn("Relay 客户端首次快照失败", append(append(connectionLogArgs(connection), "stage", "first_snapshot"), serverErrorLogArgs(err)...)...)
+		hub.logger.Warn("HPRP 客户端首次快照失败", append(append(connectionLogArgs(connection), "stage", "first_snapshot"), serverErrorLogArgs(err)...)...)
 		return
 	}
-	firstSnapshot, err := relayproto.DecodePayload[relayproto.SessionSnapshot](firstFrame)
-	if err == nil {
-		err = hub.catalog.ApplySnapshot(connectionID, snapshotFromLegacy(firstSnapshot))
-	}
+	firstSnapshot, err := hub.applySnapshot(connection, firstEnvelope)
 	if err != nil {
-		args := append(connectionLogArgs(connection), "stage", "first_snapshot", "snapshot_sequence", firstSnapshot.Sequence, "session_count", len(firstSnapshot.Sessions))
-		hub.logger.Warn("Relay 客户端首次快照失败", append(args, serverErrorLogArgs(err)...)...)
+		hub.logger.Warn("HPRP 客户端首次快照失败", append(append(connectionLogArgs(connection), "stage", "first_snapshot"), serverErrorLogArgs(err)...)...)
 		return
 	}
 	connection.ready.Store(true)
 	connection.sessionCount.Store(int64(len(firstSnapshot.Sessions)))
-	hub.logger.Info("Relay 客户端已就绪", "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID), "connection_id", connectionID, "client_version", safeLogValue(hello.ClientVersion), "snapshot_sequence", firstSnapshot.Sequence, "session_count", len(firstSnapshot.Sessions))
+	hub.logger.Info("HPRP 客户端已就绪",
+		"credential_id", safeLogValue(identity.CredentialID), "user_hash", routerHash(key.UserID), "machine_id", safeLogValue(key.MachineID),
+		"connection_id", connectionID, "client_name", safeLogValue(hello.Implementation.Name), "client_version", safeLogValue(hello.Implementation.Version),
+		"snapshot_sequence", firstSnapshot.Sequence, "session_count", len(firstSnapshot.Sessions))
 
 	heartbeatDone := make(chan struct{})
 	go hub.runOutbound(connection)
@@ -264,69 +300,159 @@ func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.
 	<-connection.outboundDone
 }
 
+func (hub *ClientHub) negotiateHello(connectionID, machineID string, hello hprp.ClientHello) hprp.ServerHello {
+	maxMessageBytes := minInt(hprp.MaxMessageBytes, hello.Limits.MaxReceiveMessageBytes)
+	maxInflight := minInt(hub.config.MaxInflight, hello.Limits.MaxInflightCommands)
+	return hprp.ServerHello{
+		ConnectionID: connectionID,
+		MachineID:    machineID,
+		Capabilities: hprp.SelectHighestCommonVersions(hello.Capabilities, serverCapabilities),
+		Features:     hprp.NegotiateFeatures(hello.Features, map[string]hprp.FeatureOffer{}),
+		Limits: hprp.ServerLimits{
+			MaxMessageBytes: maxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: maxInflight,
+			MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes, IdempotencyWindowMS: defaultIdempotencyWindow.Milliseconds(),
+		},
+		Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: hub.config.HeartbeatInterval.Milliseconds(), IdleTimeoutMS: hub.config.HeartbeatTimeout.Milliseconds()},
+	}
+}
+
+func (hub *ClientHub) applySnapshot(connection *clientConnection, envelope hprp.Envelope) (hprp.SessionSnapshot, error) {
+	snapshot, err := hprp.DecodePayload[hprp.SessionSnapshot](envelope)
+	if err == nil {
+		err = hub.catalog.ApplySnapshot(connection.id, snapshot)
+	}
+	result := hprp.SnapshotResult{Outcome: hprp.OutcomeOK, AppliedSequence: snapshot.Sequence}
+	if err != nil {
+		result = hprp.SnapshotResult{Outcome: hprp.OutcomeRejected, Error: &hprp.Error{Code: snapshotErrorCode(err), Message: "会话快照未应用", Retryable: false}}
+	}
+	response, buildErr := hprp.NewEnvelope(hprp.TypeSessionSnapshotResult, randomHubID(), envelope.ID, false, result)
+	if buildErr == nil {
+		buildErr = connection.send(connection.ctx, response)
+	}
+	if buildErr != nil {
+		return snapshot, buildErr
+	}
+	return snapshot, err
+}
+
 func (hub *ClientHub) readLoop(connection *clientConnection) {
 	for {
-		frame, err := connectionReadFrame(connection.ctx, connection.socket)
+		envelope, err := connectionReadEnvelope(connection.ctx, connection.socket)
 		if err != nil {
 			if !isNormalSocketEnd(err) {
-				hub.logger.Warn("Relay 客户端连接结束", append(append(connectionLogArgs(connection), "stage", "read_frame"), serverErrorLogArgs(err)...)...)
+				hub.logger.Warn("HPRP 客户端连接结束", append(append(connectionLogArgs(connection), "stage", "read_message"), serverErrorLogArgs(err)...)...)
 			} else {
-				hub.logger.Debug("Relay 客户端正常断开", connectionLogArgs(connection)...)
+				hub.logger.Debug("HPRP 客户端正常断开", connectionLogArgs(connection)...)
 			}
 			return
 		}
-		switch frame.Type {
-		case relayproto.TypeSessionSnapshot:
-			snapshot, err := relayproto.DecodePayload[relayproto.SessionSnapshot](frame)
+		switch envelope.Type {
+		case hprp.TypeSessionSnapshot:
+			previous := connection.sessionCount.Load()
+			snapshot, err := hub.applySnapshot(connection, envelope)
+			if err != nil && !errors.Is(err, ErrSnapshotStale) {
+				hub.logger.Warn("HPRP 客户端快照上报失败", append(append(connectionLogArgs(connection), "stage", "session.snapshot", "snapshot_sequence", snapshot.Sequence, "session_count", len(snapshot.Sessions)), serverErrorLogArgs(err)...)...)
+				return
+			}
 			if err == nil {
-				err = hub.catalog.ApplySnapshot(connection.id, snapshotFromLegacy(snapshot))
+				connection.sessionCount.Store(int64(len(snapshot.Sessions)))
 			}
-			if err != nil {
-				args := append(connectionLogArgs(connection), "stage", "session_snapshot", "snapshot_sequence", snapshot.Sequence, "session_count", len(snapshot.Sessions))
-				hub.logger.Warn("Relay 客户端快照上报失败", append(args, serverErrorLogArgs(err)...)...)
+			hub.logger.Debug("HPRP 客户端快照已处理", append(connectionLogArgs(connection), "snapshot_sequence", snapshot.Sequence, "previous_session_count", previous, "session_count", len(snapshot.Sessions), "applied", err == nil)...)
+		case hprp.TypeCommandResult:
+			result, resultErr := hprp.DecodePayload[hprp.CommandResult](envelope)
+			if resultErr == nil {
+				resultErr = hprp.ValidateCommandResult(result)
+			}
+			if resultErr == nil && result.ReplacementTarget != nil {
+				if result.ReplacementTarget.MachineID != connection.key.MachineID {
+					resultErr = ErrTargetChanged
+				} else {
+					_, resultErr = hub.catalog.ResolveTarget(connection.key.UserID, *result.ReplacementTarget)
+				}
+				if resultErr == nil {
+					resultErr = connection.replaceCommandTarget(envelope.ReplyTo, *result.ReplacementTarget)
+				}
+			}
+			if resultErr != nil {
+				hub.logger.Warn("HPRP 命令结果无效", append(append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo)), serverErrorLogArgs(resultErr)...)...)
 				return
 			}
-			previous := connection.sessionCount.Swap(int64(len(snapshot.Sessions)))
-			hub.logger.Debug("Relay 客户端快照已上报", append(connectionLogArgs(connection), "snapshot_sequence", snapshot.Sequence, "previous_session_count", previous, "session_count", len(snapshot.Sessions), "session_count_changed", previous != int64(len(snapshot.Sessions)))...)
-		case relayproto.TypeSelectResult, relayproto.TypeExecuteResponse:
-			if connection.deliver(frame) {
-				hub.logger.Debug("Relay 客户端请求响应已接收", append(connectionLogArgs(connection), "event_type", frame.Type, "request_hash", routerHash(frame.RequestID))...)
+			if connection.deliver(envelope) {
+				hub.logger.Debug("HPRP 命令结果已接收", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo))...)
 			} else {
-				hub.logger.Warn("Relay 客户端请求响应未匹配", append(connectionLogArgs(connection), "event_type", frame.Type, "request_hash", routerHash(frame.RequestID), "error_type", "unmatched_request", "reason", "响应没有对应的在途请求或响应类型不匹配")...)
+				hub.logger.Warn("HPRP 命令结果未匹配", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo), "error_type", "unmatched_request", "reason", "结果没有对应的在途 command.execute")...)
 			}
-		case relayproto.TypePong:
-			if _, err := relayproto.DecodePayload[relayproto.Heartbeat](frame); err != nil {
-				hub.logger.Warn("Relay 客户端心跳响应无效", append(append(connectionLogArgs(connection), "stage", "pong"), serverErrorLogArgs(err)...)...)
-				return
+		case hprp.TypeCommandOutput:
+			output, err := hprp.DecodePayload[hprp.CommandOutput](envelope)
+			if err == nil {
+				err = hprp.ValidateCommandOutput(output)
 			}
-			connection.lastPong.Store(time.Now().UnixNano())
-			hub.logger.Debug("Relay 客户端心跳响应已接收", connectionLogArgs(connection)...)
-		case relayproto.TypePing:
-			heartbeat, err := relayproto.DecodePayload[relayproto.Heartbeat](frame)
+			accepted := false
+			if err == nil {
+				if output.Target.MachineID != connection.key.MachineID {
+					err = ErrTargetChanged
+				} else {
+					_, err = hub.catalog.ResolveTarget(connection.key.UserID, output.Target)
+				}
+			}
+			if err == nil {
+				accepted, err = connection.acceptCommandOutput(envelope, output)
+			}
 			if err != nil {
-				hub.logger.Warn("Relay 客户端心跳请求无效", append(append(connectionLogArgs(connection), "stage", "ping"), serverErrorLogArgs(err)...)...)
+				hub.logger.Warn("HPRP 命令输出无效", append(append(connectionLogArgs(connection), targetLogArgs(output.Target)...), serverErrorLogArgs(err)...)...)
 				return
 			}
-			pong, _ := relayproto.NewFrame(relayproto.TypePong, frame.RequestID, heartbeat)
-			if err := connection.send(connection.ctx, pong); err != nil {
-				hub.logger.Warn("Relay 心跳响应发送失败", append(append(connectionLogArgs(connection), "stage", "pong_send"), serverErrorLogArgs(err)...)...)
+			if !accepted {
+				hub.logger.Debug("HPRP 重复命令输出已忽略", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo), "sequence", output.Sequence)...)
+				continue
+			}
+			if !hub.enqueueOutbound(connection, envelope) {
 				return
 			}
-			hub.logger.Debug("Relay 客户端心跳请求已处理", connectionLogArgs(connection)...)
-		case relayproto.TypeExecutePush, relayproto.TypeNotification:
-			select {
-			case connection.outboundQueue <- frame:
-				hub.logger.Debug("Relay 客户端上报已接收", append(connectionLogArgs(connection), "event_type", frame.Type, "request_hash", routerHash(frame.RequestID))...)
-			case <-connection.ctx.Done():
+		case hprp.TypeNotificationEvent:
+			notification, err := hprp.DecodePayload[hprp.NotificationEvent](envelope)
+			if err == nil {
+				err = hprp.ValidateNotificationEvent(notification)
+			}
+			if err == nil {
+				if notification.Target.MachineID != connection.key.MachineID {
+					err = ErrTargetChanged
+				} else {
+					_, err = hub.catalog.ResolveTarget(connection.key.UserID, notification.Target)
+				}
+			}
+			if err != nil {
+				hub.logger.Warn("HPRP 通知事件无效", append(append(connectionLogArgs(connection), targetLogArgs(notification.Target)...), serverErrorLogArgs(err)...)...)
 				return
-			default:
-				hub.logger.Warn("Relay 客户端上报队列已满", append(connectionLogArgs(connection), "event_type", frame.Type, "error_type", "outbound_queue_full", "reason", "服务端出站处理队列已满，连接将断开以避免静默丢失上报")...)
+			}
+			if !connection.acceptNotification(notification) {
+				hub.logger.Debug("HPRP 重复或乱序通知已忽略", append(connectionLogArgs(connection), "event_key_hash", routerHash(notification.EventKey), "sequence", notification.Sequence)...)
+				continue
+			}
+			if !hub.enqueueOutbound(connection, envelope) {
 				return
 			}
 		default:
-			hub.logger.Warn("Relay 客户端发送了不允许的帧", append(connectionLogArgs(connection), "event_type", frame.Type, "error_type", "unexpected_frame", "reason", "连接就绪后收到当前状态不允许的帧类型")...)
-			return
+			if envelope.MustUnderstand {
+				hub.logger.Warn("HPRP 客户端发送了不支持的必需消息", append(connectionLogArgs(connection), "event_type", envelope.Type, "error_type", "unsupported_required_type", "reason", "must_understand 消息类型不受支持")...)
+				hub.writeProtocolError(connection.socket, envelope.ID, hprp.CodeProtocolUnsupportedType, "消息类型不受支持", true)
+				return
+			}
+			hub.logger.Debug("HPRP 未知可选消息已忽略", append(connectionLogArgs(connection), "event_type", envelope.Type)...)
 		}
+	}
+}
+
+func (hub *ClientHub) enqueueOutbound(connection *clientConnection, envelope hprp.Envelope) bool {
+	select {
+	case connection.outboundQueue <- envelope:
+		hub.logger.Debug("HPRP 客户端上报已接收", append(connectionLogArgs(connection), "event_type", envelope.Type, "message_hash", routerHash(envelope.ID))...)
+		return true
+	case <-connection.ctx.Done():
+		return false
+	default:
+		hub.logger.Warn("HPRP 客户端上报队列已满", append(connectionLogArgs(connection), "event_type", envelope.Type, "error_type", "outbound_queue_full", "reason", "服务端出站处理队列已满，连接将断开以避免静默丢失")...)
+		return false
 	}
 }
 
@@ -336,46 +462,38 @@ func (hub *ClientHub) runOutbound(connection *clientConnection) {
 		select {
 		case <-connection.ctx.Done():
 			return
-		case frame := <-connection.outboundQueue:
+		case envelope := <-connection.outboundQueue:
 			hub.outboundMu.RLock()
 			sink := hub.outbound
 			hub.outboundMu.RUnlock()
 			if sink == nil {
-				hub.logger.Warn("Relay 出站消息无法发送", append(connectionLogArgs(connection), "event_type", frame.Type, "error_type", "outbound_sink_unavailable", "reason", "企业微信出站接收器尚未配置")...)
+				hub.logger.Warn("HPRP 出站消息无法发送", append(connectionLogArgs(connection), "event_type", envelope.Type, "error_type", "outbound_sink_unavailable", "reason", "企业微信出站接收器尚未配置")...)
 				continue
 			}
 			var err error
 			var target hprp.Target
-			switch frame.Type {
-			case relayproto.TypeExecutePush:
-				var push relayproto.ExecutePush
-				push, err = relayproto.DecodePayload[relayproto.ExecutePush](frame)
-				target = targetFromLegacy(push.Target)
-				if err == nil && (push.Target.MachineID != connection.key.MachineID || relayproto.ValidateSessionRef(push.Target) != nil) {
-					err = ErrTargetChanged
-				}
+			switch envelope.Type {
+			case hprp.TypeCommandOutput:
+				var output hprp.CommandOutput
+				output, err = hprp.DecodePayload[hprp.CommandOutput](envelope)
+				target = output.Target
 				if err == nil {
-					err = sink.SendPush(connection.ctx, connection.key.UserID, push)
+					err = sink.SendCommandOutput(connection.ctx, connection.key.UserID, output)
 				}
-			case relayproto.TypeNotification:
-				var notification relayproto.Notification
-				notification, err = relayproto.DecodePayload[relayproto.Notification](frame)
-				target = targetFromLegacy(notification.Target)
-				if err == nil && notification.Target.MachineID != connection.key.MachineID {
-					err = ErrTargetChanged
-				}
+			case hprp.TypeNotificationEvent:
+				var notification hprp.NotificationEvent
+				notification, err = hprp.DecodePayload[hprp.NotificationEvent](envelope)
+				target = notification.Target
 				if err == nil {
 					err = sink.SendNotification(connection.ctx, connection.key.UserID, connection.key.MachineID, notification)
 				}
 			}
+			args := append(connectionLogArgs(connection), "event_type", envelope.Type)
+			args = append(args, targetLogArgs(target)...)
 			if err != nil {
-				args := append(connectionLogArgs(connection), "event_type", frame.Type)
-				args = append(args, targetLogArgs(target)...)
-				hub.logger.Warn("Relay 出站消息发送失败", append(args, serverErrorLogArgs(err)...)...)
+				hub.logger.Warn("HPRP 出站消息发送失败", append(args, serverErrorLogArgs(err)...)...)
 			} else {
-				args := append(connectionLogArgs(connection), "event_type", frame.Type)
-				args = append(args, targetLogArgs(target)...)
-				hub.logger.Debug("Relay 出站消息发送成功", args...)
+				hub.logger.Debug("HPRP 出站消息发送成功", args...)
 			}
 		}
 	}
@@ -388,20 +506,16 @@ func (hub *ClientHub) runHeartbeat(connection *clientConnection) {
 		select {
 		case <-connection.ctx.Done():
 			return
-		case now := <-ticker.C:
-			lastPong := time.Unix(0, connection.lastPong.Load())
-			if now.Sub(lastPong) >= hub.config.HeartbeatTimeout {
-				hub.logger.Warn("Relay 客户端心跳超时", append(connectionLogArgs(connection), "error_type", "heartbeat_timeout", "reason", "在服务端心跳超时窗口内未收到客户端 pong", "last_pong_age", now.Sub(lastPong).String())...)
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(connection.ctx, hub.config.HeartbeatTimeout)
+			err := connection.socket.Ping(ctx)
+			cancel()
+			if err != nil {
+				hub.logger.Warn("HPRP WebSocket 心跳失败", append(append(connectionLogArgs(connection), "stage", "websocket_ping"), serverErrorLogArgs(err)...)...)
 				connection.cancel()
 				return
 			}
-			ping, _ := relayproto.NewFrame(relayproto.TypePing, randomHubID(), relayproto.Heartbeat{Nonce: randomHubID()})
-			if err := connection.send(connection.ctx, ping); err != nil {
-				hub.logger.Warn("Relay 服务端心跳发送失败", append(append(connectionLogArgs(connection), "stage", "ping_send"), serverErrorLogArgs(err)...)...)
-				connection.cancel()
-				return
-			}
-			hub.logger.Debug("Relay 服务端心跳已发送", connectionLogArgs(connection)...)
+			hub.logger.Debug("HPRP WebSocket 心跳成功", connectionLogArgs(connection)...)
 		}
 	}
 }
@@ -432,15 +546,17 @@ func (hub *ClientHub) remove(connection *clientConnection) {
 	}
 	hub.mu.Unlock()
 	hub.catalog.Detach(connection.id)
-	hub.logger.Info("Relay 客户端已移除", "user_hash", routerHash(connection.key.UserID), "machine_id", safeLogValue(connection.key.MachineID), "connection_id", connection.id, "reason", "连接生命周期结束，机器及会话已从在线目录移除")
+	hub.logger.Info("HPRP 客户端已移除", "credential_id", safeLogValue(connection.credentialID), "user_hash", routerHash(connection.key.UserID), "machine_id", safeLogValue(connection.key.MachineID), "connection_id", connection.id, "reason", "连接生命周期结束，机器及会话已从在线目录移除")
 }
 
-func (hub *ClientHub) writeProtocolError(socket *websocket.Conn, code relayproto.ErrorCode, message string, closeConnection bool) {
-	frame, err := relayproto.NewFrame(relayproto.TypeProtocolError, "", relayproto.NewProtocolError(code, message, closeConnection).Payload())
+func (hub *ClientHub) writeProtocolError(socket *websocket.Conn, replyTo string, code hprp.ErrorCode, message string, closeConnection bool) {
+	envelope, err := hprp.NewEnvelope(hprp.TypeProtocolError, randomHubID(), replyTo, false, hprp.ProtocolError{
+		Error: hprp.Error{Code: code, Message: message, Retryable: false}, Close: closeConnection,
+	})
 	if err != nil {
 		return
 	}
-	encoded, err := relayproto.Encode(frame)
+	encoded, err := hprp.Encode(envelope)
 	if err != nil {
 		return
 	}
@@ -474,12 +590,43 @@ func normalizedHubConfig(config HubConfig) HubConfig {
 	return config
 }
 
-func durationSeconds(duration time.Duration) int {
-	seconds := int(duration / time.Second)
-	if seconds < 1 {
-		return 1
+func requestOffersSubprotocol(request *http.Request, required string) bool {
+	for _, value := range request.Header.Values("Sec-WebSocket-Protocol") {
+		for _, candidate := range strings.Split(value, ",") {
+			if strings.TrimSpace(candidate) == required {
+				return true
+			}
+		}
 	}
-	return seconds
+	return false
+}
+
+func mapCommandFailure(result hprp.CommandResult) error {
+	if result.Error != nil {
+		switch result.Error.Code {
+		case hprp.CodeTargetNotFound, hprp.CodeTargetSessionChanged, hprp.CodeTargetNotReady:
+			return ErrTargetChanged
+		case hprp.CodeCommandTimeout:
+			return context.DeadlineExceeded
+		case hprp.CodeServerBusy:
+			return ErrClientQueueFull
+		}
+	}
+	return ErrClientUnavailable
+}
+
+func snapshotErrorCode(err error) hprp.ErrorCode {
+	if errors.Is(err, ErrSnapshotStale) {
+		return hprp.CodeSyncStaleSnapshot
+	}
+	return hprp.CodeProtocolInvalidMessage
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func randomHubID() string {

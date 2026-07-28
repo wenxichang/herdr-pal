@@ -26,6 +26,7 @@ const (
 	CodeTargetNotReady                       ErrorCode = "target.not_ready"
 	CodeCommandUnsupported                   ErrorCode = "command.unsupported"
 	CodeCommandDenied                        ErrorCode = "command.denied"
+	CodeCommandIdempotencyConflict           ErrorCode = "command.idempotency_conflict"
 	CodeCommandTimeout                       ErrorCode = "command.timeout"
 	CodeCommandExecutionFailed               ErrorCode = "command.execution_failed"
 	CodeFeatureUnsupported                   ErrorCode = "feature.unsupported"

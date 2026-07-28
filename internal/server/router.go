@@ -15,7 +15,6 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
-	"github.com/wenxichang/herdr-pal/internal/relayproto"
 )
 
 var ErrInvalidRouterDependency = errors.New("ConversationRouter 依赖无效")
@@ -24,7 +23,7 @@ const defaultRelayRequestTimeout = 20 * time.Second
 
 const backgroundNotificationActivityWindow = 2 * time.Minute
 
-const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户id，并配置接入herdr-pal，使用/help获取内置命令帮助"
+const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户 ID，并联系管理员签发机器 Key 后配置 herdr-pal；使用/help获取内置命令帮助"
 
 const defaultHelpRelayURL = "wss://管理员提供的地址:9443"
 
@@ -81,8 +80,7 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"{\n" +
 	"  \"relay\": {\n" +
 	"    \"url\": \"" + helpRelayURLToken + "\",\n" +
-	"    \"userid\": \"在机器人中发送 /userid 获取\",\n" +
-	"    \"machine_id\": \"当前运行herdr的机器标识\",\n" +
+	"    \"key\": \"管理员签发的 hpk_ 机器 Key\",\n" +
 	"    \"skip_verify\": true\n" +
 	"  },\n" +
 	"  \"herdr\": {\n" +
@@ -95,8 +93,7 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"}\n\n" +
 	"字段说明：\n" +
 	"- `relay.url`：向 Herdr Pal 服务管理员获取\n" +
-	"- `relay.userid`：在机器人单聊中发送 `/userid` 获取\n" +
-	"- `relay.machine_id`：替换为自行设置的机器标识，同一用户的每台机器不能重复；留空时使用系统 hostname\n" +
+	"- `relay.key`：先发送 `/userid`，把返回值交给管理员；每台机器使用独立 Key\n" +
 	"- `relay.skip_verify`：通常保持 `true`，管理员另有要求时按其说明填写\n" +
 	"- `herdr.session`：默认会话留空；使用命名会话时填写会话名\n" +
 	"- `herdr.socket_path`：通常留空，由程序自动探测\n" +
@@ -124,27 +121,27 @@ type WeComGateway interface {
 
 // RelayRequester 是 Router 复核选择和执行用户输入所需的客户端能力。
 type RelayRequester interface {
-	Select(ctx context.Context, userID string, target relayproto.SessionRef) error
-	Execute(ctx context.Context, userID string, target relayproto.SessionRef, message im.IncomingText) (RelayExecution, error)
+	Select(ctx context.Context, userID string, target hprp.Target) error
+	Execute(ctx context.Context, userID string, target hprp.Target, message im.IncomingText) (RelayExecution, error)
 }
 
 // RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
 type RelayExecution struct {
 	Content        string
-	SelectedTarget *relayproto.SessionRef
+	SelectedTarget *hprp.Target
 }
 
-// SendPush 复核后续分段的稳定来源，并发送给所属企业微信用户。
-func (router *ConversationRouter) SendPush(ctx context.Context, userID string, push relayproto.ExecutePush) error {
+// SendCommandOutput 复核后续分段的稳定来源，并发送给所属企业微信用户。
+func (router *ConversationRouter) SendCommandOutput(ctx context.Context, userID string, output hprp.CommandOutput) error {
 	if router == nil || strings.TrimSpace(userID) == "" {
 		return ErrInvalidRouterDependency
 	}
-	entry, err := router.catalog.ResolveTarget(userID, targetFromLegacy(push.Target))
+	entry, err := router.catalog.ResolveTarget(userID, output.Target)
 	if err != nil {
 		return err
 	}
 	router.activity.Touch(userID, router.now())
-	content, err := router.decorateTerminalContent(userID, entry, push.Content)
+	content, err := router.decorateTerminalContent(userID, entry, output.Content.Text)
 	if err != nil {
 		return err
 	}
@@ -161,16 +158,16 @@ func (router *ConversationRouter) SendPush(ctx context.Context, userID string, p
 }
 
 // SendNotification 复核最新目录并补充机器、本地序号和 panel 标题。
-func (router *ConversationRouter) SendNotification(ctx context.Context, userID, machineID string, notification relayproto.Notification) error {
+func (router *ConversationRouter) SendNotification(ctx context.Context, userID, machineID string, notification hprp.NotificationEvent) error {
 	if router == nil || notification.Target.MachineID != machineID {
 		return ErrTargetChanged
 	}
-	entry, err := router.catalog.ResolveTarget(userID, targetFromLegacy(notification.Target))
+	entry, err := router.catalog.ResolveTarget(userID, notification.Target)
 	if err != nil {
 		return err
 	}
 	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
-	if panel.IsRenderedPage(notification.Content) {
+	if panel.IsRenderedPage(notification.Content.Text) {
 		selected, selectedErr := router.catalog.Selected(userID)
 		if selectedErr == nil && !sameSessionRef(selected.Ref, entry.Ref) && recentlyActive {
 			listIndex, err := router.catalog.EnsureNumberedIndex(userID, entry.Ref)
@@ -180,7 +177,7 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 			content := fmt.Sprintf("⚠️ %s 有新的输出，等待你的回复，使用/%d切换", catalogTargetLabel(entry), listIndex)
 			return router.gateway.SendMarkdownTo(ctx, userID, content)
 		}
-		content, err := router.decorateTerminalContent(userID, entry, notification.Content)
+		content, err := router.decorateTerminalContent(userID, entry, notification.Content.Text)
 		if err != nil {
 			return err
 		}
@@ -203,7 +200,7 @@ func (router *ConversationRouter) SendNotification(ctx context.Context, userID, 
 	if entry.Session.Display.Title != "" {
 		header += " — " + safeRouterLabel(entry.Session.Display.Title)
 	}
-	parts := panel.SplitMarkdown(header+"\n"+notification.Content, panel.WeComContentLimit)
+	parts := panel.SplitMarkdown(header+"\n"+notification.Content.Text, panel.WeComContentLimit)
 	if len(parts) == 0 {
 		return errors.New("通知内容无效")
 	}
@@ -361,7 +358,7 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 		return
 	}
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	err = router.relay.Select(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index))
+	err = router.relay.Select(requestContext, message.UserID, entry.Ref)
 	cancel()
 	if err != nil {
 		router.logInteractionError(message, "select", "relay_select", entry.Ref, err)
@@ -376,7 +373,7 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	consoleMessage := message
 	consoleMessage.Content = "/con"
 	requestContext, cancel = context.WithTimeout(ctx, router.requestTimeout)
-	result, err := router.relay.Execute(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index), consoleMessage)
+	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
 	if err != nil {
 		cancel()
 		router.logInteractionError(message, "select", "read_console", entry.Ref, err)
@@ -412,7 +409,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		return
 	}
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	result, err := router.relay.Execute(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index), message)
+	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, message)
 	if err != nil {
 		cancel()
 		router.logInteractionError(message, "execute", "relay_execute", entry.Ref, err)
@@ -455,7 +452,7 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	directedMessage.Content = action.content
 	selectedBefore, selectedErr := router.catalog.Selected(message.UserID)
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
-	result, err := router.relay.Execute(requestContext, message.UserID, targetToLegacy(entry.Ref, entry.Session.Display.Index), directedMessage)
+	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, directedMessage)
 	if err != nil {
 		cancel()
 		router.logInteractionError(message, "directed_execute", "relay_execute", entry.Ref, err)
@@ -468,7 +465,7 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	}
 	finalEntry := entry
 	if result.SelectedTarget != nil {
-		replacement := targetFromLegacy(*result.SelectedTarget)
+		replacement := *result.SelectedTarget
 		if action.switchAfter {
 			if err := router.catalog.SetSelectionWhenAvailable(requestContext, message.UserID, replacement); err != nil {
 				cancel()
@@ -518,7 +515,7 @@ func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, u
 	if result.SelectedTarget == nil {
 		return source, nil
 	}
-	replacement := targetFromLegacy(*result.SelectedTarget)
+	replacement := *result.SelectedTarget
 	if err := router.catalog.RebindSelection(ctx, userID, source.Ref, replacement); err != nil {
 		return CatalogEntry{}, err
 	}

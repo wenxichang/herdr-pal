@@ -23,8 +23,6 @@ type RelayConfig struct {
 	Key          string `json:"key"`
 	SkipVerify   bool   `json:"-"`
 	CredentialID string `json:"-"`
-	UserID       string `json:"-"`
-	MachineID    string `json:"-"`
 }
 
 // UnmarshalJSON 在保持严格字段校验的同时区分未配置和显式 false。
@@ -68,8 +66,6 @@ func LoadClient(path string) (ClientConfig, error) {
 	}
 	loaded.Relay.Key = strings.TrimSpace(loaded.Relay.Key)
 	loaded.Relay.CredentialID = credentialID
-	loaded.Relay.UserID = credentialID
-	loaded.Relay.MachineID = credentialID
 	loaded.Relay.URL = endpoint.String()
 	if strings.TrimSpace(loaded.Log.Level) == "" {
 		loaded.Log.Level = "info"

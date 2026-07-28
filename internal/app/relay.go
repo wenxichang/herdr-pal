@@ -86,16 +86,16 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	defer func() { finishDialPathLease(stableDialPath, &runErr, timedOutComponentsDone, logger) }()
 
 	herdrClient := herdr.NewClient(stableDialPath.Path(), nil, 0)
-	relayLogger := logger.With("component", "relay_connection", "machine_id", loaded.Relay.MachineID)
+	relayLogger := logger.With("component", "relay_connection", "credential_id", loaded.Relay.CredentialID)
 	relay, err := relayclient.New(relayclient.Config{
-		URL: loaded.Relay.URL, UserID: loaded.Relay.UserID, MachineID: loaded.Relay.MachineID,
+		URL: loaded.Relay.URL, Key: loaded.Relay.Key, CredentialID: loaded.Relay.CredentialID,
 		SkipVerify: loaded.Relay.SkipVerify, Version: version.String(), Logger: relayLogger,
 	})
 	if err != nil {
 		return fmt.Errorf("创建 Relay 客户端: %w", err)
 	}
 	registry := &session.Registry{}
-	guard, err := policy.NewGuard(loaded.Relay.UserID)
+	guard, err := policy.NewGuard(loaded.Relay.CredentialID)
 	if err != nil {
 		return fmt.Errorf("创建输入策略: %w", err)
 	}
@@ -115,7 +115,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		return fmt.Errorf("创建状态通知器: %w", err)
 	}
 	supervisor, err := bridge.NewSupervisor(staticHerdrFactory{client: herdrClient}, registry, service, notifier, bridge.SupervisorOptions{
-		Logger: logger.With("component", "herdr_supervisor", "machine_id", loaded.Relay.MachineID),
+		Logger: logger.With("component", "herdr_supervisor", "credential_id", loaded.Relay.CredentialID),
 	})
 	if err != nil {
 		return fmt.Errorf("创建 Herdr Supervisor: %w", err)
@@ -127,8 +127,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	}
 	logger.Info("Herdr Pal Relay 客户端启动",
 		"client_version", version.String(),
-		"user_hash", shortHash(loaded.Relay.UserID),
-		"machine_id", loaded.Relay.MachineID,
+		"credential_id", loaded.Relay.CredentialID,
 		"relay_endpoint", relayLogEndpoint(loaded.Relay.URL),
 		"skip_verify", loaded.Relay.SkipVerify,
 		"herdr_session", herdrSession,
@@ -139,7 +138,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		logger.Error("Herdr Pal Relay 客户端停止",
 			"component", relayComponentName(runErr),
 			"error_type", safeErrorType(runErr),
-			"reason", safeRelayRuntimeReason(runErr, loaded.Relay.UserID, loaded.Relay.URL),
+			"reason", safeRelayRuntimeReason(runErr, loaded.Relay.Key, loaded.Relay.URL),
 		)
 	}
 	return runErr
@@ -209,13 +208,13 @@ func relayComponentName(err error) string {
 	return "unknown"
 }
 
-func safeRelayRuntimeReason(err error, userID, endpoint string) string {
+func safeRelayRuntimeReason(err error, secret, endpoint string) string {
 	if err == nil {
 		return ""
 	}
 	reason := err.Error()
-	if userID = strings.TrimSpace(userID); userID != "" {
-		reason = strings.ReplaceAll(reason, userID, "[userid]")
+	if secret = strings.TrimSpace(secret); secret != "" {
+		reason = strings.ReplaceAll(reason, secret, "[relay-key]")
 	}
 	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
 		reason = strings.ReplaceAll(reason, endpoint, relayLogEndpoint(endpoint))
