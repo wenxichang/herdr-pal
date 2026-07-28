@@ -171,9 +171,49 @@ func TestHPAPEndToEnd(t *testing.T) {
 	}
 }
 
+func TestHPAPServerRestartRestoresPalWithoutPalRestart(t *testing.T) {
+	harness := newHPAPHarness(t)
+	defer harness.stop(t)
+
+	issued := harness.issueKey(t, "user-restart", "home", []string{"127.0.0.1"})
+	harness.tokens = append(harness.tokens, issued.Token)
+	fakeHerdr := testkit.NewHerdrServer(t, integrationSnapshot("session-restart", herdr.AgentStatusIdle))
+	pal := startHPAPPal(t, harness.relayURL, issued.Token, fakeHerdr.SocketPath())
+	harness.pals = append(harness.pals, pal)
+
+	initialConnection := harness.waitConnections(t, 1).Items[0]
+	initialSession := harness.waitSessions(t, 1).Items[0]
+	harness.stopServerForRestart(t)
+	harness.wecom.WaitConnectionCount(t, 0)
+	if _, err := os.Lstat(harness.adminSocket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("admin socket still exists after restart stop: %v", err)
+	}
+	select {
+	case err := <-pal.done:
+		pal.done <- err
+		t.Fatalf("Pal stopped with server: %v\n%s", err, pal.logs.String())
+	default:
+	}
+
+	harness.restartServer(t)
+	harness.wecom.WaitSubscribeCount(t, 2)
+	reconnected := harness.waitConnections(t, 1).Items[0]
+	restored := harness.waitSessions(t, 1).Items[0]
+	if reconnected.ConnectionID == initialConnection.ConnectionID {
+		t.Fatalf("connection ID was reused after restart: %q", reconnected.ConnectionID)
+	}
+	if reconnected.CredentialID != initialConnection.CredentialID || reconnected.PrincipalID != initialConnection.PrincipalID || reconnected.MachineID != initialConnection.MachineID {
+		t.Fatalf("reconnected identity = %#v, want %#v", reconnected, initialConnection)
+	}
+	if restored.PrincipalID != initialSession.PrincipalID || restored.Target != initialSession.Target || restored.Status != initialSession.Status {
+		t.Fatalf("restored session = %#v, want stable identity/status from %#v", restored, initialSession)
+	}
+}
+
 type hpapHarness struct {
 	admin       *adminclient.Client
 	adminSocket string
+	configPath  string
 	relayURL    string
 	stateDir    string
 	secret      string
@@ -207,29 +247,53 @@ func newHPAPHarness(t *testing.T) *hpapHarness {
 		t.Fatal(err)
 	}
 	logs := &lockedHPAPBuffer{}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- serverapp.Run(ctx, serverapp.Options{
-			ConfigPath: configPath, Getenv: func(string) string { return secret },
-			Stderr: logs, WeComEndpoint: weComServer.Endpoint(),
-		})
-	}()
 	adminSocket := filepath.Join(stateDir, "admin.sock")
 	admin, err := adminclient.New(adminclient.Config{SocketPath: adminSocket, Timeout: time.Second})
 	if err != nil {
-		cancel()
 		t.Fatal(err)
 	}
 	harness := &hpapHarness{
-		admin: admin, adminSocket: adminSocket, relayURL: "wss://" + listenAddress,
+		admin: admin, adminSocket: adminSocket, configPath: configPath, relayURL: "wss://" + listenAddress,
 		stateDir: stateDir, secret: secret, wecom: weComServer, logs: logs,
-		cancel: cancel, done: done,
 	}
 	t.Cleanup(func() { harness.stop(t) })
+	harness.startServer(t)
 	harness.waitServerReady(t)
 	weComServer.WaitSubscribeCount(t, 1)
 	return harness
+}
+
+func (harness *hpapHarness) startServer(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	harness.cancel = cancel
+	harness.done = done
+	harness.serverDone = false
+	go func() {
+		done <- serverapp.Run(ctx, serverapp.Options{
+			ConfigPath: harness.configPath, Getenv: func(string) string { return harness.secret },
+			Stderr: harness.logs, WeComEndpoint: harness.wecom.Endpoint(),
+		})
+	}()
+}
+
+func (harness *hpapHarness) stopServerForRestart(t *testing.T) {
+	t.Helper()
+	if harness.serverDone {
+		return
+	}
+	harness.cancel()
+	harness.waitServerExit(t, true)
+}
+
+func (harness *hpapHarness) restartServer(t *testing.T) {
+	t.Helper()
+	if !harness.serverDone {
+		t.Fatal("cannot restart a running HPAP server")
+	}
+	harness.startServer(t)
+	harness.waitServerReady(t)
 }
 
 func (harness *hpapHarness) waitServerReady(t *testing.T) {
@@ -354,10 +418,15 @@ func (harness *hpapHarness) exerciseConcurrentQueriesAndMutations(t *testing.T) 
 
 func (harness *hpapHarness) waitServerStopped(t *testing.T) {
 	t.Helper()
+	harness.waitServerExit(t, false)
+}
+
+func (harness *hpapHarness) waitServerExit(t *testing.T, allowCanceled bool) {
+	t.Helper()
 	select {
 	case err := <-harness.done:
 		harness.serverDone = true
-		if err != nil {
+		if err != nil && !(allowCanceled && errors.Is(err, context.Canceled)) {
 			t.Fatalf("server.stop error = %v\n%s", err, harness.logs.String())
 		}
 	case <-time.After(10 * time.Second):
