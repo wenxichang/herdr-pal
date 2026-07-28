@@ -3,6 +3,7 @@ package adminserver
 import (
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/adminproto"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/server"
 )
@@ -34,10 +35,9 @@ type SessionInspector interface {
 	ManagementSessions(server.SessionFilter) []server.SessionView
 }
 
-// RuntimeInspector 提供不会持久化到配置文件的运行时控制能力。
-//
-// 状态返回类型在 HPAP server.status DTO 定义后加入，避免管理核心依赖 serverapp。
+// RuntimeInspector 提供安全状态快照和不持久化到配置文件的运行时控制能力。
 type RuntimeInspector interface {
+	Status() adminproto.ServerStatusResult
 	EnableDebug()
 	DisableDebug()
 	RequestStop() bool

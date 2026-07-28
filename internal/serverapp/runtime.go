@@ -77,37 +77,11 @@ type RuntimeConfig struct {
 	Stop        func()
 }
 
-// CredentialCounts 是按当前时间互斥分类的凭据数量。
-type CredentialCounts struct {
-	Enabled  int
-	Disabled int
-	Expired  int
-}
+// CredentialCounts 是 HPAP 凭据统计 DTO 的兼容别名。
+type CredentialCounts = adminproto.CredentialCounts
 
-// RuntimeStatus 是 HPAP 管理面可安全展示的服务运行快照。
-type RuntimeStatus struct {
-	ObservedAt      time.Time
-	StartedAt       time.Time
-	Uptime          time.Duration
-	Version         string
-	Commit          string
-	BuiltAt         string
-	PID             int
-	GOOS            string
-	GOARCH          string
-	HPAP            string
-	HPRP            string
-	RelayListen     string
-	AdminSocket     string
-	TLS             server.TLSInfo
-	WeCom           wecom.StatusSnapshot
-	DebugEnabled    bool
-	BaseLogLevel    string
-	PrincipalCount  int
-	ConnectionCount int
-	SessionCount    int
-	Credentials     CredentialCounts
-}
+// RuntimeStatus 是 HPAP server.status DTO 的兼容别名。
+type RuntimeStatus = adminproto.ServerStatusResult
 
 // WeComStatusProvider 提供不包含凭据和消息正文的企业微信状态快照。
 type WeComStatusProvider interface {
@@ -193,13 +167,22 @@ func (inspector *RuntimeInspector) Status() RuntimeStatus {
 	if uptime < 0 {
 		uptime = 0
 	}
+	weComStatus := inspector.weCom.Status()
 	return RuntimeStatus{
-		ObservedAt: observedAt, StartedAt: inspector.config.StartedAt, Uptime: uptime,
+		ObservedAt: observedAt, StartedAt: inspector.config.StartedAt, UptimeMS: uptime.Milliseconds(),
 		Version: inspector.config.Version, Commit: inspector.config.Commit, BuiltAt: inspector.config.BuiltAt,
 		PID: inspector.config.PID, GOOS: inspector.config.GOOS, GOARCH: inspector.config.GOARCH,
 		HPAP: adminproto.Protocol, HPRP: hprp.ProtocolVersion,
 		RelayListen: inspector.config.RelayListen, AdminSocket: inspector.config.AdminSocket,
-		TLS: inspector.config.TLS, WeCom: inspector.weCom.Status(),
+		TLS: adminproto.TLSStatus{
+			Mode: inspector.config.TLS.Mode, NotAfter: inspector.config.TLS.NotAfter,
+			SHA256Fingerprint: inspector.config.TLS.SHA256Fingerprint,
+		},
+		WeCom: adminproto.WeComStatus{
+			State: string(weComStatus.State), ChangedAt: weComStatus.ChangedAt,
+			LastErrorType: weComStatus.LastErrorType, LastErrorCode: weComStatus.LastErrorCode,
+			LastHTTPStatus: weComStatus.LastHTTPStatus,
+		},
 		DebugEnabled: inspector.logger.DebugEnabled(), BaseLogLevel: levelName(inspector.logger.BaseLevel()),
 		PrincipalCount: len(principals), ConnectionCount: len(connections), SessionCount: len(sessions),
 		Credentials: countCredentials(inspector.credentials.List(), observedAt),

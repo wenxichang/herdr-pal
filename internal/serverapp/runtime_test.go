@@ -119,7 +119,7 @@ func TestRuntimeServerStatusAggregatesSafeSnapshots(t *testing.T) {
 	}
 
 	status := inspector.Status()
-	if status.ObservedAt != now || status.StartedAt != startedAt || status.Uptime != 5*time.Minute {
+	if status.ObservedAt != now || status.StartedAt != startedAt || status.UptimeMS != (5*time.Minute).Milliseconds() {
 		t.Fatalf("runtime times = %#v", status)
 	}
 	if status.Version != "v9.8.7" || status.Commit != "abcdef0" || status.BuiltAt != "2026-07-28T08:00:00Z" || status.PID != 4321 || status.GOOS != "test-os" || status.GOARCH != "test-arch" {
@@ -128,7 +128,7 @@ func TestRuntimeServerStatusAggregatesSafeSnapshots(t *testing.T) {
 	if status.HPAP != adminproto.Protocol || status.HPRP != hprp.ProtocolVersion || status.RelayListen != "0.0.0.0:9443" || status.AdminSocket != "/state/admin.sock" {
 		t.Fatalf("runtime protocol/listener info = %#v", status)
 	}
-	if status.TLS.Mode != server.TLSModeAutomatic || status.WeCom != weComStatus {
+	if status.TLS.Mode != server.TLSModeAutomatic || status.WeCom.State != string(weComStatus.State) || status.WeCom.ChangedAt != weComStatus.ChangedAt || status.WeCom.LastErrorType != weComStatus.LastErrorType {
 		t.Fatalf("dependency status = %#v", status)
 	}
 	if !status.DebugEnabled || status.BaseLogLevel != "warn" || status.PrincipalCount != 2 || status.ConnectionCount != 3 || status.SessionCount != 4 {

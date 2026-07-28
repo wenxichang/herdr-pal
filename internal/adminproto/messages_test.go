@@ -60,6 +60,36 @@ func TestKeyCredentialJSONNeverContainsStoredSecretDigest(t *testing.T) {
 	}
 }
 
+func TestServerAndSessionManagementJSONContainsOnlyDeclaredSafeFields(t *testing.T) {
+	status := ServerStatusResult{
+		Version: "v1", WeCom: WeComStatus{State: "reconnecting", LastErrorType: "dns"},
+		TLS: TLSStatus{Mode: "automatic", SHA256Fingerprint: strings.Repeat("a", 64)},
+	}
+	encodedStatus, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret", "token", "response_body", "terminal"} {
+		if strings.Contains(strings.ToLower(string(encodedStatus)), forbidden) {
+			t.Fatalf("server status JSON leaked %q: %s", forbidden, encodedStatus)
+		}
+	}
+	session := Session{
+		PrincipalID: "user", Number: 1,
+		Target:    SessionTarget{MachineID: "home", SlotID: "w1:p1", SessionID: "session-1"},
+		Workspace: "workspace", Tab: "main", Agent: "codex", DisplayAgent: "Codex", Pane: "w1:p1", Title: "title", Status: "done", StatusLabel: "done ✅",
+	}
+	encodedSession, err := json.Marshal(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"machine_id":"home"`, `"slot_id":"w1:p1"`, `"session_id":"session-1"`, `"pane":"w1:p1"`, `"status_label":"done ✅"`} {
+		if !strings.Contains(string(encodedSession), want) {
+			t.Fatalf("session JSON = %s, want %s", encodedSession, want)
+		}
+	}
+}
+
 func TestErrorCodesContainsHPAPVersionOneSurface(t *testing.T) {
 	want := []ErrorCode{
 		CodeProtocolInvalidRequest,
