@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminclient"
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
-	"github.com/wenxichang/herdr-pal/internal/adminserver"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
@@ -332,7 +330,7 @@ func executeInvocation(ctx context.Context, configPath string, invocation Invoca
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errLocalConfig, err)
 	}
-	client, err := adminclient.New(adminclient.Config{SocketPath: filepath.Join(loaded.Server.StateDir, adminserver.DefaultSocketFileName)})
+	client, err := adminclient.New(adminclient.Config{SocketPath: loaded.Server.AdminSocketPath})
 	if err != nil {
 		return nil, err
 	}

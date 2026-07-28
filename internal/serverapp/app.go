@@ -15,8 +15,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/adminserver"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
@@ -112,10 +114,74 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("监听 Relay 地址: %w", err)
 	}
+	defer listener.Close()
 	httpServer := &http.Server{Handler: hub, TLSConfig: tlsBundle.Config, ReadHeaderTimeout: 10 * time.Second}
 	tlsListener := tls.NewListener(listener, tlsBundle.Config)
-	logger.Info("Herdr Pal Server 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "listen", loaded.Server.Listen, "verbose", options.Verbose)
-	return runServerComponents(ctx, weComClient, router, httpServer, tlsListener, logger)
+	adminListener, err := adminserver.Listen(adminserver.ListenerConfig{StateDir: loaded.Server.StateDir})
+	if err != nil {
+		return fmt.Errorf("监听 HPAP Admin Socket: %w", err)
+	}
+	defer adminListener.Close()
+
+	stopRequested := make(chan struct{})
+	var stopOnce sync.Once
+	requestStop := func() { stopOnce.Do(func() { close(stopRequested) }) }
+	runtimeInspector, err := NewRuntimeInspector(RuntimeConfig{
+		StartedAt: time.Now(), RelayListen: loaded.Server.Listen,
+		AdminSocket: loaded.Server.AdminSocketPath, TLS: tlsBundle.Info, Stop: requestStop,
+	}, runtimeLogger, weComClient, hub, catalog, credentialStore)
+	if err != nil {
+		return fmt.Errorf("创建服务运行状态: %w", err)
+	}
+	keyHandler, err := adminserver.NewKeyHandler(credentialStore, hub, logger, time.Now)
+	if err != nil {
+		return fmt.Errorf("创建 HPAP Key Handler: %w", err)
+	}
+	runtimeHandler, err := adminserver.NewRuntimeHandler(runtimeInspector)
+	if err != nil {
+		return fmt.Errorf("创建 HPAP Runtime Handler: %w", err)
+	}
+	connectionHandler, err := adminserver.NewConnectionHandler(hub, time.Now)
+	if err != nil {
+		return fmt.Errorf("创建 HPAP Connection Handler: %w", err)
+	}
+	sessionHandler, err := adminserver.NewSessionHandler(catalog, time.Now)
+	if err != nil {
+		return fmt.Errorf("创建 HPAP Session Handler: %w", err)
+	}
+	adminMux, err := adminserver.NewMethodMux(keyHandler, runtimeHandler, connectionHandler, sessionHandler)
+	if err != nil {
+		return fmt.Errorf("创建 HPAP 方法路由: %w", err)
+	}
+	adminRuntime, err := adminserver.NewServer(adminserver.ServerConfig{Handler: adminMux, Logger: logger})
+	if err != nil {
+		return fmt.Errorf("创建 HPAP Admin Server: %w", err)
+	}
+
+	components := []serverComponent{
+		{name: "wecom_connection", run: weComClient.Run},
+		{name: "wecom_event_loop", run: func(componentContext context.Context) error {
+			return runWeComEventLoop(componentContext, weComClient, router)
+		}},
+		{name: "relay_http", run: func(context.Context) error { return httpServer.Serve(tlsListener) }},
+		{name: "admin", run: func(componentContext context.Context) error {
+			return adminRuntime.Serve(componentContext, adminListener)
+		}},
+	}
+	shutdown := func(shutdownContext context.Context) {
+		_ = adminListener.Close()
+		_ = httpServer.Shutdown(shutdownContext)
+		for _, connection := range hub.Connections() {
+			hub.DisconnectConnection(connection.ConnectionID, "server shutdown")
+		}
+	}
+	logger.Info("Herdr Pal Server 启动",
+		"bot_hash", shortHash(loaded.WeCom.BotID),
+		"listen", loaded.Server.Listen,
+		"admin_socket", loaded.Server.AdminSocketPath,
+		"verbose", options.Verbose,
+	)
+	return runServerComponents(ctx, stopRequested, components, shutdown, logger)
 }
 
 func buildRelayURLHint(addrHint, listen string) (string, error) {
@@ -169,43 +235,85 @@ type serverComponentResult struct {
 	err       error
 }
 
-func runServerComponents(ctx context.Context, weCom weComRuntime, router *server.ConversationRouter, httpServer *http.Server, listener net.Listener, logger *slog.Logger) error {
-	runContext, cancel := context.WithCancel(ctx)
+type serverComponent struct {
+	name string
+	run  func(context.Context) error
+}
+
+func runWeComEventLoop(ctx context.Context, weCom weComRuntime, router *server.ConversationRouter) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case message, ok := <-weCom.Events():
+			if !ok {
+				return errors.New("企业微信事件流已关闭")
+			}
+			router.Handle(ctx, message)
+		}
+	}
+}
+
+func runServerComponents(parent context.Context, stopRequested <-chan struct{}, components []serverComponent, shutdown func(context.Context), logger *slog.Logger) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	runContext, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	results := make(chan serverComponentResult, 3)
-	go func() { results <- serverComponentResult{component: "wecom_connection", err: weCom.Run(runContext)} }()
-	go func() {
-		for {
-			select {
-			case <-runContext.Done():
-				results <- serverComponentResult{component: "wecom_event_loop", err: runContext.Err()}
+	if len(components) == 0 {
+		return errors.New("服务端没有可运行组件")
+	}
+	results := make(chan serverComponentResult, len(components))
+	for _, component := range components {
+		component := component
+		go func() {
+			if component.run == nil {
+				results <- serverComponentResult{component: component.name, err: errors.New("组件运行函数为空")}
 				return
-			case message, ok := <-weCom.Events():
-				if !ok {
-					results <- serverComponentResult{component: "wecom_event_loop", err: errors.New("企业微信事件流已关闭")}
-					return
-				}
-				router.Handle(runContext, message)
+			}
+			results <- serverComponentResult{component: component.name, err: component.run(runContext)}
+		}()
+	}
+
+	var first serverComponentResult
+	completed := 0
+	normalStop := false
+	select {
+	case <-parent.Done():
+		normalStop = true
+	case <-stopRequested:
+		normalStop = true
+	case first = <-results:
+		completed = 1
+		if parent.Err() != nil {
+			normalStop = true
+		} else {
+			select {
+			case <-stopRequested:
+				normalStop = true
+			default:
 			}
 		}
-	}()
-	go func() { results <- serverComponentResult{component: "relay_http", err: httpServer.Serve(listener)} }()
-	first := <-results
-	cancel()
+	}
+
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	_ = httpServer.Shutdown(shutdownContext)
-	for remaining := 2; remaining > 0; remaining-- {
+	if shutdown != nil {
+		shutdown(shutdownContext)
+	}
+	cancel()
+	for completed < len(components) {
 		select {
 		case <-results:
+			completed++
 		case <-shutdownContext.Done():
-			remaining = 0
+			return errors.New("服务端组件未能在 10 秒内停止")
 		}
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if errors.Is(first.err, http.ErrServerClosed) || errors.Is(first.err, context.Canceled) {
+	if normalStop {
+		if parent.Err() != nil {
+			return parent.Err()
+		}
 		return nil
 	}
 	if first.err == nil {

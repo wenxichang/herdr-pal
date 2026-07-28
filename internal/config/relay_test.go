@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,12 +92,16 @@ func TestLoadServerReadsSecretAndDefaultsCredentialPath(t *testing.T) {
 	if loaded.Server.CredentialsFile != filepath.Join(loaded.Server.StateDir, "credentials.json") {
 		t.Fatalf("credentials_file = %q, want under %q", loaded.Server.CredentialsFile, loaded.Server.StateDir)
 	}
+	if loaded.Server.AdminSocketPath != filepath.Join(loaded.Server.StateDir, "admin.sock") {
+		t.Fatalf("admin socket = %q, want under %q", loaded.Server.AdminSocketPath, loaded.Server.StateDir)
+	}
 }
 
 func TestLoadServerAdminDoesNotRequireWeComSecret(t *testing.T) {
+	stateDir := shortConfigStateDir(t)
 	path := writeConfig(t, `{
 	  "wecom": {"bot_id": ""},
-	  "server": {"state_dir": "`+filepath.ToSlash(t.TempDir())+`"},
+	  "server": {"state_dir": "`+filepath.ToSlash(stateDir)+`"},
 	  "log": {}
 	}`)
 	loaded, err := LoadServerAdmin(path)
@@ -105,6 +111,47 @@ func TestLoadServerAdminDoesNotRequireWeComSecret(t *testing.T) {
 	if filepath.Base(loaded.Server.CredentialsFile) != "credentials.json" {
 		t.Fatalf("LoadServerAdmin() = %#v", loaded.Server)
 	}
+	if loaded.Server.AdminSocketPath != filepath.Join(loaded.Server.StateDir, "admin.sock") {
+		t.Fatalf("LoadServerAdmin() admin socket = %q", loaded.Server.AdminSocketPath)
+	}
+}
+
+func TestLoadServerAdminRejectsInvalidDerivedAdminSocketPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		stateDir string
+		want     string
+	}{
+		{name: "nul", stateDir: filepath.Join(t.TempDir(), "bad\x00dir"), want: "state_dir"},
+		{name: "too long", stateDir: filepath.Join(t.TempDir(), strings.Repeat("x", 120)), want: "admin.sock"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "server.json")
+			quotedStateDir, marshalErr := json.Marshal(test.stateDir)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			raw := `{"wecom":{},"server":{"state_dir":` + string(quotedStateDir) + `},"log":{}}`
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadServerAdmin(path)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadServerAdmin() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func shortConfigStateDir(t *testing.T) string {
+	t.Helper()
+	path, err := os.MkdirTemp("/tmp", "hp-config-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(path) })
+	return path
 }
 
 func TestLoadServerRequiresListenSecretAndCertificatePair(t *testing.T) {

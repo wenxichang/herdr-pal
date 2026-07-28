@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const maxAdminSocketPathBytes = 103
+
 // ServerConfig 是 herdr-pal-server 的完整配置。
 type ServerConfig struct {
 	WeCom  ServerWeComConfig `json:"wecom"`
@@ -28,6 +30,7 @@ type ListenerConfig struct {
 	KeyFile         string `json:"key_file"`
 	StateDir        string `json:"state_dir"`
 	CredentialsFile string `json:"credentials_file"`
+	AdminSocketPath string `json:"-"`
 }
 
 // LoadServer 加载服务端配置并从环境读取企业微信 Secret。
@@ -65,6 +68,11 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 		}
 		loaded.Server.StateDir = filepath.Join(configDir, "herdr-pal-server")
 	}
+	loaded.Server.StateDir = filepath.Clean(strings.TrimSpace(loaded.Server.StateDir))
+	loaded.Server.AdminSocketPath, err = AdminSocketPath(loaded.Server.StateDir)
+	if err != nil {
+		return ServerConfig{}, err
+	}
 	if strings.TrimSpace(loaded.Server.CredentialsFile) == "" {
 		loaded.Server.CredentialsFile = filepath.Join(loaded.Server.StateDir, "credentials.json")
 	}
@@ -77,4 +85,17 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 		loaded.Log.Level = "info"
 	}
 	return loaded, nil
+}
+
+// AdminSocketPath 根据唯一的 state directory 推导本机 HPAP Socket 路径。
+func AdminSocketPath(stateDir string) (string, error) {
+	stateDir = strings.TrimSpace(stateDir)
+	if stateDir == "" || strings.ContainsRune(stateDir, '\x00') {
+		return "", fmt.Errorf("state_dir 无效，无法推导 HPAP Admin Socket")
+	}
+	path := filepath.Join(filepath.Clean(stateDir), "admin.sock")
+	if len(path) > maxAdminSocketPathBytes {
+		return "", fmt.Errorf("派生的 admin.sock 路径过长（%d 字节，最多 %d 字节）", len(path), maxAdminSocketPathBytes)
+	}
+	return path, nil
 }

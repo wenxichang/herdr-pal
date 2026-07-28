@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/wenxichang/herdr-pal/internal/im"
+	"github.com/wenxichang/herdr-pal/internal/adminserver"
 )
 
 func TestBuildRelayURLHintUsesConfiguredAddressAndListenPort(t *testing.T) {
@@ -66,66 +69,131 @@ func TestNewLoggerVerboseForcesDebugAndRedactsSecret(t *testing.T) {
 }
 
 func TestRunServerComponentsStopsHTTPAndWeComOnContextCancellation(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	weCom := &fakeWeComRuntime{events: make(chan im.IncomingText), stopped: make(chan struct{})}
-	httpServer := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = runServerComponents(ctx, weCom, nil, httpServer, listener, nil)
+	stopped := make(chan string, 4)
+	shutdownCalls := 0
+	err := runServerComponents(ctx, nil, waitingServerComponents(stopped), func(context.Context) {
+		shutdownCalls++
+	}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runServerComponents() error = %v", err)
 	}
-	select {
-	case <-weCom.stopped:
-	default:
-		t.Fatal("runServerComponents returned before WeCom runtime stopped")
+	if shutdownCalls != 1 {
+		t.Fatalf("shutdown calls = %d, want 1", shutdownCalls)
 	}
-}
-
-func TestRunServerComponentsLogsFailedComponentWithReason(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	weCom := &failingWeComRuntime{events: make(chan im.IncomingText), err: errors.New("dial exhausted")}
-	httpServer := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
-
-	err = runServerComponents(context.Background(), weCom, nil, httpServer, listener, logger)
-
-	if err == nil || !strings.Contains(err.Error(), "dial exhausted") {
-		t.Fatalf("runServerComponents() error = %v", err)
-	}
-	output := logs.String()
-	for _, want := range []string{"服务端组件异常退出", "component=wecom_connection", "error_type=component_exit", "reason=\"dial exhausted\""} {
-		if !strings.Contains(output, want) {
-			t.Fatalf("logs = %q, want %q", output, want)
+	for range 4 {
+		select {
+		case <-stopped:
+		default:
+			t.Fatal("runServerComponents returned before all components stopped")
 		}
 	}
 }
 
-type fakeWeComRuntime struct {
-	events  chan im.IncomingText
-	stopped chan struct{}
+func TestRunServerComponentsLogsFailedComponentWithReason(t *testing.T) {
+	for failingIndex, failingName := range []string{"wecom_connection", "wecom_event_loop", "relay_http", "admin"} {
+		t.Run(failingName, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			stopped := make(chan string, 3)
+			components := waitingServerComponents(stopped)
+			components[failingIndex].run = func(context.Context) error { return errors.New("component exhausted") }
+			shutdownCalls := 0
+
+			err := runServerComponents(context.Background(), nil, components, func(context.Context) {
+				shutdownCalls++
+			}, logger)
+
+			if err == nil || !strings.Contains(err.Error(), "component exhausted") {
+				t.Fatalf("runServerComponents() error = %v", err)
+			}
+			if shutdownCalls != 1 {
+				t.Fatalf("shutdown calls = %d, want 1", shutdownCalls)
+			}
+			for range 3 {
+				select {
+				case <-stopped:
+				default:
+					t.Fatal("failed component did not trigger full component cleanup")
+				}
+			}
+			output := logs.String()
+			for _, want := range []string{"服务端组件异常退出", "component=" + failingName, "error_type=component_exit", "reason=\"component exhausted\""} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("logs = %q, want %q", output, want)
+				}
+			}
+		})
+	}
 }
 
-func (runtime *fakeWeComRuntime) Run(ctx context.Context) error {
-	<-ctx.Done()
-	close(runtime.stopped)
-	return ctx.Err()
+func TestRunServerComponentsTreatsAdminStopAsNormalShutdown(t *testing.T) {
+	stopRequested := make(chan struct{})
+	close(stopRequested)
+	stopped := make(chan string, 4)
+	shutdownCalls := 0
+	if err := runServerComponents(context.Background(), stopRequested, waitingServerComponents(stopped), func(context.Context) {
+		shutdownCalls++
+	}, nil); err != nil {
+		t.Fatalf("runServerComponents(admin stop) error = %v", err)
+	}
+	if shutdownCalls != 1 || len(stopped) != 4 {
+		t.Fatalf("admin stop cleanup = calls:%d stopped:%d", shutdownCalls, len(stopped))
+	}
 }
 
-func (runtime *fakeWeComRuntime) Events() <-chan im.IncomingText { return runtime.events }
-
-type failingWeComRuntime struct {
-	events chan im.IncomingText
-	err    error
+func TestRunServerFailsWhenAdminSocketCannotStartAndClosesRelay(t *testing.T) {
+	stateDir, err := os.MkdirTemp("/tmp", "hp-serverapp-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(stateDir) })
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	adminPath := filepath.Join(stateDir, adminserver.DefaultSocketFileName)
+	if err := os.WriteFile(adminPath, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddress := probe.Addr().String()
+	probe.Close()
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	raw := fmt.Sprintf(`{"wecom":{"bot_id":"bot-test"},"server":{"listen":%q,"state_dir":%q},"log":{}}`, listenAddress, stateDir)
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = Run(ctx, Options{
+		ConfigPath: configPath,
+		Getenv:     func(string) string { return "wecom-secret" },
+		Stderr:     &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "HPAP Admin Socket") {
+		t.Fatalf("Run() error = %v, want HPAP Admin Socket detail", err)
+	}
+	listener, listenErr := net.Listen("tcp", listenAddress)
+	if listenErr != nil {
+		t.Fatalf("Relay listener leaked after Admin startup failure: %v", listenErr)
+	}
+	listener.Close()
 }
 
-func (runtime *failingWeComRuntime) Run(context.Context) error { return runtime.err }
-
-func (runtime *failingWeComRuntime) Events() <-chan im.IncomingText { return runtime.events }
+func waitingServerComponents(stopped chan<- string) []serverComponent {
+	names := []string{"wecom_connection", "wecom_event_loop", "relay_http", "admin"}
+	components := make([]serverComponent, 0, len(names))
+	for _, name := range names {
+		componentName := name
+		components = append(components, serverComponent{name: componentName, run: func(ctx context.Context) error {
+			<-ctx.Done()
+			stopped <- componentName
+			return ctx.Err()
+		}})
+	}
+	return components
+}
