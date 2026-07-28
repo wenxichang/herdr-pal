@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -208,6 +209,105 @@ func TestHPAPServerRestartRestoresPalWithoutPalRestart(t *testing.T) {
 	if restored.PrincipalID != initialSession.PrincipalID || restored.Target != initialSession.Target || restored.Status != initialSession.Status {
 		t.Fatalf("restored session = %#v, want stable identity/status from %#v", restored, initialSession)
 	}
+}
+
+func TestHPCLIProcessUsesRunningServer(t *testing.T) {
+	harness := newHPAPHarness(t)
+	defer harness.stop(t)
+
+	issued := harness.issueKey(t, "user-cli", "home", []string{"127.0.0.1"})
+	harness.tokens = append(harness.tokens, issued.Token)
+	fakeHerdr := testkit.NewHerdrServer(t, integrationSnapshot("session-cli", herdr.AgentStatusWorking))
+	fakeHerdr.SetOutput([]string{"terminal-sensitive-cli"})
+	harness.pals = append(harness.pals, startHPAPPal(t, harness.relayURL, issued.Token, fakeHerdr.SocketPath()))
+	harness.waitConnections(t, 1)
+	expectedSession := harness.waitSessions(t, 1).Items[0]
+
+	binary := buildHPCLI(t)
+	status := runHPCLI(t, binary, harness.configPath, "server", "status")
+	if status.exitCode != 0 || !bytes.Contains(status.stdout, []byte("HPAP/HPRP："+adminproto.Protocol+" / "+hprp.ProtocolVersion)) || len(status.stderr) != 0 {
+		t.Fatalf("hp-cli server status = exit:%d stdout:%q stderr:%q", status.exitCode, status.stdout, status.stderr)
+	}
+
+	keyList := runHPCLI(t, binary, harness.configPath, "key", "list", "--json")
+	var keys adminproto.KeyListResult
+	if keyList.exitCode != 0 || json.Unmarshal(keyList.stdout, &keys) != nil || len(keys.Items) != 1 || keys.Items[0].CredentialID != issued.Credential.CredentialID {
+		t.Fatalf("hp-cli key list = exit:%d stdout:%q stderr:%q", keyList.exitCode, keyList.stdout, keyList.stderr)
+	}
+	connectionList := runHPCLI(t, binary, harness.configPath, "connection", "list", "--json")
+	var connections adminproto.ConnectionListResult
+	if connectionList.exitCode != 0 || json.Unmarshal(connectionList.stdout, &connections) != nil || len(connections.Items) != 1 || connections.Items[0].CredentialID != issued.Credential.CredentialID {
+		t.Fatalf("hp-cli connection list = exit:%d stdout:%q stderr:%q", connectionList.exitCode, connectionList.stdout, connectionList.stderr)
+	}
+	sessionList := runHPCLI(t, binary, harness.configPath, "session", "list", "--json")
+	var sessions adminproto.SessionListResult
+	if sessionList.exitCode != 0 || json.Unmarshal(sessionList.stdout, &sessions) != nil || len(sessions.Items) != 1 || sessions.Items[0].Target != expectedSession.Target {
+		t.Fatalf("hp-cli session list = exit:%d stdout:%q stderr:%q", sessionList.exitCode, sessionList.stdout, sessionList.stderr)
+	}
+
+	missing := runHPCLI(t, binary, harness.configPath, "key", "show", "999999")
+	if missing.exitCode != 1 || !bytes.Contains(missing.stderr, []byte(adminproto.CodeCredentialNotFound)) || bytes.Contains(missing.stderr, []byte("Admin Socket 请求失败")) {
+		t.Fatalf("hp-cli missing key = exit:%d stdout:%q stderr:%q", missing.exitCode, missing.stdout, missing.stderr)
+	}
+	for name, result := range map[string]hpapCLIResult{
+		"status": status, "keys": keyList, "connections": connectionList, "sessions": sessionList, "missing": missing,
+	} {
+		assertNoHPAPSecrets(t, "hp-cli "+name, append(append([]byte(nil), result.stdout...), result.stderr...), harness.tokens, harness.secret)
+	}
+}
+
+type hpapCLIResult struct {
+	stdout   []byte
+	stderr   []byte
+	exitCode int
+}
+
+func buildHPCLI(t *testing.T) string {
+	t.Helper()
+	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "hp-cli")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/hp-cli")
+	command.Dir = repositoryRoot
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build hp-cli: %v\n%s", err, output)
+	}
+	return binary
+}
+
+func runHPCLI(t *testing.T, binary, configPath string, args ...string) hpapCLIResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	commandArgs := append([]string{"-config", configPath}, args...)
+	command := exec.CommandContext(ctx, binary, commandArgs...)
+	command.Env = []string{
+		"HOME=" + t.TempDir(),
+		"PATH=" + os.Getenv("PATH"),
+		"TMPDIR=" + os.TempDir(),
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("hp-cli timeout: %v stdout=%q stderr=%q", ctx.Err(), stdout.String(), stderr.String())
+	}
+	exitCode := 0
+	if err != nil {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) {
+			t.Fatalf("run hp-cli: %v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+		}
+		exitCode = exitError.ExitCode()
+	}
+	return hpapCLIResult{stdout: stdout.Bytes(), stderr: stderr.Bytes(), exitCode: exitCode}
 }
 
 type hpapHarness struct {
