@@ -7,6 +7,7 @@ Herdr Pal 是 Herdr 与企业微信之间的独立 sidecar bridge：
 - `herdr-pal-server` 独占企业微信智能机器人长连接，并监听 HPRP/1 WSS。
 - 每台运行 Herdr 的机器启动一个 `herdr-pal`，只访问本机 Herdr 公共 Socket。
 - Server 通过每机独立 Bearer Key 认证 Pal；Key 在服务端绑定企业微信用户 ID 和机器标识。
+- `hp-cli` 通过本机 HPAP/1 Unix Socket 动态管理正在运行的 Server，不直接修改凭据文件。
 - Pal 上报本机完整 Agent 会话快照，Server 为同一用户聚合多台机器并负责企业微信路由。
 - `herdr-pal -i` 保留不经过网络的本机控制台模式。
 
@@ -15,9 +16,12 @@ Herdr Pal 是 Herdr 与企业微信之间的独立 sidecar bridge：
 - Server：`~/.config/herdr-pal/server-config.json`
 - Pal：`~/.config/herdr-pal/config.json`
 - 凭据存储：默认 `<state_dir>/credentials.json`
+- Admin Socket：默认 `<state_dir>/admin.sock`
 
 `build.sh` 使用 `CGO_ENABLED=0` 生成 Darwin/Linux AMD64、ARM64 客户端和服务端，以及
-Windows AMD64 客户端 Beta。`unittest.sh` 运行全部单元和本地集成测试。
+Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平台另生成
+`dist/herdr-pal`、`dist/herdr-pal-server` 和 `dist/hp-cli`。`unittest.sh` 运行全部单元、
+本地集成和竞态测试。
 
 ## 2. 固定产品决策
 
@@ -25,7 +29,8 @@ Windows AMD64 客户端 Beta。`unittest.sh` 运行全部单元和本地集成�
   `HERDR_PAL_WECOM_SECRET`。
 - 企业微信应用可见范围是用户入口边界；Router 只处理单聊。
 - `/userid` 只用于向管理员提供企业微信 principal ID，不再写入 Pal 配置。
-- 管理员使用 `herdr-pal-server key issue` 为每台机器签发独立 `hpk_...` Key。
+- 管理员使用 `hp-cli key issue` 为每台机器签发独立 `hpk_...` Key，并必须配置至少一条
+  来源地址规则。
 - Key 在服务端绑定 `(principal_id, machine_id)`；Pal 不能自行声明或覆盖身份。
 - 同一用户、同一机器标识只允许一条在线连接；后来连接返回 HTTP 409。
 - 不同用户可以使用相同机器标识。连接断开后立即移除该机器和全部会话。
@@ -35,6 +40,8 @@ Windows AMD64 客户端 Beta。`unittest.sh` 运行全部单元和本地集成�
 - 不持久化选择、在线目录、分页、通知或在途命令，不提供离线任务和通知回放。
 - 终端内容只描述为近期快照，不承诺完整对话或结构化 LLM transcript。
 - 不自动批准权限请求；按键必须由用户显式触发并通过本地策略。
+- HPAP 只支持 Unix Domain Socket；Windows 只构建 Pal，不构建 Server 或 `hp-cli`。
+- 当前凭据文件格式为 version 2，不兼容 HPAP 实施前的无来源规则旧记录。
 
 ## 3. 部署与身份流程
 
@@ -44,19 +51,26 @@ Windows AMD64 客户端 Beta。`unittest.sh` 运行全部单元和本地集成�
 2. `EnsureTLS` 加载外部证书；未配置时在状态目录生成并复用自签名证书。
 3. `credential.LoadStore` 加载仅保存摘要的 HPRP 机器凭据。
 4. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
-5. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
-6. `/help` 使用 `addr_hint + listen 端口` 生成 Pal 的 WSS 配置示例。
+5. 在 `<state_dir>/admin.sock` 启动 HPAP 管理面；失败时整个 Server 启动失败。
+6. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
+7. `/help` 使用 `addr_hint + listen 端口` 生成 Pal 的 WSS 配置示例。
 
 用户在企业微信发送 `/userid` 后，管理员执行：
 
 ```sh
-herdr-pal-server key issue \
-  -principal-id '企业微信用户 ID' \
-  -machine-id 'office-pc'
+hp-cli key issue \
+  --principal-id '企业微信用户 ID' \
+  --machine-id 'office-pc' \
+  --source '192.168.1.20'
 ```
 
 明文 Key 只在签发时输出一次。服务端保存 `credential_id`、绑定身份和 Secret SHA-256
-摘要，不保存可直接使用的明文 Key。
+摘要，不保存可直接使用的明文 Key。来源支持单 IP、CIDR 和同地址族闭区间；认证只使用 TLS
+连接的真实 peer 地址，不信任代理头。
+
+`credential_id` 在运行期按“当前最大值 + 1”分配。删除中间记录会留下空洞；如果尾部记录
+全部删除，Server 重启后可能复用这些尾部数值，因此它只用于本机运行管理和审计定位，不是
+永久全局标识。
 
 ### 3.2 Pal
 
@@ -134,6 +148,8 @@ Pal 在 10 分钟有界窗口内缓存已完成命令结果。相同 Key 与等�
 
 - `internal/hprp`：HPRP/1 信封、公开消息、校验、协商和错误码。
 - `internal/credential`：机器 Key 生成、摘要存储和 HTTP Bearer 验证。
+- `internal/adminproto`、`internal/adminclient`、`internal/adminserver`：HPAP/1、本地客户端、
+  Unix Socket 安全边界、管理方法和审计。
 - `internal/server`：在线目录、HPRP Hub、用户执行器和企业微信路由。
 - `internal/relayclient`：Pal 的 HPRP 连接、快照、命令幂等和输出上报。
 - `internal/herdr`：公共 NDJSON 请求、订阅和平台传输。
@@ -162,7 +178,8 @@ go test -race ./internal/hprp ./internal/credential ./internal/server \
 ```
 
 覆盖重点包括严格 JSON、Bearer 认证、hello/首快照、稳定目标、快照乱序、命令关联和
-幂等、输出/通知去重、多用户多机器隔离、Herdr 重连恢复与本地输入策略。
+幂等、输出/通知去重、多用户多机器隔离、Herdr 重连恢复、本地输入策略，以及 HPAP Key
+CRUD、来源复核、连接/会话查询、动态 debug 和优雅停止。
 
 ## 8. 安全与后续工作
 
@@ -170,6 +187,7 @@ go test -race ./internal/hprp ./internal/credential ./internal/server \
 - 日志不记录完整 Key、Secret、Cookie、prompt 或终端快照；用户、消息和 session 使用摘要。
 - 服务器发来的内容仍必须经过 Pal 的 `PolicyGuard`，不构成自动授权。
 - 当前 Key 是逻辑机器绑定，不提供硬件证明；复制 Key 仍可能在其他设备使用。
-- 当前适合受信任内网。互联网部署应补充证书信任、凭据吊销命令、认证限流和审计存储。
+- 当前适合受信任内网。互联网部署应补充证书信任、认证限流和集中审计存储；Key 的动态
+  禁用、删除和来源收紧已经由 HPAP 提供。
 - 后续 Feature 必须按用户功能建模，由 Pal 展开为多个 Herdr 公共 API 操作，不提供通用
   Herdr RPC 透传。

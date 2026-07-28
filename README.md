@@ -60,12 +60,17 @@ herdr status server --json
 - `dist/herdr-pal-server-darwin-arm64`
 - `dist/herdr-pal-server-linux-amd64`
 - `dist/herdr-pal-server-linux-arm64`
+- `dist/hp-cli-darwin-amd64`
+- `dist/hp-cli-darwin-arm64`
+- `dist/hp-cli-linux-amd64`
+- `dist/hp-cli-linux-arm64`
 - `dist/herdr-pal-windows-amd64.exe`
 
 同时保留当前构建机器的便捷名称：
 
 - `dist/herdr-pal-server`
 - `dist/herdr-pal`
+- `dist/hp-cli`
 
 GitHub Release 只发布带操作系统和架构后缀的文件。Intel/AMD x64 选择 `amd64`，Apple
 Silicon 或 ARM64 Linux 选择 `arm64`。Windows 当前只发布客户端 AMD64 Beta，不发布
@@ -155,6 +160,16 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 `credentials_file` 留空时默认使用 `state_dir/credentials.json`；服务端只保存 Key 摘要，
 不会保存可直接连接的明文 Key。
 
+服务端同时在 `<state_dir>/admin.sock` 启动仅限同一系统用户访问的本地管理接口。确认服务
+已经可以管理：
+
+```sh
+./dist/hp-cli server status
+```
+
+`hp-cli` 默认读取同一个 `~/.config/herdr-pal/server-config.json` 来定位 Admin Socket，不
+需要企业微信 Secret。服务端使用其他配置文件时，给 `hp-cli` 传入相同的 `-config`。
+
 ## 第三步：获取用户 ID 并签发机器 Key
 
 服务端成功连接企业微信后，在自己的机器人单聊中发送：
@@ -167,13 +182,17 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 且在该用户下不重复的机器标识，例如 `office-pc`。管理员在服务端执行：
 
 ```sh
-./dist/herdr-pal-server key issue \
-  -principal-id '企业微信返回的用户 ID' \
-  -machine-id 'office-pc'
+./dist/hp-cli key issue \
+  --principal-id '企业微信返回的用户 ID' \
+  --machine-id 'office-pc' \
+  --source '192.168.1.20'
 ```
 
 命令只在签发时输出一次 `hpk_...` Key。请通过安全渠道交给对应机器，不要写入聊天记录、
-日志或 Git。不同用户可以使用相同机器标识；同一用户的每台机器必须使用独立 Key。
+日志或 Git。`--source` 必须至少提供一次，可重复使用；支持单 IP、CIDR
+（`192.168.1.0/24`）和闭区间（`192.168.1.20-192.168.1.30`）。这里填写 Pal 实际连接
+Server 时的来源地址，不信任 `X-Forwarded-For` 等代理头。不同用户可以使用相同机器标识；
+同一用户的每台机器必须使用独立 Key。
 
 ## 第四步：启动每台客户端
 
@@ -245,6 +264,29 @@ Windows 默认配置文件是 `%USERPROFILE%\.config\herdr-pal\config.json`。He
 ```
 
 同一用户、同一机器标识同时只能有一个客户端连接；重复连接会收到 HTTP `409` 并被拒绝。
+
+客户端上线后，管理员可以在服务端查看连接和用户看到的 Agent 会话：
+
+```sh
+./dist/hp-cli connection list
+./dist/hp-cli session list
+```
+
+机器停用时使用 `hp-cli key disable <ID>`：它会持久化禁用 Key，并立即移除对应连接和会话，
+Pal 后续也不能重连。临时排查连接时使用 `hp-cli connection disconnect <CONNECTION_ID>`：它
+只断开当前连接，不改变 Key，Pal 可以自动重连。恢复已禁用的 Key 使用
+`hp-cli key enable <ID>`；不可恢复删除必须显式执行 `hp-cli key delete <ID> --yes`。
+
+常用的来源策略维护命令：
+
+```sh
+./dist/hp-cli key source list 1
+./dist/hp-cli key source add 1 192.168.1.0/24
+./dist/hp-cli key source set 1 192.168.1.20 10.0.0.1-10.0.0.5
+```
+
+所有管理查询支持 `--json`，便于脚本审计和监控。完整命令与安全边界见
+[HPAP 本地管理面](docs/HPAP_ADMIN_DESIGN.md)。
 
 ## 第五步：开始使用
 
@@ -391,7 +433,8 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 - 确认 `relay.url` 使用 `wss://`，地址和端口可从客户端机器访问。
 - 使用自动证书时确认 `skip_verify` 为 `true`。
 - 若日志显示 HTTP `409`，检查同一用户是否已有相同机器标识的客户端在线。
-- 若日志显示 HTTP `401`，Key 无效、已过期、已吊销，或服务端读取了错误的凭据文件。
+- 若日志显示 HTTP `401`，Key 无效、已过期、已禁用、来源地址不符合规则，或服务端读取了
+  错误的凭据文件。可在服务端执行 `hp-cli key show <ID>` 和 `hp-cli key source list <ID>`。
 
 ### Herdr Socket 自动探测失败
 
@@ -410,7 +453,7 @@ marker 路径，并尝试连接对应的 Named Pipe。
 
 - 只在受信任内网部署当前版本。
 - 不要把 Bot Secret、Cookie 或用户凭据提交到仓库。
-- 每台机器使用独立 Key；机器停用时应吊销或移除对应凭据。
+- 每台机器使用独立 Key；机器停用时使用 `hp-cli key disable` 或 `key delete`。
 - Herdr Pal 不会自动批准权限请求。
 - Relay 断线期间不会缓存或补发旧任务。
 
@@ -421,6 +464,7 @@ marker 路径，并尝试连接对应的 Named Pipe。
 ```sh
 ./dist/herdr-pal-server --version
 ./dist/herdr-pal --version
+./dist/hp-cli --version
 ```
 
 运行完整检查：
@@ -435,4 +479,5 @@ marker 路径，并尝试连接对应的 Named Pipe。
 - [Herdr API 审计](docs/HERDR_API_AUDIT.md)
 - [维护交接](docs/HANDOFF_CONTEXT.md)
 - [HPRP/1 协议设计](docs/HPRP_PROTOCOL_DESIGN.md)
+- [HPAP/1 本地管理面](docs/HPAP_ADMIN_DESIGN.md)
 - [Windows AMD64 支持](docs/WINDOWS_AMD64_SUPPORT.md)

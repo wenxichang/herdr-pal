@@ -2,7 +2,8 @@
 
 ## 1. 文档状态
 
-本文定义 `hp-cli` 与 `herdr-pal-server` 之间的本地管理面。设计状态为已确认、待实施。
+本文定义 `hp-cli` 与 `herdr-pal-server` 之间的本地管理面。参考实现已经完成 HPAP/1、
+`hp-cli`、动态凭据管理、运行查询和服务生命周期接入，并通过本地端到端与竞态测试。
 
 本地管理协议命名为 Herdr Pal Administration Protocol，首个版本为 `HPAP/1`。HPAP 只在
 Server 主机的 Unix Domain Socket 上使用，与 Pal/Server 远程通讯所使用的 HPRP/1 完全
@@ -28,7 +29,7 @@ Server 主机的 Unix Domain Socket 上使用，与 Pal/Server 远程通讯所�
 - 不支持热加载普通配置、替换 TLS 证书或切换企业微信机器人。
 - 不支持多 Server 实例发现、集群管理或跨主机聚合。
 - 首版不支持 Windows Server 或 Windows `hp-cli`。
-- 当前功能尚未发布，不兼容旧凭据文件记录。
+- 凭据文件使用 version 2，不兼容实施前没有来源规则的旧记录。
 
 ## 3. 总体架构
 
@@ -93,9 +94,9 @@ Admin Socket 创建失败时，Server 启动失败，避免出现无法管理的
 {
   "protocol": "HPAP/1",
   "id": "req-1",
-  "method": "key.disable",
+  "method": "connection.disconnect",
   "params": {
-    "credential_id": 12
+    "connection_id": "conn-01J..."
   }
 }
 ```
@@ -107,8 +108,9 @@ Admin Socket 创建失败时，Server 启动失败，避免出现无法管理的
   "protocol": "HPAP/1",
   "id": "req-1",
   "result": {
-    "status": "disabled",
-    "connection_disconnected": true
+    "observed_at": "2026-07-28T12:00:00Z",
+    "connection_id": "conn-01J...",
+    "disconnected": true
   }
 }
 ```
@@ -256,7 +258,7 @@ hp-cli session list [--principal-id USERID] [--machine-id MACHINE] [--json]
 ```
 
 状态只使用 `enabled` 和 `disabled`。删除表示记录永久移除，不增加可恢复的 deleted 状态。
-当前功能尚未发布，直接调整凭据文件格式，不加载无来源规则的旧记录。
+参考实现直接使用 version 2 凭据文件格式，不加载无来源规则的旧记录。
 
 ### 7.1 Credential ID 分配
 
@@ -387,13 +389,16 @@ Bearer Secret、状态、过期时间和来源地址必须全部通过，才能�
 
 - CredentialStore 是 Key 持久化和认证内存的唯一所有者。
 - 所有变更在进程内串行化：校验新状态、写入权限受限的临时文件、`fsync`、原子重命名，
-  然后提交内存状态。
+  然后提交内存状态。原子重命名是磁盘与内存的共同提交点；其后的目录 `fsync` 只增强崩溃
+  耐久性，失败时不能把已经替换的磁盘文件伪装为回滚。
 - 持久化期间认证读取可以短暂等待，不能观察到文件与内存不一致的中间状态。
-- AdminServer 使用有界连接数、请求队列和响应大小，不能为每个请求创建无界 goroutine。
+- AdminServer 使用有界连接数和响应大小；同一连接顺序处理请求，不为每个请求创建无界
+  goroutine。
 - Runtime、Connection 和 Session 查询各自返回线程安全快照，不承诺跨组件全局事务一致性；
   每个结果包含 `observed_at`。
 - 断连动作先从 Hub 的可路由集合撤下连接，再取消连接 context，避免继续接受新命令。
-- `server.stop` 将响应完整写出并关闭当前请求后，再触发 Server 根 context 取消。
+- `server.stop` 将响应完整写出后再触发 Server 根停止入口；响应写入失败时释放停止预留，
+  允许管理员重新请求停止。
 
 ## 11. 代码边界
 
@@ -417,7 +422,7 @@ AdminServer 通过 `RuntimeInspector`、`CredentialManager`、`ConnectionManager
 - peer UID。
 - method。
 - request ID 摘要。
-- 目标 credential ID、connection ID 或筛选条件。
+- 目标 credential ID、connection ID 或筛选条件；principal ID 只记录摘要。
 - 成功或稳定错误类型。
 - 是否断开连接、受影响数量和耗时。
 
@@ -469,12 +474,16 @@ dist/hp-cli-linux-arm64
 
 当前平台同时生成 `dist/hp-cli`。Windows 首版不生成 hp-cli，也不发布 Server 管理面。
 
-## 15. 实施顺序
+## 15. 实施结果与边界
 
-1. HPAP 信封、严格编解码、错误码和来源规则纯模块。
-2. CredentialStore CRUD、来源验证和原子持久化。
-3. ClientHub、SessionCatalog、WeCom 和 Runtime 的线程安全查询接口。
-4. AdminServer Unix Socket、安全校验和方法分发。
-5. `hp-cli` 命令、分页、表格/JSON 和退出码。
-6. Server 生命周期、动态日志级别、优雅停止和构建脚本接入。
-7. 文档、端到端测试和安全日志审计。
+- HPAP 信封、严格编解码、稳定错误码、分页和来源规则已经实现。
+- CredentialStore 是动态 Key CRUD 的唯一写入口；Server 运行期间签发和变更立即生效。
+- Admin Socket 会校验目录、现有路径、文件权限和 peer UID；派生路径超过 Unix Socket 安全
+  长度时在配置阶段拒绝启动。
+- `hp-cli` 支持人工表格和聚合后的 `--json` 输出；人工输出会替换控制字符，避免在线会话
+  标题或状态污染本地终端。
+- `session list` 只读取 SessionCatalog 管理快照，不读取终端内容，也不改变企业微信路由、
+  `/ls` 编号缓存或当前选择。
+- Server 停止时先撤下 HPRP 路由，再断开连接，并等待已经 Upgrade 的 WebSocket handler
+  退出，避免 HTTP `Shutdown` 遗留活动 Pal。
+- Darwin 和 Linux 构建 Server 与 `hp-cli`；Windows 当前只提供 Pal Beta，不包含本地管理面。

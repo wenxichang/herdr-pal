@@ -6,23 +6,20 @@ Herdr Pal 由中央 Server 与每机 Pal sidecar 组成。Server 集中持有企
 只访问本机 Herdr 公共 Socket，并通过 HPRP/1 WSS 上报会话与执行用户功能。
 
 ```text
-企业微信智能机器人
-        │
-        ▼
-herdr-pal-server
-WeComClient ─ ConversationRouter ─ UserExecutor
-                    │
-CredentialStore ─ ClientHub ─ SessionCatalog
-                    │ HPRP/1 WSS
-          ┌─────────┴─────────┐
-          ▼                   ▼
-  herdr-pal: office-pc  herdr-pal: home-mac
-  RelayClient           RelayClient
-  Service / Notifier    Service / Notifier
-  EventSupervisor       EventSupervisor
-          │ Local Socket      │ Local Socket
-          ▼                   ▼
-        Herdr               Herdr
+企业微信智能机器人 ──▶ herdr-pal-server
+                       ├── WeComClient / ConversationRouter / UserExecutor
+hp-cli ── HPAP/1 ────▶ ├── AdminServer / CredentialStore
+                       └── ClientHub / SessionCatalog
+                                  │ HPRP/1 WSS
+                     ┌────────────┴────────────┐
+                     ▼                         ▼
+             herdr-pal: office-pc      herdr-pal: home-mac
+             RelayClient               RelayClient
+             Service / Notifier        Service / Notifier
+             EventSupervisor           EventSupervisor
+                     │ Local Socket             │ Local Socket
+                     ▼                          ▼
+                   Herdr                      Herdr
 ```
 
 固定边界：
@@ -37,7 +34,7 @@ CredentialStore ─ ClientHub ─ SessionCatalog
 每台机器使用一把协议外签发的 Bearer Key。服务端凭据记录绑定：
 
 ```text
-credential_id + principal_id + machine_id + secret_digest
+credential_id + principal_id + machine_id + secret_digest + allowed_sources
 ```
 
 - `principal_id` 是企业微信回调中的用户 ID。
@@ -47,7 +44,7 @@ credential_id + principal_id + machine_id + secret_digest
   `Sec-WebSocket-Protocol: herdr-pal-relay.v1`。
 - 同一 `(principal_id, machine_id)` 只允许一条活动连接；重复连接返回 HTTP 409。
 - HTTP Upgrade 成功后，Server 先保留身份，再完成 HPRP hello 与首快照同步。
-- Key 无效、过期或吊销统一返回 HTTP 401；日志只记录 `credential_id` 和身份摘要。
+- Key 无效、过期、禁用或来源不匹配统一返回 HTTP 401；日志只记录 `credential_id` 和身份摘要。
 
 ## 3. Server 模块
 
@@ -70,15 +67,23 @@ Router 以企业微信用户 ID 为隔离边界：
 
 ### 3.3 CredentialStore
 
-保存每机 Key 的摘要和绑定身份。管理命令只在签发时输出一次明文 Key：
+保存每机 Key 的摘要、绑定身份和来源地址规则。所有变更由运行中的 Server 通过 HPAP 完成，
+管理命令只在签发时输出一次明文 Key：
 
 ```sh
-herdr-pal-server key issue -principal-id USERID -machine-id MACHINE
+hp-cli key issue --principal-id USERID --machine-id MACHINE --source 192.168.1.20
 ```
 
-凭据存储默认位于 `state_dir/credentials.json`，文件权限受限。验证使用常量时间摘要比较。
+凭据存储默认位于 `state_dir/credentials.json`，文件权限受限。验证使用常量时间摘要比较，并
+同时核验 TLS 连接的真实来源地址。`hp-cli` 只连接 `<state_dir>/admin.sock`，不直接修改文件。
 
-### 3.4 ClientHub
+### 3.4 AdminServer
+
+AdminServer 通过 HPAP/1 Unix Socket 向同一系统用户提供 Key CRUD、来源策略、连接与会话
+查询、动态 debug 和优雅停止。它不提供远程管理端口，不读取终端内容，也不能发送 Agent
+输入。Windows 当前不构建 Server 或 `hp-cli`。
+
+### 3.5 ClientHub
 
 ClientHub 实现 HPRP/1 Server 状态机：
 

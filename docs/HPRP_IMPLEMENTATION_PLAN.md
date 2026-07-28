@@ -1,5 +1,8 @@
 # HPRP/1 Pal 与 Server 改造实施计划
 
+> **状态：** HPRP/1 改造已完成。本文保留为历史实施记录；其中旧的 Server Key 签发子命令
+> 已由 HPAP/1 和 `hp-cli` 替代，当前行为以 README、HPRP 与 HPAP 设计文档为准。
+
 > 本计划在当前会话内按任务顺序执行，禁止使用 subagent-driven development。每个行为变更
 > 都先添加失败测试，再编写最小实现，最后运行相关包测试和完整回归。
 
@@ -195,14 +198,15 @@ Upgrade 前把 Key 解析为 `(principal_id, machine_id)`，Pal 只持有 Bearer
    }
    ```
 
-3. 服务端增加管理命令：
+3. 当前管理面使用运行中 Server 的 HPAP 接口签发 Key：
 
    ```sh
-   herdr-pal-server key issue -config /path/server-config.json \
-     -principal-id USERID -machine-id office-pc
+   hp-cli -config /path/server-config.json key issue \
+     --principal-id USERID --machine-id office-pc --source 192.168.1.20
    ```
 
-   命令把摘要记录写入凭据文件，只向 stdout 展示一次完整 Key，不要求企业微信 Secret。
+   Server 把摘要记录写入凭据文件，只向 stdout 展示一次完整 Key；`hp-cli` 不要求企业微信
+   Secret，也不直接修改凭据文件。
 4. 配置错误必须指出具体字段，日志和错误不得回显完整 Key。
 5. 运行相关测试并提交：
 

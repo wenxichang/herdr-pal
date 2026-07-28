@@ -1,5 +1,8 @@
 # HPAP 本地管理面实施计划
 
+> **状态：** 已完成。本文保留为实现过程和测试门禁记录，当前行为以
+> `docs/HPAP_ADMIN_DESIGN.md` 与代码为准。
+
 > **执行要求：** 使用 `superpowers:executing-plans` 按任务逐项实施；本项目禁止使用
 > subagent-driven。所有功能先写失败测试，再实现最小代码；每次提交前必须执行
 > `./unittest.sh && ./build.sh`。

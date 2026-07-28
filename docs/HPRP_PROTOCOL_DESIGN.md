@@ -193,10 +193,11 @@ Key 由协议外的管理平面签发，每把 Key 唯一绑定一个用户和�
 
 ```json
 {
-  "credential_id": "cred_7F2Q9",
+  "credential_id": 7,
   "principal_id": "user-internal-id",
   "machine_id": "office-pc",
-  "status": "active",
+  "status": "enabled",
+  "allowed_sources": ["192.168.1.20"],
   "expires_at": null
 }
 ```
