@@ -1,6 +1,11 @@
 package adminproto
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestMethodsContainsHPAPVersionOneSurface(t *testing.T) {
 	want := []Method{
@@ -37,6 +42,21 @@ func TestMethodsContainsHPAPVersionOneSurface(t *testing.T) {
 	}
 	if IsKnownMethod("key.rotate") {
 		t.Fatal("IsKnownMethod() accepted unsupported method")
+	}
+}
+
+func TestKeyCredentialJSONNeverContainsStoredSecretDigest(t *testing.T) {
+	expiresAt := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	credential := Credential{
+		CredentialID: 1, PrincipalID: "user-a", MachineID: "home", Status: "enabled",
+		AllowedSources: []string{"192.168.1.10"}, ExpiresAt: &expiresAt,
+	}
+	encoded, err := json.Marshal(CredentialResult{Credential: credential})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "secret") || !strings.Contains(string(encoded), `"credential_id":1`) {
+		t.Fatalf("credential JSON = %s", encoded)
 	}
 }
 
