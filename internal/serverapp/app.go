@@ -53,10 +53,11 @@ func Run(ctx context.Context, options Options) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	logger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, loaded.WeCom.Secret)
+	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, loaded.WeCom.Secret)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
+	logger := runtimeLogger.Logger
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return err
@@ -231,7 +232,7 @@ func safeRuntimeReason(err error) string {
 	return reason
 }
 
-func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) (*slog.Logger, error) {
+func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) (*RuntimeLogger, error) {
 	var minimum slog.Level
 	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "", "info":
@@ -245,10 +246,17 @@ func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) 
 	default:
 		return nil, fmt.Errorf("无效日志级别")
 	}
+	runtimeLogger := &RuntimeLogger{baseLevel: minimum}
 	if verbose {
-		minimum = slog.LevelDebug
+		runtimeLogger.level.Set(slog.LevelDebug)
+	} else {
+		runtimeLogger.level.Set(minimum)
 	}
-	return slog.New(slog.NewTextHandler(redactingWriter{destination: writer, secrets: compactSecrets(secrets)}, &slog.HandlerOptions{Level: minimum})), nil
+	runtimeLogger.Logger = slog.New(slog.NewTextHandler(
+		redactingWriter{destination: writer, secrets: compactSecrets(secrets)},
+		&slog.HandlerOptions{Level: &runtimeLogger.level},
+	))
+	return runtimeLogger, nil
 }
 
 type redactingWriter struct {

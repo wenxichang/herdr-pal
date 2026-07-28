@@ -49,11 +49,11 @@ func TestNewLoggerRejectsUnknownLevel(t *testing.T) {
 
 func TestNewLoggerVerboseForcesDebugAndRedactsSecret(t *testing.T) {
 	var logs bytes.Buffer
-	logger, err := newLogger(&logs, "error", true, "secret-sensitive")
+	runtimeLogger, err := newLogger(&logs, "error", true, "secret-sensitive")
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger.Debug("服务端详细诊断", "reason", "upstream rejected secret-sensitive")
+	runtimeLogger.Logger.Debug("服务端详细诊断", "reason", "upstream rejected secret-sensitive")
 	output := logs.String()
 	for _, want := range []string{"level=DEBUG", "服务端详细诊断", "reason=\"upstream rejected [REDACTED]\""} {
 		if !strings.Contains(output, want) {
