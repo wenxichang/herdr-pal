@@ -4,9 +4,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -23,6 +25,10 @@ const (
 	AutoCertFileName = "relay-cert.pem"
 	// AutoKeyFileName 是自动生成私钥的固定文件名。
 	AutoKeyFileName = "relay-key.pem"
+	// TLSModeAutomatic 表示服务端使用自动生成并持久化的自签名证书。
+	TLSModeAutomatic = "automatic"
+	// TLSModeExternal 表示服务端使用管理员配置的外部证书。
+	TLSModeExternal = "external"
 )
 
 // TLSConfig 指定外部证书对或自动证书状态目录。
@@ -32,52 +38,78 @@ type TLSConfig struct {
 	StateDir string
 }
 
+// TLSInfo 是可安全暴露给本地管理接口的证书元数据。
+type TLSInfo struct {
+	Mode              string
+	NotAfter          time.Time
+	SHA256Fingerprint string
+}
+
+// TLSBundle 同时提供监听所需配置和不包含私钥信息的运行快照。
+type TLSBundle struct {
+	Config *tls.Config
+	Info   TLSInfo
+}
+
 // EnsureTLS 加载外部证书，或生成并持久化可复用的自签名证书。
-func EnsureTLS(config TLSConfig) (*tls.Config, error) {
+func EnsureTLS(config TLSConfig) (TLSBundle, error) {
 	certConfigured := strings.TrimSpace(config.CertFile) != ""
 	keyConfigured := strings.TrimSpace(config.KeyFile) != ""
 	if certConfigured != keyConfigured {
-		return nil, errors.New("Relay cert_file 与 key_file 必须同时配置")
+		return TLSBundle{}, errors.New("Relay cert_file 与 key_file 必须同时配置")
 	}
 	if certConfigured {
-		return loadTLSCertificate(config.CertFile, config.KeyFile)
+		return loadTLSCertificate(config.CertFile, config.KeyFile, TLSModeExternal)
 	}
 	if strings.TrimSpace(config.StateDir) == "" {
-		return nil, errors.New("Relay 自动证书状态目录不能为空")
+		return TLSBundle{}, errors.New("Relay 自动证书状态目录不能为空")
 	}
 	if err := os.MkdirAll(config.StateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("创建 Relay 证书目录: %w", err)
+		return TLSBundle{}, fmt.Errorf("创建 Relay 证书目录: %w", err)
 	}
 	certPath := filepath.Join(config.StateDir, AutoCertFileName)
 	keyPath := filepath.Join(config.StateDir, AutoKeyFileName)
 	if fileExists(certPath) && fileExists(keyPath) {
 		if err := os.Chmod(keyPath, 0o600); err != nil {
-			return nil, fmt.Errorf("收紧 Relay 私钥权限: %w", err)
+			return TLSBundle{}, fmt.Errorf("收紧 Relay 私钥权限: %w", err)
 		}
-		return loadTLSCertificate(certPath, keyPath)
+		return loadTLSCertificate(certPath, keyPath, TLSModeAutomatic)
 	}
 	certPEM, keyPEM, err := generateSelfSignedCertificate(time.Now())
 	if err != nil {
-		return nil, err
+		return TLSBundle{}, err
 	}
 	if err := writePrivateFileAtomic(keyPath, keyPEM, 0o600); err != nil {
-		return nil, fmt.Errorf("写入 Relay 私钥: %w", err)
+		return TLSBundle{}, fmt.Errorf("写入 Relay 私钥: %w", err)
 	}
 	if err := writePrivateFileAtomic(certPath, certPEM, 0o644); err != nil {
-		return nil, fmt.Errorf("写入 Relay 证书: %w", err)
+		return TLSBundle{}, fmt.Errorf("写入 Relay 证书: %w", err)
 	}
-	return loadTLSCertificate(certPath, keyPath)
+	return loadTLSCertificate(certPath, keyPath, TLSModeAutomatic)
 }
 
-func loadTLSCertificate(certPath, keyPath string) (*tls.Config, error) {
+func loadTLSCertificate(certPath, keyPath, mode string) (TLSBundle, error) {
 	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("加载 Relay TLS 证书: %w", err)
+		return TLSBundle{}, fmt.Errorf("加载 Relay TLS 证书: %w", err)
 	}
-	return &tls.Config{
+	if len(pair.Certificate) == 0 {
+		return TLSBundle{}, errors.New("Relay TLS 证书链为空")
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return TLSBundle{}, fmt.Errorf("解析 Relay TLS 叶证书: %w", err)
+	}
+	pair.Leaf = leaf
+	fingerprint := sha256.Sum256(pair.Certificate[0])
+	return TLSBundle{Config: &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{pair},
-	}, nil
+	}, Info: TLSInfo{
+		Mode:              mode,
+		NotAfter:          leaf.NotAfter,
+		SHA256Fingerprint: hex.EncodeToString(fingerprint[:]),
+	}}, nil
 }
 
 func generateSelfSignedCertificate(now time.Time) ([]byte, []byte, error) {

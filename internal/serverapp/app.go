@@ -70,7 +70,7 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	defer lock.Release()
-	tlsConfig, err := server.EnsureTLS(server.TLSConfig{CertFile: loaded.Server.CertFile, KeyFile: loaded.Server.KeyFile, StateDir: loaded.Server.StateDir})
+	tlsBundle, err := server.EnsureTLS(server.TLSConfig{CertFile: loaded.Server.CertFile, KeyFile: loaded.Server.KeyFile, StateDir: loaded.Server.StateDir})
 	if err != nil {
 		return fmt.Errorf("准备 Relay TLS: %w", err)
 	}
@@ -111,8 +111,8 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("监听 Relay 地址: %w", err)
 	}
-	httpServer := &http.Server{Handler: hub, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second}
-	tlsListener := tls.NewListener(listener, tlsConfig)
+	httpServer := &http.Server{Handler: hub, TLSConfig: tlsBundle.Config, ReadHeaderTimeout: 10 * time.Second}
+	tlsListener := tls.NewListener(listener, tlsBundle.Config)
 	logger.Info("Herdr Pal Server 启动", "bot_hash", shortHash(loaded.WeCom.BotID), "listen", loaded.Server.Listen, "verbose", options.Verbose)
 	return runServerComponents(ctx, weComClient, router, httpServer, tlsListener, logger)
 }

@@ -177,6 +177,101 @@ func TestClientWaitsBackoffAfterSubscribedSessionEnds(t *testing.T) {
 	awaitDone(t, done)
 }
 
+func TestClientStatusTracksConnectReconnectAndStop(t *testing.T) {
+	socket := newFakeSocket()
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	client := newTestClient(t, func(ctx context.Context, _ string) (Socket, error) {
+		close(dialStarted)
+		select {
+		case <-releaseDial:
+			return socket, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	waitStarted := make(chan struct{}, 1)
+	client.wait = func(ctx context.Context, _ time.Duration) error {
+		waitStarted <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	<-dialStarted
+	connecting := client.Status()
+	if connecting.State != StatusConnecting || connecting.ChangedAt.IsZero() {
+		t.Fatalf("connecting status = %#v", connecting)
+	}
+
+	close(releaseDial)
+	completeSubscribe(t, client, socket)
+	waitForClientStatus(t, client, StatusConnected)
+	connected := client.Status()
+	if connected.LastErrorType != "" || connected.LastErrorCode != 0 || connected.LastHTTPStatus != 0 {
+		t.Fatalf("connected status retained error = %#v", connected)
+	}
+
+	socket.push([]byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"event-1"},"body":{"msgid":"event-message-1","create_time":1720000000,"aibotid":"bot-1","msgtype":"event","event":{"eventtype":"disconnected_event"}}}`))
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("client did not enter reconnect wait")
+	}
+	reconnecting := client.Status()
+	if reconnecting.State != StatusReconnecting || reconnecting.ChangedAt.Before(connected.ChangedAt) {
+		t.Fatalf("reconnecting status = %#v, connected = %#v", reconnecting, connected)
+	}
+
+	cancel()
+	awaitDone(t, done)
+	stopped := client.Status()
+	if stopped.State != StatusStopped || stopped.ChangedAt.Before(reconnecting.ChangedAt) {
+		t.Fatalf("stopped status = %#v, reconnecting = %#v", stopped, reconnecting)
+	}
+}
+
+func TestClientStatusRetainsSafeErrorMetadata(t *testing.T) {
+	client := newTestClient(t, func(context.Context, string) (Socket, error) {
+		return nil, &weComDialError{kind: "handshake", statusCode: http.StatusUnauthorized, cause: errors.New("secret response body")}
+	})
+	waitStarted := make(chan struct{})
+	client.wait = func(ctx context.Context, _ time.Duration) error {
+		close(waitStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	<-waitStarted
+	status := client.Status()
+	if status.State != StatusReconnecting || status.LastErrorType != "handshake" || status.LastHTTPStatus != http.StatusUnauthorized || status.LastErrorCode != 0 {
+		t.Fatalf("dial failure status = %#v", status)
+	}
+	cancel()
+	awaitDone(t, done)
+
+	socket := newFakeSocket()
+	client = newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	ctx, cancel = context.WithCancel(context.Background())
+	done = runClient(t, client, ctx)
+	request := socket.nextWrite(t)
+	socket.push(responseJSON(requestIDOf(t, request), 40001))
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrProtocol) {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("protocol error did not stop client")
+	}
+	status = client.Status()
+	if status.State != StatusStopped || status.LastErrorType != "protocol" || status.LastErrorCode != 40001 || status.LastHTTPStatus != 0 {
+		t.Fatalf("protocol failure status = %#v", status)
+	}
+	cancel()
+}
+
 func TestClientSendMarkdownToTargetsRequestedUserAndWaitsResponse(t *testing.T) {
 	socket := newFakeSocket()
 	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
@@ -979,6 +1074,21 @@ func waitForCurrent(t *testing.T, ctx context.Context, client *Client) {
 		case <-ctx.Done():
 			t.Fatal("current session was not installed")
 		case <-ticker.C:
+		}
+	}
+}
+
+func waitForClientStatus(t *testing.T, client *Client, state StatusState) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if client.Status().State == state {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("client status = %#v, want %q", client.Status(), state)
+		case <-time.After(time.Millisecond):
 		}
 	}
 }

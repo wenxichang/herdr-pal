@@ -54,6 +54,29 @@ type ClientConfig struct {
 	Logger            *slog.Logger
 }
 
+// StatusState 表示企业微信长连接当前所处的生命周期阶段。
+type StatusState string
+
+const (
+	// StatusConnecting 表示客户端正在建立或订阅连接。
+	StatusConnecting StatusState = "connecting"
+	// StatusConnected 表示客户端已经订阅成功并可收发消息。
+	StatusConnected StatusState = "connected"
+	// StatusReconnecting 表示客户端在失败后等待或准备重连。
+	StatusReconnecting StatusState = "reconnecting"
+	// StatusStopped 表示客户端尚未启动或 Run 已退出。
+	StatusStopped StatusState = "stopped"
+)
+
+// StatusSnapshot 是不包含凭据、消息正文和底层响应的企业微信运行快照。
+type StatusSnapshot struct {
+	State          StatusState
+	ChangedAt      time.Time
+	LastErrorType  string
+	LastErrorCode  int
+	LastHTTPStatus int
+}
+
 // String 返回不包含订阅密钥、原始机器人标识和用户标识的配置摘要。
 func (config ClientConfig) String() string {
 	return fmt.Sprintf("ClientConfig{Endpoint:%q BotHash:%q UserHash:%q}",
@@ -84,6 +107,7 @@ type Client struct {
 	mu         sync.Mutex
 	current    *session
 	runStarted bool
+	status     StatusSnapshot
 	closeOnce  sync.Once
 }
 
@@ -136,11 +160,22 @@ func NewClient(config ClientConfig) (*Client, error) {
 		dial: config.Dial, requestID: config.RequestID, heartbeatInterval: config.HeartbeatInterval,
 		requestTimeout: config.RequestTimeout, events: make(chan IncomingText, config.EventsCapacity),
 		backoff: config.Backoff, wait: config.Wait, logger: config.Logger,
+		status: StatusSnapshot{State: StatusStopped, ChangedAt: time.Now()},
 	}, nil
 }
 
+// Status 返回当前企业微信连接状态的线程安全快照。
+func (c *Client) Status() StatusSnapshot {
+	if c == nil {
+		return StatusSnapshot{State: StatusStopped}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status
+}
+
 // Run 持续维护唯一的已订阅 WebSocket 会话，直到 context 被取消。
-func (c *Client) Run(ctx context.Context) error {
+func (c *Client) Run(ctx context.Context) (runErr error) {
 	if c == nil {
 		return ErrUnavailable
 	}
@@ -151,6 +186,7 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	c.runStarted = true
 	c.mu.Unlock()
+	defer func() { c.setStatus(StatusStopped, runErr) }()
 	defer c.closeEvents()
 	defer c.clearCurrentAndClose()
 
@@ -158,10 +194,12 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		c.setStatus(StatusConnecting, nil)
 		connectionFields := c.connectionLogFields()
 		c.logInfo("企业微信连接中", connectionFields...)
 		socket, err := c.dial(ctx, c.endpoint)
 		if err != nil {
+			c.setStatus(StatusReconnecting, err)
 			delay := c.backoff.Next()
 			fields := append(connectionFields, weComDialLogFields(err)...)
 			fields = append(fields, "retry_delay", delay)
@@ -173,6 +211,7 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 		session := newSession(ctx, socket, c.events, c.logger)
 		if err := c.subscribe(ctx, session); err != nil {
+			c.setStatus(StatusReconnecting, err)
 			session.finish(ErrUnavailable)
 			session.wait()
 			if errors.Is(err, ErrProtocol) || errors.Is(err, ErrEventQueueFull) {
@@ -188,6 +227,7 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 		c.install(session)
 		if err := session.activate(); err != nil {
+			c.setStatus(StatusReconnecting, err)
 			session.finish(ErrUnavailable)
 			session.wait()
 			c.clearIfCurrent(session)
@@ -203,6 +243,7 @@ func (c *Client) Run(ctx context.Context) error {
 			continue
 		}
 		c.backoff.Reset()
+		c.setStatus(StatusConnected, nil)
 		c.logInfo("企业微信订阅成功", connectionFields...)
 		session.startHeartbeat(c)
 		<-session.done
@@ -211,6 +252,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		c.setStatus(StatusReconnecting, session.reason())
 		disconnectedFields := append(connectionFields, wecomErrorLogFields(session.reason())...)
 		c.logWarn("企业微信连接已断开", disconnectedFields...)
 		if errors.Is(session.reason(), ErrProtocol) {
@@ -226,6 +268,31 @@ func (c *Client) Run(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+func (c *Client) setStatus(state StatusState, err error) {
+	if c == nil {
+		return
+	}
+	snapshot := StatusSnapshot{State: state, ChangedAt: time.Now()}
+	if err != nil {
+		snapshot.LastErrorType, snapshot.LastErrorCode, snapshot.LastHTTPStatus = wecomStatusError(err)
+	}
+	c.mu.Lock()
+	c.status = snapshot
+	c.mu.Unlock()
+}
+
+func wecomStatusError(err error) (string, int, int) {
+	var dialErr *weComDialError
+	if errors.As(err, &dialErr) {
+		return dialErr.kind, 0, dialErr.statusCode
+	}
+	var protocolError *ProtocolError
+	if errors.As(err, &protocolError) {
+		return "protocol", protocolError.ErrCode, 0
+	}
+	return wecomErrorType(err), 0, 0
 }
 
 func (c *Client) logInfo(message string, args ...any) {
