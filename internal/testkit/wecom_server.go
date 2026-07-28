@@ -94,6 +94,21 @@ func (s *WeComServer) WaitSubscribeCount(t testing.TB, count int) {
 	})
 }
 
+// ConnectionCount 返回当前仍保持打开的企业微信 WebSocket 数量。
+func (s *WeComServer) ConnectionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.connections)
+}
+
+// WaitConnectionCount 等待当前企业微信 WebSocket 数量等于 count。
+func (s *WeComServer) WaitConnectionCount(t testing.TB, count int) {
+	t.Helper()
+	s.wait(t, fmt.Sprintf("企业微信连接数等于 %d", count), func() bool {
+		return s.ConnectionCount() == count
+	})
+}
+
 // Requests 返回指定命令的请求记录副本；command 为空时返回全部。
 func (s *WeComServer) Requests(command string) []WeComRequest {
 	s.mu.Lock()

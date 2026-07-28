@@ -36,6 +36,8 @@ type Options struct {
 	Getenv     func(string) string
 	Stderr     io.Writer
 	Verbose    bool
+	// WeComEndpoint 覆盖企业微信长连接地址；CLI 和配置文件不暴露该入口。
+	WeComEndpoint string
 }
 
 // Run 启动唯一企业微信连接和 Relay TLS 监听，直到 context 取消或关键组件失败。
@@ -77,8 +79,12 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("准备 Relay TLS: %w", err)
 	}
+	weComEndpoint := strings.TrimSpace(options.WeComEndpoint)
+	if weComEndpoint == "" {
+		weComEndpoint = wecom.DefaultEndpoint
+	}
 	weComClient, err := wecom.NewClient(wecom.ClientConfig{
-		Endpoint: wecom.DefaultEndpoint, BotID: loaded.WeCom.BotID, Secret: loaded.WeCom.Secret, Logger: logger,
+		Endpoint: weComEndpoint, BotID: loaded.WeCom.BotID, Secret: loaded.WeCom.Secret, Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("创建企业微信客户端: %w", err)
@@ -170,9 +176,11 @@ func Run(ctx context.Context, options Options) error {
 	}
 	shutdown := func(shutdownContext context.Context) {
 		_ = adminListener.Close()
+		hub.BeginShutdown()
 		_ = httpServer.Shutdown(shutdownContext)
-		for _, connection := range hub.Connections() {
-			hub.DisconnectConnection(connection.ConnectionID, "server shutdown")
+		hub.DisconnectAll("server shutdown")
+		if err := hub.Wait(shutdownContext); err != nil && logger != nil {
+			logger.Warn("等待 HPRP 连接退出超时", "error_type", "shutdown_timeout")
 		}
 	}
 	logger.Info("Herdr Pal Server 启动",

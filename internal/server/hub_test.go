@@ -33,6 +33,45 @@ func TestHPRPHubRejectsDuplicatePrincipalMachineBeforeUpgrade(t *testing.T) {
 	}
 }
 
+func TestHPRPHubShutdownRejectsNewConnectionsAndWaitsForActiveHandlers(t *testing.T) {
+	hub, server := startHPRPHubServer(t, HubConfig{}, discardHPRPLogger())
+	client := dialHPRPReady(t, server)
+	defer client.Close(websocket.StatusNormalClosure, "test complete")
+
+	hub.BeginShutdown()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- hub.Wait(context.Background()) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait() returned before active HPRP handler stopped: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-key")
+	connection, response, err := websocket.Dial(context.Background(), hprpTestURL(server), &websocket.DialOptions{
+		HTTPClient: server.Client(), HTTPHeader: header, Subprotocols: []string{hprp.Subprotocol},
+	})
+	if connection != nil {
+		connection.CloseNow()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("shutdown Dial() response = %#v, error = %v, want HTTP 503", response, err)
+	}
+
+	if disconnected := hub.DisconnectAll("server shutdown"); disconnected != 1 {
+		t.Fatalf("DisconnectAll() = %d, want 1", disconnected)
+	}
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wait() did not observe HPRP handler exit")
+	}
+}
+
 func TestHPRPHubSelectIsLocalAndExecuteUsesStableTarget(t *testing.T) {
 	hub, server := startHPRPHubServer(t, HubConfig{}, discardHPRPLogger())
 	client := dialHPRPReady(t, server)

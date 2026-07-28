@@ -62,6 +62,10 @@ type ClientHub struct {
 	config   HubConfig
 	logger   *slog.Logger
 
+	handlerMu    sync.Mutex
+	shuttingDown bool
+	handlers     sync.WaitGroup
+
 	mu      sync.RWMutex
 	clients map[ClientKey]*clientConnection
 
@@ -108,10 +112,18 @@ func (hub *ClientHub) SetOutboundSink(sink HubOutboundSink) error {
 
 // ServeHTTP 在 Upgrade 前完成 TLS、子协议、Bearer Key 和机器唯一连接校验。
 func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if hub == nil || request.TLS == nil {
-		if hub != nil {
-			hub.logger.Warn("HPRP 连接被拒绝", "stage", "tls_upgrade", "error_type", "tls_required", "reason", "HPRP/1 只接受 TLS 连接")
-		}
+	if hub == nil {
+		http.Error(writer, "HPRP unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !hub.beginHandler() {
+		hub.logger.Info("HPRP 连接被拒绝", "stage", "shutdown", "error_type", "server_stopping", "reason", "服务端正在停止")
+		http.Error(writer, "HPRP server stopping", http.StatusServiceUnavailable)
+		return
+	}
+	defer hub.handlers.Done()
+	if request.TLS == nil {
+		hub.logger.Warn("HPRP 连接被拒绝", "stage", "tls_upgrade", "error_type", "tls_required", "reason", "HPRP/1 只接受 TLS 连接")
 		http.Error(writer, "HPRP requires TLS", http.StatusUpgradeRequired)
 		return
 	}
@@ -169,6 +181,16 @@ func (hub *ClientHub) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	reserved = false
 	source, _ := credential.RequestSourceAddr(request)
 	hub.serveConnection(request.Context(), socket, connectionID, identity, key, source)
+}
+
+func (hub *ClientHub) beginHandler() bool {
+	hub.handlerMu.Lock()
+	defer hub.handlerMu.Unlock()
+	if hub.shuttingDown {
+		return false
+	}
+	hub.handlers.Add(1)
+	return true
 }
 
 // Select 复核目标仍存在于已就绪连接；HPRP/1 不发送远端选择消息。

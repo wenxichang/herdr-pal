@@ -16,6 +16,7 @@ func TestWeComServerCorrelatesReqIDRecordsPingAndReturnsConfiguredError(t *testi
 		t.Fatalf("Dial() error = %v", err)
 	}
 	defer connection.Close(websocket.StatusNormalClosure, "test completed")
+	server.WaitConnectionCount(t, 1)
 
 	writeWeComTestFrame(t, connection, map[string]any{
 		"cmd": "aibot_subscribe", "headers": map[string]any{"req_id": "subscribe-1"},
@@ -35,6 +36,7 @@ func TestWeComServerCorrelatesReqIDRecordsPingAndReturnsConfiguredError(t *testi
 	}
 
 	server.Disconnect()
+	server.WaitConnectionCount(t, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if _, _, err := connection.Read(ctx); err == nil {

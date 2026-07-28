@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"time"
@@ -88,6 +89,42 @@ func (hub *ClientHub) RevalidateCredentialSource(credentialID uint64, rules []cr
 	return hub.withdrawConnections(func(connection *clientConnection) bool {
 		return connection.credentialID == credentialID && !credential.MatchSource(rules, connection.source)
 	}, reason)
+}
+
+// BeginShutdown 原子禁止新的 HPRP HTTP handler 进入活动集合。
+func (hub *ClientHub) BeginShutdown() {
+	if hub == nil {
+		return
+	}
+	hub.handlerMu.Lock()
+	hub.shuttingDown = true
+	hub.handlerMu.Unlock()
+}
+
+// DisconnectAll 先撤下路由，再取消当前全部 HPRP 连接。
+func (hub *ClientHub) DisconnectAll(reason string) int {
+	return hub.withdrawConnections(func(*clientConnection) bool { return true }, reason)
+}
+
+// Wait 等待 BeginShutdown 前已经进入的全部 HPRP handler 完成。
+func (hub *ClientHub) Wait(ctx context.Context) error {
+	if hub == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		hub.handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (hub *ClientHub) withdrawConnections(match func(*clientConnection) bool, reason string) int {
