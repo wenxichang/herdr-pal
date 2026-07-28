@@ -77,8 +77,16 @@ func ValidateServerHello(hello ServerHello) error {
 
 // ValidateTarget 校验机器、物理 slot 和逻辑 session 三层稳定身份。
 func ValidateTarget(target Target) error {
-	if !machineIDPattern.MatchString(target.MachineID) || !validRequiredLabel(target.SlotID) ||
+	if ValidateMachineID(target.MachineID) != nil || !validRequiredLabel(target.SlotID) ||
 		!validRequiredLabel(target.SessionID) {
+		return ErrInvalidTarget
+	}
+	return nil
+}
+
+// ValidateMachineID 校验由终端凭据绑定的逻辑机器标识。
+func ValidateMachineID(machineID string) error {
+	if !machineIDPattern.MatchString(machineID) {
 		return ErrInvalidTarget
 	}
 	return nil
