@@ -133,7 +133,7 @@ func TestHelpTextDocumentsSupportedCommands(t *testing.T) {
 			t.Fatalf("HelpText() = %q, want %q", help, want)
 		}
 	}
-	for _, removed := range []string{"/keyup", "/keydn", "/space", "/esc"} {
+	for _, removed := range []string{"/keyup", "/keydn", "/space", "/esc", "/mode"} {
 		if strings.Contains(help, removed) {
 			t.Fatalf("HelpText() = %q, must not document removed command %q", help, removed)
 		}

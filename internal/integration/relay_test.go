@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -51,9 +54,9 @@ func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 	defer relayServer.Close()
 	endpoint := "wss" + strings.TrimPrefix(relayServer.URL, "https")
 
-	homeA := startIntegrationRelayClient(t, endpoint, homeAKey, "home-mac", "A 的任务")
-	officeA := startIntegrationRelayClient(t, endpoint, officeAKey, "office-pc", "办公室任务")
-	homeB := startIntegrationRelayClient(t, endpoint, homeBKey, "home-mac", "B 的任务")
+	homeA := startIntegrationRelayClient(t, endpoint, homeAKey, "home-mac", "codex", "A 的任务")
+	officeA := startIntegrationRelayClient(t, endpoint, officeAKey, "office-pc", "codex", "办公室任务")
+	homeB := startIntegrationRelayClient(t, endpoint, homeBKey, "home-mac", "codex", "B 的任务")
 	defer homeA.Stop(t)
 	defer officeA.Stop(t)
 	defer homeB.Stop(t)
@@ -90,10 +93,111 @@ func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SendNotification() error = %v", err)
 	}
-	eventuallyRelay(t, func() bool {
+	eventuallyRelayWithDetails(t, func() bool {
 		messages := strings.Join(gateway.Pushes("user-a"), "\n")
 		return strings.Contains(messages, "[home-mac/1] Codex — A 的任务")
+	}, func() string {
+		return strings.Join(gateway.Pushes("user-a"), "\n")
 	})
+}
+
+func TestIntegrationImageConCarriesAuditTextAndUploadsPNG(t *testing.T) {
+	router, catalog, gateway, client := startSingleIntegrationRelay(t, "opencode")
+	client.Executor.SetTerminal("带颜色的审计文本", integrationPNG(t), 3)
+	eventuallyRelay(t, func() bool { return catalog.HasSessions("user-a") })
+	router.Handle(context.Background(), relayIncoming("image-list", "user-a", "/ls"))
+	router.Handle(context.Background(), relayIncoming("image-select", "user-a", "/1"))
+	eventuallyRelay(t, func() bool { return len(gateway.Images("user-a")) == 1 })
+	if reply := gateway.Reply("request-image-select"); !strings.Contains(reply, "[终端输出#1]") || !strings.Contains(reply, "页码:[3/3]") {
+		t.Fatalf("image reply = %q", reply)
+	}
+	if calls := client.Executor.TerminalCalls(); len(calls) != 1 || calls[0].Mode != im.OutputModeImage || calls[0].Text != "带颜色的审计文本" {
+		t.Fatalf("terminal calls = %#v", calls)
+	}
+
+	gateway.SetImageError(errors.New("image unavailable"))
+	router.Handle(context.Background(), relayIncoming("image-fallback", "user-a", "/con"))
+	eventuallyRelay(t, func() bool {
+		return strings.Contains(strings.Join(gateway.Pushes("user-a"), "\n"), "带颜色的审计文本")
+	})
+}
+
+func TestIntegrationPageUpPageDownAcrossModeChanges(t *testing.T) {
+	router, catalog, gateway, client := startSingleIntegrationRelay(t, "codex")
+	client.Executor.SetTerminal("分页终端", integrationPNG(t), 3)
+	eventuallyRelay(t, func() bool { return catalog.HasSessions("user-a") })
+	router.Handle(context.Background(), relayIncoming("page-list", "user-a", "/ls"))
+	router.Handle(context.Background(), relayIncoming("page-select", "user-a", "/1"))
+	router.Handle(context.Background(), relayIncoming("mode-image", "user-a", "/mode img"))
+	router.Handle(context.Background(), relayIncoming("page-up", "user-a", "/pageup"))
+	router.Handle(context.Background(), relayIncoming("mode-text", "user-a", "/mode txt"))
+	router.Handle(context.Background(), relayIncoming("page-down", "user-a", "/pagedn"))
+
+	eventuallyRelay(t, func() bool { return len(client.Executor.TerminalCalls()) == 3 })
+	calls := client.Executor.TerminalCalls()
+	if calls[0].Mode != im.OutputModeText || calls[0].Page.Current != 3 ||
+		calls[1].Mode != im.OutputModeImage || calls[1].Page.Current != 2 ||
+		calls[2].Mode != im.OutputModeText || calls[2].Page.Current != 3 {
+		t.Fatalf("terminal calls = %#v", calls)
+	}
+	if reply := gateway.Reply("request-page-down"); !strings.Contains(reply, "分页终端") || !strings.Contains(reply, "页码:[3/3]") {
+		t.Fatalf("page down reply = %q", reply)
+	}
+	if len(gateway.Images("user-a")) != 1 {
+		t.Fatalf("images = %d, want 1", len(gateway.Images("user-a")))
+	}
+}
+
+func TestIntegrationDoneEventLetsServerFetchSnapshot(t *testing.T) {
+	router, catalog, gateway, client := startSingleIntegrationRelay(t, "codex")
+	client.Executor.SetTerminal("完成后的终端快照", integrationPNG(t), 1)
+	eventuallyRelay(t, func() bool { return catalog.HasSessions("user-a") })
+	router.Handle(context.Background(), relayIncoming("done-list", "user-a", "/ls"))
+	router.Handle(context.Background(), relayIncoming("done-select", "user-a", "/1"))
+
+	if err := client.Client.SendNotification(context.Background(), im.NotificationTarget{
+		PaneID: "pane-1", OccupantHash: "occ-home-mac", Agent: "codex", DisplayAgent: "Codex", Title: "集成任务",
+	}, im.NotificationEvent{
+		Kind: im.NotificationKindAgentStatusChanged, PreviousStatus: "working", Status: "done", OccurredAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eventuallyRelay(t, func() bool {
+		return strings.Contains(strings.Join(gateway.Pushes("user-a"), "\n"), "完成后的终端快照")
+	})
+	mode, maxLines, count := client.Executor.SnapshotStats()
+	if count != 1 || mode != im.OutputModeText || maxLines != 100 {
+		t.Fatalf("snapshot stats = mode %q max_lines %d count %d", mode, maxLines, count)
+	}
+}
+
+func startSingleIntegrationRelay(t *testing.T, agent string) (*server.ConversationRouter, *server.SessionCatalog, *relayGateway, *integrationRelayClient) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	catalog := server.NewSessionCatalog()
+	key, identity := issueIntegrationKey(t, "user-a", "home-mac", 9)
+	hub, err := server.NewClientHub(catalog, integrationVerifier{identities: map[string]credential.Identity{key: identity}}, server.HubConfig{}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := &relayGateway{replies: make(map[string]string), pushes: make(map[string][]string), images: make(map[string][][]byte)}
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := server.NewConversationRouter(catalog, server.NewUserExecutor(64), gateway, hub, deduper, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.SetOutboundSink(router); err != nil {
+		t.Fatal(err)
+	}
+	relayServer := httptest.NewTLSServer(hub)
+	t.Cleanup(relayServer.Close)
+	endpoint := "wss" + strings.TrimPrefix(relayServer.URL, "https")
+	client := startIntegrationRelayClient(t, endpoint, key, "home-mac", agent, "集成任务")
+	t.Cleanup(func() { client.Stop(t) })
+	return router, catalog, gateway, client
 }
 
 type integrationRelayClient struct {
@@ -103,7 +207,7 @@ type integrationRelayClient struct {
 	done     chan error
 }
 
-func startIntegrationRelayClient(t *testing.T, endpoint, key, machineID, title string) *integrationRelayClient {
+func startIntegrationRelayClient(t *testing.T, endpoint, key, machineID, agent, title string) *integrationRelayClient {
 	t.Helper()
 	client, err := relayclient.New(relayclient.Config{
 		URL: endpoint, Key: key, SkipVerify: true, Version: "integration",
@@ -116,7 +220,7 @@ func startIntegrationRelayClient(t *testing.T, endpoint, key, machineID, title s
 	executor := &integrationRelayExecutor{
 		target: session.Target{
 			PaneID: "pane-1", TerminalID: "terminal-1", OccupantKey: "occ-" + machineID,
-			Agent: "codex", DisplayAgent: "Codex", Title: title, Status: herdr.AgentStatusIdle, Workspace: "workspace", Tab: "main",
+			Agent: agent, DisplayAgent: integrationDisplayAgent(agent), Title: title, Status: herdr.AgentStatusIdle, Workspace: "workspace", Tab: "main",
 		},
 		sink: client,
 	}
@@ -127,6 +231,17 @@ func startIntegrationRelayClient(t *testing.T, endpoint, key, machineID, title s
 	done := make(chan error, 1)
 	go func() { done <- client.Run(ctx) }()
 	return &integrationRelayClient{Client: client, Executor: executor, cancel: cancel, done: done}
+}
+
+func integrationDisplayAgent(agent string) string {
+	switch agent {
+	case "codex":
+		return "Codex"
+	case "opencode":
+		return "OpenCode"
+	default:
+		return agent
+	}
 }
 
 type integrationVerifier struct {
@@ -161,11 +276,17 @@ func (client *integrationRelayClient) Stop(t *testing.T) {
 }
 
 type integrationRelayExecutor struct {
-	mu       sync.Mutex
-	target   session.Target
-	selected bool
-	prompt   string
-	sink     im.ReplySink
+	mu               sync.Mutex
+	target           session.Target
+	selected         bool
+	prompt           string
+	sink             im.ReplySink
+	terminal         *im.TerminalContent
+	page             int
+	terminalCalls    []im.TerminalContent
+	snapshotMode     im.OutputMode
+	snapshotMaxLines int
+	snapshotCount    int
 }
 
 func (executor *integrationRelayExecutor) CurrentTargets() []session.Target {
@@ -195,6 +316,22 @@ func (executor *integrationRelayExecutor) SelectTarget(paneID, occupantHash stri
 
 func (executor *integrationRelayExecutor) HandleMessage(ctx context.Context, message im.IncomingText) {
 	executor.mu.Lock()
+	if executor.selected && executor.terminal != nil && isIntegrationTerminalCommand(message.Content) {
+		total := executor.terminal.Page.Total
+		switch message.Content {
+		case "/con":
+			executor.page = total
+		case "/pageup":
+			executor.page = max(1, executor.page-1)
+		case "/pagedn":
+			executor.page = min(total, executor.page+1)
+		}
+		content := executor.terminalContentLocked(message.OutputMode, executor.page)
+		executor.terminalCalls = append(executor.terminalCalls, content)
+		executor.mu.Unlock()
+		_ = executor.sink.(im.TerminalReplySink).RespondTerminal(ctx, message.RequestID, content)
+		return
+	}
 	if executor.selected {
 		executor.prompt = message.Content
 	}
@@ -203,13 +340,67 @@ func (executor *integrationRelayExecutor) HandleMessage(ctx context.Context, mes
 }
 
 func (executor *integrationRelayExecutor) ReadTerminalSnapshot(
-	context.Context,
-	string,
-	string,
-	im.OutputMode,
-	int,
+	_ context.Context,
+	paneID string,
+	occupantHash string,
+	mode im.OutputMode,
+	maxLines int,
 ) (im.TerminalContent, error) {
-	return im.TerminalContent{}, errors.New("integration terminal snapshot unavailable")
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.terminal == nil || executor.target.PaneID != paneID || executor.target.OccupantKey != occupantHash {
+		return im.TerminalContent{}, errors.New("integration terminal snapshot unavailable")
+	}
+	executor.snapshotMode, executor.snapshotMaxLines = mode, maxLines
+	executor.snapshotCount++
+	return executor.terminalContentLocked(mode, executor.terminal.Page.Total), nil
+}
+
+func (executor *integrationRelayExecutor) SetTerminal(text string, pngData []byte, totalPages int) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	now := time.Now().UTC()
+	executor.terminal = &im.TerminalContent{
+		Mode: im.OutputModeImage, Text: text, CapturedAt: now,
+		Image: &im.TerminalImage{MediaType: "image/png", Data: append([]byte(nil), pngData...), Width: 2, Height: 1, ColorMode: "indexed-256"},
+		Page:  &im.TerminalPage{Current: totalPages, Total: totalPages},
+	}
+	executor.page = totalPages
+}
+
+func (executor *integrationRelayExecutor) terminalContentLocked(mode im.OutputMode, page int) im.TerminalContent {
+	content := *executor.terminal
+	content.Mode = mode
+	pageValue := *executor.terminal.Page
+	pageValue.Current = page
+	content.Page = &pageValue
+	if mode == im.OutputModeText {
+		content.Image = nil
+	} else if executor.terminal.Image != nil {
+		imageValue := *executor.terminal.Image
+		imageValue.Data = append([]byte(nil), executor.terminal.Image.Data...)
+		content.Image = &imageValue
+	}
+	return content
+}
+
+func (executor *integrationRelayExecutor) TerminalCalls() []im.TerminalContent {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return append([]im.TerminalContent(nil), executor.terminalCalls...)
+}
+
+func (executor *integrationRelayExecutor) SnapshotStats() (im.OutputMode, int, int) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.snapshotMode, executor.snapshotMaxLines, executor.snapshotCount
+}
+
+func isIntegrationTerminalCommand(content string) bool {
+	return content == "/con" || content == "/pageup" || content == "/pagedn"
 }
 
 func (executor *integrationRelayExecutor) LastPrompt() string {
@@ -219,9 +410,11 @@ func (executor *integrationRelayExecutor) LastPrompt() string {
 }
 
 type relayGateway struct {
-	mu      sync.Mutex
-	replies map[string]string
-	pushes  map[string][]string
+	mu       sync.Mutex
+	replies  map[string]string
+	pushes   map[string][]string
+	images   map[string][][]byte
+	imageErr error
 }
 
 func (gateway *relayGateway) RespondMarkdown(_ context.Context, requestID, content string) error {
@@ -236,6 +429,31 @@ func (gateway *relayGateway) SendMarkdownTo(_ context.Context, userID, content s
 	defer gateway.mu.Unlock()
 	gateway.pushes[userID] = append(gateway.pushes[userID], content)
 	return nil
+}
+
+func (gateway *relayGateway) SendImageTo(_ context.Context, userID string, pngData []byte) error {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if gateway.imageErr != nil {
+		return gateway.imageErr
+	}
+	if gateway.images == nil {
+		gateway.images = make(map[string][][]byte)
+	}
+	gateway.images[userID] = append(gateway.images[userID], append([]byte(nil), pngData...))
+	return nil
+}
+
+func (gateway *relayGateway) SetImageError(err error) {
+	gateway.mu.Lock()
+	gateway.imageErr = err
+	gateway.mu.Unlock()
+}
+
+func (gateway *relayGateway) Images(userID string) [][]byte {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	return append([][]byte(nil), gateway.images[userID]...)
 }
 
 func (gateway *relayGateway) Reply(requestID string) string {
@@ -254,7 +472,19 @@ func relayIncoming(id, userID, content string) im.IncomingText {
 	return im.IncomingText{RequestID: "request-" + id, MessageID: "message-" + id, UserID: userID, ChatType: "single", Content: content}
 }
 
+func integrationPNG(t *testing.T) []byte {
+	t.Helper()
+	imageData := image.NewPaletted(image.Rect(0, 0, 2, 1), color.Palette{color.Black, color.White})
+	imageData.SetColorIndex(1, 0, 1)
+	var output bytes.Buffer
+	if err := png.Encode(&output, imageData); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
 func eventuallyRelay(t *testing.T, condition func() bool) {
+	t.Helper()
 	eventuallyRelayWithDetails(t, condition, func() string { return "" })
 }
 

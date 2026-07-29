@@ -14,7 +14,22 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminserver"
+	"github.com/wenxichang/herdr-pal/internal/server"
+	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
+
+func TestServerAppRoutesImageGateway(t *testing.T) {
+	client, err := wecom.NewClient(wecom.ClientConfig{
+		Endpoint: "ws://fake", BotID: "bot-1", Secret: "secret-1",
+		Dial: func(context.Context, string) (wecom.Socket, error) { return nil, errors.New("unused") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := any(client).(server.WeComImageGateway); !ok {
+		t.Fatal("wecom.Client does not satisfy server.WeComImageGateway")
+	}
+}
 
 func TestBuildRelayURLHintUsesConfiguredAddressAndListenPort(t *testing.T) {
 	got, err := buildRelayURLHint("10.1.3.4", "0.0.0.0:9443")

@@ -56,6 +56,20 @@ func TestRunRejectsConfigurationBeforeStartingConnections(t *testing.T) {
 	}
 }
 
+func TestRelayAppBuildsTerminalRendererAndAdvertisesImage(t *testing.T) {
+	renderer, err := newRelayTerminalRenderer()
+	if err != nil {
+		t.Fatalf("newRelayTerminalRenderer() error = %v", err)
+	}
+	result, err := renderer.Render(context.Background(), "\x1b[31m红色终端\x1b[0m")
+	if err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+	if len(result.PNG) < 8 || !bytes.Equal(result.PNG[:8], []byte{'\x89', 'P', 'N', 'G', '\r', '\n', '\x1a', '\n'}) {
+		t.Fatalf("renderer PNG invalid: %x", result.PNG)
+	}
+}
+
 func TestRunReportsLockConflictWithoutResolvingSocket(t *testing.T) {
 	options := testOptions(t)
 	resolveCalls := 0

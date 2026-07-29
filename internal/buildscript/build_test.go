@@ -145,6 +145,25 @@ func TestProjectScriptsRequirePatchedProductionToolchain(t *testing.T) {
 	}
 }
 
+func TestServerBinaryDoesNotDependOnTerminalImagePackage(t *testing.T) {
+	command := exec.Command("go", "list", "-deps", "./cmd/herdr-pal-server")
+	command.Dir = repositoryRoot(t)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps error = %v\n%s", err, output)
+	}
+	dependencies := string(output)
+	for _, forbidden := range []string{
+		"github.com/wenxichang/herdr-pal/internal/terminalimage",
+		"github.com/jiro4989/textimg/v3",
+		"golang.org/x/image/font/opentype",
+	} {
+		if strings.Contains(dependencies, forbidden) {
+			t.Fatalf("herdr-pal-server unexpectedly depends on %s", forbidden)
+		}
+	}
+}
+
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
 	_, currentFile, _, ok := runtime.Caller(0)

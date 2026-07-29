@@ -42,7 +42,9 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"`/N 内容` 在第 N 个会话执行，成功后切换；`#N 内容` 执行但不切换\n" +
 	"`/con` 查看当前会话最近 100 行\n" +
 	"`/pageup`、`/pagedn` 上下翻页\n" +
-	"`/mode txt` 使用文本显示；`/mode img` 使用终端图片显示\n" +
+	"`/mode img` 当前会话使用终端图片，保留颜色和选中样式\n" +
+	"`/mode txt` 当前会话使用纯文本\n" +
+	"OpenCode 默认使用图片模式，其他 Agent 默认使用文本模式；模式只在 Server 本次运行期间保存。\n" +
 	"`/slash clear` 向 Agent 发送 `/clear`\n" +
 	"普通文字直接发送给当前 Agent\n" +
 	"`/help` 显示本帮助\n\n" +

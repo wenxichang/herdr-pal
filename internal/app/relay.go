@@ -19,6 +19,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/relayclient"
 	"github.com/wenxichang/herdr-pal/internal/session"
+	"github.com/wenxichang/herdr-pal/internal/terminalimage"
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
 
@@ -108,6 +109,13 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("创建 BridgeService: %w", err)
 	}
+	renderer, err := newRelayTerminalRenderer()
+	if err != nil {
+		return fmt.Errorf("创建终端图片渲染器: %w", err)
+	}
+	if err := service.SetTerminalRenderer(renderer); err != nil {
+		return fmt.Errorf("绑定终端图片渲染器: %w", err)
+	}
 	if err := relay.SetExecutor(service); err != nil {
 		return fmt.Errorf("绑定 Relay 执行器: %w", err)
 	}
@@ -143,6 +151,10 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		)
 	}
 	return runErr
+}
+
+func newRelayTerminalRenderer() (bridge.TerminalRenderer, error) {
+	return terminalimage.New()
 }
 
 func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(context.Context) error, shutdownTimeout time.Duration) (error, <-chan struct{}) {

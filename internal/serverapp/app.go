@@ -30,6 +30,8 @@ import (
 
 var ErrConfig = errors.New("服务端配置错误")
 
+var _ server.WeComImageGateway = (*wecom.Client)(nil)
+
 // Options 是 herdr-pal-server 的外部启动选项。
 type Options struct {
 	ConfigPath string
