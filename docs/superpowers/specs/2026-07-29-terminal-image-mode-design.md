@@ -213,7 +213,7 @@ ANSI 清理允许保留 SGR 颜色和样式，必须移除 OSC、DCS、终端标
 
 ## 8. 图片渲染
 
-Pal 使用 `github.com/xyproto/textimg` 渲染终端图片，并通过 `go:embed` 内嵌
+Pal 使用 `github.com/jiro4989/textimg/v3` 渲染终端图片，并通过 `go:embed` 内嵌
 `Noto Sans Mono CJK SC Regular` 字体。仓库必须同时包含字体的 OFL 1.1 许可证和来源
 说明。字体只被 Pal 渲染包引用，避免 Server 和 `hp-cli` 二进制包含字体数据。
 
