@@ -126,8 +126,9 @@ type RelayRequester interface {
 
 // RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
 type RelayExecution struct {
-	Content        string
-	SelectedTarget *hprp.Target
+	Content           string
+	StructuredContent *hprp.Content
+	SelectedTarget    *hprp.Target
 }
 
 // SendCommandOutput 复核后续分段的稳定来源，并发送给所属企业微信用户。

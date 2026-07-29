@@ -52,6 +52,7 @@ type routingState struct {
 	numberedValid bool
 	selected      *hprp.Target
 	invalidated   *hprp.Target
+	outputModes   map[hprp.Target]hprp.OutputMode
 }
 
 // SessionCatalog 保存所有在线机器的最新完整快照和用户路由状态。
@@ -124,6 +125,7 @@ func (catalog *SessionCatalog) ApplySnapshot(connectionID string, snapshot hprp.
 	if snapshot.Sequence < current.sequence {
 		return ErrSnapshotStale
 	}
+	catalog.migrateOutputModesLocked(key, current.sessions, snapshot.Sessions)
 	current.sequence = snapshot.Sequence
 	current.sessions = append([]hprp.Session(nil), snapshot.Sessions...)
 	catalog.machines[key] = current
@@ -158,6 +160,11 @@ func (catalog *SessionCatalog) Detach(connectionID string) bool {
 	}
 	if routing.invalidated != nil && routing.invalidated.MachineID == key.MachineID {
 		routing.invalidated = nil
+	}
+	for target := range routing.outputModes {
+		if target.MachineID == key.MachineID {
+			delete(routing.outputModes, target)
+		}
 	}
 	catalog.routing[key.UserID] = routing
 	catalog.signalUpdateLocked()
@@ -397,6 +404,40 @@ func (catalog *SessionCatalog) ResolveTarget(userID string, target hprp.Target) 
 	return entry, nil
 }
 
+// SetOutputMode 保存完整稳定目标的显式终端输出模式。
+func (catalog *SessionCatalog) SetOutputMode(userID string, target hprp.Target, mode hprp.OutputMode) error {
+	if catalog == nil || (mode != hprp.OutputModeText && mode != hprp.OutputModeImage) {
+		return ErrTargetChanged
+	}
+	catalog.mu.Lock()
+	defer catalog.mu.Unlock()
+	if _, ok := catalog.findEntryLocked(userID, target); !ok {
+		return ErrTargetChanged
+	}
+	routing := catalog.routing[userID]
+	if routing.outputModes == nil {
+		routing.outputModes = make(map[hprp.Target]hprp.OutputMode)
+	}
+	routing.outputModes[target] = mode
+	catalog.routing[userID] = routing
+	catalog.signalUpdateLocked()
+	return nil
+}
+
+// OutputMode 返回稳定目标的显式终端模式；bool 为 false 表示使用 Agent 默认模式。
+func (catalog *SessionCatalog) OutputMode(userID string, target hprp.Target) (hprp.OutputMode, bool, error) {
+	if catalog == nil {
+		return "", false, ErrTargetChanged
+	}
+	catalog.mu.RLock()
+	defer catalog.mu.RUnlock()
+	if _, ok := catalog.findEntryLocked(userID, target); !ok {
+		return "", false, ErrTargetChanged
+	}
+	mode, explicit := catalog.routing[userID].outputModes[target]
+	return mode, explicit, nil
+}
+
 // WaitForTarget 等待稳定目标出现在最新在线目录中，但不修改用户选择。
 func (catalog *SessionCatalog) WaitForTarget(ctx context.Context, userID string, target hprp.Target) (CatalogEntry, error) {
 	if catalog == nil || hprp.ValidateTarget(target) != nil {
@@ -482,6 +523,37 @@ func (catalog *SessionCatalog) invalidateChangedSelectionLocked(userID string) {
 		routing.invalidated = &invalidated
 		catalog.routing[userID] = routing
 	}
+}
+
+func (catalog *SessionCatalog) migrateOutputModesLocked(key ClientKey, previous, next []hprp.Session) {
+	routing := catalog.routing[key.UserID]
+	if len(routing.outputModes) == 0 {
+		return
+	}
+	previousBySlot := make(map[string]string, len(previous))
+	for _, current := range previous {
+		previousBySlot[current.SlotID] = current.SessionID
+	}
+	nextBySlot := make(map[string]string, len(next))
+	for _, current := range next {
+		nextBySlot[current.SlotID] = current.SessionID
+	}
+	for target, mode := range routing.outputModes {
+		if target.MachineID != key.MachineID {
+			continue
+		}
+		nextSessionID, slotExists := nextBySlot[target.SlotID]
+		if slotExists && nextSessionID == target.SessionID {
+			continue
+		}
+		delete(routing.outputModes, target)
+		if previousBySlot[target.SlotID] != target.SessionID || !slotExists {
+			continue
+		}
+		replacement := hprp.Target{MachineID: key.MachineID, SlotID: target.SlotID, SessionID: nextSessionID}
+		routing.outputModes[replacement] = mode
+	}
+	catalog.routing[key.UserID] = routing
 }
 
 func (catalog *SessionCatalog) signalUpdateLocked() {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -51,6 +52,54 @@ func TestClientConnectionCorrelatesReplyToWithPendingRequest(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("request did not complete")
+	}
+}
+
+func TestClientConnectionCorrelatesTerminalReplyWithStableTarget(t *testing.T) {
+	connection := newClientConnection(context.Background(), clientConnectionConfig{
+		ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"},
+		SendCapacity: 2, MaxPending: 2, Logger: slog.Default(),
+	})
+	connection.ready.Store(true)
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+	request, err := hprp.NewEnvelope(hprp.TypeTerminalSnapshotGet, "snapshot-1", "", true, hprp.TerminalSnapshotGet{
+		Target: target, Mode: hprp.OutputModeText, Purpose: hprp.TerminalSnapshotPurposeNotification, MaxLines: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan hprp.Envelope, 1)
+	go func() {
+		response, requestErr := connection.requestTarget(context.Background(), request, hprp.TypeTerminalSnapshotResult, &target)
+		if requestErr != nil {
+			done <- hprp.Envelope{}
+			return
+		}
+		done <- response
+	}()
+	<-connection.sendQueue
+	response, err := hprp.NewEnvelope(hprp.TypeTerminalSnapshotResult, "result-1", "snapshot-1", false, hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeFailed, Target: target,
+		Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotFailed, Retryable: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := target
+	wrong.SessionID = "session-2"
+	if delivered, err := connection.deliverTarget(response, wrong); delivered || !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("deliverTarget(wrong) = %v, %v", delivered, err)
+	}
+	if delivered, err := connection.deliverTarget(response, target); err != nil || !delivered {
+		t.Fatalf("deliverTarget(correct) = %v, %v", delivered, err)
+	}
+	select {
+	case got := <-done:
+		if got.ID != "result-1" {
+			t.Fatalf("response = %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("targeted request did not complete")
 	}
 }
 

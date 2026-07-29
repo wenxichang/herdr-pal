@@ -42,7 +42,11 @@ const (
 	defaultIdempotencyWindow          = 10 * time.Minute
 )
 
-var serverCapabilities = []string{hprp.CapabilityCommandOutputV1}
+var serverCapabilities = []string{
+	hprp.CapabilityCommandOutputV1,
+	hprp.CapabilityTerminalSnapshotV1,
+	hprp.CapabilityTerminalImageV1,
+}
 
 // HubConfig 是服务端连接状态机的时间和资源限制。
 type HubConfig struct {
@@ -205,6 +209,65 @@ func (hub *ClientHub) Select(_ context.Context, userID string, target hprp.Targe
 	return err
 }
 
+// SupportsCapability 报告目标当前在线连接是否协商了指定能力。
+func (hub *ClientHub) SupportsCapability(userID string, target hprp.Target, capability string) bool {
+	if hub == nil || hprp.ValidateTarget(target) != nil {
+		return false
+	}
+	if _, err := hub.catalog.ResolveTarget(userID, target); err != nil {
+		return false
+	}
+	connection := hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID})
+	return connection != nil && connection.supportsCapability(capability)
+}
+
+// FetchTerminalSnapshot 请求目标 Pal 无副作用读取一次终端快照。
+func (hub *ClientHub) FetchTerminalSnapshot(
+	ctx context.Context,
+	userID string,
+	target hprp.Target,
+	mode hprp.OutputMode,
+	maxLines int,
+) (hprp.TerminalSnapshotResult, error) {
+	request := hprp.TerminalSnapshotGet{
+		Target: target, Mode: mode, Purpose: hprp.TerminalSnapshotPurposeNotification, MaxLines: maxLines,
+	}
+	if hub == nil || hprp.ValidateTerminalSnapshotGet(request) != nil {
+		return hprp.TerminalSnapshotResult{}, ErrInvalidHubRequest
+	}
+	connection := hub.readyClient(ClientKey{UserID: userID, MachineID: target.MachineID})
+	if connection == nil {
+		return hprp.TerminalSnapshotResult{}, ErrClientUnavailable
+	}
+	if _, err := hub.catalog.ResolveTarget(userID, target); err != nil {
+		return hprp.TerminalSnapshotResult{}, err
+	}
+	if !connection.supportsCapability(hprp.CapabilityTerminalSnapshotV1) ||
+		(mode == hprp.OutputModeImage && !connection.supportsCapability(hprp.CapabilityTerminalImageV1)) {
+		return hprp.TerminalSnapshotResult{}, ErrInvalidHubRequest
+	}
+	requestID := randomHubID()
+	envelope, err := hprp.NewEnvelope(hprp.TypeTerminalSnapshotGet, requestID, "", true, request)
+	if err != nil {
+		return hprp.TerminalSnapshotResult{}, err
+	}
+	response, err := connection.requestTarget(ctx, envelope, hprp.TypeTerminalSnapshotResult, &target)
+	if err != nil {
+		return hprp.TerminalSnapshotResult{}, err
+	}
+	result, err := hprp.DecodePayload[hprp.TerminalSnapshotResult](response)
+	if err == nil {
+		err = hprp.ValidateTerminalSnapshotResult(result)
+	}
+	if err != nil || result.Target != target {
+		if err != nil {
+			return hprp.TerminalSnapshotResult{}, err
+		}
+		return hprp.TerminalSnapshotResult{}, ErrTargetChanged
+	}
+	return result, nil
+}
+
 // Execute 发送 HPRP command.execute 并等待唯一 command.result。
 func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Target, message im.IncomingText) (RelayExecution, error) {
 	if hprp.ValidateTarget(target) != nil || strings.TrimSpace(message.MessageID) == "" {
@@ -231,6 +294,7 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 		IdempotencyKey: message.MessageID,
 		Target:         target,
 		Content:        hprp.TextContent{Type: hprp.ContentTypeText, Text: message.Content},
+		OutputMode:     hprp.OutputMode(message.OutputMode),
 	}
 	if err := hprp.ValidateCommandExecute(command); err != nil {
 		return RelayExecution{}, err
@@ -261,7 +325,7 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 	if result.Content != nil {
 		content = result.Content.Text
 	}
-	return RelayExecution{Content: content, SelectedTarget: result.ReplacementTarget}, nil
+	return RelayExecution{Content: content, StructuredContent: result.Content, SelectedTarget: result.ReplacementTarget}, nil
 }
 
 func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn, connectionID string, identity credential.Identity, key ClientKey, source netip.Addr) {
@@ -347,7 +411,9 @@ func (hub *ClientHub) negotiateHello(connectionID, machineID string, hello hprp.
 		Features:     hprp.NegotiateFeatures(hello.Features, map[string]hprp.FeatureOffer{}),
 		Limits: hprp.ServerLimits{
 			MaxMessageBytes: maxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: maxInflight,
-			MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes, IdempotencyWindowMS: defaultIdempotencyWindow.Milliseconds(),
+			MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes,
+			MaxTerminalTextBytes: hprp.MaxTerminalTextBytes, MaxTerminalImageBytes: hprp.MaxTerminalImageBytes,
+			IdempotencyWindowMS: defaultIdempotencyWindow.Milliseconds(),
 		},
 		Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: hub.config.HeartbeatInterval.Milliseconds(), IdleTimeoutMS: hub.config.HeartbeatTimeout.Milliseconds()},
 	}
@@ -419,6 +485,23 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 			} else {
 				hub.logger.Warn("HPRP 命令结果未匹配", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo), "error_type", "unmatched_request", "reason", "结果没有对应的在途 command.execute")...)
 			}
+		case hprp.TypeTerminalSnapshotResult:
+			result, resultErr := hprp.DecodePayload[hprp.TerminalSnapshotResult](envelope)
+			if resultErr == nil {
+				resultErr = hprp.ValidateTerminalSnapshotResult(result)
+			}
+			if resultErr == nil && result.Target.MachineID != connection.key.MachineID {
+				resultErr = ErrTargetChanged
+			}
+			matched := false
+			if resultErr == nil {
+				matched, resultErr = connection.deliverTarget(envelope, result.Target)
+			}
+			if resultErr != nil || !matched {
+				hub.logger.Warn("HPRP 终端快照结果无效", append(append(connectionLogArgs(connection), targetLogArgs(result.Target)...), serverErrorLogArgs(resultErr)...)...)
+				return
+			}
+			hub.logger.Debug("HPRP 终端快照结果已接收", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo))...)
 		case hprp.TypeCommandOutput:
 			output, err := hprp.DecodePayload[hprp.CommandOutput](envelope)
 			if err == nil {
@@ -451,10 +534,13 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 			if err == nil {
 				err = hprp.ValidateNotificationEvent(notification)
 			}
+			if err == nil && !connection.confirmsSnapshot(notification.SnapshotSequence) {
+				err = ErrSnapshotStale
+			}
 			if err == nil {
 				if notification.Target.MachineID != connection.key.MachineID {
 					err = ErrTargetChanged
-				} else {
+				} else if notification.Kind != hprp.NotificationKindTargetInvalidated {
 					_, err = hub.catalog.ResolveTarget(connection.key.UserID, notification.Target)
 				}
 			}

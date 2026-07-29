@@ -87,7 +87,9 @@ func TestHPRPHubSelectIsLocalAndExecuteUsesStableTarget(t *testing.T) {
 	}
 	done := make(chan executeResult, 1)
 	go func() {
-		result, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "继续处理"})
+		result, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{
+			MessageID: "message-1", UserID: "user-a", Content: "继续处理", OutputMode: im.OutputModeText,
+		})
 		done <- executeResult{result: result, err: err}
 	}()
 	commandEnvelope := readHPRPTestEnvelope(t, client)
@@ -95,15 +97,19 @@ func TestHPRPHubSelectIsLocalAndExecuteUsesStableTarget(t *testing.T) {
 		t.Fatalf("command envelope = %#v", commandEnvelope)
 	}
 	command, err := hprp.DecodePayload[hprp.CommandExecute](commandEnvelope)
-	if err != nil || command.Target != target || command.IdempotencyKey != "message-1" || command.Content.Text != "继续处理" {
+	if err != nil || command.Target != target || command.IdempotencyKey != "message-1" || command.Content.Text != "继续处理" || command.OutputMode != hprp.OutputModeText {
 		t.Fatalf("command = %#v, %v", command, err)
 	}
+	capturedAt := time.Now().UTC()
 	writeHPRPTestEnvelope(t, client, hprp.TypeCommandResult, "result-1", commandEnvelope.ID, hprp.CommandResult{
-		Outcome: hprp.OutcomeOK, Content: &hprp.TextContent{Type: hprp.ContentTypeText, Text: "已发送"},
+		Outcome: hprp.OutcomeOK, Content: &hprp.Content{
+			Type: hprp.ContentTypeTerminal, Text: "已发送", Mode: hprp.OutputModeText, CapturedAt: &capturedAt,
+		},
 	})
 	select {
 	case got := <-done:
-		if got.err != nil || got.result.Content != "已发送" || got.result.SelectedTarget != nil {
+		if got.err != nil || got.result.Content != "已发送" || got.result.StructuredContent == nil ||
+			got.result.StructuredContent.Type != hprp.ContentTypeTerminal || got.result.SelectedTarget != nil {
 			t.Fatalf("Execute() = %#v, %v", got.result, got.err)
 		}
 	case <-time.After(time.Second):
@@ -197,8 +203,9 @@ func TestHPRPHubRoutesCommandOutputAndNotification(t *testing.T) {
 		Target: target, Sequence: 1, Final: true, Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: "后续分段"},
 	})
 	writeHPRPTestEnvelope(t, client, hprp.TypeNotificationEvent, "notification-1", "", hprp.NotificationEvent{
-		EventKey: "event-1", Sequence: 1, Kind: "agent.status", Target: target,
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: "Agent 已完成"},
+		EventKey: "event-1", Sequence: 1, Kind: hprp.NotificationKindAgentStatusChanged, Target: target,
+		SnapshotSequence: 1, OccurredAt: time.Now().UTC(),
+		Data: &hprp.StatusChangeData{PreviousStatus: hprp.StatusWorking, Status: hprp.StatusDone},
 	})
 	select {
 	case output := <-sink.outputs:
@@ -210,7 +217,7 @@ func TestHPRPHubRoutesCommandOutputAndNotification(t *testing.T) {
 	}
 	select {
 	case notification := <-sink.notifications:
-		if notification.Content.Text != "Agent 已完成" || notification.Target != target {
+		if notification.Data == nil || notification.Data.Status != hprp.StatusDone || notification.Target != target {
 			t.Fatalf("notification = %#v", notification)
 		}
 	case <-time.After(time.Second):
@@ -274,8 +281,9 @@ func TestHPRPHubLogsOutboundFailureWithoutLeakingContentOrPrincipal(t *testing.T
 	defer client.Close(websocket.StatusNormalClosure, "test complete")
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
 	writeHPRPTestEnvelope(t, client, hprp.TypeNotificationEvent, "notification-log", "", hprp.NotificationEvent{
-		EventKey: "event-log", Sequence: 1, Kind: "agent.status", Target: target,
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: "private-terminal-output"},
+		EventKey: "event-log", Sequence: 1, Kind: hprp.NotificationKindAgentStatusChanged, Target: target,
+		SnapshotSequence: 1, OccurredAt: time.Now().UTC(),
+		Data: &hprp.StatusChangeData{PreviousStatus: hprp.StatusWorking, Status: hprp.StatusDone},
 	})
 	eventuallyHPRP(t, func() bool {
 		output := logs.String()
@@ -284,6 +292,33 @@ func TestHPRPHubLogsOutboundFailureWithoutLeakingContentOrPrincipal(t *testing.T
 	})
 	if output := logs.String(); strings.Contains(output, "private-terminal-output") || strings.Contains(output, "user-a") || strings.Contains(output, "test-key") {
 		t.Fatalf("logs leaked sensitive data: %s", output)
+	}
+}
+
+func TestHPRPHubForwardsTargetInvalidatedAfterSessionRemoval(t *testing.T) {
+	hub, server := startHPRPHubServer(t, HubConfig{}, discardHPRPLogger())
+	sink := &hprpOutboundRecorder{outputs: make(chan hprp.CommandOutput, 1), notifications: make(chan hprp.NotificationEvent, 1)}
+	if err := hub.SetOutboundSink(sink); err != nil {
+		t.Fatal(err)
+	}
+	client := dialHPRPReady(t, server)
+	defer client.Close(websocket.StatusNormalClosure, "test complete")
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+	writeHPRPTestEnvelope(t, client, hprp.TypeSessionSnapshot, "snapshot-empty", "", hprp.SessionSnapshot{Sequence: 2})
+	if result := readHPRPTestEnvelope(t, client); result.Type != hprp.TypeSessionSnapshotResult {
+		t.Fatalf("snapshot result = %#v", result)
+	}
+	writeHPRPTestEnvelope(t, client, hprp.TypeNotificationEvent, "notification-invalidated", "", hprp.NotificationEvent{
+		EventKey: "event-invalidated", Sequence: 1, Kind: hprp.NotificationKindTargetInvalidated,
+		Target: target, SnapshotSequence: 2, OccurredAt: time.Now().UTC(),
+	})
+	select {
+	case notification := <-sink.notifications:
+		if notification.Kind != hprp.NotificationKindTargetInvalidated || notification.Target != target {
+			t.Fatalf("notification = %#v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing target.invalidated notification")
 	}
 }
 

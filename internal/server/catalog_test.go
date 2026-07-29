@@ -48,6 +48,85 @@ func TestCatalogAppliesOnlyIncreasingFullSnapshots(t *testing.T) {
 	}
 }
 
+func TestCatalogStoresOutputModePerFullTarget(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-1", "first"),
+			hprpSession(2, "pane-2", "occ-2", "second"),
+		},
+	})
+	entries := catalog.CreateNumberedSnapshot("user-a")
+	if err := catalog.SetOutputMode("user-a", entries[0].Ref, hprp.OutputModeImage); err != nil {
+		t.Fatalf("SetOutputMode() error = %v", err)
+	}
+	mode, explicit, err := catalog.OutputMode("user-a", entries[0].Ref)
+	if err != nil || !explicit || mode != hprp.OutputModeImage {
+		t.Fatalf("OutputMode(first) = %q, %v, %v", mode, explicit, err)
+	}
+	mode, explicit, err = catalog.OutputMode("user-a", entries[1].Ref)
+	if err != nil || explicit || mode != "" {
+		t.Fatalf("OutputMode(second) = %q, %v, %v", mode, explicit, err)
+	}
+}
+
+func TestCatalogMigratesExplicitModeAcrossSameSlotReplacement(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-old", "old")},
+	})
+	oldTarget := catalog.CreateNumberedSnapshot("user-a")[0].Ref
+	if err := catalog.SetOutputMode("user-a", oldTarget, hprp.OutputModeImage); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-new", "new")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newTarget := catalog.CreateNumberedSnapshot("user-a")[0].Ref
+	mode, explicit, err := catalog.OutputMode("user-a", newTarget)
+	if err != nil || !explicit || mode != hprp.OutputModeImage {
+		t.Fatalf("OutputMode(replacement) = %q, %v, %v", mode, explicit, err)
+	}
+	if _, _, err := catalog.OutputMode("user-a", oldTarget); !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("OutputMode(old) error = %v", err)
+	}
+}
+
+func TestCatalogDropsModesOnSessionRemovalAndDetach(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-1", "first"),
+			hprpSession(2, "pane-2", "occ-2", "second"),
+		},
+	})
+	entries := catalog.CreateNumberedSnapshot("user-a")
+	for _, entry := range entries {
+		if err := catalog.SetOutputMode("user-a", entry.Ref, hprp.OutputModeImage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{hprpSession(1, "pane-2", "occ-2", "second")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := catalog.OutputMode("user-a", entries[0].Ref); !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("removed mode error = %v", err)
+	}
+	if mode, explicit, err := catalog.OutputMode("user-a", entries[1].Ref); err != nil || !explicit || mode != hprp.OutputModeImage {
+		t.Fatalf("remaining mode = %q, %v, %v", mode, explicit, err)
+	}
+	if !catalog.Detach("conn-1") {
+		t.Fatal("Detach() = false")
+	}
+	if _, _, err := catalog.OutputMode("user-a", entries[1].Ref); !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("detached mode error = %v", err)
+	}
+}
+
 func TestCatalogCreatesStableCrossMachineNumbering(t *testing.T) {
 	catalog := NewSessionCatalog()
 	attachSnapshot(t, catalog, "conn-z", ClientKey{UserID: "user-a", MachineID: "z-machine"}, hprp.SessionSnapshot{

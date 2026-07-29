@@ -17,6 +17,7 @@ import (
 
 type pendingRequest struct {
 	expected hprp.Type
+	target   *hprp.Target
 	result   chan hprp.Envelope
 }
 
@@ -108,6 +109,12 @@ func (connection *clientConnection) supportsCapability(capability string) bool {
 	defer connection.metadataMu.RUnlock()
 	_, supported := connection.capabilities[capability]
 	return supported
+}
+
+func (connection *clientConnection) confirmsSnapshot(sequence uint64) bool {
+	connection.metadataMu.RLock()
+	defer connection.metadataMu.RUnlock()
+	return sequence > 0 && sequence <= connection.snapshotSequence
 }
 
 func (connection *clientConnection) recordSnapshot(sequence uint64, sessionCount int, observedAt time.Time) {
@@ -238,10 +245,23 @@ func (connection *clientConnection) send(ctx context.Context, envelope hprp.Enve
 }
 
 func (connection *clientConnection) request(ctx context.Context, envelope hprp.Envelope, expected hprp.Type) (hprp.Envelope, error) {
+	return connection.requestTarget(ctx, envelope, expected, nil)
+}
+
+func (connection *clientConnection) requestTarget(
+	ctx context.Context,
+	envelope hprp.Envelope,
+	expected hprp.Type,
+	target *hprp.Target,
+) (hprp.Envelope, error) {
 	if connection == nil || !connection.ready.Load() || envelope.ID == "" || envelope.ReplyTo != "" {
 		return hprp.Envelope{}, ErrInvalidHubRequest
 	}
 	request := pendingRequest{expected: expected, result: make(chan hprp.Envelope, 1)}
+	if target != nil {
+		targetCopy := *target
+		request.target = &targetCopy
+	}
 	connection.pendingMu.Lock()
 	if len(connection.pending) >= connection.maxPending {
 		connection.pendingMu.Unlock()
@@ -265,6 +285,26 @@ func (connection *clientConnection) request(ctx context.Context, envelope hprp.E
 	case response := <-request.result:
 		return response, nil
 	}
+}
+
+func (connection *clientConnection) deliverTarget(envelope hprp.Envelope, target hprp.Target) (bool, error) {
+	if envelope.ReplyTo == "" {
+		return false, ErrInvalidHubRequest
+	}
+	connection.pendingMu.Lock()
+	request, exists := connection.pending[envelope.ReplyTo]
+	if !exists || request.expected != envelope.Type {
+		connection.pendingMu.Unlock()
+		return false, ErrInvalidHubRequest
+	}
+	if request.target == nil || *request.target != target {
+		connection.pendingMu.Unlock()
+		return false, ErrTargetChanged
+	}
+	delete(connection.pending, envelope.ReplyTo)
+	connection.pendingMu.Unlock()
+	request.result <- envelope
+	return true, nil
 }
 
 func (connection *clientConnection) deliver(envelope hprp.Envelope) bool {
