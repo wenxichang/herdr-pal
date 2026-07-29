@@ -40,8 +40,10 @@ const (
 	defaultPollInterval        = 250 * time.Millisecond
 	defaultSnapshotInterval    = 30 * time.Second
 	defaultSnapshotAckTimeout  = 20 * time.Second
+	defaultTerminalReadTimeout = 15 * time.Second
 	defaultIdempotencyWindow   = 10 * time.Minute
-	defaultIdempotencyCapacity = 1024
+	defaultIdempotencyCapacity = 16_384
+	defaultIdempotencyBytes    = 64 << 20
 )
 
 type relayStageError struct {
@@ -117,6 +119,7 @@ type Client struct {
 
 	notificationSequence atomic.Uint64
 	resultCache          *commandResultCache
+	requestSlots         chan struct{}
 }
 
 type clientPendingRequest struct {
@@ -175,7 +178,8 @@ func New(config Config) (*Client, error) {
 	config.CredentialID = credentialID
 	return &Client{
 		config: config, logger: config.Logger,
-		resultCache: newCommandResultCache(defaultIdempotencyCapacity, defaultIdempotencyWindow, time.Now),
+		resultCache:  newCommandResultCache(defaultIdempotencyCapacity, defaultIdempotencyBytes, defaultIdempotencyWindow, time.Now),
+		requestSlots: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -306,8 +310,10 @@ func (client *Client) SendNotification(ctx context.Context, target im.Notificati
 	if current == nil {
 		return ErrUnavailable
 	}
-	if _, err := client.resolveLocalTarget(current.machineID, target.PaneID, target.OccupantHash); err != nil {
-		return err
+	if event.Kind != im.NotificationKindTargetInvalidated {
+		if _, err := client.resolveLocalTarget(current.machineID, target.PaneID, target.OccupantHash); err != nil {
+			return err
+		}
 	}
 	sequence := client.notificationSequence.Add(1)
 	occurredAt := event.OccurredAt.UTC()
@@ -496,9 +502,32 @@ func (client *Client) readLoop(current *clientSession) error {
 				return fmt.Errorf("%w: 未匹配的 session.snapshot.result", hprp.ErrInvalidMessage)
 			}
 		case hprp.TypeCommandExecute:
-			go client.handleCommand(current, envelope)
+			if err := validateInboundRequestEnvelope(envelope); err != nil {
+				client.writeProtocolError(current, envelope.ID, hprp.CodeProtocolInvalidMessage, "命令请求信封无效")
+				continue
+			}
+			if !client.acquireRequestSlot() {
+				_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false,
+					rejectedCommand(hprp.CodeServerBusy, "本地请求正在执行"))
+				continue
+			}
+			go func() {
+				defer client.releaseRequestSlot()
+				client.handleCommand(current, envelope)
+			}()
 		case hprp.TypeTerminalSnapshotGet:
-			go client.handleTerminalSnapshot(current, envelope)
+			if err := validateInboundRequestEnvelope(envelope); err != nil {
+				client.writeProtocolError(current, envelope.ID, hprp.CodeProtocolInvalidMessage, "终端快照请求信封无效")
+				continue
+			}
+			if !client.acquireRequestSlot() {
+				client.writeBusyTerminalSnapshot(current, envelope)
+				continue
+			}
+			go func() {
+				defer client.releaseRequestSlot()
+				client.handleTerminalSnapshot(current, envelope)
+			}()
 		case hprp.TypeProtocolError:
 			return decodeHPRPProtocolError(envelope)
 		default:
@@ -514,6 +543,38 @@ func (client *Client) readLoop(current *clientSession) error {
 			client.logger.Debug("HPRP 未知可选消息已忽略", "credential_id", client.config.CredentialID, "machine_id", current.machineID, "event_type", envelope.Type)
 		}
 	}
+}
+
+func validateInboundRequestEnvelope(envelope hprp.Envelope) error {
+	if envelope.ReplyTo != "" || !envelope.MustUnderstand {
+		return hprp.ErrInvalidMessage
+	}
+	return nil
+}
+
+func (client *Client) acquireRequestSlot() bool {
+	select {
+	case client.requestSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (client *Client) releaseRequestSlot() {
+	<-client.requestSlots
+}
+
+func (client *Client) writeBusyTerminalSnapshot(current *clientSession, envelope hprp.Envelope) {
+	request, err := hprp.DecodePayload[hprp.TerminalSnapshotGet](envelope)
+	if err != nil || hprp.ValidateTerminalSnapshotGet(request) != nil {
+		client.writeProtocolError(current, envelope.ID, hprp.CodeProtocolInvalidMessage, "终端快照请求格式无效")
+		return
+	}
+	client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeFailed, Target: request.Target,
+		Error: &hprp.Error{Code: hprp.CodeServerBusy, Message: "本地请求正在执行", Retryable: true},
+	})
 }
 
 func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelope) {
@@ -541,6 +602,11 @@ func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelo
 		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false,
 			rejectedCommand(hprp.CodeCommandIdempotencyConflict, "幂等键已用于其他命令"))
 		client.logCommandResult(envelope.ID, command, "idempotency_conflict")
+		return
+	case commandCacheFull:
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false,
+			rejectedCommand(hprp.CodeServerBusy, "本地幂等保护容量已满，请稍后重试"))
+		client.logCommandResult(envelope.ID, command, "idempotency_capacity_full")
 		return
 	}
 	if command.Target.MachineID != current.machineID || client.localExecutor().SelectTarget(command.Target.SlotID, command.Target.SessionID) != nil {
@@ -603,8 +669,10 @@ func (client *Client) handleTerminalSnapshot(current *clientSession, envelope hp
 		return
 	}
 
+	requestContext, cancel := context.WithTimeout(current.ctx, defaultTerminalReadTimeout)
+	defer cancel()
 	content, readErr := client.localExecutor().ReadTerminalSnapshot(
-		current.ctx,
+		requestContext,
 		request.Target.SlotID,
 		request.Target.SessionID,
 		im.OutputMode(request.Mode),
@@ -620,7 +688,7 @@ func (client *Client) handleTerminalSnapshot(current *clientSession, envelope hp
 		}
 		readErr = encodeErr
 	}
-	if request.Mode == hprp.OutputModeImage && content.Text != "" {
+	if request.Mode == hprp.OutputModeImage && content.Page != nil && !content.CapturedAt.IsZero() {
 		content.Mode = im.OutputModeText
 		content.Image = nil
 		fallback, fallbackErr := encodeTerminalContent(content)
@@ -712,7 +780,7 @@ func (client *Client) writeCachedCommand(current *clientSession, requestID strin
 	if !current.supportsCapability(hprp.CapabilityCommandOutputV1) {
 		return
 	}
-	target := cached.command.Target
+	target := cached.target
 	if cached.result.ReplacementTarget != nil {
 		target = *cached.result.ReplacementTarget
 	}

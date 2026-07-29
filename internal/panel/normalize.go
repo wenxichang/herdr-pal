@@ -112,13 +112,12 @@ func sanitizeANSI(text string) string {
 	var result strings.Builder
 	result.Grow(len(text))
 	for index := 0; index < len(text); {
-		if text[index] == 0 {
-			index++
-			continue
-		}
 		if text[index] != 0x1b {
-			result.WriteByte(text[index])
-			index++
+			current, size := utf8.DecodeRuneInString(text[index:])
+			if safeTerminalRune(current) {
+				result.WriteString(text[index : index+size])
+			}
+			index += size
 			continue
 		}
 		if index+1 >= len(text) {
@@ -152,6 +151,13 @@ func sanitizeANSI(text string) string {
 		}
 	}
 	return result.String()
+}
+
+func safeTerminalRune(current rune) bool {
+	if current == '\n' || current == '\r' || current == '\t' {
+		return true
+	}
+	return current >= 0x20 && !(current >= 0x7f && current <= 0x9f)
 }
 
 type ansiToken struct {

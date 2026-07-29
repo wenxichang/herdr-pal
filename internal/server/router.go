@@ -150,6 +150,12 @@ func (router *ConversationRouter) SendCommandOutput(ctx context.Context, userID 
 	if router == nil || strings.TrimSpace(userID) == "" {
 		return ErrInvalidRouterDependency
 	}
+	return router.executor.Submit(ctx, userID, func(taskContext context.Context) error {
+		return router.sendCommandOutput(taskContext, userID, output)
+	})
+}
+
+func (router *ConversationRouter) sendCommandOutput(ctx context.Context, userID string, output hprp.CommandOutput) error {
 	entry, err := router.catalog.ResolveTarget(userID, output.Target)
 	if err != nil {
 		return err
@@ -160,7 +166,16 @@ func (router *ConversationRouter) SendCommandOutput(ctx context.Context, userID 
 
 // SendNotification 根据结构化状态事件决定是否拉取并发送终端快照。
 func (router *ConversationRouter) SendNotification(ctx context.Context, userID, machineID string, notification hprp.NotificationEvent) error {
-	if router == nil || notification.Target.MachineID != machineID {
+	if router == nil || strings.TrimSpace(userID) == "" {
+		return ErrInvalidRouterDependency
+	}
+	return router.executor.Submit(ctx, userID, func(taskContext context.Context) error {
+		return router.sendNotification(taskContext, userID, machineID, notification)
+	})
+}
+
+func (router *ConversationRouter) sendNotification(ctx context.Context, userID, machineID string, notification hprp.NotificationEvent) error {
+	if notification.Target.MachineID != machineID {
 		return ErrTargetChanged
 	}
 	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
@@ -586,11 +601,10 @@ func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, u
 func (router *ConversationRouter) sendContentReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
 	if content.Type == hprp.ContentTypeText {
 		if strings.TrimSpace(content.Text) == "" {
-			router.reply(ctx, message, "客户端已处理。")
+			return router.reply(ctx, message, "客户端已处理。")
 		} else {
-			router.reply(ctx, message, content.Text)
+			return router.reply(ctx, message, content.Text)
 		}
-		return nil
 	}
 	if content.Type != hprp.ContentTypeTerminal {
 		return hprp.ErrInvalidMessage
@@ -602,8 +616,7 @@ func (router *ConversationRouter) sendContentReply(ctx context.Context, message 
 	if err != nil {
 		return err
 	}
-	router.reply(ctx, message, text)
-	return nil
+	return router.reply(ctx, message, text)
 }
 
 func (router *ConversationRouter) sendContentPush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
@@ -636,7 +649,9 @@ func (router *ConversationRouter) sendTerminalImageReply(ctx context.Context, me
 	if err != nil {
 		return err
 	}
-	router.reply(ctx, message, header)
+	if err := router.reply(ctx, message, header); err != nil {
+		return err
+	}
 	if err := imageGateway.SendImageTo(ctx, message.UserID, png); err != nil {
 		router.logger.Warn("企业微信终端图片发送失败，降级为文本", append(append([]any{"user_hash", routerHash(message.UserID)}, targetLogArgs(source.Ref)...), serverErrorLogArgs(err)...)...)
 		text, renderErr := router.renderTerminalText(message.UserID, source, content)
@@ -653,8 +668,7 @@ func (router *ConversationRouter) sendTerminalTextFallbackReply(ctx context.Cont
 	if err != nil {
 		return err
 	}
-	router.reply(ctx, message, text)
-	return nil
+	return router.reply(ctx, message, text)
 }
 
 func (router *ConversationRouter) sendTerminalImagePush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
@@ -952,7 +966,7 @@ func positiveASCIIInt(value string) (int, error) {
 	return number, nil
 }
 
-func (router *ConversationRouter) reply(ctx context.Context, message im.IncomingText, content string) {
+func (router *ConversationRouter) reply(ctx context.Context, message im.IncomingText, content string) error {
 	parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
 	if len(parts) == 0 {
 		parts = []string{"回复内容无效。"}
@@ -960,18 +974,19 @@ func (router *ConversationRouter) reply(ctx context.Context, message im.Incoming
 	if err := router.gateway.RespondMarkdown(ctx, message.RequestID, parts[0]); err != nil {
 		args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", 1, "part_count", len(parts), "content_bytes", len([]byte(parts[0]))}
 		router.logger.Warn("企业微信首段回复失败", append(args, serverErrorLogArgs(err)...)...)
-		return
+		return err
 	}
 	router.logger.Debug("企业微信回复分段发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", 1, "part_count", len(parts), "content_bytes", len([]byte(parts[0])))
 	for index, part := range parts[1:] {
 		if err := router.gateway.SendMarkdownTo(ctx, message.UserID, part); err != nil {
 			args := []any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", index + 2, "part_count", len(parts), "content_bytes", len([]byte(part))}
 			router.logger.Warn("企业微信后续回复失败", append(args, serverErrorLogArgs(err)...)...)
-			return
+			return err
 		}
 		router.logger.Debug("企业微信回复分段发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_index", index+2, "part_count", len(parts), "content_bytes", len([]byte(part)))
 	}
 	router.logger.Debug("企业微信回复发送成功", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "part_count", len(parts), "content_bytes", len([]byte(content)))
+	return nil
 }
 
 func (router *ConversationRouter) logInteractionError(message im.IncomingText, action, stage string, target hprp.Target, err error) {

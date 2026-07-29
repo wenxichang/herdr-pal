@@ -39,6 +39,16 @@ func TestNormalizePreservesMeaningfulWhitespaceAndUnicode(t *testing.T) {
 	}
 }
 
+func TestNormalizeDropsUnsafeC0AndC1ControlsOutsideEscapeSequences(t *testing.T) {
+	input := "a\a\b\v\f\u0085b\tc"
+
+	got := panel.Normalize(input)
+	want := []string{"ab\tc"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Normalize() = %#v, want %#v", got, want)
+	}
+}
+
 func TestNormalizeCollapsesLongHorizontalRules(t *testing.T) {
 	input := "保留 ──────\n压缩 ────────────── 尾部\n分开 ─────── x ────────"
 

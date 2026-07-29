@@ -20,17 +20,20 @@ import (
 )
 
 const (
-	fontSize    = 16
-	cellWidth   = 8
-	cellHeight  = 17
-	maxColumns  = 300
-	maxRows     = 100
-	maxPNGBytes = 512 * 1024
+	fontSize     = 16
+	cellWidth    = 8
+	cellHeight   = 17
+	maxColumns   = 300
+	maxRows      = 100
+	maxANSIBytes = 256 * 1024
+	maxPNGBytes  = 512 * 1024
 )
 
 var (
 	// ErrScreenTooLarge 表示终端页超过渲染尺寸上限。
 	ErrScreenTooLarge = errors.New("终端图片尺寸超过限制")
+	// ErrInputTooLarge 表示安全 ANSI 输入超过渲染器字节上限。
+	ErrInputTooLarge = errors.New("终端 ANSI 输入超过限制")
 	// ErrImageTooLarge 表示生成的 PNG 超过传输上限。
 	ErrImageTooLarge = errors.New("终端 PNG 超过限制")
 
@@ -74,6 +77,9 @@ func (r *Renderer) Render(ctx context.Context, safeANSI string) (Result, error) 
 	if r == nil || r.face == nil {
 		return Result{}, errors.New("终端图片渲染器未初始化")
 	}
+	if len(safeANSI) > maxANSIBytes {
+		return Result{}, ErrInputTooLarge
+	}
 	input, columns, rows, err := normalizeScreen(safeANSI)
 	if err != nil {
 		return Result{}, err
@@ -105,15 +111,27 @@ func (r *Renderer) Render(ctx context.Context, safeANSI string) (Result, error) 
 	if err := drawn.Encode(&intermediate, ".png"); err != nil {
 		return Result{}, fmt.Errorf("编码 textimg 图片: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	decoded, err := png.Decode(bytes.NewReader(intermediate.Bytes()))
 	if err != nil {
 		return Result{}, fmt.Errorf("解码 textimg 图片: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	paletted := histogramQuantize(decoded, 256)
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	var output bytes.Buffer
 	encoder := png.Encoder{CompressionLevel: png.DefaultCompression}
 	if err := encoder.Encode(&output, paletted); err != nil {
 		return Result{}, fmt.Errorf("编码终端 PNG8: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
 	}
 	if output.Len() > maxPNGBytes {
 		return Result{}, ErrImageTooLarge

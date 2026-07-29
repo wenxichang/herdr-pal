@@ -32,6 +32,20 @@ func TestValidateClientHelloRejectsInvalidExtensionName(t *testing.T) {
 	}
 }
 
+func TestValidateHelloRequiresTerminalSnapshotForImage(t *testing.T) {
+	clientHello := validClientHello()
+	clientHello.Capabilities = []string{CapabilityTerminalImageV1}
+	if err := ValidateClientHello(clientHello); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("ValidateClientHello() error = %v, want ErrInvalidMessage", err)
+	}
+
+	serverHello := validServerHello()
+	serverHello.Capabilities = []string{CapabilityTerminalImageV1}
+	if err := ValidateServerHello(serverHello); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("ValidateServerHello() error = %v, want ErrInvalidMessage", err)
+	}
+}
+
 func TestValidateServerHelloRejectsInvalidIdentityCapabilitiesAndLimits(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -101,6 +115,13 @@ func TestValidateResultOutcomeUsesMessageSubset(t *testing.T) {
 	}
 	if err := ValidateFeatureCancelResult(FeatureCancelResult{Outcome: OutcomeIndeterminate}); !errors.Is(err, ErrInvalidOutcome) {
 		t.Fatalf("ValidateFeatureCancelResult() error = %v, want ErrInvalidOutcome", err)
+	}
+	if err := ValidateTerminalSnapshotResult(TerminalSnapshotResult{
+		Outcome: OutcomeIndeterminate,
+		Target:  validTarget(),
+		Error:   &Error{Code: CodeTerminalSnapshotFailed},
+	}); !errors.Is(err, ErrInvalidOutcome) {
+		t.Fatalf("ValidateTerminalSnapshotResult() error = %v, want ErrInvalidOutcome", err)
 	}
 }
 
@@ -197,6 +218,25 @@ func TestValidateTerminalContentRejectsInvalidMetadataAndLimits(t *testing.T) {
 	}
 }
 
+func TestValidateTerminalContentRejectsCompressedPixelBomb(t *testing.T) {
+	width, height := 2401, 1700
+	imageData := image.NewPaletted(image.Rect(0, 0, width, height), color.Palette{color.Black})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, imageData); err != nil {
+		t.Fatal(err)
+	}
+	if encoded.Len() > MaxTerminalImageBytes {
+		t.Fatalf("test PNG bytes = %d, want <= %d", encoded.Len(), MaxTerminalImageBytes)
+	}
+	content := validTerminalImageContent(t)
+	content.Image.Data = base64.StdEncoding.EncodeToString(encoded.Bytes())
+	content.Image.Width = width
+	content.Image.Height = height
+	if err := ValidateContent(content); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("ValidateContent() error = %v, want ErrInvalidMessage", err)
+	}
+}
+
 func TestValidateTerminalTextContentAllowsEmptyScreen(t *testing.T) {
 	content := validTerminalTextContent()
 	content.Text = ""
@@ -280,6 +320,14 @@ func TestValidateTerminalSnapshotResultAllowsSameReadFallback(t *testing.T) {
 	}
 	if err := ValidateTerminalSnapshotResult(result); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("successful result error combination = %v", err)
+	}
+}
+
+func TestValidateTerminalSnapshotResultRejectsPlainTextSuccess(t *testing.T) {
+	content := Content{Type: ContentTypeText, Text: "plain text"}
+	result := TerminalSnapshotResult{Outcome: OutcomeOK, Target: validTarget(), Content: &content}
+	if err := ValidateTerminalSnapshotResult(result); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("ValidateTerminalSnapshotResult() error = %v, want ErrInvalidMessage", err)
 	}
 }
 

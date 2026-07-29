@@ -6,4 +6,3 @@
 - 获取日期：2026-07-29
 - SHA256：`ec04cc376b34887cedbdf84074e2e226ed2761eeabdcb9173fc1dd7bfd153ef7`
 - 许可证：SIL Open Font License 1.1，见 `OFL.txt`
-

@@ -71,7 +71,7 @@ func TestClientConnectionCorrelatesTerminalReplyWithStableTarget(t *testing.T) {
 	}
 	done := make(chan hprp.Envelope, 1)
 	go func() {
-		response, requestErr := connection.requestTarget(context.Background(), request, hprp.TypeTerminalSnapshotResult, &target)
+		response, requestErr := connection.requestTerminalSnapshot(context.Background(), request, target, hprp.OutputModeText)
 		if requestErr != nil {
 			done <- hprp.Envelope{}
 			return
@@ -88,11 +88,13 @@ func TestClientConnectionCorrelatesTerminalReplyWithStableTarget(t *testing.T) {
 	}
 	wrong := target
 	wrong.SessionID = "session-2"
-	if delivered, err := connection.deliverTarget(response, wrong); delivered || !errors.Is(err, ErrTargetChanged) {
-		t.Fatalf("deliverTarget(wrong) = %v, %v", delivered, err)
+	wrongResult := hprp.TerminalSnapshotResult{Outcome: hprp.OutcomeFailed, Target: wrong, Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotFailed}}
+	if delivered, err := connection.deliverTerminal(response, wrongResult); delivered || !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("deliverTerminal(wrong) = %v, %v", delivered, err)
 	}
-	if delivered, err := connection.deliverTarget(response, target); err != nil || !delivered {
-		t.Fatalf("deliverTarget(correct) = %v, %v", delivered, err)
+	result := hprp.TerminalSnapshotResult{Outcome: hprp.OutcomeFailed, Target: target, Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotFailed}}
+	if delivered, err := connection.deliverTerminal(response, result); err != nil || !delivered {
+		t.Fatalf("deliverTerminal(correct) = %v, %v", delivered, err)
 	}
 	select {
 	case got := <-done:
@@ -104,11 +106,51 @@ func TestClientConnectionCorrelatesTerminalReplyWithStableTarget(t *testing.T) {
 	}
 }
 
+func TestClientConnectionRecognizesLateTerminalReplyAfterRequestTimeout(t *testing.T) {
+	connection := newClientConnection(context.Background(), clientConnectionConfig{
+		ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"},
+		SendCapacity: 2, MaxPending: 2, Logger: slog.Default(),
+	})
+	connection.ready.Store(true)
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+	request, err := hprp.NewEnvelope(hprp.TypeTerminalSnapshotGet, "snapshot-timeout", "", true, hprp.TerminalSnapshotGet{
+		Target: target, Mode: hprp.OutputModeText, Purpose: hprp.TerminalSnapshotPurposeNotification, MaxLines: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, requestErr := connection.requestTerminalSnapshot(ctx, request, target, hprp.OutputModeText)
+		done <- requestErr
+	}()
+	<-connection.sendQueue
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("request error = %v", err)
+	}
+	response, err := hprp.NewEnvelope(hprp.TypeTerminalSnapshotResult, "late-result", request.ID, false, hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeFailed, Target: target,
+		Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotFailed, Retryable: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := hprp.DecodePayload[hprp.TerminalSnapshotResult](response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivered, err := connection.deliverTerminal(response, result); delivered || !errors.Is(err, ErrRequestExpired) {
+		t.Fatalf("deliverTerminal(late) = %v, %v", delivered, err)
+	}
+}
+
 func TestClientConnectionDeduplicatesAndOrdersCommandOutput(t *testing.T) {
 	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 1, MaxPending: 2, Logger: slog.Default()})
 	connection.setCapabilities([]string{hprp.CapabilityCommandOutputV1})
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
-	if err := connection.registerCommand("command-1", target, time.Minute); err != nil {
+	if err := connection.registerCommand("command-1", target, hprp.OutputModeText, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	envelope := hprp.Envelope{ReplyTo: "command-1"}
@@ -125,10 +167,33 @@ func TestClientConnectionDeduplicatesAndOrdersCommandOutput(t *testing.T) {
 	}
 }
 
+func TestClientConnectionKeepsCompletedCommandRouteForFinalOutputDeduplication(t *testing.T) {
+	connection := newClientConnection(context.Background(), clientConnectionConfig{
+		ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"},
+		SendCapacity: 1, MaxPending: 2, Logger: slog.Default(),
+	})
+	connection.setCapabilities([]string{hprp.CapabilityCommandOutputV1})
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+	if err := connection.registerCommand("command-1", target, hprp.OutputModeText, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	output := hprp.CommandOutput{
+		Target: target, Sequence: 1, Final: true,
+		Content: hprp.Content{Type: hprp.ContentTypeText, Text: "done"},
+	}
+	envelope := hprp.Envelope{ReplyTo: "command-1"}
+	if accepted, err := connection.acceptCommandOutput(envelope, output); err != nil || !accepted {
+		t.Fatalf("first final output = %v, %v", accepted, err)
+	}
+	if accepted, err := connection.acceptCommandOutput(envelope, output); err != nil || accepted {
+		t.Fatalf("duplicate final output = %v, %v", accepted, err)
+	}
+}
+
 func TestClientConnectionRejectsUnnegotiatedCommandOutput(t *testing.T) {
 	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 1, MaxPending: 2, Logger: slog.Default()})
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
-	if err := connection.registerCommand("command-1", target, time.Minute); err != nil {
+	if err := connection.registerCommand("command-1", target, hprp.OutputModeText, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	accepted, err := connection.acceptCommandOutput(hprp.Envelope{ReplyTo: "command-1"}, hprp.CommandOutput{
@@ -137,6 +202,42 @@ func TestClientConnectionRejectsUnnegotiatedCommandOutput(t *testing.T) {
 	})
 	if err == nil || accepted {
 		t.Fatalf("acceptCommandOutput() = %v, %v, want capability error", accepted, err)
+	}
+}
+
+func TestClientConnectionRejectsCommandContentModeMismatch(t *testing.T) {
+	connection := newClientConnection(context.Background(), clientConnectionConfig{
+		ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"},
+		SendCapacity: 1, MaxPending: 2, Logger: slog.Default(),
+	})
+	connection.setCapabilities([]string{hprp.CapabilityCommandOutputV1, hprp.CapabilityTerminalSnapshotV1, hprp.CapabilityTerminalImageV1})
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+	if err := connection.registerCommand("command-1", target, hprp.OutputModeText, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	content := hprp.Content{Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeImage}
+	if err := connection.validateCommandResultContent("command-1", &content); !errors.Is(err, hprp.ErrInvalidMessage) {
+		t.Fatalf("validateCommandResultContent() error = %v, want ErrInvalidMessage", err)
+	}
+	accepted, err := connection.acceptCommandOutput(hprp.Envelope{ReplyTo: "command-1"}, hprp.CommandOutput{
+		Target: target, Sequence: 1, Final: true, Content: content,
+	})
+	if accepted || !errors.Is(err, hprp.ErrInvalidMessage) {
+		t.Fatalf("acceptCommandOutput() = %v, %v, want mode mismatch", accepted, err)
+	}
+}
+
+func TestClientConnectionRejectsPlainTextTerminalSnapshotResult(t *testing.T) {
+	connection := newClientConnection(context.Background(), clientConnectionConfig{
+		ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"},
+		SendCapacity: 1, MaxPending: 2, Logger: slog.Default(),
+	})
+	result := hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeOK,
+		Content: &hprp.Content{Type: hprp.ContentTypeText, Text: "not a terminal snapshot"},
+	}
+	if err := connection.validateTerminalSnapshotMode(hprp.OutputModeText, result); !errors.Is(err, hprp.ErrInvalidMessage) {
+		t.Fatalf("validateTerminalSnapshotMode() error = %v, want ErrInvalidMessage", err)
 	}
 }
 

@@ -68,6 +68,17 @@ func TestRendererRejectsUnboundedScreen(t *testing.T) {
 	}
 }
 
+func TestRendererRejectsOversizedANSIInput(t *testing.T) {
+	renderer, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Repeat("\x1b[31m", maxANSIBytes/5+1) + "x"
+	if _, err := renderer.Render(context.Background(), input); !errors.Is(err, ErrInputTooLarge) {
+		t.Fatalf("Render() error = %v", err)
+	}
+}
+
 func TestRendererHonorsCancelledContext(t *testing.T) {
 	renderer, err := New()
 	if err != nil {

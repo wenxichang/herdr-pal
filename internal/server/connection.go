@@ -16,14 +16,17 @@ import (
 )
 
 type pendingRequest struct {
-	expected hprp.Type
-	target   *hprp.Target
-	result   chan hprp.Envelope
+	expected   hprp.Type
+	target     *hprp.Target
+	outputMode hprp.OutputMode
+	result     chan hprp.Envelope
 }
 
 type commandRoute struct {
 	target       hprp.Target
+	outputMode   hprp.OutputMode
 	nextSequence uint64
+	completed    bool
 	expiresAt    time.Time
 }
 
@@ -32,6 +35,8 @@ type notificationRecord struct {
 	sequence  uint64
 	expiresAt time.Time
 }
+
+const expiredRequestTTL = time.Minute
 
 type clientConnection struct {
 	id           string
@@ -60,6 +65,7 @@ type clientConnection struct {
 
 	pendingMu  sync.Mutex
 	pending    map[string]pendingRequest
+	expired    map[string]time.Time
 	maxPending int
 
 	commandMu     sync.Mutex
@@ -89,7 +95,7 @@ func newClientConnection(parent context.Context, config clientConnectionConfig) 
 		id: config.ID, credentialID: config.CredentialID, key: config.Key, socket: config.Socket, logger: config.Logger, ctx: ctx, cancel: cancel,
 		sendQueue: make(chan hprp.Envelope, config.SendCapacity), writerDone: make(chan struct{}),
 		outboundQueue: make(chan hprp.Envelope, config.SendCapacity), outboundDone: make(chan struct{}),
-		pending: make(map[string]pendingRequest), maxPending: config.MaxPending,
+		pending: make(map[string]pendingRequest), expired: make(map[string]time.Time), maxPending: config.MaxPending,
 		commandRoutes: make(map[string]commandRoute), maxCommands: defaultCommandRouteCapacity,
 		notifications: make(map[string]notificationRecord), notificationSequence: make(map[hprp.Target]uint64),
 		capabilities: make(map[string]struct{}), implementation: config.Implementation, source: normalizeConnectionSource(config.Source), connectedAt: time.Now().UTC(),
@@ -245,7 +251,7 @@ func (connection *clientConnection) send(ctx context.Context, envelope hprp.Enve
 }
 
 func (connection *clientConnection) request(ctx context.Context, envelope hprp.Envelope, expected hprp.Type) (hprp.Envelope, error) {
-	return connection.requestTarget(ctx, envelope, expected, nil)
+	return connection.requestTargetMode(ctx, envelope, expected, nil, "")
 }
 
 func (connection *clientConnection) requestTarget(
@@ -254,10 +260,32 @@ func (connection *clientConnection) requestTarget(
 	expected hprp.Type,
 	target *hprp.Target,
 ) (hprp.Envelope, error) {
+	return connection.requestTargetMode(ctx, envelope, expected, target, "")
+}
+
+func (connection *clientConnection) requestTerminalSnapshot(
+	ctx context.Context,
+	envelope hprp.Envelope,
+	target hprp.Target,
+	mode hprp.OutputMode,
+) (hprp.Envelope, error) {
+	if mode != hprp.OutputModeText && mode != hprp.OutputModeImage {
+		return hprp.Envelope{}, ErrInvalidHubRequest
+	}
+	return connection.requestTargetMode(ctx, envelope, hprp.TypeTerminalSnapshotResult, &target, mode)
+}
+
+func (connection *clientConnection) requestTargetMode(
+	ctx context.Context,
+	envelope hprp.Envelope,
+	expected hprp.Type,
+	target *hprp.Target,
+	outputMode hprp.OutputMode,
+) (hprp.Envelope, error) {
 	if connection == nil || !connection.ready.Load() || envelope.ID == "" || envelope.ReplyTo != "" {
 		return hprp.Envelope{}, ErrInvalidHubRequest
 	}
-	request := pendingRequest{expected: expected, result: make(chan hprp.Envelope, 1)}
+	request := pendingRequest{expected: expected, outputMode: outputMode, result: make(chan hprp.Envelope, 1)}
 	if target != nil {
 		targetCopy := *target
 		request.target = &targetCopy
@@ -273,18 +301,52 @@ func (connection *clientConnection) requestTarget(
 	}
 	connection.pending[envelope.ID] = request
 	connection.pendingMu.Unlock()
-	defer connection.removePending(envelope.ID)
 	if err := connection.send(ctx, envelope); err != nil {
+		connection.removePending(envelope.ID)
 		return hprp.Envelope{}, err
 	}
 	select {
 	case <-ctx.Done():
+		connection.expirePending(envelope.ID)
 		return hprp.Envelope{}, ctx.Err()
 	case <-connection.ctx.Done():
+		connection.removePending(envelope.ID)
 		return hprp.Envelope{}, ErrClientUnavailable
 	case response := <-request.result:
 		return response, nil
 	}
+}
+
+func (connection *clientConnection) deliverTerminal(envelope hprp.Envelope, result hprp.TerminalSnapshotResult) (bool, error) {
+	if envelope.ReplyTo == "" {
+		return false, ErrInvalidHubRequest
+	}
+	connection.pendingMu.Lock()
+	request, exists := connection.pending[envelope.ReplyTo]
+	if !exists {
+		expired := connection.requestExpiredLocked(envelope.ReplyTo, time.Now())
+		connection.pendingMu.Unlock()
+		if expired {
+			return false, ErrRequestExpired
+		}
+		return false, ErrInvalidHubRequest
+	}
+	if request.expected != envelope.Type {
+		connection.pendingMu.Unlock()
+		return false, ErrInvalidHubRequest
+	}
+	if request.target == nil || *request.target != result.Target {
+		connection.pendingMu.Unlock()
+		return false, ErrTargetChanged
+	}
+	if err := connection.validateTerminalSnapshotMode(request.outputMode, result); err != nil {
+		connection.pendingMu.Unlock()
+		return false, err
+	}
+	delete(connection.pending, envelope.ReplyTo)
+	connection.pendingMu.Unlock()
+	request.result <- envelope
+	return true, nil
 }
 
 func (connection *clientConnection) deliverTarget(envelope hprp.Envelope, target hprp.Target) (bool, error) {
@@ -329,8 +391,34 @@ func (connection *clientConnection) removePending(requestID string) {
 	connection.pendingMu.Unlock()
 }
 
-func (connection *clientConnection) registerCommand(commandID string, target hprp.Target, ttl time.Duration) error {
-	if commandID == "" || hprp.ValidateTarget(target) != nil {
+func (connection *clientConnection) expirePending(requestID string) {
+	connection.pendingMu.Lock()
+	if _, exists := connection.pending[requestID]; exists {
+		delete(connection.pending, requestID)
+		connection.expired[requestID] = time.Now().Add(expiredRequestTTL)
+	}
+	connection.pendingMu.Unlock()
+}
+
+func (connection *clientConnection) requestExpiredLocked(requestID string, now time.Time) bool {
+	for id, expiresAt := range connection.expired {
+		if !now.Before(expiresAt) {
+			delete(connection.expired, id)
+		}
+	}
+	_, exists := connection.expired[requestID]
+	return exists
+}
+
+func (connection *clientConnection) requestExpired(requestID string) bool {
+	connection.pendingMu.Lock()
+	defer connection.pendingMu.Unlock()
+	return connection.requestExpiredLocked(requestID, time.Now())
+}
+
+func (connection *clientConnection) registerCommand(commandID string, target hprp.Target, outputMode hprp.OutputMode, ttl time.Duration) error {
+	if commandID == "" || hprp.ValidateTarget(target) != nil ||
+		(outputMode != hprp.OutputModeText && outputMode != hprp.OutputModeImage) {
 		return ErrInvalidHubRequest
 	}
 	connection.commandMu.Lock()
@@ -342,8 +430,24 @@ func (connection *clientConnection) registerCommand(commandID string, target hpr
 	if _, exists := connection.commandRoutes[commandID]; exists {
 		return ErrInvalidHubRequest
 	}
-	connection.commandRoutes[commandID] = commandRoute{target: target, nextSequence: 1, expiresAt: time.Now().Add(ttl)}
+	connection.commandRoutes[commandID] = commandRoute{
+		target: target, outputMode: outputMode, nextSequence: 1, expiresAt: time.Now().Add(ttl),
+	}
 	return nil
+}
+
+func (connection *clientConnection) validateCommandResultContent(commandID string, content *hprp.Content) error {
+	if content == nil {
+		return nil
+	}
+	connection.commandMu.Lock()
+	defer connection.commandMu.Unlock()
+	connection.pruneCommandsLocked(time.Now())
+	route, exists := connection.commandRoutes[commandID]
+	if !exists {
+		return ErrInvalidHubRequest
+	}
+	return connection.validateContentMode(route.outputMode, *content)
 }
 
 func (connection *clientConnection) removeCommand(commandID string) {
@@ -383,20 +487,56 @@ func (connection *clientConnection) acceptCommandOutput(envelope hprp.Envelope, 
 	if !exists || route.target != output.Target {
 		return false, ErrTargetChanged
 	}
+	if err := connection.validateContentMode(route.outputMode, output.Content); err != nil {
+		return false, err
+	}
 	if output.Sequence < route.nextSequence {
 		return false, nil
 	}
 	if output.Sequence > route.nextSequence {
 		return false, fmt.Errorf("%w: command.output sequence 不连续", hprp.ErrInvalidMessage)
 	}
-	if output.Final {
-		delete(connection.commandRoutes, envelope.ReplyTo)
-	} else {
-		route.nextSequence++
-		route.expiresAt = now.Add(defaultCommandRouteTTL)
-		connection.commandRoutes[envelope.ReplyTo] = route
+	if route.completed {
+		return false, fmt.Errorf("%w: command.output 已结束", hprp.ErrInvalidMessage)
 	}
+	route.nextSequence++
+	route.expiresAt = now.Add(defaultCommandRouteTTL)
+	if output.Final {
+		route.completed = true
+	}
+	connection.commandRoutes[envelope.ReplyTo] = route
 	return true, nil
+}
+
+func (connection *clientConnection) validateContentMode(expected hprp.OutputMode, content hprp.Content) error {
+	if content.Type == hprp.ContentTypeText {
+		return nil
+	}
+	if content.Type != hprp.ContentTypeTerminal || content.Mode != expected {
+		return fmt.Errorf("%w: 终端内容模式与请求不一致", hprp.ErrInvalidMessage)
+	}
+	if content.Mode == hprp.OutputModeImage && !connection.supportsCapability(hprp.CapabilityTerminalImageV1) {
+		return fmt.Errorf("%w: terminal.image.v1 未协商", hprp.ErrInvalidMessage)
+	}
+	return nil
+}
+
+func (connection *clientConnection) validateTerminalSnapshotMode(expected hprp.OutputMode, result hprp.TerminalSnapshotResult) error {
+	if expected != hprp.OutputModeText && expected != hprp.OutputModeImage {
+		return ErrInvalidHubRequest
+	}
+	if result.Content != nil {
+		if result.Content.Type != hprp.ContentTypeTerminal {
+			return fmt.Errorf("%w: terminal snapshot 成功内容类型无效", hprp.ErrInvalidMessage)
+		}
+		if err := connection.validateContentMode(expected, *result.Content); err != nil {
+			return err
+		}
+	}
+	if result.FallbackContent != nil && expected != hprp.OutputModeImage {
+		return fmt.Errorf("%w: 文本快照请求不能返回图片降级内容", hprp.ErrInvalidMessage)
+	}
+	return nil
 }
 
 func (connection *clientConnection) pruneCommandsLocked(now time.Time) {

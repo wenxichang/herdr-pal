@@ -476,6 +476,9 @@ HPRP/1 的恢复机制。
 `output_mode` 是必填字段，只能为 `txt` 或 `img`，表示本次命令产生终端内容时使用的格式。它不在
 Pal 中保存模式，也不影响普通文本确认。`img` 必须已经协商 `terminal.image.v1`；没有
 协商时返回 `terminal.image_unsupported`。Server 必须为每次命令显式发送当前模式。
+`command.result` 和 `command.output` 中的 `text/plain` 确认不受该字段约束；一旦返回
+`terminal.snapshot`，其 `mode` 必须与原命令的 `output_mode` 完全一致，接收方必须按
+`reply_to` 保存的请求上下文校验，不能只校验内容对象自身是否合法。
 
 `command.execute` 是 HPRP/1 基础 Agent 交互的专用消息，不是未来 Feature 的通用 RPC
 入口。新增用户功能不应继续向该消息加入与文本交互无关的参数，而应使用第 11 节的
@@ -543,6 +546,16 @@ Pal 只能通过 `command.result` 返回当前命令的同步结果。
 执行，而不是重复产生副作用。超过该窗口后，服务端必须把重发视为可能产生重复
 副作用的操作，并要求上层重新确认。
 
+Pal 的实现必须把轻量幂等索引与大块响应正文分离：在承诺窗口内不得因图片或输出正文
+占满缓存而驱逐 Key。响应正文可以在明确的字节预算下省略可选内容，但必须保留等价输入
+指纹、原始 outcome、错误码和替换目标，从而识别重复和冲突并禁止再次执行。幂等索引达到
+实现容量时，Pal 必须在产生本地副作用前以 `server.busy` 拒绝新 Key，不能通过删除窗口内
+旧 Key 腾出空间。
+
+Server 本地等待超时后，可以忽略与近期已过期 `reply_to` 精确匹配的迟到
+`command.result` 和 `command.output`；未知关联仍是协议错误。迟到结果不得导致整条 Pal
+连接断开，也不得触发新的自动执行。
+
 ### 10.1 终端内容
 
 普通提示、确认和错误继续使用 `text/plain`。`/con`、`/pageup`、`/pagedn`、按键后自动
@@ -560,7 +573,7 @@ Pal 只能通过 `command.result` 返回当前命令的同步结果。
     "data": "iVBORw0KGgo...",
     "width": 1280,
     "height": 720,
-    "color_mode": "indexed"
+    "color_mode": "indexed-256"
   },
   "page": {
     "current": 1,
@@ -575,9 +588,11 @@ Pal 只能通过 `command.result` 返回当前命令的同步结果。
 - `text` 始终必填，必须是有效 UTF-8，并与可选图片来自同一目标、同一次采集和同一页；
 - `mode: txt` 时禁止携带 `image`；
 - `mode: img` 时必须携带 `image`，且连接必须已经协商 `terminal.image.v1`；
-- 图片固定使用 `media_type: image/png` 和 `encoding: base64`，解码结果必须具有合法 PNG
-  签名；
-- `width`、`height` 必须为正整数，`color_mode` 当前只能为 `indexed`；
+- 图片固定使用 `media_type: image/png` 和 `encoding: base64`，解码结果必须是合法的索引色
+  PNG8，而不只是具有 PNG 签名；
+- `width`、`height` 必须为正整数且与 PNG 头一致，单边不得超过 16384，总像素不得超过
+  4,080,000；接收方必须在完整解码前使用 PNG 配置执行该检查；`color_mode` 当前只能为
+  `indexed-256`；
 - `page` 只在内容属于交互分页缓存时出现，`current` 和 `total` 从 1 开始且
   `current <= total`；
 - `captured_at` 使用 RFC 3339 UTC 时间；
@@ -797,18 +812,24 @@ Pal 使用 `notification.event` 上报 Agent 状态变化，但不主动附带�
 
 状态事件规则：
 
-- Server 必须确认目标存在于该连接最近确认的快照中；
-- `snapshot_sequence` 必须引用本连接已经确认、且包含该目标的会话快照；
-- 新会话的事件只能在对应快照确认后发送；
+- `agent.status.changed` 的目标必须存在于该连接最近确认的快照中；
+- `agent.status.changed` 的 `snapshot_sequence` 必须引用本连接已经确认、且包含该目标的会话
+  快照；新会话的状态事件只能在对应快照确认后发送；
+- `target.invalidated` 可以在旧目标已经离开本地当前快照后发送，Server 不得要求它仍存在于
+  在线目录；其 `snapshot_sequence` 只需引用本连接已确认的同步边界；
 - `event_key` 在去重窗口内保持唯一；`sequence` 在同一目标内严格递增，用于排序和去重；
 - `previous_status` 和 `status` 使用第 9 节定义的基础状态；重复状态不得产生新事件；
 - `notification.event` 不携带终端 `content`，Server 必须自行决定是否需要获取内容；
-- 未知 `kind` 在 `must_understand` 为 `false` 时忽略；
+- `kind` 是当前消息类型的必填枚举；HPRP/1 只接受 `agent.status.changed` 和
+  `target.invalidated`，新增事件语义应使用协商能力或新的消息类型；
 - HPRP/1 基础事件采用连接在线期间的尽力投递，不提供断线后的离线回放；
 - 双方协商 `notification.ack.v1` 后，可以使用相同 `event_key` 确认和重试。
 
 Server 可以根据状态、当前选择、最近交互时间、用户策略和 IM 能力决定忽略事件、只发送
 状态说明，或者继续请求终端快照。Pal 不负责这些通知策略。
+
+`target.invalidated` 表示 Pal 已确认目标 pane 关闭或 occupant 被替换。该事件不携带
+`data` 或终端正文；Server 应撤销旧目标的选择和显示模式，不能为已失效目标请求快照。
 
 ### 12.2 无副作用终端快照
 
@@ -835,11 +856,13 @@ Server 可以根据状态、当前选择、最近交互时间、用户策略和 
 
 字段规则：
 
+- 信封 `reply_to` 必须为空，`must_understand` 必须为 `true`；
 - `target` 必须是当前连接最近确认快照中的完整稳定目标；
 - `mode` 只能为 `txt` 或 `img`，`img` 还要求已经协商 `terminal.image.v1`；
 - `purpose` 在 v1 中只能为 `notification`；
 - `max_lines` 必须为正整数，且不得超过 hello 中 `terminal.inspect.v1` 的有效限制；
-- 请求是只读操作，不使用命令幂等键，但必须受连接并发、超时和消息大小限制；
+- 请求是只读操作，不使用命令幂等键，但必须与 `command.execute` 合并计入
+  `max_inflight_commands`，并受本地执行截止时间和消息大小限制；
 - 请求不得重置或修改 `/con`、`/pageup`、`/pagedn` 使用的交互分页缓存。
 
 Pal 返回且只返回一个 `terminal.snapshot.result`：
@@ -867,7 +890,7 @@ Pal 返回且只返回一个 `terminal.snapshot.result`：
         "data": "iVBORw0KGgo...",
         "width": 1280,
         "height": 720,
-        "color_mode": "indexed"
+        "color_mode": "indexed-256"
       },
       "captured_at": "2026-07-29T10:00:01Z"
     }
@@ -875,18 +898,22 @@ Pal 返回且只返回一个 `terminal.snapshot.result`：
 }
 ```
 
-`outcome` 允许 `ok`、`rejected` 和 `failed`。成功结果中的 `target` 必须与请求完全一致，
-`content` 遵循第 10.1 节。状态事件到读取之间目标已经变化、消失或尚未同步时，Pal 必须
-返回稳定目标错误，不能把新会话内容标记为旧 Target。
+`outcome` 只允许 `ok`、`rejected` 和 `failed`。成功结果中的 `target` 必须与请求完全一致，
+`content.type` 必须是 `terminal.snapshot`，且 `content.mode` 必须与请求的 `mode` 完全一致；
+普通 `text/plain` 不能冒充成功快照。其余字段遵循第 10.1 节。状态事件到读取之间目标已经
+变化、消失或尚未同步时，Pal 必须返回稳定目标错误，不能把新会话内容标记为旧 Target。
 
 图片请求已经成功读取纯文本但渲染失败时，结果使用 `outcome: failed` 和
 `terminal.image_failed`，并可以携带 `fallback_content`。`fallback_content` 必须是同一次
 读取产生的 `mode: txt` 终端内容，不得重新读取后拼接成不同快照。Server 可以只在通知
-场景使用该内容降级；用户主动执行图片终端命令时仍应展示明确错误。
+场景使用该内容降级；空白终端页也是合法的同次读取结果，不能用 `text` 是否为空判断能否
+降级。用户主动执行图片终端命令时仍应展示明确错误。
 
 该快照表示 Pal 处理请求时能够读取到的最新终端视图，不承诺冻结状态事件发生瞬间的
 屏幕。Server 获取内容失败时仍应保留状态事件，并可以发送不含终端正文的通知。图片生成
 或 IM 上传失败时，Server 可以使用 `content.text` 降级，但不得修改用户保存的模式。
+Server 超时后可以忽略与近期已过期 `reply_to` 精确匹配的迟到结果；未知关联仍是协议错误，
+不得为了容忍迟到消息而忽略任意未匹配结果。
 
 ## 13. 统一结果与错误模型
 

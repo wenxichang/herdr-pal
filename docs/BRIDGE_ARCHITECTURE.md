@@ -50,8 +50,8 @@ credential_id + principal_id + machine_id + secret_digest + allowed_sources
 
 ### 3.1 WeComClient
 
-独占企业微信智能机器人长连接，处理订阅、心跳、请求关联、单聊文本回调和主动发送。它只
-转换 `im.IncomingText`，不理解 Herdr 或 HPRP。
+独占企业微信智能机器人长连接，处理订阅、心跳、请求关联、单聊文本回调、Markdown 和
+临时图片上传发送。它只转换平台消息，不理解 Herdr 或 HPRP。
 
 ### 3.2 ConversationRouter 与 UserExecutor
 
@@ -60,10 +60,13 @@ Router 以企业微信用户 ID 为隔离边界：
 - 直接处理 `/userid`、`/ls`、独立 `/N`/`/sel N` 和 `/help`。
 - 把 `/N 内容`、`#N 内容` 的全局编号解析成 HPRP 稳定目标。
 - 将其他输入路由到当前选择，并在成功后按命令语义更新选择。
+- 按完整稳定目标维护 `/mode img|txt` 的内存覆盖；OpenCode 默认图片，其他 Agent 默认文本。
 - 为输出补充机器、全局序号、Workspace/Tab、pane 和状态信息。
 - 维护同一用户 2 分钟双向活跃窗口，减少后台会话的大段输出打断。
+- 根据状态事件决定是否请求无副作用终端快照，并负责图片发送失败后的同页文本降级。
 
-每个用户由 `UserExecutor` 串行处理，不同用户并行；队列容量有界。
+每个用户由 `UserExecutor` 串行处理，不同用户并行；用户输入、状态通知和命令后续输出使用
+同一队列，确保“终端标题 + 图片”不会被同一用户其他机器的消息插入；队列容量有界。
 
 ### 3.3 CredentialStore
 
@@ -100,6 +103,7 @@ TLS/Upgrade 认证
 - 维护有界发送队列、在途请求、命令输出路由和 WebSocket heartbeat。
 - `Select` 只复核在线目录，不向 Pal 发送远端选择消息。
 - `Execute` 发送 `command.execute`，通过 `reply_to` 等待 `command.result`。
+- `FetchTerminalSnapshot` 发送 `terminal.snapshot.get`，并复核返回目标、结果和能力协商。
 - 验证 `command.output` 与 `notification.event` 的机器身份、稳定目标、序号和幂等键。
 - 连接结束时立即撤下机器及其全部会话。
 
@@ -127,8 +131,10 @@ Target
 - 上报完整会话快照并等待 `session.snapshot.result`，确认后才能引用新目标。
 - 默认每 250ms 检测本地目录变化，并发送周期性完整校准快照。
 - 接收 `command.execute`，校验稳定目标后交给 Bridge Service。
+- 接收 `terminal.snapshot.get`，对指定稳定目标执行无副作用读取并返回文本或图片结果。
 - 先发送唯一 `command.result`，再发送可选、有序的 `command.output`。
-- 使用 `idempotency_key` 的有界 TTL 缓存避免重复本地副作用。
+- 使用 `idempotency_key` 的有界 TTL 轻量索引避免重复本地副作用；图片和正文使用独立字节
+  预算，不能通过驱逐窗口内 Key 释放空间。
 - 上报带稳定目标的 `notification.event`；断线时不缓存任何输入、输出或通知。
 
 ### 4.2 HerdrClient、SessionRegistry 与 EventSupervisor
@@ -151,13 +157,17 @@ Herdr 不可用时向 HPRP 暴露空会话。
 ### 4.3 Service、PolicyGuard 与 Notifier
 
 Service 解析 `/con`、分页、`/key`、`/enter`、`/slash` 和普通 prompt。普通文本只允许
-实时 `idle` 或 `done`；prompt stalled 时最多补发一次经过目标复核的 Enter。
+实时 `idle` 或 `done`；prompt stalled 时最多补发一次经过目标复核的 Enter。交互终端页
+同时保存规范化纯文本与安全 ANSI；图片模式由 Pal 侧内嵌字体渲染为 16px PNG8，并限制
+ANSI 字节数、可见行列和 PNG 大小。
+安全 ANSI 只保留换行、回车重绘、Tab、可打印 Unicode 和合法 SGR；其余 C0/C1 控制字符
+全部删除。
 
 按键只允许 `up/down/esc/space/enter` 与单个 ASCII 字母或数字。多键间隔 100ms，Enter
 只能单独发送；每个按键前重新复核目标。
 
-Notifier 对 `blocked`、`done` 和需要关注的 `idle` 读取最近 100 行，执行 ANSI/TUI 清理、
-快照去重与 UTF-8 安全分段。它不改变用户手工分页位置。
+Notifier 只发送经过 occupant 复核和去重的状态事件，不读取终端正文。Server 在需要内容时
+另发 `terminal.snapshot.get`；该读取不复用或改变用户手工分页位置。
 
 ## 5. HPRP/1 核心语义
 
@@ -168,6 +178,7 @@ hello.client / hello.server
 session.snapshot / session.snapshot.result
 command.execute / command.result / command.output
 notification.event
+terminal.snapshot.get / terminal.snapshot.result
 protocol.error
 ```
 
@@ -176,6 +187,10 @@ protocol.error
 - `command.execute` 是基础文本交互，不是通用 Herdr RPC。
 - 相同命令幂等键和等价输入重放原结果；冲突输入明确拒绝。
 - 输出和通知队列有界；序号重复被去重，跳号或跨机器目标被拒绝。
+- 终端图片必须协商 `terminal.image.v1`，并同时协商 `terminal.snapshot.v1`；图片始终配对
+  同次采集纯文本，模式由 Server 按请求显式指定。
+- Pal 把命令和终端快照合并限制为一个在途本地请求；快照读取设置短于 Server 请求的截止
+  时间，Server 只忽略与近期超时请求精确匹配的迟到结果。
 - 同一 pane 产生新 Agent 会话时，Pal 先确认快照，再返回同机器、同 slot 的替换目标。
 - 超时或 `indeterminate` 不触发新的自动执行。
 
@@ -207,6 +222,8 @@ protocol.error
 - Bearer Key 签发、摘要存储、过期/吊销、HTTP 401 与重复机器 HTTP 409。
 - hello、首快照、快照幂等/乱序、断线撤下和 heartbeat。
 - 稳定目标、会话替换、命令关联、命令幂等、输出与通知去重。
+- 状态事件不含正文、无副作用快照、文本与安全 ANSI 配对、PNG8 限制和分页一致性。
+- 企业微信图片初始化、分块、完成、发送以及上传失败后的文本降级。
 - 多用户多机器目录隔离和企业微信路由。
 - Herdr NDJSON、订阅、重连、prompt 门禁、按键策略和终端清理。
 

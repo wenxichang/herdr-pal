@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
+	"github.com/wenxichang/herdr-pal/internal/im"
 )
 
 func TestHPRPHubRequiresBearerAuthenticationBeforeUpgrade(t *testing.T) {
@@ -135,7 +136,7 @@ func TestHPRPHubFetchTerminalSnapshotRoutesAndValidatesTarget(t *testing.T) {
 	}
 	fetched := make(chan fetchResult, 1)
 	go func() {
-		result, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeImage, 100)
+		result, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeText, 100)
 		fetched <- fetchResult{result: result, err: err}
 	}()
 	requestEnvelope := readHPRPTestEnvelope(t, connection)
@@ -143,7 +144,7 @@ func TestHPRPHubFetchTerminalSnapshotRoutesAndValidatesTarget(t *testing.T) {
 		t.Fatalf("request envelope = %#v", requestEnvelope)
 	}
 	request, err := hprp.DecodePayload[hprp.TerminalSnapshotGet](requestEnvelope)
-	if err != nil || request.Target != target || request.Mode != hprp.OutputModeImage || request.MaxLines != 100 {
+	if err != nil || request.Target != target || request.Mode != hprp.OutputModeText || request.MaxLines != 100 {
 		t.Fatalf("terminal snapshot request = %#v, %v", request, err)
 	}
 	capturedAt := time.Now().UTC()
@@ -160,6 +161,35 @@ func TestHPRPHubFetchTerminalSnapshotRoutesAndValidatesTarget(t *testing.T) {
 	}
 }
 
+func TestHPRPHubRejectsTerminalSnapshotModeMismatch(t *testing.T) {
+	hub := newHPRPTestHub(t)
+	server := httptest.NewTLSServer(hub)
+	defer server.Close()
+	connection := connectReadyHPRPTestClient(t, server, []string{
+		hprp.CapabilityCommandOutputV1, hprp.CapabilityTerminalSnapshotV1, hprp.CapabilityTerminalImageV1,
+	})
+	defer connection.Close(websocket.StatusNormalClosure, "test complete")
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+
+	fetched := make(chan error, 1)
+	go func() {
+		_, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeImage, 100)
+		fetched <- err
+	}()
+	requestEnvelope := readHPRPTestEnvelope(t, connection)
+	capturedAt := time.Now().UTC()
+	writeHPRPTestEnvelope(t, connection, hprp.TypeTerminalSnapshotResult, "terminal-result-mismatch", requestEnvelope.ID, hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeOK, Target: target,
+		Content: &hprp.Content{
+			Type: hprp.ContentTypeTerminal, Text: "terminal", Mode: hprp.OutputModeText,
+			Page: &hprp.TerminalPage{Current: 1, Total: 1}, CapturedAt: &capturedAt,
+		},
+	})
+	if err := <-fetched; err == nil {
+		t.Fatal("FetchTerminalSnapshot() accepted mismatched output mode")
+	}
+}
+
 func TestHPRPHubRejectsImageSnapshotWithoutCapability(t *testing.T) {
 	hub := newHPRPTestHub(t)
 	server := httptest.NewTLSServer(hub)
@@ -170,6 +200,54 @@ func TestHPRPHubRejectsImageSnapshotWithoutCapability(t *testing.T) {
 
 	if _, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeImage, 100); !errors.Is(err, ErrInvalidHubRequest) {
 		t.Fatalf("FetchTerminalSnapshot(image) error = %v", err)
+	}
+}
+
+func TestHPRPHubIgnoresLateCommandResultWithoutDisconnectingClient(t *testing.T) {
+	hub := newHPRPTestHub(t)
+	server := httptest.NewTLSServer(hub)
+	defer server.Close()
+	connection := connectReadyHPRPTestClient(t, server, []string{
+		hprp.CapabilityCommandOutputV1, hprp.CapabilityTerminalSnapshotV1,
+	})
+	defer connection.Close(websocket.StatusNormalClosure, "test complete")
+	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	executeDone := make(chan error, 1)
+	go func() {
+		_, err := hub.Execute(ctx, "user-a", target, im.IncomingText{MessageID: "late-command", Content: "prompt"})
+		executeDone <- err
+	}()
+	commandEnvelope := readHPRPTestEnvelope(t, connection)
+	cancel()
+	if err := <-executeDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	capturedAt := time.Now().UTC()
+	writeHPRPTestEnvelope(t, connection, hprp.TypeCommandResult, "late-command-result", commandEnvelope.ID, hprp.CommandResult{
+		Outcome: hprp.OutcomeOK,
+		Content: &hprp.Content{
+			Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeText, Text: "late",
+			CapturedAt: &capturedAt,
+		},
+	})
+
+	fetchDone := make(chan error, 1)
+	go func() {
+		_, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeText, 100)
+		fetchDone <- err
+	}()
+	snapshotEnvelope := readHPRPTestEnvelope(t, connection)
+	if snapshotEnvelope.Type != hprp.TypeTerminalSnapshotGet {
+		t.Fatalf("next envelope = %#v", snapshotEnvelope)
+	}
+	writeHPRPTestEnvelope(t, connection, hprp.TypeTerminalSnapshotResult, "snapshot-after-late", snapshotEnvelope.ID, hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeFailed, Target: target,
+		Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotFailed, Retryable: true},
+	})
+	if err := <-fetchDone; err != nil {
+		t.Fatalf("FetchTerminalSnapshot() error = %v", err)
 	}
 }
 

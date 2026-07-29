@@ -25,6 +25,7 @@ var (
 	ErrClientQueueFull      = errors.New("Relay 客户端发送队列已满")
 	ErrInflightFull         = errors.New("Relay 客户端在途请求已满")
 	ErrInvalidHubRequest    = errors.New("Relay Hub 请求无效")
+	ErrRequestExpired       = errors.New("Relay 请求已超时")
 )
 
 const (
@@ -251,7 +252,7 @@ func (hub *ClientHub) FetchTerminalSnapshot(
 	if err != nil {
 		return hprp.TerminalSnapshotResult{}, err
 	}
-	response, err := connection.requestTarget(ctx, envelope, hprp.TypeTerminalSnapshotResult, &target)
+	response, err := connection.requestTerminalSnapshot(ctx, envelope, target, mode)
 	if err != nil {
 		return hprp.TerminalSnapshotResult{}, err
 	}
@@ -280,16 +281,6 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 	if _, err := hub.catalog.ResolveTarget(userID, target); err != nil {
 		return RelayExecution{}, err
 	}
-	commandID := randomHubID()
-	if err := connection.registerCommand(commandID, target, defaultCommandRouteTTL); err != nil {
-		return RelayExecution{}, err
-	}
-	keepRoute := false
-	defer func() {
-		if !keepRoute {
-			connection.removeCommand(commandID)
-		}
-	}()
 	outputMode := hprp.OutputMode(message.OutputMode)
 	if outputMode == "" {
 		outputMode = hprp.OutputModeText
@@ -303,6 +294,16 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 	if err := hprp.ValidateCommandExecute(command); err != nil {
 		return RelayExecution{}, err
 	}
+	commandID := randomHubID()
+	if err := connection.registerCommand(commandID, target, outputMode, defaultCommandRouteTTL); err != nil {
+		return RelayExecution{}, err
+	}
+	keepRoute := false
+	defer func() {
+		if !keepRoute {
+			connection.removeCommand(commandID)
+		}
+	}()
 	envelope, err := hprp.NewEnvelope(hprp.TypeCommandExecute, commandID, "", true, command)
 	if err != nil {
 		return RelayExecution{}, err
@@ -462,9 +463,16 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 			}
 			hub.logger.Debug("HPRP 客户端快照已处理", append(connectionLogArgs(connection), "snapshot_sequence", snapshot.Sequence, "previous_session_count", previous, "session_count", len(snapshot.Sessions), "applied", err == nil)...)
 		case hprp.TypeCommandResult:
+			if connection.requestExpired(envelope.ReplyTo) {
+				hub.logger.Debug("HPRP 迟到命令结果已忽略", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo))...)
+				continue
+			}
 			result, resultErr := hprp.DecodePayload[hprp.CommandResult](envelope)
 			if resultErr == nil {
 				resultErr = hprp.ValidateCommandResult(result)
+			}
+			if resultErr == nil {
+				resultErr = connection.validateCommandResultContent(envelope.ReplyTo, result.Content)
 			}
 			if resultErr == nil && result.ReplacementTarget != nil {
 				if result.ReplacementTarget.MachineID != connection.key.MachineID {
@@ -495,14 +503,22 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 			}
 			matched := false
 			if resultErr == nil {
-				matched, resultErr = connection.deliverTarget(envelope, result.Target)
+				matched, resultErr = connection.deliverTerminal(envelope, result)
 			}
 			if resultErr != nil || !matched {
+				if errors.Is(resultErr, ErrRequestExpired) {
+					hub.logger.Debug("HPRP 迟到终端快照结果已忽略", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo))...)
+					continue
+				}
 				hub.logger.Warn("HPRP 终端快照结果无效", append(append(connectionLogArgs(connection), targetLogArgs(result.Target)...), serverErrorLogArgs(resultErr)...)...)
 				return
 			}
 			hub.logger.Debug("HPRP 终端快照结果已接收", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo))...)
 		case hprp.TypeCommandOutput:
+			if connection.requestExpired(envelope.ReplyTo) {
+				hub.logger.Debug("HPRP 迟到命令输出已忽略", append(connectionLogArgs(connection), "request_hash", routerHash(envelope.ReplyTo))...)
+				continue
+			}
 			output, err := hprp.DecodePayload[hprp.CommandOutput](envelope)
 			if err == nil {
 				err = hprp.ValidateCommandOutput(output)

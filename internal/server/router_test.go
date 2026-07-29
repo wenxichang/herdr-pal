@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -902,6 +903,76 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	}
 }
 
+func TestRouterSerializesOutboundImageAndTextForSameUser(t *testing.T) {
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := newBlockingImageGateway()
+	relay := &routerRelay{capabilities: make(map[string]bool)}
+	router, err := NewConversationRouter(NewSessionCatalog(), NewUserExecutor(64), gateway, relay, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	})
+	target := hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"}
+	imageDone := make(chan error, 1)
+	go func() {
+		imageDone <- router.SendCommandOutput(context.Background(), "user-a", hprp.CommandOutput{
+			Target: target, Sequence: 1, Final: true, Content: terminalImageContent("图片", 1, 1),
+		})
+	}()
+	<-gateway.imageStarted
+
+	textDone := make(chan error, 1)
+	go func() {
+		textDone <- router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(target, "后续文本"))
+	}()
+	select {
+	case err := <-textDone:
+		t.Fatalf("text output completed before image pair: %v, events=%#v", err, gateway.Events())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gateway.releaseImage)
+	if err := <-imageDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-textDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := gateway.Events(); !reflect.DeepEqual(got, []string{"header", "image-start", "image-end", "text"}) {
+		t.Fatalf("events = %#v", got)
+	}
+}
+
+func TestRouterDoesNotSendImageWhenReplyHeaderFails(t *testing.T) {
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := &failingImageHeaderGateway{err: errors.New("header failed")}
+	router, err := NewConversationRouter(NewSessionCatalog(), NewUserExecutor(64), gateway, &routerRelay{capabilities: make(map[string]bool)}, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	})
+	entry, err := router.catalog.ResolveTarget("user-a", hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := routerMessage("request-1", "message-1", "user-a", "/con")
+	if err := router.sendTerminalImageReply(context.Background(), message, entry, terminalImageContent("图片", 1, 1)); !errors.Is(err, gateway.err) {
+		t.Fatalf("sendTerminalImageReply() error = %v", err)
+	}
+	if gateway.imageCalls != 0 {
+		t.Fatalf("image calls = %d", gateway.imageCalls)
+	}
+}
+
 func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
@@ -1149,7 +1220,7 @@ func terminalImageContent(content string, current, total int) hprp.Content {
 		Page: &hprp.TerminalPage{Current: current, Total: total},
 		Image: &hprp.TerminalImage{
 			MediaType: "image/png", Encoding: "base64", Data: base64.StdEncoding.EncodeToString(testPNG),
-			Width: 1, Height: 1, ColorMode: "png8",
+			Width: 1, Height: 1, ColorMode: "indexed-256",
 		},
 	}
 }
@@ -1177,6 +1248,72 @@ type routerGateway struct {
 
 type failingRouterGateway struct {
 	err error
+}
+
+type failingImageHeaderGateway struct {
+	err        error
+	imageCalls int
+}
+
+func (gateway *failingImageHeaderGateway) RespondMarkdown(context.Context, string, string) error {
+	return gateway.err
+}
+
+func (gateway *failingImageHeaderGateway) SendMarkdownTo(context.Context, string, string) error {
+	return nil
+}
+
+func (gateway *failingImageHeaderGateway) SendImageTo(context.Context, string, []byte) error {
+	gateway.imageCalls++
+	return nil
+}
+
+type blockingImageGateway struct {
+	mu           sync.Mutex
+	events       []string
+	imageStarted chan struct{}
+	releaseImage chan struct{}
+}
+
+func newBlockingImageGateway() *blockingImageGateway {
+	return &blockingImageGateway{imageStarted: make(chan struct{}), releaseImage: make(chan struct{})}
+}
+
+func (gateway *blockingImageGateway) RespondMarkdown(ctx context.Context, _ string, content string) error {
+	return gateway.SendMarkdownTo(ctx, "user-a", content)
+}
+
+func (gateway *blockingImageGateway) SendMarkdownTo(_ context.Context, _ string, content string) error {
+	event := "text"
+	if strings.HasPrefix(content, "[终端输出#") {
+		event = "header"
+	}
+	gateway.mu.Lock()
+	gateway.events = append(gateway.events, event)
+	gateway.mu.Unlock()
+	return nil
+}
+
+func (gateway *blockingImageGateway) SendImageTo(ctx context.Context, _ string, _ []byte) error {
+	gateway.mu.Lock()
+	gateway.events = append(gateway.events, "image-start")
+	gateway.mu.Unlock()
+	close(gateway.imageStarted)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gateway.releaseImage:
+	}
+	gateway.mu.Lock()
+	gateway.events = append(gateway.events, "image-end")
+	gateway.mu.Unlock()
+	return nil
+}
+
+func (gateway *blockingImageGateway) Events() []string {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	return append([]string(nil), gateway.events...)
 }
 
 func (gateway failingRouterGateway) RespondMarkdown(context.Context, string, string) error {

@@ -38,6 +38,8 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - 网络只允许 WSS。`skip_verify` 默认开启仅用于受信任内网的自签名证书部署。
 - Herdr 只接受精确 protocol 17，只使用公共 Local Socket API、CLI 和公开 Schema。
 - 不持久化选择、在线目录、分页、通知或在途命令，不提供离线任务和通知回放。
+- 终端显示模式按用户和完整稳定目标保存在 Server 内存中；OpenCode 默认图片，其他 Agent
+  默认文本，Server 重启后恢复默认。
 - 终端内容只描述为近期快照，不承诺完整对话或结构化 LLM transcript。
 - 不自动批准权限请求；按键必须由用户显式触发并通过本地策略。
 - HPAP 只支持 Unix Domain Socket；Windows 只构建 Pal，不构建 Server 或 `hp-cli`。
@@ -109,19 +111,29 @@ machine_id + slot_id + session_id
 - 其余内容要求已有稳定选择，Server 发送 `command.execute`。
 - Pal 再次校验 Key 绑定机器、pane 和 occupant，之后才进入本地 Bridge Service。
 - Pal 返回唯一 `command.result`；协商 `command.output.v1` 后再发送有序后续输出。
+- Server 为每次 `command.execute` 显式携带 `output_mode`；Pal 不保存模式。
 - 命令导致同一 pane 创建新 Agent 会话时，Pal 先上报并确认新快照，再在结果中返回
   `replacement_target`。
 - Server 超时不自动生成新命令重试；相同 IM `msgid` 作为 `idempotency_key`。
 
-Pal 在 10 分钟有界窗口内缓存已完成命令结果。相同 Key 与等价命令会重放结果而不重复
-产生本地副作用；同一 Key 对应不同目标或内容时返回 `command.idempotency_conflict`。
+Pal 在 10 分钟有界窗口内保存轻量幂等索引。相同 Key 与等价命令不会重复产生本地副作用；
+同一 Key 对应不同目标或内容时返回 `command.idempotency_conflict`。图片和大段输出使用
+独立 64 MiB 重放预算，预算不足时可省略可选正文但不能驱逐窗口内 Key；索引容量满时在
+执行前以 `server.busy` 拒绝新 Key。
 
 ### 4.3 输出和通知
 
 - `command.output` 必须引用原 `command.execute`，携带稳定目标和从 1 开始的连续序号。
 - `notification.event` 使用 `event_key + sequence + target` 去重和排序。
-- Server 只接受连接绑定机器且仍存在于最新快照的目标，跨机器上报会断开连接。
-- 本地 Notifier 对 `blocked`、`done` 和需要关注的 `idle` 只读取最近 100 行。
+- Server 只接受连接绑定机器的目标；状态事件目标必须仍存在于最新快照，
+  `target.invalidated` 允许引用刚从目录移除的旧目标，跨机器上报会断开连接。
+- 本地 Notifier 只上报状态元数据，不读取或附带终端正文。
+- `done`、`blocked` 和需要关注的 `idle` 由 Server 按通知策略发送
+  `terminal.snapshot.get`，Pal 无副作用读取最近 100 行；`working` 和 `unknown` 不读取正文。
+- 图片模式返回同次采集的规范化纯文本和 PNG8；渲染或企业微信上传失败时可以降级为该
+  纯文本，但不修改会话模式。
+- 命令和无副作用快照合并限制为一个本地在途请求；快照读取 15 秒超时，Server 对精确匹配
+  已超时请求的迟到结果只记录并忽略，不断开连接。
 - 同一用户最近 2 分钟有过任一方向交互时，其他会话通知降级为简短提醒。
 - 断线期间的输出和通知直接失败，不排队等待下次连接。
 
@@ -155,6 +167,7 @@ Pal 在 10 分钟有界窗口内缓存已完成命令结果。相同 Key 与等�
 - `internal/herdr`：公共 NDJSON 请求、订阅和平台传输。
 - `internal/session`：本机会话索引、选择和 occupant 身份。
 - `internal/bridge`：Service、Notifier 和 EventSupervisor。
+- `internal/terminalimage`：Pal 侧内嵌字体、ANSI 终端页和 PNG8 渲染限制。
 - `internal/command`、`internal/panel`、`internal/policy`：命令、终端和安全策略。
 - `internal/wecom`、`internal/im`：企业微信协议与平台无关消息模型。
 
@@ -178,8 +191,9 @@ go test -race ./internal/hprp ./internal/credential ./internal/server \
 ```
 
 覆盖重点包括严格 JSON、Bearer 认证、hello/首快照、稳定目标、快照乱序、命令关联和
-幂等、输出/通知去重、多用户多机器隔离、Herdr 重连恢复、本地输入策略，以及 HPAP Key
-CRUD、来源复核、连接/会话查询、动态 debug 和优雅停止。
+幂等、输出/通知去重、终端图片能力协商、同页文本、无副作用快照、分页、企业微信图片
+上传和文本降级、多用户多机器隔离、Herdr 重连恢复、本地输入策略，以及 HPAP Key CRUD、
+来源复核、连接/会话查询、动态 debug 和优雅停止。
 
 ## 8. 安全与后续工作
 

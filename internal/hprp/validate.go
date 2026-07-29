@@ -23,6 +23,7 @@ const (
 	MaxTerminalTextBytes     = 1 << 18
 	MaxTerminalImageBytes    = 1 << 19
 	MaxTerminalDimension     = 16384
+	MaxTerminalPixels        = 2400 * 1700
 	MaxTerminalSnapshotLines = 100
 )
 
@@ -47,6 +48,9 @@ func ValidateClientHello(hello ClientHello) error {
 	if err := validateVersionedList(hello.Capabilities); err != nil {
 		return err
 	}
+	if err := validateCapabilityDependencies(hello.Capabilities); err != nil {
+		return err
+	}
 	if err := validateFeatureOffers(hello.Features); err != nil {
 		return err
 	}
@@ -68,6 +72,9 @@ func ValidateServerHello(hello ServerHello) error {
 		return fmt.Errorf("%w: server identity 无效", ErrInvalidMessage)
 	}
 	if err := validateVersionedList(hello.Capabilities); err != nil {
+		return err
+	}
+	if err := validateCapabilityDependencies(hello.Capabilities); err != nil {
 		return err
 	}
 	if err := validateFeatureOffers(hello.Features); err != nil {
@@ -235,11 +242,11 @@ func ValidateTerminalSnapshotResult(result TerminalSnapshotResult) error {
 	if err := ValidateTarget(result.Target); err != nil {
 		return err
 	}
-	if !oneOfOutcome(result.Outcome, OutcomeOK, OutcomeRejected, OutcomeFailed, OutcomeIndeterminate) {
+	if !oneOfOutcome(result.Outcome, OutcomeOK, OutcomeRejected, OutcomeFailed) {
 		return ErrInvalidOutcome
 	}
 	if result.Outcome == OutcomeOK {
-		if result.Content == nil || result.FallbackContent != nil || result.Error != nil {
+		if result.Content == nil || result.Content.Type != ContentTypeTerminal || result.FallbackContent != nil || result.Error != nil {
 			return fmt.Errorf("%w: terminal snapshot 成功结果无效", ErrInvalidMessage)
 		}
 		return ValidateContent(*result.Content)
@@ -318,7 +325,8 @@ func validateTerminalImage(terminalImage *TerminalImage) error {
 		return fmt.Errorf("%w: terminal image Base64 无效", ErrInvalidMessage)
 	}
 	config, err := png.DecodeConfig(bytes.NewReader(decoded))
-	if err != nil || config.Width != terminalImage.Width || config.Height != terminalImage.Height {
+	if err != nil || config.Width <= 0 || config.Height <= 0 || config.Width > MaxTerminalPixels/config.Height ||
+		config.Width != terminalImage.Width || config.Height != terminalImage.Height {
 		return fmt.Errorf("%w: terminal image PNG 无效", ErrInvalidMessage)
 	}
 	decodedImage, err := png.Decode(bytes.NewReader(decoded))
@@ -358,6 +366,19 @@ func validateVersionedList(names []string) error {
 			return fmt.Errorf("%w: 扩展名称重复", ErrInvalidMessage)
 		}
 		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+func validateCapabilityDependencies(capabilities []string) error {
+	present := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		present[capability] = struct{}{}
+	}
+	if _, image := present[CapabilityTerminalImageV1]; image {
+		if _, snapshot := present[CapabilityTerminalSnapshotV1]; !snapshot {
+			return fmt.Errorf("%w: terminal.image.v1 依赖 terminal.snapshot.v1", ErrInvalidMessage)
+		}
 	}
 	return nil
 }
