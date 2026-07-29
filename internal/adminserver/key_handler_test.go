@@ -17,7 +17,7 @@ import (
 )
 
 func TestKeyHandlerIssueListShowAndPagination(t *testing.T) {
-	now := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second)
 	credentialsPath := filepath.Join(t.TempDir(), "credentials.json")
 	store, err := credential.LoadStore(credentialsPath)
 	if err != nil {
