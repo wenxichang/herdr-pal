@@ -9,6 +9,10 @@ Herdr Pal 客户端与多租户 Relay Server，使两端能够独立发布、升
 Relay Protocol 3 的运行时兼容分支。旧 Pal 必须与旧 Server 配套使用，不能把两套协议
 混在同一条连接中。
 
+截至 2026-07-29，HPRP/1 尚未发布。本次状态事件、无副作用终端快照和图片内容结构直接
+纳入 HPRP/1 基线，不为此前开发版本保留运行时兼容分支。HPRP/1 正式发布后再遵守第 3 节
+的主版本兼容规则。
+
 本文使用“必须”“禁止”“应该”“可以”表达规范性要求，其含义遵循
 [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174.html)。WebSocket 和 JSON 分别遵循
 [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html) 与
@@ -23,6 +27,7 @@ Relay Protocol 3 的运行时兼容分支。旧 Pal 必须与旧 Server 配套�
 - 在断线、重连、重复投递和执行结果不确定时保持保守、可诊断的行为。
 - 允许第三方实现 Pal 或 Server，并能通过公开测试验证互操作性。
 - 认证、路由、终端文本和状态通知具有清晰边界。
+- Server 可以根据用户策略按需获取文本或图片终端快照，Pal 不保存 IM 显示模式。
 - 允许以用户功能为单位增加扩展，由 Pal 吸收 Herdr API 和实现版本差异。
 
 ### 2.2 非目标
@@ -33,6 +38,7 @@ Relay Protocol 3 的运行时兼容分支。旧 Pal 必须与旧 Server 配套�
 - HPRP 不定义 IM 平台 webhook、用户领钥页面、计费或组织管理接口。
 - HPRP 不提供自动审批权限请求的能力。
 - HPRP/1 不提供离线通知存储和保证送达。
+- HPRP/1 不定义终端正文的审计存储、保留周期或脱敏策略。
 
 ## 3. 兼容性模型
 
@@ -62,6 +68,8 @@ Sec-WebSocket-Protocol: herdr-pal-relay.v2, herdr-pal-relay.v1
 session.delta.v1
 notification.ack.v1
 command.output.v1
+terminal.snapshot.v1
+terminal.image.v1
 feature.invoke.v1
 blob.reference.v1
 ```
@@ -142,6 +150,12 @@ HPRP/1 的普通 JSON 消息适合文本和小型结构化数据。需要传输�
 Feature 不得绕过帧大小限制，也不应把大对象直接内嵌为无界 base64。此类能力应协商
 独立的 `blob.reference.v1` 等技术 capability，由 HPRP 消息携带对象标识、大小、摘要和
 内容类型，具体数据通过该 capability 定义的有界分块或独立数据通道传输。
+
+`terminal.image.v1` 是上述规则的一个有界例外：它允许在终端内容对象中内嵌一张 PNG，
+但解码后的图片、配对纯文本和完整 JSON 帧必须分别满足 hello 协商的限制。参考实现把
+单张 PNG 限制为 512 KiB、配对纯文本限制为 256 KiB，完整帧仍不得超过 1 MiB。超过限制
+的图片不得拆成多条没有原子关系的终端结果；未来如需更大内容，应另行协商
+`blob.reference.v1`。
 
 连接应同时使用 WebSocket ping/pong 和应用侧 watchdog。任一方长时间收不到有效帧或
 pong 时都应主动断开，避免服务端保留已经失效的机器会话。
@@ -250,7 +264,12 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
       "os": "linux",
       "arch": "amd64"
     },
-    "capabilities": ["command.output.v1", "feature.invoke.v1"],
+    "capabilities": [
+      "command.output.v1",
+      "terminal.snapshot.v1",
+      "terminal.image.v1",
+      "feature.invoke.v1"
+    ],
     "features": {
       "terminal.inspect.v1": {
         "parameters": {
@@ -292,7 +311,12 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
   "payload": {
     "connection_id": "conn-01J...",
     "machine_id": "office-pc",
-    "capabilities": ["command.output.v1", "feature.invoke.v1"],
+    "capabilities": [
+      "command.output.v1",
+      "terminal.snapshot.v1",
+      "terminal.image.v1",
+      "feature.invoke.v1"
+    ],
     "features": {
       "terminal.inspect.v1": {
         "parameters": {
@@ -313,6 +337,8 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
       "max_inflight_commands": 8,
       "max_inflight_features": 4,
       "max_output_bytes": 262144,
+      "max_terminal_text_bytes": 262144,
+      "max_terminal_image_bytes": 524288,
       "idempotency_window_ms": 600000
     },
     "heartbeat": {
@@ -327,12 +353,19 @@ Pal 必须把 `hello.client` 作为首条 HPRP 消息：
 共同版本。Feature 参数是结合 Pal 实际能力、Server 实现和服务端策略计算出的有效值，
 只能描述用户层功能和限制，禁止列出 Herdr Socket 方法或内部调用步骤。
 
+`terminal.snapshot.v1` 表示 Server 可以向 Pal 请求指定稳定目标的无副作用终端快照。
+`terminal.image.v1` 表示该快照或命令终端输出可以包含有界 PNG；它必须与
+`terminal.snapshot.v1` 一起协商。没有协商图片能力时，显式图片请求必须返回错误，默认
+图片策略则由 Server 降级为文本请求。
+
 Feature Package 必须为每个可协商参数定义类型、默认值和合并规则。未知参数必须忽略，
 缺失参数使用 Package 默认值；`hello.server` 只返回本连接实际生效的参数。hello 完成后，
 本连接的 capability、Feature 版本和参数保持不变；运行时能力变化必须断线重连并重新
 协商，除非未来另行协商专用的动态更新 capability。
 
 `limits` 是连接级有效限制。客户端必须遵守服务端返回的值。
+`max_terminal_text_bytes` 和 `max_terminal_image_bytes` 分别限制终端内容对象中的 UTF-8
+纯文本字节数和 Base64 解码后的 PNG 字节数；它们不替代 `max_message_bytes`。
 `idempotency_window_ms` 表示 Pal 承诺识别重复 `idempotency_key` 的最短窗口，服务端
 不得假定更长的保护时间。
 
@@ -427,6 +460,7 @@ HPRP/1 的恢复机制。
       "slot_id": "w1:p1",
       "session_id": "session-opaque-id"
     },
+    "output_mode": "txt",
     "content": {
       "type": "text/plain",
       "text": "继续处理"
@@ -438,6 +472,10 @@ HPRP/1 的恢复机制。
 `content.text` 表示传给 Pal 命令处理层的原始文本。Server 可以先处理全局命令，Pal
 继续负责需要访问本地 Herdr 或终端状态的命令。终端按键仍必须经过 Pal 的策略检查，
 协议不会把普通 prompt 自动提升为审批或高风险操作。
+
+`output_mode` 是必填字段，只能为 `txt` 或 `img`，表示本次命令产生终端内容时使用的格式。它不在
+Pal 中保存模式，也不影响普通文本确认。`img` 必须已经协商 `terminal.image.v1`；没有
+协商时返回 `terminal.image_unsupported`。Server 必须为每次命令显式发送当前模式。
 
 `command.execute` 是 HPRP/1 基础 Agent 交互的专用消息，不是未来 Feature 的通用 RPC
 入口。新增用户功能不应继续向该消息加入与文本交互无关的参数，而应使用第 11 节的
@@ -497,7 +535,7 @@ Pal 只能通过 `command.result` 返回当前命令的同步结果。
 ```
 
 `reply_to` 必须引用原始 `command.execute` 的 `id`。`target` 必须与该命令当前有效目标一致；
-发生第 10.1 节的合法会话替换后，后续输出使用已经确认的替换目标。首段序号为 1，之后
+发生第 10.2 节的合法会话替换后，后续输出使用已经确认的替换目标。首段序号为 1，之后
 必须连续递增。重复分段可以忽略，跳号、未知命令、过期命令或目标不一致必须拒绝。
 
 服务端不得因超时或 `indeterminate` 自动创建新命令重试。需要安全重发时必须继续
@@ -505,7 +543,53 @@ Pal 只能通过 `command.result` 返回当前命令的同步结果。
 执行，而不是重复产生副作用。超过该窗口后，服务端必须把重发视为可能产生重复
 副作用的操作，并要求上层重新确认。
 
-### 10.1 会话替换
+### 10.1 终端内容
+
+普通提示、确认和错误继续使用 `text/plain`。`/con`、`/pageup`、`/pagedn`、按键后自动
+刷新等终端输出使用以下终端内容对象；该对象可以出现在 `command.result.content`、
+`command.output.content` 和第 12 节的 `terminal.snapshot.result.content` 中：
+
+```json
+{
+  "type": "terminal.snapshot",
+  "mode": "img",
+  "text": "同一页的规范化纯文本",
+  "image": {
+    "media_type": "image/png",
+    "encoding": "base64",
+    "data": "iVBORw0KGgo...",
+    "width": 1280,
+    "height": 720,
+    "color_mode": "indexed"
+  },
+  "page": {
+    "current": 1,
+    "total": 5
+  },
+  "captured_at": "2026-07-29T10:00:00Z"
+}
+```
+
+终端内容规则：
+
+- `text` 始终必填，必须是有效 UTF-8，并与可选图片来自同一目标、同一次采集和同一页；
+- `mode: txt` 时禁止携带 `image`；
+- `mode: img` 时必须携带 `image`，且连接必须已经协商 `terminal.image.v1`；
+- 图片固定使用 `media_type: image/png` 和 `encoding: base64`，解码结果必须具有合法 PNG
+  签名；
+- `width`、`height` 必须为正整数，`color_mode` 当前只能为 `indexed`；
+- `page` 只在内容属于交互分页缓存时出现，`current` 和 `total` 从 1 开始且
+  `current <= total`；
+- `captured_at` 使用 RFC 3339 UTC 时间；
+- 文本、图片和完整消息不得超过 hello 限制，接收方必须在分配大块内存前检查 Base64
+  编码长度；
+- Server 可以把 `text` 交给审计边界或用于图片失败降级，但 HPRP/1 不要求持久化终端
+  正文。
+
+终端标题、全局列表序号、机器标识和当前选择不匹配提示属于 IM 展示信息，由 Server
+根据会话目录生成，不绘制进 Pal 返回的终端图片。
+
+### 10.2 会话替换
 
 如果命令导致同一 slot 产生新逻辑会话，Pal 必须：
 
@@ -681,9 +765,11 @@ Feature Package 必须明确是否可取消、哪些阶段可以停止，以及�
 - Pal 重启或 Herdr 断线后，如果无法恢复或核实本地效果，必须返回 `indeterminate`；
 - Feature Package 可以定义可核实的恢复步骤，但不能承诺 Herdr 本身没有提供的事务性。
 
-## 12. 状态与终端通知
+## 12. 状态事件与终端快照
 
-Pal 使用 `notification.event` 上报 Agent 状态变化和需要用户关注的终端文本：
+### 12.1 状态事件
+
+Pal 使用 `notification.event` 上报 Agent 状态变化，但不主动附带终端正文：
 
 ```json
 {
@@ -697,25 +783,110 @@ Pal 使用 `notification.event` 上报 Agent 状态变化和需要用户关注�
       "slot_id": "w1:p1",
       "session_id": "session-opaque-id"
     },
-    "kind": "agent.status",
+    "kind": "agent.status.changed",
     "sequence": 89,
-    "content": {
-      "type": "text/plain",
-      "text": "终端最近输出"
+    "snapshot_sequence": 12,
+    "occurred_at": "2026-07-29T10:00:00Z",
+    "data": {
+      "previous_status": "working",
+      "status": "done"
     }
   }
 }
 ```
 
-通知规则：
+状态事件规则：
 
-- 服务端必须确认目标存在于该连接最近确认的快照中。
-- 新会话的通知只能在对应快照确认后发送。
-- `event_key` 在去重窗口内保持唯一；`sequence` 用于同一目标事件排序和去重。
-- 未知 `kind` 在 `must_understand` 为 `false` 时忽略。
-- 通知内容是终端快照或状态说明，不是结构化 LLM 对话记录。
-- HPRP/1 基础通知采用连接在线期间的尽力投递，不提供断线后的离线回放。
+- Server 必须确认目标存在于该连接最近确认的快照中；
+- `snapshot_sequence` 必须引用本连接已经确认、且包含该目标的会话快照；
+- 新会话的事件只能在对应快照确认后发送；
+- `event_key` 在去重窗口内保持唯一；`sequence` 在同一目标内严格递增，用于排序和去重；
+- `previous_status` 和 `status` 使用第 9 节定义的基础状态；重复状态不得产生新事件；
+- `notification.event` 不携带终端 `content`，Server 必须自行决定是否需要获取内容；
+- 未知 `kind` 在 `must_understand` 为 `false` 时忽略；
+- HPRP/1 基础事件采用连接在线期间的尽力投递，不提供断线后的离线回放；
 - 双方协商 `notification.ack.v1` 后，可以使用相同 `event_key` 确认和重试。
+
+Server 可以根据状态、当前选择、最近交互时间、用户策略和 IM 能力决定忽略事件、只发送
+状态说明，或者继续请求终端快照。Pal 不负责这些通知策略。
+
+### 12.2 无副作用终端快照
+
+协商 `terminal.snapshot.v1` 后，Server 可以发送 `terminal.snapshot.get`：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "terminal.snapshot.get",
+  "id": "terminal-get-01J...",
+  "must_understand": true,
+  "payload": {
+    "target": {
+      "machine_id": "office-pc",
+      "slot_id": "w1:p1",
+      "session_id": "session-opaque-id"
+    },
+    "mode": "img",
+    "purpose": "notification",
+    "max_lines": 100
+  }
+}
+```
+
+字段规则：
+
+- `target` 必须是当前连接最近确认快照中的完整稳定目标；
+- `mode` 只能为 `txt` 或 `img`，`img` 还要求已经协商 `terminal.image.v1`；
+- `purpose` 在 v1 中只能为 `notification`；
+- `max_lines` 必须为正整数，且不得超过 hello 中 `terminal.inspect.v1` 的有效限制；
+- 请求是只读操作，不使用命令幂等键，但必须受连接并发、超时和消息大小限制；
+- 请求不得重置或修改 `/con`、`/pageup`、`/pagedn` 使用的交互分页缓存。
+
+Pal 返回且只返回一个 `terminal.snapshot.result`：
+
+```json
+{
+  "protocol": "HPRP/1",
+  "type": "terminal.snapshot.result",
+  "id": "terminal-result-01J...",
+  "reply_to": "terminal-get-01J...",
+  "payload": {
+    "outcome": "ok",
+    "target": {
+      "machine_id": "office-pc",
+      "slot_id": "w1:p1",
+      "session_id": "session-opaque-id"
+    },
+    "content": {
+      "type": "terminal.snapshot",
+      "mode": "img",
+      "text": "终端最近输出",
+      "image": {
+        "media_type": "image/png",
+        "encoding": "base64",
+        "data": "iVBORw0KGgo...",
+        "width": 1280,
+        "height": 720,
+        "color_mode": "indexed"
+      },
+      "captured_at": "2026-07-29T10:00:01Z"
+    }
+  }
+}
+```
+
+`outcome` 允许 `ok`、`rejected` 和 `failed`。成功结果中的 `target` 必须与请求完全一致，
+`content` 遵循第 10.1 节。状态事件到读取之间目标已经变化、消失或尚未同步时，Pal 必须
+返回稳定目标错误，不能把新会话内容标记为旧 Target。
+
+图片请求已经成功读取纯文本但渲染失败时，结果使用 `outcome: failed` 和
+`terminal.image_failed`，并可以携带 `fallback_content`。`fallback_content` 必须是同一次
+读取产生的 `mode: txt` 终端内容，不得重新读取后拼接成不同快照。Server 可以只在通知
+场景使用该内容降级；用户主动执行图片终端命令时仍应展示明确错误。
+
+该快照表示 Pal 处理请求时能够读取到的最新终端视图，不承诺冻结状态事件发生瞬间的
+屏幕。Server 获取内容失败时仍应保留状态事件，并可以发送不含终端正文的通知。图片生成
+或 IM 上传失败时，Server 可以使用 `content.text` 降级，但不得修改用户保存的模式。
 
 ## 13. 统一结果与错误模型
 
@@ -764,6 +935,10 @@ command.denied
 command.idempotency_conflict
 command.timeout
 command.execution_failed
+terminal.snapshot_unsupported
+terminal.snapshot_failed
+terminal.image_unsupported
+terminal.image_failed
 feature.unsupported
 feature.invalid_input
 feature.idempotency_conflict
@@ -785,6 +960,8 @@ server.internal
   排队。
 - hello 协商得到 `max_inflight_features`，执行中的 Feature 在发送最终结果前持续占用一个
   名额；取消请求不得被该限制阻塞。
+- `terminal.snapshot.get` 计入 `max_inflight_commands`，其读取和渲染不得阻塞 heartbeat、
+  状态事件或其他请求的最终结果。
 - 输出、Feature 事件和通知队列必须有界；任何队列溢出都要产生可诊断错误或指标，
   禁止静默丢弃最终结果。
 - heartbeat、关闭帧、取消请求和最终结果优先于大块终端输出或进度事件。
@@ -802,6 +979,8 @@ server.internal
   证书链验证的兼容默认值，但必须支持开启严格验证，并在跳过验证时输出明确告警。
 - 服务端必须限制认证失败频率、消息大小、快照数量、并发命令和输出速率。
 - 日志不得包含完整凭据、Cookie 或未经处理的大段敏感终端内容。
+- 终端图片的 Base64、配对纯文本和企业微信临时媒体标识不得写入常规运行日志；日志只
+  记录目标、模式、尺寸、耗时、页码和错误类别。
 - 服务端只能向 Key 所属用户和机器的连接路由命令。
 - Pal 必须继续执行本地 PolicyGuard；服务器发来的内容不是自动授权。
 - 未绑定目标、已经变化的 `session_id`、未协商 Feature 和未知用户功能默认拒绝。
@@ -834,6 +1013,10 @@ HPRP/1 发布时应同时提供：
 - 重复消息、重复结果和重复通知能够去重；
 - 过期快照和基准不一致增量触发明确错误；
 - 目标会话替换后旧命令不会误发；
+- 状态事件不携带终端正文，由 Server 决定是否请求无副作用快照；
+- 无副作用快照不会改变 `/con`、`/pageup` 和 `/pagedn` 的交互分页状态；
+- 图片终端内容始终包含同目标、同次采集、同一页的纯文本；
+- 非法 Base64、PNG、尺寸、页码和超限图片被明确拒绝；
 - 超时和不确定结果不会被不安全地自动重试；
 - 新旧实现只共享 HPRP/1 基础能力时仍可互操作。
 
@@ -862,6 +1045,8 @@ HPRP/1 发布时应同时提供：
 - `command`：请求关联、幂等、结果和分段输出；
 - `feature`：Feature 协商、Schema 校验、调用编排、事件、取消和恢复；
 - `notification`：状态事件、去重和可选确认；
+- `terminal`：无副作用快照、配对文本与安全 ANSI、分页和图片渲染；
+- `im`：终端标题、文本降级、临时媒体上传和图片消息发送；
 - `conformance`：测试向量、fake client/server 和跨版本验证。
 
 Herdr Pal 参考实现中的 Server 与 Pal 已统一使用 HPRP/1，并删除旧 `relayproto` 运行时
