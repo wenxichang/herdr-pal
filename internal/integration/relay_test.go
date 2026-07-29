@@ -84,7 +84,9 @@ func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 
 	if err := homeA.Client.SendNotification(context.Background(), im.NotificationTarget{
 		PaneID: "pane-1", OccupantHash: "occ-home-mac", Agent: "codex", DisplayAgent: "Codex", Title: "A 的任务",
-	}, "Agent 已阻塞，需要你的处理。"); err != nil {
+	}, im.NotificationEvent{
+		Kind: im.NotificationKindAgentStatusChanged, PreviousStatus: "working", Status: "blocked", OccurredAt: time.Now().UTC(),
+	}); err != nil {
 		t.Fatalf("SendNotification() error = %v", err)
 	}
 	eventuallyRelay(t, func() bool {

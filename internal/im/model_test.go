@@ -32,6 +32,20 @@ func TestNotificationTargetPreservesStableIdentity(t *testing.T) {
 	}
 }
 
+func TestNotificationEventCarriesStatusWithoutTerminalContent(t *testing.T) {
+	occurredAt := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	event := NotificationEvent{
+		Kind:           NotificationKindAgentStatusChanged,
+		PreviousStatus: "working",
+		Status:         "done",
+		OccurredAt:     occurredAt,
+	}
+
+	if event.Kind != NotificationKindAgentStatusChanged || event.PreviousStatus != "working" || event.Status != "done" || !event.OccurredAt.Equal(occurredAt) {
+		t.Fatalf("NotificationEvent = %#v", event)
+	}
+}
+
 func TestTerminalContentKeepsAuditTextWithImage(t *testing.T) {
 	now := time.Now().UTC()
 	content := TerminalContent{

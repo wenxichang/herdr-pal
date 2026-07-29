@@ -154,7 +154,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 		assertCallParams(t, calls[2], map[string]any{"target": "pane-1", "lines": float64(200)})
 	})
 
-	t.Run("blocked 与 done 自动通知每次只读最近一百行", func(t *testing.T) {
+	t.Run("blocked 与 done 只发送状态通知且不读取终端", func(t *testing.T) {
 		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
 		defer harness.stop(t)
 		harness.herdr.SetOutput(numberedLines(180))
@@ -165,19 +165,21 @@ func TestBridgeEndToEnd(t *testing.T) {
 		}); delivered != 1 {
 			t.Fatalf("blocked 事件写入订阅数 = %d, want 1", delivered)
 		}
-		harness.herdr.WaitCallCount(t, "agent.read", 1)
-		blockedMessages := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
-		assertRecentNotification(t, blockedMessages[:2])
+		blockedMessages := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
+		if !strings.Contains(blockedMessages[0].Content, "已阻塞") {
+			t.Fatalf("blocked 通知 = %q", blockedMessages[0].Content)
+		}
 		if delivered := harness.herdr.EmitStatus(herdr.AgentStatusEvent{
 			PaneID: "pane-1", WorkspaceID: "workspace-1", AgentStatus: herdr.AgentStatusDone, Agent: &agent,
 		}); delivered != 1 {
 			t.Fatalf("done 事件写入订阅数 = %d, want 1", delivered)
 		}
-		calls := harness.herdr.WaitCallCount(t, "agent.read", 2)
-		doneMessages := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 4)
-		assertRecentNotification(t, doneMessages[2:4])
-		for _, call := range calls {
-			assertCallParams(t, call, map[string]any{"lines": float64(100)})
+		doneMessages := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+		if !strings.Contains(doneMessages[1].Content, "已完成") {
+			t.Fatalf("done 通知 = %q", doneMessages[1].Content)
+		}
+		if calls := harness.herdr.Calls("agent.read"); len(calls) != 0 {
+			t.Fatalf("状态通知读取了终端：%#v", calls)
 		}
 	})
 
@@ -288,8 +290,8 @@ func TestBridgeEndToEnd(t *testing.T) {
 		}); delivered != 1 {
 			t.Fatalf("blocked 事件写入订阅数 = %d, want 1", delivered)
 		}
-		harness.wecom.WaitRequestCount(t, "aibot_send_msg", 2)
-		harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+		harness.wecom.WaitRequestCount(t, "aibot_send_msg", 1)
+		harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
 		sentBeforeDisconnect := len(harness.wecom.Requests("aibot_send_msg"))
 
 		harness.wecom.SendDisconnectedEvent(t)

@@ -804,7 +804,7 @@ func assembleBridgeRuntime(im imRuntime, allowedUserID string, client bridge.Man
 	if err != nil {
 		return nil, fmt.Errorf("创建 BridgeService: %w", err)
 	}
-	notifier, err := bridge.NewNotifier(im, client.GetAgent, client.ReadRecent)
+	notifier, err := bridge.NewNotifier(im, client.GetAgent)
 	if err != nil {
 		return nil, fmt.Errorf("创建状态通知器: %w", err)
 	}

@@ -95,22 +95,19 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	}); delivered != 1 {
 		t.Fatalf("blocked 事件写入订阅数 = %d, want 1", delivered)
 	}
-	readCalls = herdrServer.WaitCallCount(t, "agent.read", 4)
-	assertCallParams(t, readCalls[3], map[string]any{"target": "pane-1", "lines": float64(100)})
 	notification := waitForConsoleOutput(t, application.stdout, notificationStart, "blocked 主动通知", func(output string) bool {
-		return strings.Count(output, "\n[通知]\n") == 2 &&
-			strings.Contains(output, "line-081") && strings.Contains(output, "line-180") &&
+		return strings.Count(output, "\n[通知]\n") == 1 && strings.Contains(output, "Agent 已阻塞") &&
 			strings.HasSuffix(output, "herdr-pal> ")
 	})
-	if strings.Contains(notification, "line-080") {
-		t.Fatalf("blocked 通知包含最近 100 行之前的内容：%q", notification)
+	if strings.Contains(notification, "line-180") {
+		t.Fatalf("blocked 状态通知包含终端内容：%q", notification)
 	}
-	assertCompleteConsoleBlocks(t, notification, "通知", 2)
+	assertCompleteConsoleBlocks(t, notification, "通知", 1)
 
 	assertStableCount(t, func() int { return len(herdrServer.Calls("agent.prompt")) }, 1)
 	assertStableCount(t, func() int { return len(herdrServer.Calls("agent.send_keys")) }, 1)
-	if calls := herdrServer.Calls("agent.read"); len(calls) != 4 {
-		t.Fatalf("agent.read 调用数 = %d, want 4", len(calls))
+	if calls := herdrServer.Calls("agent.read"); len(calls) != 3 {
+		t.Fatalf("agent.read 调用数 = %d, want 3", len(calls))
 	}
 
 	stdout := application.stdout.String()

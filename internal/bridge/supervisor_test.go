@@ -282,16 +282,16 @@ func TestSupervisorStatusEventAppliesThenNotifiesAndSuppressesReplay(t *testing.
 
 	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusBlocked))
 	status.Emit(supervisorStatusEvent("pane-1", "workspace-1", "codex", herdr.AgentStatusBlocked))
-	awaitSupervisorCondition(t, "状态通知", func() bool { return len(harness.im.Messages()) >= 2 })
+	awaitSupervisorCondition(t, "状态通知", func() bool { return len(harness.im.Messages()) == 1 })
 
 	targets := harness.registry.CreateListSnapshot()
 	if len(targets) != 1 || targets[0].Status != herdr.AgentStatusBlocked {
 		t.Fatalf("Registry 状态 = %#v", targets)
 	}
-	if calls := harness.reader.Calls(); len(calls) != 1 || calls[0].lines != 100 {
-		t.Fatalf("重复状态事件读取 = %#v", calls)
+	if calls := harness.reader.Calls(); len(calls) != 0 {
+		t.Fatalf("状态事件不应读取终端：%#v", calls)
 	}
-	if messages := harness.im.Messages(); len(messages) != 2 || !strings.Contains(messages[0], "已阻塞") {
+	if messages := harness.im.Messages(); len(messages) != 1 || !strings.Contains(messages[0], "已阻塞") {
 		t.Fatalf("重复状态事件通知 = %#v", messages)
 	}
 }
@@ -1357,9 +1357,17 @@ func newSupervisorHarnessWithLogger(t *testing.T, clients []*supervisorClient, l
 	return &supervisorHarness{supervisor: supervisor, registry: registry, service: service, im: im, reader: reader, factory: factory, waiter: waiter, backoff: backoff, log: log}
 }
 
-func matchingSupervisorAgent(context.Context, string) (herdr.AgentInfo, error) {
+func matchingSupervisorAgent(_ context.Context, target string) (herdr.AgentInfo, error) {
+	agent := "codex"
+	switch target {
+	case "pane-2":
+		agent = "claude"
+	case "pane-3":
+		agent = "gemini"
+	}
+	display := strings.ToUpper(agent[:1]) + agent[1:]
 	return herdr.AgentInfo{
-		PaneID: "pane-1", TerminalID: "terminal-1", Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"),
+		PaneID: target, TerminalID: strings.Replace(target, "pane-", "terminal-", 1), Agent: stringRef(agent), DisplayAgent: stringRef(display),
 	}, nil
 }
 

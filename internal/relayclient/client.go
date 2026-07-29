@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/session"
@@ -272,7 +273,7 @@ func (client *Client) SendMarkdown(_ context.Context, content string) error {
 }
 
 // SendNotification 发送携带稳定本机目标的主动通知；断线时直接失败且不缓存。
-func (client *Client) SendNotification(ctx context.Context, target im.NotificationTarget, content string) error {
+func (client *Client) SendNotification(ctx context.Context, target im.NotificationTarget, event im.NotificationEvent) error {
 	current := client.currentSession()
 	if current == nil {
 		return ErrUnavailable
@@ -285,9 +286,27 @@ func (client *Client) SendNotification(ctx context.Context, target im.Notificati
 		EventKey: randomClientID(),
 		Sequence: sequence, Kind: "agent.status",
 		Target:  hprp.Target{MachineID: current.machineID, SlotID: target.PaneID, SessionID: target.OccupantHash},
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
+		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: relayNotificationText(event)},
 	}
 	return current.write(ctx, hprp.TypeNotificationEvent, randomClientID(), "", false, notification)
+}
+
+func relayNotificationText(event im.NotificationEvent) string {
+	if event.Kind == im.NotificationKindTargetInvalidated {
+		return "Agent 目标已失效，请重新执行 /ls 和 /sel。"
+	}
+	switch herdr.AgentStatus(event.Status) {
+	case herdr.AgentStatusWorking:
+		return "Agent 开始工作。"
+	case herdr.AgentStatusBlocked:
+		return "Agent 已阻塞，需要你的处理。"
+	case herdr.AgentStatusDone:
+		return "Agent 已完成。"
+	case herdr.AgentStatusIdle:
+		return "Agent 已空闲。"
+	default:
+		return "Agent 状态无法可靠识别，请在 Herdr 中确认。"
+	}
 }
 
 func (client *Client) runSession(parent context.Context, onReady func()) error {

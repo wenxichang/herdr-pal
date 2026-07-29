@@ -10,7 +10,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/im"
@@ -52,74 +51,48 @@ func TestNotifierSendsStructuredStableTarget(t *testing.T) {
 	if target.PaneID != "pane-1" || target.OccupantHash == "" || target.Agent != "claude" || target.DisplayAgent != "Claude" || target.Title != "修复 <问题>" {
 		t.Fatalf("notification target = %#v", target)
 	}
-}
-
-func TestNotifierSnapshotPoliciesReadOnlyRecentHundredLines(t *testing.T) {
-	tests := []struct {
-		name     string
-		previous herdr.AgentStatus
-		current  herdr.AgentStatus
-		wantText string
-	}{
-		{name: "blocked", previous: herdr.AgentStatusWorking, current: herdr.AgentStatusBlocked, wantText: "已阻塞"},
-		{name: "done", previous: herdr.AgentStatusWorking, current: herdr.AgentStatusDone, wantText: "已完成"},
-		{name: "working to idle", previous: herdr.AgentStatusWorking, current: herdr.AgentStatusIdle, wantText: "已空闲"},
-		{name: "blocked to idle", previous: herdr.AgentStatusBlocked, current: herdr.AgentStatusIdle, wantText: "已空闲"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			reader := &notifierReader{result: herdr.ReadResult{PaneID: "pane-1", Text: numberedNotificationLines(130)}}
-			im := &notifierIM{}
-			notifier := mustNotifier(t, im, reader.ReadRecent)
-
-			if err := notifier.HandleTransition(context.Background(), notificationTransition(test.previous, test.current)); err != nil {
-				t.Fatalf("HandleTransition() 返回错误：%v", err)
-			}
-			calls := reader.Calls()
-			if len(calls) != 1 || calls[0] != (notifierReadCall{target: "pane-1", lines: 100}) {
-				t.Fatalf("ReadRecent 调用 = %#v", calls)
-			}
-			messages := im.Messages()
-			if len(messages) < 2 {
-				t.Fatalf("通知条数 = %d，内容：%#v", len(messages), messages)
-			}
-			if !strings.Contains(messages[0], test.wantText) {
-				t.Fatalf("状态标题 = %q，期望包含 %q", messages[0], test.wantText)
-			}
-			if !strings.HasPrefix(messages[1], "```\n") || !strings.Contains(messages[1], "[终端输出]") || !strings.Contains(messages[1], "页码:[1/1]") {
-				t.Fatalf("快照标题不符合约定：%q", messages[1])
-			}
-			snapshot := strings.Join(messages[1:], "\n")
-			if strings.Contains(snapshot, "line-029") || !strings.Contains(snapshot, "line-030") || !strings.Contains(snapshot, "line-129") {
-				t.Fatalf("快照未限制为规范化后的最后 100 行：%q", snapshot)
-			}
-		})
+	events := sink.Events()
+	if len(events) != 1 || events[0].Kind != im.NotificationKindAgentStatusChanged || events[0].PreviousStatus != "idle" || events[0].Status != "working" || events[0].OccurredAt.IsZero() {
+		t.Fatalf("notification events = %#v", events)
 	}
 }
 
-func TestNotifierSnapshotValidationUsesPaneIDInOrder(t *testing.T) {
-	for _, current := range []herdr.AgentStatus{herdr.AgentStatusBlocked, herdr.AgentStatusDone} {
-		t.Run(string(current), func(t *testing.T) {
-			trace := &notifierCallTrace{}
-			getter := &notifierAgentGetter{agent: notificationAgentInfo(""), trace: trace}
-			reader := &notifierReader{
-				result: herdr.ReadResult{PaneID: "pane-1", Text: "终端近期快照"},
-				trace:  trace,
-			}
-			notifier := mustNotifierWithGetter(t, &notifierIM{}, getter.GetAgent, reader.ReadRecent)
+func TestNotifierAllStatusEventsDoNotReadTerminal(t *testing.T) {
+	reader := &notifierReader{result: herdr.ReadResult{PaneID: "pane-1", Text: "不应读取"}}
+	sink := &notifierIM{}
+	notifier := mustNotifier(t, sink, reader.ReadRecent)
 
-			if err := notifier.HandleTransition(context.Background(), notificationTransition(herdr.AgentStatusWorking, current)); err != nil {
-				t.Fatalf("HandleTransition() 返回错误：%v", err)
-			}
-			if got, want := trace.Calls(), []notifierTargetCall{
-				{method: "get", target: "pane-1"},
-				{method: "read", target: "pane-1", lines: 100},
-				{method: "get", target: "pane-1"},
-			}; !reflect.DeepEqual(got, want) {
-				t.Fatalf("occupant/read 调用顺序 = %#v, want %#v", got, want)
-			}
-		})
+	for _, transition := range []session.Transition{
+		notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked),
+		notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone),
+		notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusIdle),
+		notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusUnknown),
+	} {
+		if err := notifier.HandleTransition(context.Background(), transition); err != nil {
+			t.Fatalf("HandleTransition(%s) error = %v", transition.Current, err)
+		}
+	}
+	if calls := reader.Calls(); len(calls) != 0 {
+		t.Fatalf("状态通知读取了终端：%#v", calls)
+	}
+	if events := sink.Events(); len(events) != 4 {
+		t.Fatalf("notification events = %#v", events)
+	}
+}
+
+func TestNotifierRejectsStaleOccupantWithoutSending(t *testing.T) {
+	getter := &notifierAgentGetter{agent: notificationAgentInfo("session-new")}
+	sink := &notifierIM{}
+	notifier := mustNotifierWithGetter(t, sink, getter.GetAgent, nil)
+	transition := session.Transition{
+		Target: notificationTargetWithSession("session-old"), Previous: herdr.AgentStatusWorking, Current: herdr.AgentStatusDone,
+	}
+
+	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
+		t.Fatalf("HandleTransition() error = %v", err)
+	}
+	if events := sink.Events(); len(events) != 0 {
+		t.Fatalf("旧 occupant 发送了事件：%#v", events)
 	}
 }
 
@@ -152,151 +125,6 @@ func TestNotifierUnknownWarnsWithoutReadingOrClaimingCompletion(t *testing.T) {
 	}
 }
 
-func TestNotifierSuppressesSameNormalizedSnapshotAndAllowsDistinctKey(t *testing.T) {
-	reader := &notifierReader{results: []herdr.ReadResult{
-		{PaneID: "pane-1", Text: "\x1b[31m相同内容\x1b[0m\n"},
-		{PaneID: "pane-1", Text: "相同内容\n"},
-		{PaneID: "pane-1", Text: "相同内容\n"},
-	}}
-	im := &notifierIM{}
-	getter := &notifierAgentGetter{agent: notificationAgentInfo("")}
-	notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
-	transition := notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked)
-
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("首次 HandleTransition() 返回错误：%v", err)
-	}
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("重复 HandleTransition() 返回错误：%v", err)
-	}
-	transition.Target = notificationTargetWithSession("session-2")
-	getter.SetAgent(notificationAgentInfo("session-2"))
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("新 occupant HandleTransition() 返回错误：%v", err)
-	}
-	if got := len(im.Messages()); got != 4 {
-		t.Fatalf("通知条数 = %d，期望首次两条、重复零条、新 occupant 两条", got)
-	}
-	if got := len(reader.Calls()); got != 3 {
-		t.Fatalf("读取次数 = %d，期望为生成快照 hash 读取三次", got)
-	}
-}
-
-func TestNotifierReadFailureStillSendsStatusTitleAndCanRetryWithSnapshot(t *testing.T) {
-	reader := &notifierReader{
-		results: []herdr.ReadResult{{}, {PaneID: "pane-1", Text: "恢复后的内容"}},
-		errors:  []error{errors.New("read failed"), nil},
-	}
-	im := &notifierIM{}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
-	transition := notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked)
-
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("读取失败时 HandleTransition() 返回错误：%v", err)
-	}
-	if messages := im.Messages(); len(messages) != 1 || !strings.Contains(messages[0], "已阻塞") || strings.Contains(messages[0], "read failed") {
-		t.Fatalf("读取失败通知 = %#v", messages)
-	}
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("恢复后 HandleTransition() 返回错误：%v", err)
-	}
-	if messages := im.Messages(); len(messages) != 3 || !strings.Contains(messages[2], "恢复后的内容") {
-		t.Fatalf("恢复后未补发快照：%#v", messages)
-	}
-}
-
-func TestNotifierPreReadOccupantValidationFailureSkipsTerminalRead(t *testing.T) {
-	tests := []struct {
-		name   string
-		agent  herdr.AgentInfo
-		getErr error
-	}{
-		{name: "occupant replaced", agent: notificationAgentInfo("session-new")},
-		{name: "get failed", getErr: errors.New("get failed")},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			target := notificationTargetWithSession("session-old")
-			getter := &notifierAgentGetter{agent: test.agent, err: test.getErr}
-			reader := &notifierReader{result: herdr.ReadResult{PaneID: target.PaneID, Text: "不应读取"}}
-			im := &notifierIM{}
-			notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
-
-			transition := session.Transition{Target: target, Previous: herdr.AgentStatusWorking, Current: herdr.AgentStatusBlocked}
-			if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-				t.Fatalf("HandleTransition() 返回错误：%v", err)
-			}
-			if calls := reader.Calls(); len(calls) != 0 {
-				t.Fatalf("occupant 前置校验失败后仍读取终端：%#v", calls)
-			}
-			messages := im.Messages()
-			if len(messages) != 1 || !strings.Contains(messages[0], "已阻塞") || strings.Contains(messages[0], "不应读取") {
-				t.Fatalf("前置校验失败通知 = %#v", messages)
-			}
-		})
-	}
-}
-
-func TestNotifierPostReadOccupantReplacementDoesNotLeakSnapshot(t *testing.T) {
-	target := notificationTargetWithSession("session-old")
-	trace := &notifierCallTrace{}
-	getter := &notifierAgentGetter{agent: notificationAgentInfo("session-old"), trace: trace}
-	reader := &blockingNotifierReader{
-		result:  herdr.ReadResult{PaneID: target.PaneID, Text: "SENSITIVE-MARKER"},
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-		trace:   trace,
-	}
-	im := &notifierIM{}
-	notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
-	transition := session.Transition{Target: target, Previous: herdr.AgentStatusWorking, Current: herdr.AgentStatusDone}
-	result := make(chan error, 1)
-	go func() { result <- notifier.HandleTransition(context.Background(), transition) }()
-	<-reader.started
-
-	getter.SetAgent(notificationAgentInfo("session-new"))
-	close(reader.release)
-	if err := <-result; err != nil {
-		t.Fatalf("HandleTransition() 返回错误：%v", err)
-	}
-	messages := im.Messages()
-	if len(messages) != 1 || !strings.Contains(messages[0], "已完成") || strings.Contains(strings.Join(messages, "\n"), "SENSITIVE-MARKER") {
-		t.Fatalf("post-read occupant 替换后泄露终端快照：%#v", messages)
-	}
-	if got := getter.CallCount(); got != 2 {
-		t.Fatalf("GetAgent 调用次数 = %d，期望读取前后各一次", got)
-	}
-	if got, want := trace.Calls(), []notifierTargetCall{
-		{method: "get", target: "pane-1"},
-		{method: "read", target: "pane-1", lines: 100},
-		{method: "get", target: "pane-1"},
-	}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("occupant/read 调用顺序 = %#v, want %#v", got, want)
-	}
-}
-
-func TestNotifierPartialSnapshotRetryRevalidatesOccupant(t *testing.T) {
-	target := notificationTargetWithSession("session-old")
-	getter := &notifierAgentGetter{agent: notificationAgentInfo("session-old")}
-	reader := &notifierReader{result: herdr.ReadResult{PaneID: target.PaneID, Text: "SENSITIVE-PARTIAL-MARKER"}}
-	im := &failOnceNotifierIM{failAt: 2}
-	notifier := mustNotifierWithGetter(t, im, getter.GetAgent, reader.ReadRecent)
-	transition := session.Transition{Target: target, Previous: herdr.AgentStatusWorking, Current: herdr.AgentStatusDone}
-
-	if err := notifier.HandleTransition(context.Background(), transition); err == nil {
-		t.Fatal("首轮快照分段失败时 HandleTransition() 未返回错误")
-	}
-	getter.SetAgent(notificationAgentInfo("session-new"))
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("occupant 替换后重试返回错误：%v", err)
-	}
-	messages := im.Messages()
-	joined := strings.Join(messages, "\n")
-	if strings.Contains(joined, "SENSITIVE-PARTIAL-MARKER") || strings.Count(joined, "已完成") != 1 || len(messages) != 1 {
-		t.Fatalf("分段重试泄露旧 occupant 快照或重复标题：%#v", messages)
-	}
-}
-
 func TestNotifierDoesNotModifyManualPanelBuffer(t *testing.T) {
 	buffer := &panel.Buffer{}
 	buffer.Refresh("occupant-1", []string{"manual-1", "manual-2"})
@@ -312,77 +140,19 @@ func TestNotifierDoesNotModifyManualPanelBuffer(t *testing.T) {
 	}
 }
 
-func TestNotifierRejectsMismatchedReadResultWithoutForwardingTerminalContent(t *testing.T) {
-	reader := &notifierReader{result: herdr.ReadResult{PaneID: "other-pane", Text: "不应发送的内容"}}
-	im := &notifierIM{}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
-
-	if err := notifier.HandleTransition(context.Background(), notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
-		t.Fatalf("HandleTransition() 返回错误：%v", err)
-	}
-	messages := im.Messages()
-	if len(messages) != 1 || strings.Contains(messages[0], "不应发送的内容") {
-		t.Fatalf("pane 不匹配时泄露终端内容：%#v", messages)
-	}
-}
-
 func TestNotifierDeliveryFailureDoesNotCommitDedupeState(t *testing.T) {
-	reader := &notifierReader{result: herdr.ReadResult{PaneID: "pane-1", Text: "内容"}}
-	im := &failOnceNotifierIM{failAt: 2}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
+	sink := &notifierIM{failAt: 1}
+	notifier := mustNotifier(t, sink, nil)
 	transition := notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)
 
 	if err := notifier.HandleTransition(context.Background(), transition); err == nil {
-		t.Fatal("首轮分段发送失败时 HandleTransition() 未返回错误")
+		t.Fatal("首轮发送失败时 HandleTransition() 未返回错误")
 	}
 	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
 		t.Fatalf("重试 HandleTransition() 返回错误：%v", err)
 	}
-	messages := im.Messages()
-	if len(messages) != 2 || im.CallCount() != 3 || strings.Count(strings.Join(messages, "\n"), "已完成") != 1 {
-		t.Fatalf("失败后未从失败分段继续：calls=%d messages=%#v", im.CallCount(), messages)
-	}
-}
-
-func TestNotifierSnapshotSplittingIsUTF8AndCodeFenceSafe(t *testing.T) {
-	reader := &notifierReader{result: herdr.ReadResult{PaneID: "pane-1", Text: strings.Repeat("中", panel.WeComContentLimit)}}
-	im := &notifierIM{}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
-
-	if err := notifier.HandleTransition(context.Background(), notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusBlocked)); err != nil {
-		t.Fatalf("HandleTransition() 返回错误：%v", err)
-	}
-	messages := im.Messages()
-	if len(messages) < 3 {
-		t.Fatalf("长快照未分段：共 %d 条", len(messages))
-	}
-	for index, message := range messages[1:] {
-		if len(message) > panel.WeComContentLimit || !strings.Contains(message, "\n```\n") || !strings.Contains(message, "[终端输出]") || strings.Count(message, "```") != 2 {
-			t.Fatalf("快照分段 %d 不安全：bytes=%d content=%q", index, len(message), message)
-		}
-	}
-}
-
-func TestNotifierStatusTitleIsSplitWithinMarkdownLimit(t *testing.T) {
-	im := &notifierIM{}
-	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
-	transition := notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)
-	transition.Target.Title = strings.Repeat("中", panel.WeComContentLimit)
-
-	if err := notifier.HandleTransition(context.Background(), transition); err != nil {
-		t.Fatalf("HandleTransition() 返回错误：%v", err)
-	}
-	messages := im.Messages()
-	if len(messages) < 2 {
-		t.Fatalf("超长状态标题未分段：%#v", messages)
-	}
-	for index, message := range messages {
-		if len(message) > panel.WeComContentLimit || !utf8.ValidString(message) {
-			t.Fatalf("状态标题分段 %d 不安全：bytes=%d", index, len(message))
-		}
-	}
-	if !strings.Contains(strings.Join(messages, ""), "中") {
-		t.Fatal("状态标题分段丢失 UTF-8 内容")
+	if events := sink.Events(); len(events) != 2 || sink.CallCount() != 2 {
+		t.Fatalf("失败后未重发事件：calls=%d events=%#v", sink.CallCount(), events)
 	}
 }
 
@@ -722,76 +492,6 @@ func TestNotificationDispatcherInvalidationCancelsSamePaneStatusRetry(t *testing
 	}
 }
 
-func TestNotificationDispatcherRetriesOnlyFailedNotificationParts(t *testing.T) {
-	im := &failOnceNotifierIM{failAt: 2}
-	reader := &notifierReader{result: herdr.ReadResult{PaneID: "pane-1", Text: "快照内容"}}
-	notifier := mustNotifier(t, im, reader.ReadRecent)
-	waiter := newNotificationRetryWaiter()
-	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
-		Capacity: 1,
-		Backoff:  &notificationRetry{delay: time.Second},
-		Wait:     waiter.Wait,
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- dispatcher.Run(ctx) }()
-	epoch := dispatcher.BeginEpoch()
-
-	if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
-		t.Fatalf("EnqueueStatus() 返回错误：%v", err)
-	}
-	wait := <-waiter.started
-	close(wait.release)
-	awaitNotifierCondition(t, "剩余通知分段重试", func() bool { return len(im.Messages()) == 2 })
-	messages := im.Messages()
-	if im.CallCount() != 3 || strings.Count(strings.Join(messages, "\n"), "已完成") != 1 || !strings.Contains(messages[1], "快照内容") {
-		t.Fatalf("分段重试重复已成功内容：calls=%d messages=%#v", im.CallCount(), messages)
-	}
-
-	dispatcher.EndEpoch(epoch)
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
-	}
-}
-
-func TestNotificationDispatcherKeepsInvalidationProgressAcrossReset(t *testing.T) {
-	target := notificationTarget()
-	target.Title = strings.Repeat("中", panel.WeComContentLimit)
-	expected := renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target)
-	if len(expected) < 2 {
-		t.Fatalf("测试目标未生成多段 invalidation：%d", len(expected))
-	}
-	im := &failOnceNotifierIM{failAt: 2}
-	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
-	waiter := newNotificationRetryWaiter()
-	retry := &notificationRetry{delay: time.Second}
-	dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
-		Capacity: 1,
-		Backoff:  retry,
-		Wait:     waiter.Wait,
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- dispatcher.Run(ctx) }()
-
-	if err := dispatcher.EnqueueInvalidated(target); err != nil {
-		t.Fatalf("EnqueueInvalidated() 返回错误：%v", err)
-	}
-	wait := <-waiter.started
-	notifier.Reset()
-	close(wait.release)
-	awaitNotifierCondition(t, "跨 Reset invalidation 重试完成", func() bool { return retry.ResetCount() == 1 })
-	if messages := im.Messages(); !reflect.DeepEqual(messages, expected) || im.CallCount() != len(expected)+1 {
-		t.Fatalf("跨 Reset 重复已成功 invalidation 分段：calls=%d messages=%#v want=%#v", im.CallCount(), messages, expected)
-	}
-
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v，期望 context.Canceled", err)
-	}
-}
-
 func TestNotificationDispatcherReturnsInjectedWaitError(t *testing.T) {
 	waitErr := errors.New("notification wait failed")
 	im := &failOnceNotifierIM{failAt: 1}
@@ -1057,114 +757,14 @@ func TestNotificationDispatcherLatestTransitionCancelsActiveStatus(t *testing.T)
 	}
 }
 
-func TestNotificationDispatcherSupersedeDiscardsStatusProgress(t *testing.T) {
-	tests := []struct {
-		name         string
-		secondResult herdr.ReadResult
-		secondError  error
-		wantMessages int
-		wantSnapshot string
-	}{
-		{
-			name:         "new done sends title and snapshot",
-			secondResult: herdr.ReadResult{PaneID: "pane-1", Text: "新快照"},
-			wantMessages: 3,
-			wantSnapshot: "新快照",
-		},
-		{
-			name:         "new done without snapshot still sends title",
-			secondError:  errors.New("read failed"),
-			wantMessages: 2,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			reader := &notifierReader{
-				results: []herdr.ReadResult{
-					{PaneID: "pane-1", Text: "旧快照"},
-					test.secondResult,
-				},
-				errors: []error{nil, test.secondError},
-			}
-			im := &failOnceNotifierIM{failAt: 2}
-			notifier := mustNotifier(t, im, reader.ReadRecent)
-			waiter := newCancellationGateWaiter()
-			dispatcher := newNotificationDispatcher(notifier, notificationDispatcherOptions{
-				Capacity: 1,
-				Backoff:  &notificationRetry{delay: time.Minute},
-				Wait:     waiter.Wait,
-			})
-			ctx, cancel := context.WithCancel(context.Background())
-			result := make(chan error, 1)
-			go func() { result <- dispatcher.Run(ctx) }()
-			epoch := dispatcher.BeginEpoch()
-
-			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
-				t.Fatalf("首次 done EnqueueStatus() 返回错误：%v", err)
-			}
-			wait := <-waiter.started
-			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusDone, herdr.AgentStatusIdle)); err != nil {
-				t.Fatalf("idle EnqueueStatus() 返回错误：%v", err)
-			}
-			<-wait.canceled
-			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusIdle, herdr.AgentStatusWorking)); err != nil {
-				t.Fatalf("working EnqueueStatus() 返回错误：%v", err)
-			}
-			if err := dispatcher.EnqueueStatus(epoch, notificationTransition(herdr.AgentStatusWorking, herdr.AgentStatusDone)); err != nil {
-				t.Fatalf("再次 done EnqueueStatus() 返回错误：%v", err)
-			}
-			close(wait.release)
-			if err := <-wait.done; !errors.Is(err, context.Canceled) {
-				t.Fatalf("旧 done 重试等待 = %v，期望 context.Canceled", err)
-			}
-			awaitNotifierCondition(t, "再次 done 完整发送", func() bool { return len(im.Messages()) == test.wantMessages })
-			messages := strings.Join(im.Messages(), "\n")
-			if strings.Count(messages, "已完成") != 2 || strings.Contains(messages, "开始工作") {
-				t.Fatalf("再次 done 复用了旧分段进度：%#v", im.Messages())
-			}
-			if test.wantSnapshot != "" && !strings.Contains(messages, test.wantSnapshot) {
-				t.Fatalf("再次 done 缺少新快照：%#v", im.Messages())
-			}
-
-			dispatcher.EndEpoch(epoch)
-			cancel()
-			if err := <-result; !errors.Is(err, context.Canceled) {
-				t.Fatalf("Run() error = %v，期望 context.Canceled", err)
-			}
-		})
-	}
-}
-
-func TestNotifierDiscardStatusPreservesInvalidationProgress(t *testing.T) {
-	target := notificationTarget()
-	target.Title = strings.Repeat("中", panel.WeComContentLimit)
-	expected := renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target)
-	if len(expected) < 2 {
-		t.Fatalf("测试目标未生成多段 invalidation：%d", len(expected))
-	}
-	im := &failOnceNotifierIM{failAt: 2}
-	notifier := mustNotifier(t, im, (&notifierReader{}).ReadRecent)
-	if err := notifier.TargetInvalidated(context.Background(), target); err == nil {
-		t.Fatal("首轮 invalidation 分段发送未失败")
-	}
-
-	notifier.discardStatus(target.PaneID)
-	if err := notifier.TargetInvalidated(context.Background(), target); err != nil {
-		t.Fatalf("invalidation 重试返回错误：%v", err)
-	}
-	if messages := im.Messages(); !reflect.DeepEqual(messages, expected) {
-		t.Fatalf("discardStatus 错误清除 invalidation 进度：%#v", messages)
-	}
-}
-
-func mustNotifier(t *testing.T, im IMAdapter, read ReadRecentFunc) *Notifier {
+func mustNotifier(t *testing.T, im IMAdapter, read func(context.Context, string, int) (herdr.ReadResult, error)) *Notifier {
 	t.Helper()
 	return mustNotifierWithGetter(t, im, matchingNotificationAgent, read)
 }
 
-func mustNotifierWithGetter(t *testing.T, im IMAdapter, get GetAgentFunc, read ReadRecentFunc) *Notifier {
+func mustNotifierWithGetter(t *testing.T, im IMAdapter, get GetAgentFunc, _ func(context.Context, string, int) (herdr.ReadResult, error)) *Notifier {
 	t.Helper()
-	notifier, err := NewNotifier(im, get, read)
+	notifier, err := NewNotifier(im, get)
 	if err != nil {
 		t.Fatalf("NewNotifier() 返回错误：%v", err)
 	}
@@ -1333,6 +933,7 @@ type notifierIM struct {
 	mu       sync.Mutex
 	messages []string
 	targets  []im.NotificationTarget
+	events   []im.NotificationEvent
 	failAt   int
 	calls    int
 }
@@ -1618,8 +1219,11 @@ func (i *notifierIM) SendMarkdown(_ context.Context, content string) error {
 	return i.record(im.NotificationTarget{}, content)
 }
 
-func (i *notifierIM) SendNotification(_ context.Context, target im.NotificationTarget, content string) error {
-	return i.record(target, content)
+func (i *notifierIM) SendNotification(_ context.Context, target im.NotificationTarget, event im.NotificationEvent) error {
+	i.mu.Lock()
+	i.events = append(i.events, event)
+	i.mu.Unlock()
+	return i.record(target, renderNotificationEvent(event, target))
 }
 
 func (i *notifierIM) record(target im.NotificationTarget, content string) error {
@@ -1644,6 +1248,18 @@ func (i *notifierIM) Messages() []string {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return append([]string(nil), i.messages...)
+}
+
+func (i *notifierIM) Events() []im.NotificationEvent {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]im.NotificationEvent(nil), i.events...)
+}
+
+func (i *notifierIM) CallCount() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.calls
 }
 
 func (i *notifierIM) SetFailAt(call int) {

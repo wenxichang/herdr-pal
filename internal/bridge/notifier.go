@@ -2,7 +2,6 @@ package bridge
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,26 +24,15 @@ var (
 
 const defaultNotificationQueueCapacity = 64
 
-// ReadRecentFunc 读取目标的 recent_unwrapped 终端快照。
-type ReadRecentFunc func(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
-
-// GetAgentFunc 查询目标当前的 Agent occupant，供自动快照读取前后校验。
+// GetAgentFunc 查询目标当前的 Agent occupant，供通知发送前校验。
 type GetAgentFunc func(ctx context.Context, target string) (herdr.AgentInfo, error)
 
 type notificationKey struct {
-	paneID            string
-	occupantKey       string
-	kind              string
-	status            herdr.AgentStatus
-	snapshotHash      string
-	snapshotAvailable bool
-}
-
-type notificationProgress struct {
-	key   notificationKey
-	parts []string
-	next  int
-	epoch uint64
+	paneID         string
+	occupantKey    string
+	kind           string
+	previousStatus herdr.AgentStatus
+	status         herdr.AgentStatus
 }
 
 type notificationTaskKind uint8
@@ -146,7 +134,7 @@ func (d *notificationDispatcher) EnqueueStatus(epoch uint64, transition session.
 	}
 	paneID := transition.Target.PaneID
 	dropped := d.dropPaneStatusLocked(paneID)
-	if _, _, notify := notificationPolicy(transition); !notify {
+	if !notificationPolicy(transition) {
 		d.mu.Unlock()
 		d.logStatusReplacement(dropped, transition.Current)
 		d.logger.Info("Agent 状态无需通知", statusTransitionLogArgs(transition)...)
@@ -455,25 +443,23 @@ func (d *notificationDispatcher) signal() {
 	}
 }
 
-// Notifier 根据 Agent 状态迁移向企业微信发送主动通知。
+// Notifier 根据 Agent 状态迁移发送轻量主动事件。
 //
-// 自动快照只保留独立的通知去重状态，不读取或修改手工 PanelBuffer。内部锁只保护去重
-// 元数据，不跨越 Herdr 读取或企业微信发送调用。
+// Notifier 不读取终端快照；上游服务端可根据事件、用户活跃度和输出模式决定是否另行
+// 请求内容。内部锁只保护事件去重元数据，不跨越 Herdr 查询或消息发送调用。
 type Notifier struct {
 	notification im.NotificationSink
 	get          GetAgentFunc
-	read         ReadRecentFunc
 
 	mu       sync.Mutex
 	recent   map[string]notificationKey
 	inflight map[string]chan struct{}
-	pending  map[string]*notificationProgress
 	epoch    uint64
 }
 
-// NewNotifier 创建状态通知器，并要求自动读取前后可实时校验 Agent occupant。
-func NewNotifier(adapter IMAdapter, get GetAgentFunc, read ReadRecentFunc) (*Notifier, error) {
-	if adapter == nil || get == nil || read == nil {
+// NewNotifier 创建状态通知器，并要求发送前可实时校验 Agent occupant。
+func NewNotifier(adapter IMAdapter, get GetAgentFunc) (*Notifier, error) {
+	if adapter == nil || get == nil {
 		return nil, ErrInvalidNotifierDependency
 	}
 	notification, ok := adapter.(im.NotificationSink)
@@ -483,10 +469,8 @@ func NewNotifier(adapter IMAdapter, get GetAgentFunc, read ReadRecentFunc) (*Not
 	return &Notifier{
 		notification: notification,
 		get:          get,
-		read:         read,
 		recent:       make(map[string]notificationKey),
 		inflight:     make(map[string]chan struct{}),
-		pending:      make(map[string]*notificationProgress),
 	}, nil
 }
 
@@ -494,8 +478,14 @@ type replyNotificationSink struct {
 	reply im.ReplySink
 }
 
-func (s replyNotificationSink) SendNotification(ctx context.Context, _ im.NotificationTarget, content string) error {
-	return s.reply.SendMarkdown(ctx, content)
+func (s replyNotificationSink) SendNotification(ctx context.Context, target im.NotificationTarget, event im.NotificationEvent) error {
+	content := renderNotificationEvent(event, target)
+	for _, part := range panel.SplitMarkdown(content, panel.WeComContentLimit) {
+		if err := s.reply.SendMarkdown(ctx, part); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Reset 清空当前进程内的通知去重基线，供 Herdr 重连后的新健康周期使用。
@@ -506,28 +496,15 @@ func (n *Notifier) Reset() {
 	n.mu.Lock()
 	n.epoch++
 	n.recent = make(map[string]notificationKey)
-	pending := make(map[string]*notificationProgress)
-	for paneID, progress := range n.pending {
-		if progress.key.kind == "invalidated" {
-			pending[paneID] = progress
-		}
-	}
-	n.pending = pending
 	n.mu.Unlock()
 }
 
-// discardStatus 废弃指定 pane 的状态通知进度和去重结果。
-//
-// inflight 任务由 Dispatcher 的 context 取消；其后续更新会因 pending 指针变化失效。
-// invalidation 进度和去重结果不属于状态迁移，必须跨抢占与重连保留。
+// discardStatus 废弃指定 pane 的状态通知去重结果。
 func (n *Notifier) discardStatus(paneID string) {
 	if n == nil {
 		return
 	}
 	n.mu.Lock()
-	if progress := n.pending[paneID]; progress != nil && progress.key.kind == "status" {
-		delete(n.pending, paneID)
-	}
 	if recent, exists := n.recent[paneID]; exists && recent.kind == "status" {
 		delete(n.recent, paneID)
 	}
@@ -539,32 +516,28 @@ func (n *Notifier) HandleTransition(ctx context.Context, transition session.Tran
 	if n == nil {
 		return ErrInvalidNotifierDependency
 	}
-	title, includeSnapshot, notify := notificationPolicy(transition)
-	if !notify {
+	if !notificationPolicy(transition) {
+		return nil
+	}
+	current, err := n.get(ctx, transition.Target.PaneID)
+	if err != nil || !session.MatchesAgent(transition.Target, current) {
 		return nil
 	}
 
 	key := notificationKey{
-		paneID:      transition.Target.PaneID,
-		occupantKey: transition.Target.OccupantKey,
-		kind:        "status",
-		status:      transition.Current,
+		paneID:         transition.Target.PaneID,
+		occupantKey:    transition.Target.OccupantKey,
+		kind:           "status",
+		previousStatus: transition.Previous,
+		status:         transition.Current,
 	}
-	parts := renderStatusTitleParts(title, transition.Target)
-	if includeSnapshot {
-		before, err := n.get(ctx, transition.Target.PaneID)
-		if err == nil && session.MatchesAgent(transition.Target, before) {
-			result, readErr := n.read(ctx, transition.Target.PaneID, panel.PageSize)
-			after, getErr := n.get(ctx, transition.Target.PaneID)
-			if readErr == nil && getErr == nil && session.MatchesAgent(transition.Target, after) && result.PaneID == transition.Target.PaneID {
-				lines := lastNotificationLines(panel.Normalize(result.Text))
-				key.snapshotAvailable = true
-				key.snapshotHash = notificationHash(lines)
-				parts = append(parts, renderNotificationSnapshot(transition.Target, lines)...)
-			}
-		}
+	event := im.NotificationEvent{
+		Kind:           im.NotificationKindAgentStatusChanged,
+		PreviousStatus: string(transition.Previous),
+		Status:         string(transition.Current),
+		OccurredAt:     time.Now().UTC(),
 	}
-	return n.deliverOnce(ctx, transition.Target, key, parts)
+	return n.deliverOnce(ctx, transition.Target, key, event)
 }
 
 // TargetInvalidated 通知 pane 关闭或 occupant 替换。
@@ -573,33 +546,25 @@ func (n *Notifier) TargetInvalidated(ctx context.Context, target session.Target)
 		return ErrInvalidNotifierDependency
 	}
 	key := notificationKey{paneID: target.PaneID, occupantKey: target.OccupantKey, kind: "invalidated"}
-	return n.deliverOnce(ctx, target, key, renderStatusTitleParts("Agent 目标已失效，请重新执行 /ls 和 /sel。", target))
+	event := im.NotificationEvent{Kind: im.NotificationKindTargetInvalidated, OccurredAt: time.Now().UTC()}
+	return n.deliverOnce(ctx, target, key, event)
 }
 
-func notificationPolicy(transition session.Transition) (title string, includeSnapshot, notify bool) {
+func notificationPolicy(transition session.Transition) bool {
 	if transition.Previous == transition.Current {
-		return "", false, false
+		return false
 	}
 	switch transition.Current {
-	case herdr.AgentStatusWorking:
-		return "Agent 开始工作。", false, true
-	case herdr.AgentStatusBlocked:
-		return "Agent 已阻塞，需要你的处理。", true, true
-	case herdr.AgentStatusDone:
-		return "Agent 已完成。", true, true
+	case herdr.AgentStatusWorking, herdr.AgentStatusBlocked, herdr.AgentStatusDone, herdr.AgentStatusUnknown:
+		return true
 	case herdr.AgentStatusIdle:
-		if transition.Previous == herdr.AgentStatusWorking || transition.Previous == herdr.AgentStatusBlocked {
-			return "Agent 已空闲。", true, true
-		}
-		return "", false, false
-	case herdr.AgentStatusUnknown:
-		return "Agent 状态无法可靠识别，请在 Herdr 中确认。", false, true
+		return transition.Previous == herdr.AgentStatusWorking || transition.Previous == herdr.AgentStatusBlocked
 	default:
-		return "", false, false
+		return false
 	}
 }
 
-func (n *Notifier) deliverOnce(ctx context.Context, target session.Target, key notificationKey, parts []string) error {
+func (n *Notifier) deliverOnce(ctx context.Context, target session.Target, key notificationKey, event im.NotificationEvent) error {
 	paneID := target.PaneID
 	notificationTarget := im.NotificationTarget{
 		PaneID:       target.PaneID,
@@ -626,42 +591,13 @@ func (n *Notifier) deliverOnce(ctx context.Context, target session.Target, key n
 		completed := make(chan struct{})
 		n.inflight[paneID] = completed
 		deliveryEpoch := n.epoch
-		progress := n.pending[paneID]
-		if progress == nil || !sameNotificationIdentity(progress.key, key) ||
-			(progress.key.kind != "invalidated" && progress.epoch != deliveryEpoch) {
-			progress = &notificationProgress{
-				key: key, parts: append([]string(nil), parts...), epoch: deliveryEpoch,
-			}
-			n.pending[paneID] = progress
-		} else {
-			shared := commonNotificationPrefix(progress.parts, parts)
-			if progress.next > shared {
-				progress.next = shared
-			}
-			progress.key = key
-			progress.parts = append(progress.parts[:0], parts...)
-			progress.epoch = deliveryEpoch
-		}
-		deliveryParts := progress.parts
-		start := progress.next
 		n.mu.Unlock()
 
-		var err error
-		for index := start; index < len(deliveryParts); index++ {
-			if err = n.notification.SendNotification(ctx, notificationTarget, deliveryParts[index]); err != nil {
-				break
-			}
-			n.mu.Lock()
-			if n.notificationProgressCurrentLocked(paneID, progress) {
-				progress.next = index + 1
-			}
-			n.mu.Unlock()
-		}
+		err := n.notification.SendNotification(ctx, notificationTarget, event)
 
 		n.mu.Lock()
-		if err == nil && n.notificationProgressCurrentLocked(paneID, progress) {
-			n.recent[paneID] = progress.key
-			delete(n.pending, paneID)
+		if err == nil && n.epoch == deliveryEpoch {
+			n.recent[paneID] = key
 		}
 		delete(n.inflight, paneID)
 		close(completed)
@@ -670,29 +606,29 @@ func (n *Notifier) deliverOnce(ctx context.Context, target session.Target, key n
 	}
 }
 
-func (n *Notifier) notificationProgressCurrentLocked(paneID string, progress *notificationProgress) bool {
-	if n.pending[paneID] != progress {
-		return false
-	}
-	// invalidation 任务属于 Dispatcher 的 Run 生命周期，必须跨健康 epoch 保留进度。
-	return progress.key.kind == "invalidated" || n.epoch == progress.epoch
-}
-
-func sameNotificationIdentity(left, right notificationKey) bool {
-	return left.paneID == right.paneID &&
-		left.occupantKey == right.occupantKey &&
-		left.kind == right.kind &&
-		left.status == right.status
-}
-
-func commonNotificationPrefix(left, right []string) int {
-	limit := min(len(left), len(right))
-	for index := 0; index < limit; index++ {
-		if left[index] != right[index] {
-			return index
+func renderNotificationEvent(event im.NotificationEvent, target im.NotificationTarget) string {
+	title := "Agent 状态发生变化。"
+	switch event.Kind {
+	case im.NotificationKindTargetInvalidated:
+		title = "Agent 目标已失效，请重新执行 /ls 和 /sel。"
+	case im.NotificationKindAgentStatusChanged:
+		switch herdr.AgentStatus(event.Status) {
+		case herdr.AgentStatusWorking:
+			title = "Agent 开始工作。"
+		case herdr.AgentStatusBlocked:
+			title = "Agent 已阻塞，需要你的处理。"
+		case herdr.AgentStatusDone:
+			title = "Agent 已完成。"
+		case herdr.AgentStatusIdle:
+			title = "Agent 已空闲。"
+		case herdr.AgentStatusUnknown:
+			title = "Agent 状态无法可靠识别，请在 Herdr 中确认。"
 		}
 	}
-	return limit
+	return renderStatusTitle(title, session.Target{
+		PaneID: target.PaneID, OccupantKey: target.OccupantHash, Agent: target.Agent,
+		DisplayAgent: target.DisplayAgent, Title: target.Title,
+	})
 }
 
 func renderStatusTitle(title string, target session.Target) string {
@@ -711,26 +647,5 @@ func renderStatusTitle(title string, target session.Target) string {
 }
 
 func renderStatusTitleParts(title string, target session.Target) []string {
-	content := renderStatusTitle(title, target)
-	if len(content) <= panel.WeComContentLimit {
-		return []string{content}
-	}
-	return panel.SplitMarkdown(content, panel.WeComContentLimit)
-}
-
-func renderNotificationSnapshot(target session.Target, lines []string) []string {
-	content := panel.RenderPageWithTotal(target, 1, 1, lines)
-	return panel.SplitMarkdown(content, panel.WeComContentLimit)
-}
-
-func lastNotificationLines(lines []string) []string {
-	if len(lines) > panel.PageSize {
-		lines = lines[len(lines)-panel.PageSize:]
-	}
-	return append([]string(nil), lines...)
-}
-
-func notificationHash(lines []string) string {
-	digest := sha256.Sum256([]byte(strings.Join(lines, "\n")))
-	return fmt.Sprintf("%x", digest)
+	return panel.SplitMarkdown(renderStatusTitle(title, target), panel.WeComContentLimit)
 }

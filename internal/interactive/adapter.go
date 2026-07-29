@@ -158,11 +158,6 @@ func (a *Adapter) SendMarkdown(ctx context.Context, content string) error {
 	return a.write(ctx, markdownBlock("通知", content))
 }
 
-// SendNotification 输出带“通知”标签的结构化主动消息。
-func (a *Adapter) SendNotification(ctx context.Context, _ im.NotificationTarget, content string) error {
-	return a.SendMarkdown(ctx, content)
-}
-
 func (a *Adapter) startRun() error {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()

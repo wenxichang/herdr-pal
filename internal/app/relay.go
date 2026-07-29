@@ -111,7 +111,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if err := relay.SetExecutor(service); err != nil {
 		return fmt.Errorf("绑定 Relay 执行器: %w", err)
 	}
-	notifier, err := bridge.NewNotifier(relay, herdrClient.GetAgent, herdrClient.ReadRecent)
+	notifier, err := bridge.NewNotifier(relay, herdrClient.GetAgent)
 	if err != nil {
 		return fmt.Errorf("创建状态通知器: %w", err)
 	}

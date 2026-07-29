@@ -58,6 +58,24 @@ type NotificationTarget struct {
 	Title        string `json:"title"`
 }
 
+// NotificationKind 描述主动通知的业务事件类型。
+type NotificationKind string
+
+const (
+	// NotificationKindAgentStatusChanged 表示 Agent 状态发生了值得通知的变化。
+	NotificationKindAgentStatusChanged NotificationKind = "agent.status.changed"
+	// NotificationKindTargetInvalidated 表示原 Agent occupant 已不再是可操作目标。
+	NotificationKindTargetInvalidated NotificationKind = "target.invalidated"
+)
+
+// NotificationEvent 是 Pal 上报给消息侧的轻量事件，不携带终端快照。
+type NotificationEvent struct {
+	Kind           NotificationKind
+	PreviousStatus string
+	Status         string
+	OccurredAt     time.Time
+}
+
 // ReplySink 接收一条命令的首段回复和后续分段。
 type ReplySink interface {
 	// RespondMarkdown 使用上游请求标识发送首段 Markdown 回复。
@@ -76,6 +94,6 @@ type TerminalReplySink interface {
 
 // NotificationSink 接收携带稳定目标身份的主动通知。
 type NotificationSink interface {
-	// SendNotification 发送一段属于 target 的主动通知。
-	SendNotification(ctx context.Context, target NotificationTarget, content string) error
+	// SendNotification 发送一条属于 target 的主动事件。
+	SendNotification(ctx context.Context, target NotificationTarget, event NotificationEvent) error
 }

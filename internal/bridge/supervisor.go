@@ -424,7 +424,7 @@ func (s *Supervisor) runHealthyCycle(ctx context.Context, client ManagedHerdr, d
 					s.logger.Debug("Agent 重复状态事件已忽略", statusTransitionLogArgs(transition)...)
 					continue
 				}
-				_, _, notify := notificationPolicy(transition)
+				notify := notificationPolicy(transition)
 				s.logger.Info("Agent 状态发生变化", append(
 					statusTransitionLogArgs(transition), "notification_required", notify,
 				)...)
