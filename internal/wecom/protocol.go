@@ -3,6 +3,9 @@ package wecom
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +23,10 @@ const (
 	DefaultEndpoint = "wss://openws.work.weixin.qq.com"
 	// MarkdownByteLimit 是企业微信 Markdown 正文允许的最大 UTF-8 字节数。
 	MarkdownByteLimit   = 20480
+	mediaChunkSize      = 512 * 1024
+	maxMediaChunks      = 100
+	maxImageBytes       = 10 * 1024 * 1024
+	terminalImageName   = "herdr-terminal.png"
 	logFieldByteLimit   = 80
 	safeProtocolMessage = "企业微信请求失败"
 )
@@ -29,6 +36,7 @@ var (
 	ErrProtocol = errors.New("企业微信协议错误")
 	// ErrUnavailable 表示企业微信长连接已不可用。
 	ErrUnavailable = errors.New("企业微信连接不可用")
+	pngSignature   = []byte{'\x89', 'P', 'N', 'G', '\r', '\n', '\x1a', '\n'}
 )
 
 // Headers 是企业微信帧中用于关联请求与响应的公共头部。
@@ -41,9 +49,10 @@ type IncomingText = im.IncomingText
 
 // Response 是企业微信对单个请求返回的响应。
 type Response struct {
-	Headers Headers `json:"headers"`
-	ErrCode int     `json:"errcode"`
-	ErrMsg  string  `json:"errmsg"`
+	Headers Headers         `json:"headers"`
+	ErrCode int             `json:"errcode"`
+	ErrMsg  string          `json:"errmsg"`
+	Body    json.RawMessage `json:"body,omitempty"`
 }
 
 // ProtocolError 表示可关联到企业微信请求的协议或业务错误。
@@ -151,6 +160,83 @@ func EncodeSendMarkdown(requestID, userID, content string) ([]byte, error) {
 		return nil, err
 	}
 	return encodeMarkdownRequest("aibot_send_msg", requestID, userID, 1, content)
+}
+
+// EncodeUploadMediaInit 编码图片临时素材初始化请求。
+func EncodeUploadMediaInit(requestID, filename string, totalSize, totalChunks int, md5Hex string) ([]byte, error) {
+	if err := validateRequired(requestID, "请求标识"); err != nil {
+		return nil, err
+	}
+	if err := validateRequired(filename, "文件名"); err != nil {
+		return nil, err
+	}
+	digest, err := hex.DecodeString(md5Hex)
+	if totalSize <= 0 || totalSize > maxImageBytes || totalChunks <= 0 || totalChunks > maxMediaChunks ||
+		totalChunks != (totalSize+mediaChunkSize-1)/mediaChunkSize ||
+		err != nil || len(digest) != md5.Size || strings.ToLower(md5Hex) != md5Hex {
+		return nil, newProtocolError(requestID, 0, "上传初始化参数无效")
+	}
+	return encodeRequest("aibot_upload_media_init", requestID, struct {
+		Type        string `json:"type"`
+		Filename    string `json:"filename"`
+		TotalSize   int    `json:"total_size"`
+		TotalChunks int    `json:"total_chunks"`
+		MD5         string `json:"md5"`
+	}{Type: "image", Filename: filename, TotalSize: totalSize, TotalChunks: totalChunks, MD5: md5Hex})
+}
+
+// EncodeUploadMediaChunk 编码从零开始编号的临时素材分片请求。
+func EncodeUploadMediaChunk(requestID, uploadID string, chunkIndex int, chunk []byte) ([]byte, error) {
+	if err := validateRequired(requestID, "请求标识"); err != nil {
+		return nil, err
+	}
+	if err := validateRequired(uploadID, "上传标识"); err != nil {
+		return nil, err
+	}
+	if chunkIndex < 0 || len(chunk) == 0 || len(chunk) > mediaChunkSize {
+		return nil, newProtocolError(requestID, 0, "上传分片参数无效")
+	}
+	return encodeRequest("aibot_upload_media_chunk", requestID, struct {
+		UploadID   string `json:"upload_id"`
+		ChunkIndex int    `json:"chunk_index"`
+		Base64Data string `json:"base64_data"`
+	}{UploadID: uploadID, ChunkIndex: chunkIndex, Base64Data: base64.StdEncoding.EncodeToString(chunk)})
+}
+
+// EncodeUploadMediaFinish 编码临时素材完成上传请求。
+func EncodeUploadMediaFinish(requestID, uploadID string) ([]byte, error) {
+	if err := validateRequired(requestID, "请求标识"); err != nil {
+		return nil, err
+	}
+	if err := validateRequired(uploadID, "上传标识"); err != nil {
+		return nil, err
+	}
+	return encodeRequest("aibot_upload_media_finish", requestID, struct {
+		UploadID string `json:"upload_id"`
+	}{UploadID: uploadID})
+}
+
+// EncodeSendImage 编码面向指定单聊用户的主动图片消息。
+func EncodeSendImage(requestID, userID, mediaID string) ([]byte, error) {
+	if err := validateRequired(requestID, "请求标识"); err != nil {
+		return nil, err
+	}
+	if err := validateRequired(userID, "用户标识"); err != nil {
+		return nil, err
+	}
+	if err := validateRequired(mediaID, "素材标识"); err != nil {
+		return nil, err
+	}
+	return encodeRequest("aibot_send_msg", requestID, struct {
+		ChatID   string `json:"chatid"`
+		ChatType int    `json:"chat_type"`
+		MsgType  string `json:"msgtype"`
+		Image    struct {
+			MediaID string `json:"media_id"`
+		} `json:"image"`
+	}{ChatID: userID, ChatType: 1, MsgType: "image", Image: struct {
+		MediaID string `json:"media_id"`
+	}{MediaID: mediaID}})
 }
 
 // EncodePing 编码企业微信长连接心跳请求。
@@ -288,6 +374,9 @@ func decodeResponse(values map[string]json.RawMessage, data []byte) (Frame, erro
 		return Frame{}, newProtocolError(headers.RequestID, errCode, "响应说明无效")
 	}
 	response := Response{Headers: headers, ErrCode: errCode, ErrMsg: errMsg}
+	if body, exists := values["body"]; exists {
+		response.Body = append(json.RawMessage(nil), body...)
+	}
 	frame := Frame{Kind: FrameResponse, Headers: headers, Response: &response, Raw: append(json.RawMessage(nil), data...)}
 	return frame, nil
 }

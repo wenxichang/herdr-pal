@@ -1,7 +1,10 @@
 package testkit
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,11 +20,20 @@ import (
 
 // WeComRequest 记录 fake 企业微信收到的一次客户端请求。
 type WeComRequest struct {
-	Command   string
-	RequestID string
-	ChatID    string
-	ChatType  int
-	Content   string
+	Command     string
+	RequestID   string
+	ChatID      string
+	ChatType    int
+	Content     string
+	MediaType   string
+	Filename    string
+	TotalSize   int
+	TotalChunks int
+	MD5         string
+	UploadID    string
+	ChunkIndex  int
+	Chunk       []byte
+	MediaID     string
 }
 
 // WeComServer 是通过 httptest 提供的企业微信智能机器人 WebSocket fake。
@@ -39,6 +51,17 @@ type WeComServer struct {
 	subscribeCount int
 	changed        chan struct{}
 	nextCallback   atomic.Uint64
+	nextUpload     atomic.Uint64
+	uploads        map[string]*weComUpload
+}
+
+type weComUpload struct {
+	mediaType   string
+	filename    string
+	totalSize   int
+	totalChunks int
+	md5         string
+	chunks      map[int][]byte
 }
 
 type weComConnection struct {
@@ -60,7 +83,7 @@ func NewWeComServer(t testing.TB, botID, secret string) *WeComServer {
 	t.Helper()
 	server := &WeComServer{
 		botID: botID, secret: secret, connections: make(map[*weComConnection]struct{}),
-		responseErrors: make(map[string]int), changed: make(chan struct{}, 1),
+		responseErrors: make(map[string]int), uploads: make(map[string]*weComUpload), changed: make(chan struct{}, 1),
 	}
 	server.server = httptest.NewServer(http.HandlerFunc(server.accept))
 	t.Cleanup(server.Close)
@@ -264,9 +287,20 @@ func (s *WeComServer) accept(writer http.ResponseWriter, request *http.Request) 
 		} else if configured := s.responseError(wire.Command); configured != 0 {
 			code, message = configured, "configured error"
 		}
-		response, err := json.Marshal(map[string]any{
+		var responseBody any
+		if code == 0 {
+			responseBody, valid = s.completeRequest(record)
+			if !valid {
+				code, message = 40001, "invalid request"
+			}
+		}
+		responseValue := map[string]any{
 			"headers": map[string]any{"req_id": wire.Headers.RequestID}, "errcode": code, "errmsg": message,
-		})
+		}
+		if responseBody != nil && code == 0 {
+			responseValue["body"] = responseBody
+		}
+		response, err := json.Marshal(responseValue)
 		if err != nil || connection.write(response) != nil {
 			return
 		}
@@ -301,20 +335,131 @@ func (s *WeComServer) decodeRequest(wire weComWireRequest) (WeComRequest, bool) 
 		var body struct {
 			ChatID   string `json:"chatid"`
 			ChatType int    `json:"chat_type"`
+			MsgType  string `json:"msgtype"`
 			Markdown struct {
 				Content string `json:"content"`
 			} `json:"markdown"`
+			Image struct {
+				MediaID string `json:"media_id"`
+			} `json:"image"`
 		}
 		if json.Unmarshal(wire.Body, &body) != nil {
 			return record, false
 		}
 		record.ChatID, record.ChatType, record.Content = body.ChatID, body.ChatType, body.Markdown.Content
-		return record, true
+		record.MediaType, record.MediaID = body.MsgType, body.Image.MediaID
+		switch body.MsgType {
+		case "markdown":
+			return record, body.Markdown.Content != ""
+		case "image":
+			return record, wire.Command == "aibot_send_msg" && body.ChatID != "" && body.Image.MediaID != ""
+		default:
+			return record, false
+		}
+	case "aibot_upload_media_init":
+		var body struct {
+			Type        string `json:"type"`
+			Filename    string `json:"filename"`
+			TotalSize   int    `json:"total_size"`
+			TotalChunks int    `json:"total_chunks"`
+			MD5         string `json:"md5"`
+		}
+		if json.Unmarshal(wire.Body, &body) != nil {
+			return record, false
+		}
+		record.MediaType, record.Filename, record.TotalSize = body.Type, body.Filename, body.TotalSize
+		record.TotalChunks, record.MD5 = body.TotalChunks, body.MD5
+		return record, body.Type == "image" && body.Filename != "" && body.TotalSize > 0 && body.TotalChunks > 0 && body.TotalChunks <= 100 && body.MD5 != ""
+	case "aibot_upload_media_chunk":
+		var body struct {
+			UploadID   string `json:"upload_id"`
+			ChunkIndex int    `json:"chunk_index"`
+			Base64Data string `json:"base64_data"`
+		}
+		if json.Unmarshal(wire.Body, &body) != nil || body.UploadID == "" || body.ChunkIndex < 0 {
+			return record, false
+		}
+		chunk, err := base64.StdEncoding.DecodeString(body.Base64Data)
+		if err != nil || len(chunk) == 0 || len(chunk) > 512*1024 {
+			return record, false
+		}
+		record.UploadID, record.ChunkIndex, record.Chunk = body.UploadID, body.ChunkIndex, chunk
+		return record, s.validUploadChunk(record)
+	case "aibot_upload_media_finish":
+		var body struct {
+			UploadID string `json:"upload_id"`
+		}
+		if json.Unmarshal(wire.Body, &body) != nil || body.UploadID == "" {
+			return record, false
+		}
+		record.UploadID = body.UploadID
+		return record, s.validUploadFinish(body.UploadID)
 	case "ping":
 		return record, true
 	default:
 		return record, false
 	}
+}
+
+func (s *WeComServer) completeRequest(request WeComRequest) (any, bool) {
+	switch request.Command {
+	case "aibot_upload_media_init":
+		uploadID := fmt.Sprintf("upload-%d", s.nextUpload.Add(1))
+		s.mu.Lock()
+		s.uploads[uploadID] = &weComUpload{
+			mediaType: request.MediaType, filename: request.Filename, totalSize: request.TotalSize,
+			totalChunks: request.TotalChunks, md5: request.MD5, chunks: make(map[int][]byte),
+		}
+		s.mu.Unlock()
+		return map[string]any{"upload_id": uploadID}, true
+	case "aibot_upload_media_chunk":
+		s.mu.Lock()
+		upload := s.uploads[request.UploadID]
+		if upload != nil {
+			upload.chunks[request.ChunkIndex] = append([]byte(nil), request.Chunk...)
+		}
+		s.mu.Unlock()
+		return nil, upload != nil
+	case "aibot_upload_media_finish":
+		s.mu.Lock()
+		upload := s.uploads[request.UploadID]
+		delete(s.uploads, request.UploadID)
+		s.mu.Unlock()
+		if upload == nil {
+			return nil, false
+		}
+		return map[string]any{
+			"type": upload.mediaType, "media_id": "media-" + request.UploadID, "created_at": time.Now().UTC().Format(time.RFC3339),
+		}, true
+	default:
+		return nil, true
+	}
+}
+
+func (s *WeComServer) validUploadChunk(request WeComRequest) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	upload := s.uploads[request.UploadID]
+	return upload != nil && request.ChunkIndex < upload.totalChunks
+}
+
+func (s *WeComServer) validUploadFinish(uploadID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	upload := s.uploads[uploadID]
+	if upload == nil || len(upload.chunks) != upload.totalChunks {
+		return false
+	}
+	var content bytes.Buffer
+	for index := 0; index < upload.totalChunks; index++ {
+		chunk, exists := upload.chunks[index]
+		if !exists {
+			return false
+		}
+		content.Write(chunk)
+	}
+	digest := md5.Sum(content.Bytes())
+	return content.Len() == upload.totalSize && fmt.Sprintf("%x", digest) == upload.md5
 }
 
 func (s *WeComServer) record(request WeComRequest) {

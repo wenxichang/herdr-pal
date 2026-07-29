@@ -1,8 +1,11 @@
 package wecom
 
 import (
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -76,6 +79,92 @@ func TestProtocolEncodeMarkdownRequests(t *testing.T) {
 				t.Fatalf("send request = %+v, want user-1 single chat", got)
 			}
 		})
+	}
+}
+
+func TestEncodeUploadMediaInitIncludesImageMetadataAndMD5(t *testing.T) {
+	data := make([]byte, mediaChunkSize+1)
+	digest := md5.Sum(data)
+	payload, err := EncodeUploadMediaInit("upload-init-1", "herdr-terminal.png", len(data), 2, fmt.Sprintf("%x", digest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Cmd     string  `json:"cmd"`
+		Headers Headers `json:"headers"`
+		Body    struct {
+			Type        string `json:"type"`
+			Filename    string `json:"filename"`
+			TotalSize   int    `json:"total_size"`
+			TotalChunks int    `json:"total_chunks"`
+			MD5         string `json:"md5"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(payload, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Cmd != "aibot_upload_media_init" || request.Headers.RequestID != "upload-init-1" ||
+		request.Body.Type != "image" || request.Body.Filename != "herdr-terminal.png" ||
+		request.Body.TotalSize != len(data) || request.Body.TotalChunks != 2 || request.Body.MD5 != fmt.Sprintf("%x", digest) {
+		t.Fatalf("request = %#v", request)
+	}
+}
+
+func TestEncodeUploadMediaChunkUsesZeroBasedIndexAndBase64(t *testing.T) {
+	chunk := []byte{0, 1, 2, 3}
+	payload, err := EncodeUploadMediaChunk("upload-chunk-1", "upload-1", 0, chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Cmd  string `json:"cmd"`
+		Body struct {
+			UploadID   string `json:"upload_id"`
+			ChunkIndex int    `json:"chunk_index"`
+			Base64Data string `json:"base64_data"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(payload, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Cmd != "aibot_upload_media_chunk" || request.Body.UploadID != "upload-1" ||
+		request.Body.ChunkIndex != 0 || request.Body.Base64Data != base64.StdEncoding.EncodeToString(chunk) {
+		t.Fatalf("request = %#v", request)
+	}
+}
+
+func TestEncodeUploadMediaFinishUsesUploadID(t *testing.T) {
+	payload, err := EncodeUploadMediaFinish("upload-finish-1", "upload-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Cmd  string `json:"cmd"`
+		Body struct {
+			UploadID string `json:"upload_id"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(payload, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Cmd != "aibot_upload_media_finish" || request.Body.UploadID != "upload-1" {
+		t.Fatalf("request = %#v", request)
+	}
+}
+
+func TestDecodeResponsePreservesTypedBody(t *testing.T) {
+	frame, err := DecodeFrame([]byte(`{"headers":{"req_id":"upload-init-1"},"errcode":0,"errmsg":"ok","body":{"upload_id":"upload-1"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame.Response == nil {
+		t.Fatal("response is nil")
+	}
+	var body struct {
+		UploadID string `json:"upload_id"`
+	}
+	if err := json.Unmarshal(frame.Response.Body, &body); err != nil || body.UploadID != "upload-1" {
+		t.Fatalf("body = %#v, error = %v", body, err)
 	}
 }
 

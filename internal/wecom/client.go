@@ -1,12 +1,16 @@
 package wecom
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -393,7 +397,7 @@ func (c *Client) heartbeat(session *session) {
 				return
 			}
 			ctx, cancel := context.WithTimeout(session.ctx, c.requestTimeout)
-			err = session.request(ctx, requestID, payload)
+			_, err = session.request(ctx, requestID, payload)
 			cancel()
 			if err != nil {
 				c.logWarn("企业微信心跳失败", append([]any{"request_hash", wecomShortHash(requestID)}, wecomErrorLogFields(err)...)...)
@@ -419,7 +423,8 @@ func (c *Client) RespondMarkdown(ctx context.Context, callbackRequestID, content
 	if err != nil {
 		return err
 	}
-	return c.request(ctx, callbackRequestID, payload)
+	_, err = c.request(ctx, callbackRequestID, payload)
+	return err
 }
 
 // SendMarkdown 向配置中唯一允许的单聊用户主动发送 Markdown 消息。
@@ -437,7 +442,103 @@ func (c *Client) SendMarkdownTo(ctx context.Context, userID, content string) err
 	if err != nil {
 		return err
 	}
-	return c.request(ctx, requestID, payload)
+	_, err = c.request(ctx, requestID, payload)
+	return err
+}
+
+// UploadImage 通过企业微信长连接三阶段上传一张 PNG 图片，并返回临时素材标识。
+func (c *Client) UploadImage(ctx context.Context, png []byte) (string, error) {
+	if c == nil {
+		return "", ErrUnavailable
+	}
+	if len(png) < len(pngSignature) || len(png) > maxImageBytes || !bytes.Equal(png[:len(pngSignature)], pngSignature) {
+		return "", newProtocolError("", 0, "图片数据无效")
+	}
+	totalChunks := (len(png) + mediaChunkSize - 1) / mediaChunkSize
+	if totalChunks <= 0 || totalChunks > maxMediaChunks {
+		return "", newProtocolError("", 0, "图片分片数量无效")
+	}
+	digest := md5.Sum(png)
+	requestID := c.requestID()
+	payload, err := EncodeUploadMediaInit(requestID, terminalImageName, len(png), totalChunks, hex.EncodeToString(digest[:]))
+	if err != nil {
+		return "", err
+	}
+	c.logDebug("企业微信图片上传开始", "stage", "init", "image_bytes", len(png), "chunk_count", totalChunks)
+	response, err := c.request(ctx, requestID, payload)
+	if err != nil {
+		c.logWarn("企业微信图片上传失败", append([]any{"stage", "init", "image_bytes", len(png), "chunk_count", totalChunks}, wecomErrorLogFields(err)...)...)
+		return "", err
+	}
+	var initBody struct {
+		UploadID string `json:"upload_id"`
+	}
+	if err := decodeTypedResponseBody(response, &initBody); err != nil || strings.TrimSpace(initBody.UploadID) == "" {
+		if err == nil {
+			err = newProtocolError(requestID, 0, "上传初始化响应缺少 upload_id")
+		}
+		c.logWarn("企业微信图片上传失败", append([]any{"stage", "init_response", "image_bytes", len(png), "chunk_count", totalChunks}, wecomErrorLogFields(err)...)...)
+		return "", err
+	}
+
+	for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
+		start := chunkIndex * mediaChunkSize
+		end := min(start+mediaChunkSize, len(png))
+		requestID = c.requestID()
+		payload, err = EncodeUploadMediaChunk(requestID, initBody.UploadID, chunkIndex, png[start:end])
+		if err == nil {
+			_, err = c.request(ctx, requestID, payload)
+		}
+		if err != nil {
+			c.logWarn("企业微信图片上传失败", append([]any{"stage", "chunk", "image_bytes", len(png), "chunk_count", totalChunks, "chunk_index", chunkIndex}, wecomErrorLogFields(err)...)...)
+			return "", err
+		}
+		c.logDebug("企业微信图片分片上传成功", "stage", "chunk", "chunk_index", chunkIndex, "chunk_count", totalChunks, "chunk_bytes", end-start)
+	}
+
+	requestID = c.requestID()
+	payload, err = EncodeUploadMediaFinish(requestID, initBody.UploadID)
+	if err != nil {
+		return "", err
+	}
+	response, err = c.request(ctx, requestID, payload)
+	if err != nil {
+		c.logWarn("企业微信图片上传失败", append([]any{"stage", "finish", "image_bytes", len(png), "chunk_count", totalChunks}, wecomErrorLogFields(err)...)...)
+		return "", err
+	}
+	var finishBody struct {
+		Type      string `json:"type,omitempty"`
+		MediaID   string `json:"media_id"`
+		CreatedAt string `json:"created_at,omitempty"`
+	}
+	if err := decodeTypedResponseBody(response, &finishBody); err != nil || strings.TrimSpace(finishBody.MediaID) == "" ||
+		(finishBody.Type != "" && finishBody.Type != "image") {
+		if err == nil {
+			err = newProtocolError(requestID, 0, "上传完成响应无效")
+		}
+		c.logWarn("企业微信图片上传失败", append([]any{"stage", "finish_response", "image_bytes", len(png), "chunk_count", totalChunks}, wecomErrorLogFields(err)...)...)
+		return "", err
+	}
+	c.logDebug("企业微信图片上传完成", "stage", "finish", "image_bytes", len(png), "chunk_count", totalChunks)
+	return finishBody.MediaID, nil
+}
+
+// SendImageTo 上传 PNG 并向指定单聊用户主动发送图片消息。
+func (c *Client) SendImageTo(ctx context.Context, userID string, png []byte) error {
+	mediaID, err := c.UploadImage(ctx, png)
+	if err != nil {
+		return err
+	}
+	requestID := c.requestID()
+	payload, err := EncodeSendImage(requestID, userID, mediaID)
+	if err != nil {
+		return err
+	}
+	_, err = c.request(ctx, requestID, payload)
+	if err != nil {
+		c.logWarn("企业微信图片消息发送失败", append([]any{"stage", "send", "image_bytes", len(png), "user_hash", wecomShortHash(userID)}, wecomErrorLogFields(err)...)...)
+	}
+	return err
 }
 
 func (c *Client) subscribe(parent context.Context, session *session) error {
@@ -448,20 +549,37 @@ func (c *Client) subscribe(parent context.Context, session *session) error {
 	}
 	ctx, cancel := context.WithTimeout(parent, c.requestTimeout)
 	defer cancel()
-	return session.request(ctx, requestID, payload)
+	_, err = session.request(ctx, requestID, payload)
+	return err
 }
 
-func (c *Client) request(parent context.Context, requestID string, payload []byte) error {
+func (c *Client) request(parent context.Context, requestID string, payload []byte) (Response, error) {
 	if c == nil {
-		return ErrUnavailable
+		return Response{}, ErrUnavailable
 	}
 	session := c.getCurrent()
 	if session == nil {
-		return ErrUnavailable
+		return Response{}, ErrUnavailable
 	}
 	ctx, cancel := context.WithTimeout(parent, c.requestTimeout)
 	defer cancel()
 	return session.request(ctx, requestID, payload)
+}
+
+func decodeTypedResponseBody(response Response, destination any) error {
+	if len(response.Body) == 0 || destination == nil {
+		return newProtocolError(response.Headers.RequestID, 0, "响应正文缺失")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(response.Body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return newProtocolError(response.Headers.RequestID, 0, "响应正文无效")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return newProtocolError(response.Headers.RequestID, 0, "响应正文包含尾随内容")
+	}
+	return nil
 }
 
 func (c *Client) install(next *session) {
@@ -659,41 +777,44 @@ func newSession(parent context.Context, socket Socket, events chan<- IncomingTex
 	return session
 }
 
-func (s *session) request(ctx context.Context, requestID string, payload []byte) error {
+func (s *session) request(ctx context.Context, requestID string, payload []byte) (Response, error) {
 	if s == nil {
-		return ErrUnavailable
+		return Response{}, ErrUnavailable
 	}
 	wait, err := s.pending.register(requestID)
 	if err != nil {
-		return err
+		return Response{}, err
 	}
 	if err := s.write(ctx, payload); err != nil {
 		owned := s.pending.cancel(requestID)
 		if !owned {
-			return (<-wait).Err
+			result := <-wait
+			return result.Response, result.Err
 		}
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			s.finish(ErrUnavailable)
-			return ErrUnavailable
+			return Response{}, ErrUnavailable
 		}
-		return err
+		return Response{}, err
 	}
 	select {
 	case result := <-wait:
-		return result.Err
+		return result.Response, result.Err
 	case <-ctx.Done():
 		if s.pending.cancel(requestID) {
-			return ctx.Err()
+			return Response{}, ctx.Err()
 		}
-		return (<-wait).Err
+		result := <-wait
+		return result.Response, result.Err
 	case <-s.done:
 		if s.pending.cancel(requestID) {
 			if reason := s.reason(); reason != nil {
-				return reason
+				return Response{}, reason
 			}
-			return ErrUnavailable
+			return Response{}, ErrUnavailable
 		}
-		return (<-wait).Err
+		result := <-wait
+		return result.Response, result.Err
 	}
 }
 

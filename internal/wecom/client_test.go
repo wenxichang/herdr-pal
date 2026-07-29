@@ -3,6 +3,7 @@ package wecom
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -299,6 +300,118 @@ func TestClientSendMarkdownToTargetsRequestedUserAndWaitsResponse(t *testing.T) 
 	socket.push(responseJSON(request.Headers.RequestID, 0))
 	if err := <-result; err != nil {
 		t.Fatalf("SendMarkdownTo() error = %v", err)
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientSendImageToUploadsAndSendsMediaID(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, socket)
+	png := testWeComPNG(64)
+
+	result := make(chan error, 1)
+	go func() { result <- client.SendImageTo(context.Background(), "user-2", png) }()
+
+	initRequest := socket.nextWrite(t)
+	if commandOf(t, initRequest).Cmd != "aibot_upload_media_init" {
+		t.Fatalf("init command = %s", initRequest)
+	}
+	socket.push(responseWithBodyJSON(requestIDOf(t, initRequest), 0, map[string]any{"upload_id": "upload-1"}))
+
+	chunkRequest := socket.nextWrite(t)
+	var chunk struct {
+		Cmd  string `json:"cmd"`
+		Body struct {
+			UploadID   string `json:"upload_id"`
+			ChunkIndex int    `json:"chunk_index"`
+			Base64Data string `json:"base64_data"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(chunkRequest, &chunk); err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Cmd != "aibot_upload_media_chunk" || chunk.Body.UploadID != "upload-1" || chunk.Body.ChunkIndex != 0 {
+		t.Fatalf("chunk = %#v", chunk)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(chunk.Body.Base64Data)
+	if err != nil || !bytes.Equal(decoded, png) {
+		t.Fatalf("chunk payload error = %v", err)
+	}
+	socket.push(responseJSON(requestIDOf(t, chunkRequest), 0))
+
+	finishRequest := socket.nextWrite(t)
+	if commandOf(t, finishRequest).Cmd != "aibot_upload_media_finish" {
+		t.Fatalf("finish command = %s", finishRequest)
+	}
+	socket.push(responseWithBodyJSON(requestIDOf(t, finishRequest), 0, map[string]any{"media_id": "media-1"}))
+
+	sendRequest := socket.nextWrite(t)
+	var send struct {
+		Cmd  string `json:"cmd"`
+		Body struct {
+			ChatID   string `json:"chatid"`
+			ChatType int    `json:"chat_type"`
+			MsgType  string `json:"msgtype"`
+			Image    struct {
+				MediaID string `json:"media_id"`
+			} `json:"image"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(sendRequest, &send); err != nil {
+		t.Fatal(err)
+	}
+	if send.Cmd != "aibot_send_msg" || send.Body.ChatID != "user-2" || send.Body.ChatType != 1 ||
+		send.Body.MsgType != "image" || send.Body.Image.MediaID != "media-1" {
+		t.Fatalf("send = %#v", send)
+	}
+	socket.push(responseJSON(requestIDOf(t, sendRequest), 0))
+	if err := <-result; err != nil {
+		t.Fatalf("SendImageTo() error = %v", err)
+	}
+	cancel()
+	awaitDone(t, done)
+}
+
+func TestClientUploadImageSplitsAt512KiBAndStopsOnChunkFailure(t *testing.T) {
+	socket := newFakeSocket()
+	client := newTestClient(t, func(context.Context, string) (Socket, error) { return socket, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runClient(t, client, ctx)
+	completeSubscribe(t, client, socket)
+	png := testWeComPNG(mediaChunkSize + 1)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.UploadImage(context.Background(), png)
+		result <- err
+	}()
+
+	initRequest := socket.nextWrite(t)
+	var initBody struct {
+		Body struct {
+			TotalChunks int `json:"total_chunks"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(initRequest, &initBody); err != nil || initBody.Body.TotalChunks != 2 {
+		t.Fatalf("init = %#v, error = %v", initBody, err)
+	}
+	socket.push(responseWithBodyJSON(requestIDOf(t, initRequest), 0, map[string]any{"upload_id": "upload-2"}))
+
+	firstChunk := socket.nextWrite(t)
+	socket.push(responseJSON(requestIDOf(t, firstChunk), 0))
+	secondChunk := socket.nextWrite(t)
+	socket.push(responseJSON(requestIDOf(t, secondChunk), 40001))
+	if err := <-result; !errors.Is(err, ErrProtocol) {
+		t.Fatalf("UploadImage() error = %v", err)
+	}
+	select {
+	case unexpected := <-socket.writes:
+		t.Fatalf("unexpected request after chunk failure: %s", unexpected)
+	case <-time.After(20 * time.Millisecond):
 	}
 	cancel()
 	awaitDone(t, done)
@@ -738,7 +851,8 @@ func TestSessionResponseOwnershipWinsOverCancellationAndFinish(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- session.request(ctx, "request-1", []byte(`{"cmd":"ping","headers":{"req_id":"request-1"}}`))
+		_, err := session.request(ctx, "request-1", []byte(`{"cmd":"ping","headers":{"req_id":"request-1"}}`))
+		result <- err
 	}()
 	_ = socket.nextWrite(t)
 	socket.push(responseJSON("request-1", 0))
@@ -758,7 +872,7 @@ func TestSessionWriteErrorAfterResponseOwnershipReturnsResponse(t *testing.T) {
 		socket.push(responseJSON(requestIDOfJSON(data), 0))
 		waitPendingGone(t, &session.pending, requestIDOfJSON(data))
 	}
-	if err := session.request(context.Background(), "request-1", []byte(`{"cmd":"ping","headers":{"req_id":"request-1"}}`)); err != nil {
+	if _, err := session.request(context.Background(), "request-1", []byte(`{"cmd":"ping","headers":{"req_id":"request-1"}}`)); err != nil {
 		t.Fatalf("request result = %v, want response success", err)
 	}
 	session.finish(ErrUnavailable)
@@ -1145,6 +1259,25 @@ func completeSubscribe(t *testing.T, client *Client, socket *fakeSocket) {
 }
 func responseJSON(requestID string, code int) []byte {
 	return []byte(fmt.Sprintf(`{"headers":{"req_id":%q},"errcode":%d,"errmsg":"ok"}`, requestID, code))
+}
+
+func responseWithBodyJSON(requestID string, code int, body any) []byte {
+	payload, err := json.Marshal(map[string]any{
+		"headers": map[string]any{"req_id": requestID}, "errcode": code, "errmsg": "ok", "body": body,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return payload
+}
+
+func testWeComPNG(size int) []byte {
+	if size < 8 {
+		size = 8
+	}
+	data := make([]byte, size)
+	copy(data, []byte{'\x89', 'P', 'N', 'G', '\r', '\n', '\x1a', '\n'})
+	return data
 }
 func textCallbackJSON(requestID string) []byte {
 	return []byte(fmt.Sprintf(`{"cmd":"aibot_msg_callback","headers":{"req_id":%q},"body":{"msgid":"message-%s","aibotid":"bot-1","chattype":"single","from":{"userid":"user-1"},"msgtype":"text","text":{"content":"/ls"}}}`, requestID, requestID))
