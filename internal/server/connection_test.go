@@ -17,6 +17,7 @@ func TestClientConnectionCorrelatesReplyToWithPendingRequest(t *testing.T) {
 		IdempotencyKey: "message-1",
 		Target:         hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"},
 		Content:        hprp.TextContent{Type: hprp.ContentTypeText, Text: "prompt"},
+		OutputMode:     hprp.OutputModeText,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -143,8 +144,9 @@ func TestClientConnectionDeduplicatesAndOrdersNotificationsPerTarget(t *testing.
 	connection := newClientConnection(context.Background(), clientConnectionConfig{ID: "connection-1", CredentialID: 1, Key: ClientKey{UserID: "user-a", MachineID: "home-mac"}, SendCapacity: 1, MaxPending: 2, Logger: slog.Default()})
 	target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
 	event := hprp.NotificationEvent{
-		EventKey: "event-1", Sequence: 1, Kind: "agent.status", Target: target,
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: "Agent 已完成"},
+		EventKey: "event-1", Sequence: 1, Kind: hprp.NotificationKindAgentStatusChanged, Target: target,
+		SnapshotSequence: 1, OccurredAt: time.Now().UTC(),
+		Data: &hprp.StatusChangeData{PreviousStatus: hprp.StatusWorking, Status: hprp.StatusDone},
 	}
 	if !connection.acceptNotification(event) {
 		t.Fatal("first notification was rejected")

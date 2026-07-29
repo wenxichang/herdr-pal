@@ -526,9 +526,6 @@ func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelo
 		return
 	}
 	mode := command.OutputMode
-	if mode == "" {
-		mode = hprp.OutputModeText
-	}
 	if mode == hprp.OutputModeImage && !current.supportsCapability(hprp.CapabilityTerminalImageV1) {
 		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false,
 			rejectedCommand(hprp.CodeTerminalImageUnsupported, "当前连接未协商终端图片能力"))

@@ -76,8 +76,8 @@ type ServerLimits struct {
 	MaxInflightCommands   int   `json:"max_inflight_commands"`
 	MaxInflightFeatures   int   `json:"max_inflight_features"`
 	MaxOutputBytes        int   `json:"max_output_bytes"`
-	MaxTerminalTextBytes  int   `json:"max_terminal_text_bytes,omitempty"`
-	MaxTerminalImageBytes int   `json:"max_terminal_image_bytes,omitempty"`
+	MaxTerminalTextBytes  int   `json:"max_terminal_text_bytes"`
+	MaxTerminalImageBytes int   `json:"max_terminal_image_bytes"`
 	IdempotencyWindowMS   int64 `json:"idempotency_window_ms"`
 }
 
@@ -186,7 +186,7 @@ type CommandExecute struct {
 	IdempotencyKey string      `json:"idempotency_key"`
 	Target         Target      `json:"target"`
 	Content        TextContent `json:"content"`
-	OutputMode     OutputMode  `json:"output_mode,omitempty"`
+	OutputMode     OutputMode  `json:"output_mode"`
 }
 
 // CommandResult 是基础命令唯一的最终同步结果。
@@ -217,33 +217,9 @@ type NotificationEvent struct {
 	Sequence         uint64            `json:"sequence"`
 	Kind             string            `json:"kind"`
 	Target           Target            `json:"target"`
-	SnapshotSequence uint64            `json:"snapshot_sequence,omitempty"`
-	OccurredAt       time.Time         `json:"occurred_at,omitempty"`
+	SnapshotSequence uint64            `json:"snapshot_sequence"`
+	OccurredAt       time.Time         `json:"occurred_at"`
 	Data             *StatusChangeData `json:"data,omitempty"`
-	Content          Content           `json:"content,omitempty"`
-}
-
-// MarshalJSON 在迁移期间仅为旧文本通知保留 content；结构化事件不会输出空正文对象。
-func (event NotificationEvent) MarshalJSON() ([]byte, error) {
-	type notificationEventWire struct {
-		EventKey         string            `json:"event_key"`
-		Sequence         uint64            `json:"sequence"`
-		Kind             string            `json:"kind"`
-		Target           Target            `json:"target"`
-		SnapshotSequence uint64            `json:"snapshot_sequence,omitempty"`
-		OccurredAt       time.Time         `json:"occurred_at,omitempty"`
-		Data             *StatusChangeData `json:"data,omitempty"`
-		Content          *Content          `json:"content,omitempty"`
-	}
-	wire := notificationEventWire{
-		EventKey: event.EventKey, Sequence: event.Sequence, Kind: event.Kind, Target: event.Target,
-		SnapshotSequence: event.SnapshotSequence, OccurredAt: event.OccurredAt, Data: event.Data,
-	}
-	if event.Content.Type != "" || event.Content.Text != "" || event.Content.Mode != "" || event.Content.Image != nil || event.Content.Page != nil || event.Content.CapturedAt != nil {
-		content := event.Content
-		wire.Content = &content
-	}
-	return json.Marshal(wire)
 }
 
 // TerminalSnapshotGet 请求 Pal 无副作用读取一次终端快照。

@@ -56,7 +56,7 @@ func TestClientConnectsReportsSnapshotAndExecutesRequests(t *testing.T) {
 		t.Fatalf("Select() error = %v", err)
 	}
 	result, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{MessageID: "message-1", UserID: "user-a", Content: "prompt"})
-	if err != nil || result.Content != "handled: prompt" {
+	if err != nil || result.StructuredContent == nil || result.StructuredContent.Text != "handled: prompt" {
 		t.Fatalf("Execute() = %#v, %v", result, err)
 	}
 	if selected := executor.Selected(); selected.PaneID != "pane-1" || selected.OccupantHash != "occ-1" {
@@ -113,7 +113,7 @@ func TestClientReplaysCompletedCommandWithoutRepeatingLocalSideEffects(t *testin
 	message := im.IncomingText{MessageID: "same-message", UserID: "user-a", Content: "prompt"}
 	for attempt := 0; attempt < 2; attempt++ {
 		result, err := hub.Execute(context.Background(), "user-a", target, message)
-		if err != nil || result.Content != "handled: prompt" {
+		if err != nil || result.StructuredContent == nil || result.StructuredContent.Text != "handled: prompt" {
 			t.Fatalf("Execute(%d) = %#v, %v", attempt, result, err)
 		}
 	}
@@ -247,7 +247,7 @@ func TestClientSynchronizesServerSelectionAfterExecutorRebind(t *testing.T) {
 	result, err := hub.Execute(context.Background(), "user-a", oldTarget, im.IncomingText{
 		MessageID: "message-rebind", UserID: "user-a", Content: "prompt",
 	})
-	if err != nil || result.Content != "handled: prompt" || result.SelectedTarget == nil {
+	if err != nil || result.StructuredContent == nil || result.StructuredContent.Text != "handled: prompt" || result.SelectedTarget == nil {
 		t.Fatalf("Execute() = %#v, %v", result, err)
 	}
 	if err := hub.Catalog().RebindSelection(context.Background(), "user-a", oldTarget, *result.SelectedTarget); err != nil {

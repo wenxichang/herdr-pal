@@ -14,6 +14,7 @@ func TestCommandResultCacheReplaysEquivalentCommandAndRejectsConflict(t *testing
 		IdempotencyKey: "message-1",
 		Target:         hprp.Target{MachineID: "home", SlotID: "pane-1", SessionID: "session-1"},
 		Content:        hprp.TextContent{Type: hprp.ContentTypeText, Text: "prompt"},
+		OutputMode:     hprp.OutputModeText,
 	}
 	capturedAt := now.UTC()
 	want := cachedCommandResult{

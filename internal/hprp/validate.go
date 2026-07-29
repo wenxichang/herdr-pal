@@ -75,7 +75,9 @@ func ValidateServerHello(hello ServerHello) error {
 	}
 	if hello.Limits.MaxMessageBytes <= 0 || hello.Limits.MaxSessions <= 0 ||
 		hello.Limits.MaxInflightCommands <= 0 || hello.Limits.MaxInflightFeatures < 0 ||
-		hello.Limits.MaxOutputBytes <= 0 || hello.Limits.IdempotencyWindowMS <= 0 ||
+		hello.Limits.MaxOutputBytes <= 0 || hello.Limits.MaxTerminalTextBytes <= 0 ||
+		hello.Limits.MaxTerminalTextBytes > MaxTerminalTextBytes || hello.Limits.MaxTerminalImageBytes <= 0 ||
+		hello.Limits.MaxTerminalImageBytes > MaxTerminalImageBytes || hello.Limits.IdempotencyWindowMS <= 0 ||
 		hello.Heartbeat.PingIntervalMS <= 0 || hello.Heartbeat.IdleTimeoutMS <= 0 {
 		return fmt.Errorf("%w: server limits 无效", ErrInvalidMessage)
 	}
@@ -161,7 +163,7 @@ func ValidateCommandExecute(command CommandExecute) error {
 	if err := ValidateTarget(command.Target); err != nil {
 		return err
 	}
-	if command.OutputMode != "" && !validOutputMode(command.OutputMode) {
+	if !validOutputMode(command.OutputMode) {
 		return fmt.Errorf("%w: output_mode 无效", ErrInvalidMessage)
 	}
 	return validateTextContent(command.Content)
@@ -190,17 +192,17 @@ func ValidateNotificationEvent(event NotificationEvent) error {
 	case NotificationKindAgentStatusChanged:
 		if event.SnapshotSequence == 0 || event.OccurredAt.IsZero() || event.Data == nil ||
 			!validSessionStatus(event.Data.PreviousStatus) || !validSessionStatus(event.Data.Status) ||
-			event.Data.PreviousStatus == event.Data.Status || !contentIsZero(event.Content) {
+			event.Data.PreviousStatus == event.Data.Status {
 			return fmt.Errorf("%w: Agent 状态事件无效", ErrInvalidMessage)
 		}
 		return nil
 	case NotificationKindTargetInvalidated:
-		if event.SnapshotSequence == 0 || event.OccurredAt.IsZero() || event.Data != nil || !contentIsZero(event.Content) {
+		if event.SnapshotSequence == 0 || event.OccurredAt.IsZero() || event.Data != nil {
 			return fmt.Errorf("%w: 目标失效事件无效", ErrInvalidMessage)
 		}
 		return nil
 	default:
-		return validateTextContent(event.Content)
+		return fmt.Errorf("%w: notification kind 无效", ErrInvalidMessage)
 	}
 }
 
@@ -331,11 +333,6 @@ func validateTerminalImage(terminalImage *TerminalImage) error {
 
 func validOutputMode(mode OutputMode) bool {
 	return mode == OutputModeText || mode == OutputModeImage
-}
-
-func contentIsZero(content Content) bool {
-	return content.Type == "" && content.Text == "" && content.Mode == "" && content.Image == nil &&
-		content.Page == nil && content.CapturedAt == nil
 }
 
 func validateResultError(outcome Outcome, resultError *Error) error {

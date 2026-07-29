@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,9 +15,13 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
+	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
 var ErrInvalidRouterDependency = errors.New("ConversationRouter 依赖无效")
+
+// ErrTerminalImageUnsupported 表示目标 Pal 没有协商终端图片能力。
+var ErrTerminalImageUnsupported = errors.New("目标 Pal 不支持终端图片模式")
 
 const defaultRelayRequestTimeout = 20 * time.Second
 
@@ -37,6 +42,7 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"`/N 内容` 在第 N 个会话执行，成功后切换；`#N 内容` 执行但不切换\n" +
 	"`/con` 查看当前会话最近 100 行\n" +
 	"`/pageup`、`/pagedn` 上下翻页\n" +
+	"`/mode txt` 使用文本显示；`/mode img` 使用终端图片显示\n" +
 	"`/slash clear` 向 Agent 发送 `/clear`\n" +
 	"普通文字直接发送给当前 Agent\n" +
 	"`/help` 显示本帮助\n\n" +
@@ -118,15 +124,21 @@ type WeComGateway interface {
 	SendMarkdownTo(ctx context.Context, userID, content string) error
 }
 
+// WeComImageGateway 是 Router 可选使用的企业微信图片发送能力。
+type WeComImageGateway interface {
+	SendImageTo(ctx context.Context, userID string, png []byte) error
+}
+
 // RelayRequester 是 Router 复核选择和执行用户输入所需的客户端能力。
 type RelayRequester interface {
 	Select(ctx context.Context, userID string, target hprp.Target) error
 	Execute(ctx context.Context, userID string, target hprp.Target, message im.IncomingText) (RelayExecution, error)
+	SupportsCapability(userID string, target hprp.Target, capability string) bool
+	FetchTerminalSnapshot(ctx context.Context, userID string, target hprp.Target, mode hprp.OutputMode, maxLines int) (hprp.TerminalSnapshotResult, error)
 }
 
 // RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
 type RelayExecution struct {
-	Content           string
 	StructuredContent *hprp.Content
 	SelectedTarget    *hprp.Target
 }
@@ -141,73 +153,59 @@ func (router *ConversationRouter) SendCommandOutput(ctx context.Context, userID 
 		return err
 	}
 	router.activity.Touch(userID, router.now())
-	content, err := router.decorateTerminalContent(userID, entry, output.Content.Text)
-	if err != nil {
-		return err
-	}
-	parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
-	if len(parts) == 0 {
-		return errors.New("后续分段内容无效")
-	}
-	for _, part := range parts {
-		if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
-			return err
-		}
-	}
-	return nil
+	return router.sendContentPush(ctx, userID, entry, output.Content)
 }
 
-// SendNotification 复核最新目录并补充机器、本地序号和 panel 标题。
+// SendNotification 根据结构化状态事件决定是否拉取并发送终端快照。
 func (router *ConversationRouter) SendNotification(ctx context.Context, userID, machineID string, notification hprp.NotificationEvent) error {
 	if router == nil || notification.Target.MachineID != machineID {
 		return ErrTargetChanged
+	}
+	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
+	if notification.Kind == hprp.NotificationKindTargetInvalidated {
+		return router.gateway.SendMarkdownTo(ctx, userID, invalidatedNotificationText(notification.Target))
+	}
+	if notification.Kind != hprp.NotificationKindAgentStatusChanged || notification.Data == nil {
+		return hprp.ErrInvalidMessage
 	}
 	entry, err := router.catalog.ResolveTarget(userID, notification.Target)
 	if err != nil {
 		return err
 	}
-	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
-	if panel.IsRenderedPage(notification.Content.Text) {
-		selected, selectedErr := router.catalog.Selected(userID)
-		if selectedErr == nil && !sameSessionRef(selected.Ref, entry.Ref) && recentlyActive {
-			listIndex, err := router.catalog.EnsureNumberedIndex(userID, entry.Ref)
-			if err != nil {
-				return err
-			}
-			content := fmt.Sprintf("⚠️ %s 有新的输出，等待你的回复，使用/%d切换", catalogTargetLabel(entry), listIndex)
-			return router.gateway.SendMarkdownTo(ctx, userID, content)
-		}
-		content, err := router.decorateTerminalContent(userID, entry, notification.Content.Text)
+	statusText := statusNotificationText(entry, notification.Data.Status)
+	if !statusNeedsTerminal(notification.Data.PreviousStatus, notification.Data.Status) {
+		return router.gateway.SendMarkdownTo(ctx, userID, statusText)
+	}
+	selected, selectedErr := router.catalog.Selected(userID)
+	if selectedErr == nil && !sameSessionRef(selected.Ref, entry.Ref) && recentlyActive {
+		listIndex, err := router.catalog.EnsureNumberedIndex(userID, entry.Ref)
 		if err != nil {
 			return err
 		}
-		parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
-		if len(parts) == 0 {
-			return errors.New("通知内容无效")
-		}
-		for _, part := range parts {
-			if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
-				return err
-			}
-		}
+		content := fmt.Sprintf("⚠️ %s 有新的输出，等待你的回复，使用/%d切换", catalogTargetLabel(entry), listIndex)
+		return router.gateway.SendMarkdownTo(ctx, userID, content)
+	}
+	if err := router.gateway.SendMarkdownTo(ctx, userID, statusText); err != nil {
+		return err
+	}
+	mode := router.effectiveOutputMode(userID, entry)
+	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
+	result, err := router.relay.FetchTerminalSnapshot(requestContext, userID, entry.Ref, mode, 100)
+	cancel()
+	if err != nil {
+		router.logger.Warn("Agent 状态通知终端读取失败", append(append([]any{"user_hash", routerHash(userID), "status", notification.Data.Status}, targetLogArgs(entry.Ref)...), serverErrorLogArgs(err)...)...)
 		return nil
 	}
-	name := entry.Session.Display.DisplayAgent
-	if name == "" {
-		name = entry.Session.Display.Agent
+	content := result.Content
+	if result.Outcome != hprp.OutcomeOK {
+		content = result.FallbackContent
 	}
-	header := fmt.Sprintf("[%s/%d] %s", safeRouterLabel(machineID), entry.Session.Display.Index, safeRouterLabel(name))
-	if entry.Session.Display.Title != "" {
-		header += " — " + safeRouterLabel(entry.Session.Display.Title)
+	if content == nil {
+		return nil
 	}
-	parts := panel.SplitMarkdown(header+"\n"+notification.Content.Text, panel.WeComContentLimit)
-	if len(parts) == 0 {
-		return errors.New("通知内容无效")
-	}
-	for _, part := range parts {
-		if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
-			return err
-		}
+	if err := router.sendContentPush(ctx, userID, entry, *content); err != nil {
+		router.logger.Warn("Agent 状态通知终端发送失败", append(append([]any{"user_hash", routerHash(userID), "status", notification.Data.Status}, targetLogArgs(entry.Ref)...), serverErrorLogArgs(err)...)...)
+		return nil
 	}
 	return nil
 }
@@ -312,8 +310,14 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		router.handleSelect(ctx, message, action.index)
 	case serverActionHelp:
 		router.reply(ctx, message, router.helpText)
+	case serverActionMode:
+		router.handleMode(ctx, message, action.mode)
 	case serverActionDirected:
-		router.handleDirectedExecute(ctx, message, action)
+		if action.mode != "" {
+			router.handleDirectedMode(ctx, message, action)
+		} else {
+			router.handleDirectedExecute(ctx, message, action)
+		}
 	default:
 		router.handleExecute(ctx, message)
 	}
@@ -372,6 +376,7 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 	}
 	consoleMessage := message
 	consoleMessage.Content = "/con"
+	consoleMessage.OutputMode = im.OutputMode(router.effectiveOutputMode(message.UserID, entry))
 	requestContext, cancel = context.WithTimeout(ctx, router.requestTimeout)
 	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, consoleMessage)
 	if err != nil {
@@ -387,18 +392,15 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 		router.reply(ctx, message, "已选择目标，但"+safeRouterError(err))
 		return
 	}
-	content := result.Content
-	if strings.TrimSpace(content) == "" {
-		content = "已选择 " + catalogTargetLabel(entry) + "。"
-	}
-	decorated, decorateErr := router.decorateTerminalContent(message.UserID, entry, content)
-	if decorateErr != nil {
-		router.logInteractionError(message, "select", "decorate_console", entry.Ref, decorateErr)
-		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(decorateErr))
+	router.logInteractionSuccess(message, "select", entry.Ref)
+	if result.StructuredContent == nil {
+		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"。")
 		return
 	}
-	router.logInteractionSuccess(message, "select", entry.Ref)
-	router.reply(ctx, message, decorated)
+	if err := router.sendContentReply(ctx, message, entry, *result.StructuredContent); err != nil {
+		router.logInteractionError(message, "select", "send_console", entry.Ref, err)
+		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(err))
+	}
 }
 
 func (router *ConversationRouter) handleExecute(ctx context.Context, message im.IncomingText) {
@@ -408,6 +410,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		router.reply(ctx, message, "尚未选择 Agent，请先执行 /ls 和 /N。")
 		return
 	}
+	message.OutputMode = im.OutputMode(router.effectiveOutputMode(message.UserID, entry))
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
 	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, message)
 	if err != nil {
@@ -427,18 +430,15 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
-	content := result.Content
-	if strings.TrimSpace(content) == "" {
-		content = "客户端已处理。"
-	}
-	decorated, decorateErr := router.decorateTerminalContent(message.UserID, entry, content)
-	if decorateErr != nil {
-		router.logInteractionError(message, "execute", "decorate_response", entry.Ref, decorateErr)
-		router.reply(ctx, message, safeRouterError(decorateErr))
+	router.logInteractionSuccess(message, "execute", entry.Ref)
+	if result.StructuredContent == nil {
+		router.reply(ctx, message, "客户端已处理。")
 		return
 	}
-	router.logInteractionSuccess(message, "execute", entry.Ref)
-	router.reply(ctx, message, decorated)
+	if err := router.sendContentReply(ctx, message, entry, *result.StructuredContent); err != nil {
+		router.logInteractionError(message, "execute", "send_response", entry.Ref, err)
+		router.reply(ctx, message, safeRouterError(err))
+	}
 }
 
 func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, message im.IncomingText, action serverAction) {
@@ -450,6 +450,7 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 	}
 	directedMessage := message
 	directedMessage.Content = action.content
+	directedMessage.OutputMode = im.OutputMode(router.effectiveOutputMode(message.UserID, entry))
 	selectedBefore, selectedErr := router.catalog.Selected(message.UserID)
 	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
 	result, err := router.relay.Execute(requestContext, message.UserID, entry.Ref, directedMessage)
@@ -497,18 +498,76 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 		}
 	}
 	cancel()
-	content := result.Content
-	if strings.TrimSpace(content) == "" {
-		content = "客户端已处理。"
+	router.logInteractionSuccess(message, "directed_execute", finalEntry.Ref)
+	if result.StructuredContent == nil {
+		router.reply(ctx, message, "客户端已处理。")
+		return
 	}
-	decorated, err := router.decorateTerminalContent(message.UserID, finalEntry, content)
+	if err := router.sendContentReply(ctx, message, finalEntry, *result.StructuredContent); err != nil {
+		router.logInteractionError(message, "directed_execute", "send_response", finalEntry.Ref, err)
+		router.reply(ctx, message, safeRouterError(err))
+	}
+}
+
+func (router *ConversationRouter) handleMode(ctx context.Context, message im.IncomingText, mode hprp.OutputMode) {
+	entry, err := router.catalog.Selected(message.UserID)
 	if err != nil {
-		router.logInteractionError(message, "directed_execute", "decorate_response", finalEntry.Ref, err)
+		router.logInteractionError(message, "mode", "resolve_selection", hprp.Target{}, err)
+		router.reply(ctx, message, "尚未选择 Agent，请先执行 /ls 和 /N。")
+		return
+	}
+	if err := router.setOutputMode(message.UserID, entry, mode); err != nil {
+		router.logInteractionError(message, "mode", "set_mode", entry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 		return
 	}
-	router.logInteractionSuccess(message, "directed_execute", finalEntry.Ref)
-	router.reply(ctx, message, decorated)
+	router.logInteractionSuccess(message, "mode", entry.Ref)
+	router.reply(ctx, message, modeConfirmation(entry, mode))
+}
+
+func (router *ConversationRouter) handleDirectedMode(ctx context.Context, message im.IncomingText, action serverAction) {
+	entry, err := router.catalog.ResolveNumbered(message.UserID, action.index)
+	if err != nil {
+		router.logInteractionError(message, "directed_mode", "resolve_numbered", hprp.Target{}, err)
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	if err := router.setOutputMode(message.UserID, entry, action.mode); err != nil {
+		router.logInteractionError(message, "directed_mode", "set_mode", entry.Ref, err)
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	if action.switchAfter {
+		if err := router.catalog.SetSelection(message.UserID, entry.Ref); err != nil {
+			router.logInteractionError(message, "directed_mode", "set_selection", entry.Ref, err)
+			router.reply(ctx, message, "模式已设置，但切换当前会话失败："+safeRouterError(err))
+			return
+		}
+	}
+	router.logInteractionSuccess(message, "directed_mode", entry.Ref)
+	router.reply(ctx, message, modeConfirmation(entry, action.mode))
+}
+
+func (router *ConversationRouter) setOutputMode(userID string, entry CatalogEntry, mode hprp.OutputMode) error {
+	if mode == hprp.OutputModeImage && !router.relay.SupportsCapability(userID, entry.Ref, hprp.CapabilityTerminalImageV1) {
+		return ErrTerminalImageUnsupported
+	}
+	return router.catalog.SetOutputMode(userID, entry.Ref, mode)
+}
+
+func (router *ConversationRouter) effectiveOutputMode(userID string, entry CatalogEntry) hprp.OutputMode {
+	if mode, explicit, err := router.catalog.OutputMode(userID, entry.Ref); err == nil && explicit {
+		if mode != hprp.OutputModeImage || router.relay.SupportsCapability(userID, entry.Ref, hprp.CapabilityTerminalImageV1) {
+			return mode
+		}
+	}
+	agent := strings.TrimSpace(entry.Session.Display.Agent)
+	displayAgent := strings.TrimSpace(entry.Session.Display.DisplayAgent)
+	if (strings.EqualFold(agent, "opencode") || strings.EqualFold(displayAgent, "opencode")) &&
+		router.relay.SupportsCapability(userID, entry.Ref, hprp.CapabilityTerminalImageV1) {
+		return hprp.OutputModeImage
+	}
+	return hprp.OutputModeText
 }
 
 func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, userID string, source CatalogEntry, result RelayExecution) (CatalogEntry, error) {
@@ -522,6 +581,168 @@ func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, u
 	return router.catalog.ResolveTarget(userID, replacement)
 }
 
+func (router *ConversationRouter) sendContentReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
+	if content.Type == hprp.ContentTypeText {
+		if strings.TrimSpace(content.Text) == "" {
+			router.reply(ctx, message, "客户端已处理。")
+		} else {
+			router.reply(ctx, message, content.Text)
+		}
+		return nil
+	}
+	if content.Type != hprp.ContentTypeTerminal {
+		return hprp.ErrInvalidMessage
+	}
+	if content.Mode == hprp.OutputModeImage && content.Image != nil {
+		return router.sendTerminalImageReply(ctx, message, source, content)
+	}
+	text, err := router.renderTerminalText(message.UserID, source, content)
+	if err != nil {
+		return err
+	}
+	router.reply(ctx, message, text)
+	return nil
+}
+
+func (router *ConversationRouter) sendContentPush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
+	if content.Type == hprp.ContentTypeText {
+		return router.sendMarkdownTo(ctx, userID, content.Text)
+	}
+	if content.Type != hprp.ContentTypeTerminal {
+		return hprp.ErrInvalidMessage
+	}
+	if content.Mode == hprp.OutputModeImage && content.Image != nil {
+		return router.sendTerminalImagePush(ctx, userID, source, content)
+	}
+	text, err := router.renderTerminalText(userID, source, content)
+	if err != nil {
+		return err
+	}
+	return router.sendMarkdownTo(ctx, userID, text)
+}
+
+func (router *ConversationRouter) sendTerminalImageReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
+	imageGateway, ok := router.gateway.(WeComImageGateway)
+	if !ok {
+		return router.sendTerminalTextFallbackReply(ctx, message, source, content)
+	}
+	png, err := decodeTerminalPNG(content)
+	if err != nil {
+		return router.sendTerminalTextFallbackReply(ctx, message, source, content)
+	}
+	header, err := router.terminalHeader(message.UserID, source, content)
+	if err != nil {
+		return err
+	}
+	router.reply(ctx, message, header)
+	if err := imageGateway.SendImageTo(ctx, message.UserID, png); err != nil {
+		router.logger.Warn("企业微信终端图片发送失败，降级为文本", append(append([]any{"user_hash", routerHash(message.UserID)}, targetLogArgs(source.Ref)...), serverErrorLogArgs(err)...)...)
+		text, renderErr := router.renderTerminalText(message.UserID, source, content)
+		if renderErr != nil {
+			return renderErr
+		}
+		return router.sendMarkdownTo(ctx, message.UserID, text)
+	}
+	return nil
+}
+
+func (router *ConversationRouter) sendTerminalTextFallbackReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
+	text, err := router.renderTerminalText(message.UserID, source, content)
+	if err != nil {
+		return err
+	}
+	router.reply(ctx, message, text)
+	return nil
+}
+
+func (router *ConversationRouter) sendTerminalImagePush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
+	imageGateway, ok := router.gateway.(WeComImageGateway)
+	if !ok {
+		return router.sendTerminalTextFallbackPush(ctx, userID, source, content)
+	}
+	png, err := decodeTerminalPNG(content)
+	if err != nil {
+		return router.sendTerminalTextFallbackPush(ctx, userID, source, content)
+	}
+	header, err := router.terminalHeader(userID, source, content)
+	if err != nil {
+		return err
+	}
+	if err := router.sendMarkdownTo(ctx, userID, header); err != nil {
+		return err
+	}
+	if err := imageGateway.SendImageTo(ctx, userID, png); err != nil {
+		router.logger.Warn("企业微信终端图片发送失败，降级为文本", append(append([]any{"user_hash", routerHash(userID)}, targetLogArgs(source.Ref)...), serverErrorLogArgs(err)...)...)
+		return router.sendTerminalTextFallbackPush(ctx, userID, source, content)
+	}
+	return nil
+}
+
+func (router *ConversationRouter) sendTerminalTextFallbackPush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
+	text, err := router.renderTerminalText(userID, source, content)
+	if err != nil {
+		return err
+	}
+	return router.sendMarkdownTo(ctx, userID, text)
+}
+
+func (router *ConversationRouter) renderTerminalText(userID string, source CatalogEntry, content hprp.Content) (string, error) {
+	current, total := terminalPageNumbers(content.Page)
+	target := session.Target{
+		PaneID: source.Session.SlotID, Agent: source.Session.Display.Agent,
+		DisplayAgent: source.Session.Display.DisplayAgent, Workspace: source.Session.Display.Workspace,
+		Tab: source.Session.Display.Tab, Title: source.Session.Display.Title,
+	}
+	rendered := panel.RenderPageWithTotal(target, current, total, strings.Split(content.Text, "\n"))
+	return router.decorateTerminalContent(userID, source, rendered)
+}
+
+func (router *ConversationRouter) terminalHeader(userID string, source CatalogEntry, content hprp.Content) (string, error) {
+	listIndex, err := router.catalog.EnsureNumberedIndex(userID, source.Ref)
+	if err != nil {
+		return "", err
+	}
+	current, total := terminalPageNumbers(content.Page)
+	header := fmt.Sprintf("[终端输出#%d] %s, 页码:[%d/%d]", listIndex, catalogTargetLabel(source), current, total)
+	selected, selectedErr := router.catalog.Selected(userID)
+	if selectedErr == nil && !sameSessionRef(selected.Ref, source.Ref) {
+		header += fmt.Sprintf("\n⚠️⚠️⚠️ 你的输入不会发送到该输出会话，使用 /%d 切换到当前输出的会话。", listIndex)
+	}
+	return header, nil
+}
+
+func terminalPageNumbers(page *hprp.TerminalPage) (int, int) {
+	if page == nil {
+		return 1, 1
+	}
+	current := max(1, page.Current)
+	return current, max(current, page.Total)
+}
+
+func decodeTerminalPNG(content hprp.Content) ([]byte, error) {
+	if content.Image == nil || content.Image.MediaType != "image/png" || content.Image.Encoding != "base64" {
+		return nil, hprp.ErrInvalidMessage
+	}
+	png, err := base64.StdEncoding.DecodeString(content.Image.Data)
+	if err != nil || len(png) == 0 {
+		return nil, hprp.ErrInvalidMessage
+	}
+	return png, nil
+}
+
+func (router *ConversationRouter) sendMarkdownTo(ctx context.Context, userID, content string) error {
+	parts := panel.SplitMarkdown(content, panel.WeComContentLimit)
+	if len(parts) == 0 {
+		return errors.New("发送内容无效")
+	}
+	for _, part := range parts {
+		if err := router.gateway.SendMarkdownTo(ctx, userID, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (router *ConversationRouter) decorateTerminalContent(userID string, source CatalogEntry, content string) (string, error) {
 	if !panel.IsRenderedPage(content) {
 		return content, nil
@@ -533,10 +754,65 @@ func (router *ConversationRouter) decorateTerminalContent(userID string, source 
 	content = panel.DecorateRenderedPage(content, source.Ref.MachineID, source.Session.Display.Index, listIndex)
 	selected, selectedErr := router.catalog.Selected(userID)
 	if selectedErr == nil && !sameSessionRef(selected.Ref, source.Ref) {
-		warning := fmt.Sprintf("⚠️⚠️⚠️[当前会话] %s, 你的输入将不会发送给当前输出的会话，使用 /%d 切换到当前输出的会话。", catalogTargetLabel(selected), listIndex)
+		warning := fmt.Sprintf("⚠️⚠️⚠️ 你的输入不会发送到该输出会话，使用 /%d 切换到当前输出的会话。", listIndex)
 		content = panel.AppendRenderedPageNote(content, warning)
 	}
 	return content, nil
+}
+
+func modeConfirmation(entry CatalogEntry, mode hprp.OutputMode) string {
+	name := "文本模式"
+	if mode == hprp.OutputModeImage {
+		name = "图片模式"
+	}
+	return fmt.Sprintf("已将 %s 设置为%s。", catalogTargetLabel(entry), name)
+}
+
+func statusNotificationText(entry CatalogEntry, status string) string {
+	return catalogNotificationHeader(entry) + "\n" + statusNotificationTitle(status)
+}
+
+func catalogNotificationHeader(entry CatalogEntry) string {
+	name := entry.Session.Display.DisplayAgent
+	if name == "" {
+		name = entry.Session.Display.Agent
+	}
+	if name == "" {
+		name = entry.Session.SlotID
+	}
+	header := fmt.Sprintf("[%s/%d] %s", safeRouterLabel(entry.Ref.MachineID), entry.Session.Display.Index, safeRouterLabel(name))
+	if entry.Session.Display.Title != "" {
+		header += " — " + safeRouterLabel(entry.Session.Display.Title)
+	}
+	return header
+}
+
+func statusNotificationTitle(status string) string {
+	switch hprp.NormalizeStatus(status) {
+	case hprp.StatusWorking:
+		return "Agent 开始工作。"
+	case hprp.StatusBlocked:
+		return "Agent 已阻塞，需要你的处理。"
+	case hprp.StatusDone:
+		return "Agent 已完成。"
+	case hprp.StatusIdle:
+		return "Agent 已空闲。"
+	default:
+		return "Agent 状态无法可靠识别，请在 Herdr 中确认。"
+	}
+}
+
+func statusNeedsTerminal(previous, current string) bool {
+	previous = hprp.NormalizeStatus(previous)
+	current = hprp.NormalizeStatus(current)
+	if current == hprp.StatusBlocked || current == hprp.StatusDone {
+		return true
+	}
+	return current == hprp.StatusIdle && (previous == hprp.StatusWorking || previous == hprp.StatusBlocked)
+}
+
+func invalidatedNotificationText(target hprp.Target) string {
+	return fmt.Sprintf("[%s] %s\nAgent 目标已失效，请重新执行 /ls 并选择可用会话。", safeRouterLabel(target.MachineID), safeRouterLabel(target.SlotID))
 }
 
 func catalogTargetLabel(entry CatalogEntry) string {
@@ -561,6 +837,7 @@ const (
 	serverActionList
 	serverActionSelect
 	serverActionHelp
+	serverActionMode
 	serverActionDirected
 )
 
@@ -568,6 +845,7 @@ type serverAction struct {
 	kind        serverActionKind
 	index       int
 	content     string
+	mode        hprp.OutputMode
 	switchAfter bool
 }
 
@@ -596,6 +874,20 @@ func parseServerAction(content string) (serverAction, error) {
 			return serverAction{}, errors.New("/help 用法: /help")
 		}
 		return serverAction{kind: serverActionHelp}, nil
+	case "/mode":
+		if len(fields) != 2 {
+			return serverAction{}, errors.New("/mode 用法: /mode img 或 /mode txt")
+		}
+		var mode hprp.OutputMode
+		switch fields[1] {
+		case string(hprp.OutputModeImage):
+			mode = hprp.OutputModeImage
+		case string(hprp.OutputModeText):
+			mode = hprp.OutputModeText
+		default:
+			return serverAction{}, errors.New("/mode 用法: /mode img 或 /mode txt")
+		}
+		return serverAction{kind: serverActionMode, mode: mode}, nil
 	case "/sel":
 		if len(fields) != 2 {
 			return serverAction{}, errors.New("/sel 用法: /sel N")
@@ -630,13 +922,14 @@ func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
 		return serverAction{}, true, errors.New("#N 用法: #N 内容")
 	}
 	nested, err := parseServerAction(remainder)
-	if err != nil || nested.kind != serverActionForward {
+	if err != nil || (nested.kind != serverActionForward && nested.kind != serverActionMode) {
 		return serverAction{}, true, errors.New("定向输入不能执行 /userid、/ls、/help、/N 或 /sel N。")
 	}
 	return serverAction{
 		kind:        serverActionDirected,
 		index:       index,
 		content:     remainder,
+		mode:        nested.mode,
 		switchAfter: prefix[0] == '/',
 	}, true, nil
 }
@@ -705,6 +998,8 @@ func safeRouterError(err error) string {
 		return "尚未选择 Agent，请先执行 /ls 和 /N。"
 	case errors.Is(err, ErrUnknownConnection):
 		return "目标机器已离线，请重新执行 /ls。"
+	case errors.Is(err, ErrTerminalImageUnsupported):
+		return "目标 Pal 不支持图片模式，请升级客户端或使用 /mode txt。"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "请求超时，请检查目标机器连接。"
 	default:

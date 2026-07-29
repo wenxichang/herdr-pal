@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -224,10 +225,10 @@ func TestRouterSelectImmediatelyReturnsDecoratedConsolePage(t *testing.T) {
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "Panel标题")},
 	})
-	relay.executeReply.Content = panel.RenderPageWithTotal(session.Target{
-		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "Panel标题",
-		Workspace: "workspace", Tab: "main",
-	}, 1, 1, []string{"选择后的终端内容"})
+	relay.executeReply.StructuredContent = &hprp.Content{
+		Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeText, Text: "选择后的终端内容",
+		Page: &hprp.TerminalPage{Current: 1, Total: 1},
+	}
 
 	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
 	router.Handle(context.Background(), routerMessage("request-select", "message-select", "user-a", "/1"))
@@ -247,15 +248,9 @@ func TestRouterTerminalNotificationCreatesNumberedSnapshotWhenListWasNotRequeste
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1, Sessions: []hprp.Session{relaySession(2, "w1:p1", "occ-1", "后台任务")},
 	})
-	content := panel.RenderPageWithTotal(session.Target{
-		PaneID: "w1:p1", Agent: "codex", Workspace: "workspace", Tab: "main",
-	}, 1, 1, []string{"自动编号输出"})
-
-	err := router.SendNotification(context.Background(), "user-a", "home-mac", hprp.NotificationEvent{
-		EventKey: "event-auto", Sequence: 1, Kind: "agent.status",
-		Target:  hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"},
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
-	})
+	target := hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"}
+	relay.fetchReply = terminalSnapshotResult(target, hprp.OutputModeText, "自动编号输出", 1, 1)
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(target, "working", "done"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,6 +315,105 @@ func TestRouterForwardsClientCommandsUnchanged(t *testing.T) {
 	}
 }
 
+func TestRouterModeUsesSelectedSessionOnly(t *testing.T) {
+	router, gateway, relay, home, office := directedRouterHarness(t)
+	relay.capabilities[hprp.CapabilityTerminalImageV1] = true
+
+	router.Handle(context.Background(), routerMessage("request-mode", "message-mode", "user-a", "/mode img"))
+
+	mode, explicit, err := router.catalog.OutputMode("user-a", home.Ref)
+	if err != nil || !explicit || mode != hprp.OutputModeImage {
+		t.Fatalf("home mode = %q, %v, %v", mode, explicit, err)
+	}
+	if _, explicit, err := router.catalog.OutputMode("user-a", office.Ref); err != nil || explicit {
+		t.Fatalf("office explicit = %v, error = %v", explicit, err)
+	}
+	if relay.CallCount() != 0 {
+		t.Fatalf("relay calls = %#v, mode should not execute terminal command", relay.Calls())
+	}
+	if reply := gateway.LastReply(); !strings.Contains(reply, "图片模式") || !strings.Contains(reply, "home-mac") {
+		t.Fatalf("mode reply = %q", reply)
+	}
+}
+
+func TestRouterDirectedModeSwitchesOnlyAfterSuccess(t *testing.T) {
+	router, gateway, relay, home, office := directedRouterHarness(t)
+
+	router.Handle(context.Background(), routerMessage("request-mode-fail", "message-mode-fail", "user-a", "/2 /mode img"))
+	selected, err := router.catalog.Selected("user-a")
+	if err != nil || !sameSessionRef(selected.Ref, home.Ref) {
+		t.Fatalf("selection after failure = %#v, %v", selected, err)
+	}
+	if !strings.Contains(gateway.LastReply(), "不支持图片模式") {
+		t.Fatalf("failure reply = %q", gateway.LastReply())
+	}
+
+	relay.capabilities[hprp.CapabilityTerminalImageV1] = true
+	router.Handle(context.Background(), routerMessage("request-mode-ok", "message-mode-ok", "user-a", "/2 /mode img"))
+	selected, err = router.catalog.Selected("user-a")
+	if err != nil || !sameSessionRef(selected.Ref, office.Ref) {
+		t.Fatalf("selection after success = %#v, %v", selected, err)
+	}
+	mode, explicit, err := router.catalog.OutputMode("user-a", office.Ref)
+	if err != nil || !explicit || mode != hprp.OutputModeImage {
+		t.Fatalf("office mode = %q, %v, %v", mode, explicit, err)
+	}
+}
+
+func TestRouterHashDirectedModeKeepsSelection(t *testing.T) {
+	router, _, relay, home, office := directedRouterHarness(t)
+	relay.capabilities[hprp.CapabilityTerminalImageV1] = true
+
+	router.Handle(context.Background(), routerMessage("request-mode", "message-mode-hash", "user-a", "#2 /mode img"))
+
+	selected, err := router.catalog.Selected("user-a")
+	if err != nil || !sameSessionRef(selected.Ref, home.Ref) {
+		t.Fatalf("selection = %#v, %v, want home", selected, err)
+	}
+	mode, explicit, err := router.catalog.OutputMode("user-a", office.Ref)
+	if err != nil || !explicit || mode != hprp.OutputModeImage {
+		t.Fatalf("office mode = %q, %v, %v", mode, explicit, err)
+	}
+}
+
+func TestRouterDefaultsOpenCodeToImageAndOthersToText(t *testing.T) {
+	tests := []struct {
+		name       string
+		agent      string
+		display    string
+		capability bool
+		want       im.OutputMode
+	}{
+		{name: "opencode", agent: "opencode", capability: true, want: im.OutputModeImage},
+		{name: "display opencode", agent: "custom", display: "OpenCode", capability: true, want: im.OutputModeImage},
+		{name: "opencode without capability", agent: "opencode", want: im.OutputModeText},
+		{name: "codex", agent: "codex", capability: true, want: im.OutputModeText},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router, _, relay := newRouterHarness(t)
+			sessionValue := relaySession(1, "pane-1", "occ-1", "title")
+			sessionValue.Display.Agent = test.agent
+			sessionValue.Display.DisplayAgent = test.display
+			attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+				Sequence: 1, Sessions: []hprp.Session{sessionValue},
+			})
+			entry := router.catalog.CreateNumberedSnapshot("user-a")[0]
+			if err := router.catalog.SetSelection("user-a", entry.Ref); err != nil {
+				t.Fatal(err)
+			}
+			relay.capabilities[hprp.CapabilityTerminalImageV1] = test.capability
+
+			router.Handle(context.Background(), routerMessage("request", "message-"+test.name, "user-a", "继续"))
+
+			calls := relay.Calls()
+			if len(calls) != 1 || calls[0].message.OutputMode != test.want {
+				t.Fatalf("calls = %#v, want mode %q", calls, test.want)
+			}
+		})
+	}
+}
+
 func TestParseServerActionSupportsDirectedPrefixes(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -343,6 +437,35 @@ func TestParseServerActionSupportsDirectedPrefixes(t *testing.T) {
 				t.Fatalf("parseServerAction(%q) = %#v", test.content, action)
 			}
 		})
+	}
+}
+
+func TestParseServerActionSupportsModeCommands(t *testing.T) {
+	tests := []struct {
+		content     string
+		kind        serverActionKind
+		index       int
+		mode        hprp.OutputMode
+		switchAfter bool
+	}{
+		{content: "/mode img", kind: serverActionMode, mode: hprp.OutputModeImage},
+		{content: "/mode txt", kind: serverActionMode, mode: hprp.OutputModeText},
+		{content: "/2 /mode img", kind: serverActionDirected, index: 2, mode: hprp.OutputModeImage, switchAfter: true},
+		{content: "#3 /mode txt", kind: serverActionDirected, index: 3, mode: hprp.OutputModeText},
+	}
+	for _, test := range tests {
+		action, err := parseServerAction(test.content)
+		if err != nil {
+			t.Fatalf("parseServerAction(%q) error = %v", test.content, err)
+		}
+		if action.kind != test.kind || action.index != test.index || action.mode != test.mode || action.switchAfter != test.switchAfter {
+			t.Fatalf("parseServerAction(%q) = %#v", test.content, action)
+		}
+	}
+	for _, content := range []string{"/mode", "/mode png", "/mode img extra"} {
+		if _, err := parseServerAction(content); err == nil {
+			t.Fatalf("parseServerAction(%q) should fail", content)
+		}
 	}
 }
 
@@ -446,7 +569,8 @@ func TestRouterDirectedSlashSelectsReplacementReturnedByClient(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		return RelayExecution{Content: "会话已切换", SelectedTarget: &replacement}, nil
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "会话已切换"}
+		return RelayExecution{StructuredContent: &content, SelectedTarget: &replacement}, nil
 	}
 
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "/2 /slash clear"))
@@ -467,7 +591,8 @@ func TestRouterDirectedHashDoesNotSelectNoncurrentReplacement(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		return RelayExecution{Content: "会话已切换", SelectedTarget: &replacement}, nil
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "会话已切换"}
+		return RelayExecution{StructuredContent: &content, SelectedTarget: &replacement}, nil
 	}
 
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "#2 /slash clear"))
@@ -487,7 +612,8 @@ func TestRouterDirectedHashKeepsCurrentLogicalSessionAfterReplacement(t *testing
 		}); err != nil {
 			t.Fatal(err)
 		}
-		return RelayExecution{Content: "会话已切换", SelectedTarget: &replacement}, nil
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "会话已切换"}
+		return RelayExecution{StructuredContent: &content, SelectedTarget: &replacement}, nil
 	}
 
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement-hash-current", "user-a", "#1 /slash clear"))
@@ -507,7 +633,8 @@ func TestRouterCurrentExecutionRebindsReplacementReturnedByClient(t *testing.T) 
 		}); err != nil {
 			t.Fatal(err)
 		}
-		return RelayExecution{Content: "会话已切换", SelectedTarget: &replacement}, nil
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "会话已切换"}
+		return RelayExecution{StructuredContent: &content, SelectedTarget: &replacement}, nil
 	}
 
 	router.Handle(context.Background(), routerMessage("request-replacement", "message-replacement", "user-a", "/slash clear"))
@@ -550,6 +677,166 @@ func TestRouterExecuteTimeoutDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestRouterStatusDoneFetchesSnapshotUsingCurrentMode(t *testing.T) {
+	router, gateway, relay := selectedRouterHarness(t)
+	entry, err := router.catalog.Selected("user-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := router.catalog.SetOutputMode("user-a", entry.Ref, hprp.OutputModeText); err != nil {
+		t.Fatal(err)
+	}
+	relay.fetchReply = terminalSnapshotResult(entry.Ref, hprp.OutputModeText, "完成后的终端内容", 1, 3)
+
+	err = router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(
+		entry.Ref, "working", "done"))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetches := relay.FetchCalls()
+	if len(fetches) != 1 || fetches[0].mode != hprp.OutputModeText || fetches[0].maxLines != 100 || !sameSessionRef(fetches[0].target, entry.Ref) {
+		t.Fatalf("fetches = %#v", fetches)
+	}
+	replies := gateway.Replies()
+	if len(replies) != 2 || !strings.Contains(replies[0], "Agent 已完成") || !strings.Contains(replies[1], "完成后的终端内容") || !strings.Contains(replies[1], "页码:[1/3]") {
+		t.Fatalf("replies = %#v", replies)
+	}
+}
+
+func TestRouterRecentBackgroundActivitySendsShortNoticeWithoutFetching(t *testing.T) {
+	router, gateway, relay, _, office := directedRouterHarness(t)
+	start := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	now := start
+	router.now = func() time.Time { return now }
+	router.Handle(context.Background(), routerMessage("request-help", "message-help-recent", "user-a", "/help"))
+	now = start.Add(time.Minute)
+
+	err := router.SendNotification(context.Background(), "user-a", "office-pc", statusNotification(
+		office.Ref, "working", "blocked"))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relay.FetchCalls()) != 0 {
+		t.Fatalf("fetches = %#v, want none", relay.FetchCalls())
+	}
+	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出，等待你的回复") || !strings.Contains(reply, "使用/2切换") {
+		t.Fatalf("background notice = %q", reply)
+	}
+}
+
+func TestRouterSnapshotFailureStillSendsStatusNotification(t *testing.T) {
+	router, gateway, relay := selectedRouterHarness(t)
+	entry, err := router.catalog.Selected("user-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.fetchErr = errors.New("snapshot unavailable")
+
+	err = router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(
+		entry.Ref, "working", "done"))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replies := gateway.Replies(); len(replies) != 1 || !strings.Contains(replies[0], "Agent 已完成") {
+		t.Fatalf("replies = %#v", replies)
+	}
+}
+
+func TestRouterImageNotificationUsesSameReadTextFallback(t *testing.T) {
+	router, gateway, relay := selectedRouterHarness(t)
+	entry, err := router.catalog.Selected("user-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.capabilities[hprp.CapabilityTerminalImageV1] = true
+	if err := router.catalog.SetOutputMode("user-a", entry.Ref, hprp.OutputModeImage); err != nil {
+		t.Fatal(err)
+	}
+	relay.fetchReply = hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeFailed,
+		Target:  entry.Ref,
+		FallbackContent: &hprp.Content{
+			Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeText, Text: "图片失败后的同页文本",
+			Page: &hprp.TerminalPage{Current: 2, Total: 4},
+		},
+		Error: &hprp.Error{Code: hprp.CodeTerminalImageFailed},
+	}
+
+	err = router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(
+		entry.Ref, "working", "blocked"))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gateway.Images()) != 0 {
+		t.Fatalf("images = %d, want 0", len(gateway.Images()))
+	}
+	if reply := gateway.LastReply(); !strings.Contains(reply, "图片失败后的同页文本") || !strings.Contains(reply, "页码:[2/4]") {
+		t.Fatalf("fallback reply = %q", reply)
+	}
+}
+
+func TestRouterPageUpAndPageDownKeepModeAndPageMetadata(t *testing.T) {
+	router, gateway, relay := selectedRouterHarness(t)
+	entry, err := router.catalog.Selected("user-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.capabilities[hprp.CapabilityTerminalImageV1] = true
+	if err := router.catalog.SetOutputMode("user-a", entry.Ref, hprp.OutputModeImage); err != nil {
+		t.Fatal(err)
+	}
+	relay.execute = func(_ context.Context, _ string, target hprp.Target, message im.IncomingText) (RelayExecution, error) {
+		page := 2
+		if message.Content == "/pagedn" {
+			page = 3
+		}
+		content := terminalImageContent("同页审计文本", page, 5)
+		return RelayExecution{StructuredContent: &content}, nil
+	}
+
+	router.Handle(context.Background(), routerMessage("request-up", "message-up", "user-a", "/pageup"))
+	router.Handle(context.Background(), routerMessage("request-down", "message-down", "user-a", "/pagedn"))
+
+	calls := relay.Calls()
+	if len(calls) != 2 || calls[0].message.OutputMode != im.OutputModeImage || calls[1].message.OutputMode != im.OutputModeImage {
+		t.Fatalf("calls = %#v", calls)
+	}
+	replies := gateway.Replies()
+	if len(replies) != 2 || !strings.Contains(replies[0], "页码:[2/5]") || !strings.Contains(replies[1], "页码:[3/5]") {
+		t.Fatalf("replies = %#v", replies)
+	}
+	if len(gateway.Images()) != 2 {
+		t.Fatalf("images = %d, want 2", len(gateway.Images()))
+	}
+}
+
+func TestRouterTargetInvalidatedDoesNotFetchSnapshot(t *testing.T) {
+	router, gateway, relay := selectedRouterHarness(t)
+	entry, err := router.catalog.Selected("user-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := router.catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{Sequence: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = router.SendNotification(context.Background(), "user-a", "home-mac", invalidatedNotification(entry.Ref))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relay.FetchCalls()) != 0 {
+		t.Fatalf("fetches = %#v, want none", relay.FetchCalls())
+	}
+	if reply := gateway.LastReply(); !strings.Contains(reply, "目标已失效") || !strings.Contains(reply, "pane-1") {
+		t.Fatalf("invalidated reply = %q", reply)
+	}
+}
+
 func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
 	router, gateway, _ := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "office-pc"}, hprp.SessionSnapshot{
@@ -563,14 +850,14 @@ func TestRouterSendsPushAndStructuredNotificationToOwningUser(t *testing.T) {
 	if err := router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(target, "后续分段")); err != nil {
 		t.Fatalf("SendCommandOutput() error = %v", err)
 	}
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(target, "Agent 已阻塞，需要你的处理。")); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", statusNotification(target, "idle", "working")); err != nil {
 		t.Fatalf("SendNotification() error = %v", err)
 	}
 	replies := gateway.Replies()
 	if len(replies) != 2 || replies[0] != "后续分段" {
 		t.Fatalf("replies = %#v", replies)
 	}
-	for _, want := range []string{"[office-pc/2] Claude — 修复登录", "Agent 已阻塞"} {
+	for _, want := range []string{"[office-pc/2] Claude — 修复登录", "Agent 开始工作"} {
 		if !strings.Contains(replies[1], want) {
 			t.Fatalf("notification %q lacks %q", replies[1], want)
 		}
@@ -595,20 +882,15 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	if err := router.catalog.SetSelection("user-a", selected); err != nil {
 		t.Fatal(err)
 	}
-	content := panel.RenderPageWithTotal(session.Target{
-		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "后台任务",
-		Workspace: "workspace", Tab: "main",
-	}, 1, 2, []string{"后续终端分段"})
-
-	err := router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(
-		hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-home"}, content))
+	err := router.SendCommandOutput(context.Background(), "user-a", routerTerminalCommandOutput(
+		hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-home"}, "后续终端分段", 1, 2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	reply := gateway.LastReply()
 	for _, want := range []string{
 		"[终端输出#1] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/2]",
-		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，使用 /1 切换到当前输出的会话。",
+		"⚠️⚠️⚠️ 你的输入不会发送到该输出会话，使用 /1 切换到当前输出的会话。",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal push %q lacks %q", reply, want)
@@ -621,15 +903,15 @@ func TestRouterDropsNotificationForChangedOccupant(t *testing.T) {
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "new-occ", "title")},
 	})
-	err := router.SendNotification(context.Background(), "user-a", "home-mac", routerNotification(
-		hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "old-occ"}, "stale"))
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(
+		hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "old-occ"}, "working", "done"))
 	if !errors.Is(err, ErrTargetChanged) || gateway.ReplyCount() != 0 {
 		t.Fatalf("SendNotification() = %v, replies %d", err, gateway.ReplyCount())
 	}
 }
 
 func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T) {
-	router, gateway, _ := newRouterHarness(t)
+	router, gateway, relay := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-home", "后台任务")},
 	})
@@ -646,20 +928,16 @@ func TestRouterTerminalNotificationAppendsDifferentCurrentSelection(t *testing.T
 	if err := router.catalog.SetSelection("user-a", selected); err != nil {
 		t.Fatal(err)
 	}
-	content := panel.RenderPageWithTotal(session.Target{
-		PaneID: "w1:p1", Agent: "codex", DisplayAgent: "Codex", Title: "后台任务",
-		Workspace: "workspace", Tab: "main",
-	}, 1, 1, []string{"后台输出"})
-
-	err := router.SendNotification(context.Background(), "user-a", "home-mac", routerNotification(
-		hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-home"}, content))
+	target := hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-home"}
+	relay.fetchReply = terminalSnapshotResult(target, hprp.OutputModeText, "后台输出", 1, 1)
+	err := router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(target, "working", "done"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	reply := gateway.LastReply()
 	for _, want := range []string{
 		"[终端输出#1] [home-mac/1] workspace/main-codex(w1:p1), 页码:[1/1]",
-		"⚠️⚠️⚠️[当前会话] [office-pc/2] workspace/main-codex(w2:p2), 你的输入将不会发送给当前输出的会话，使用 /1 切换到当前输出的会话。",
+		"⚠️⚠️⚠️ 你的输入不会发送到该输出会话，使用 /1 切换到当前输出的会话。",
 	} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("terminal notification %q lacks %q", reply, want)
@@ -677,11 +955,7 @@ func TestRouterUsesBriefBackgroundNoticeWhileUserIsActive(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-help", "message-help-active", "user-a", "/help"))
 	now = now.Add(time.Minute)
 
-	err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref,
-		panel.RenderPageWithTotal(session.Target{
-			PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
-			Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
-		}, 1, 1, []string{"不应发送的完整后台输出"})))
+	err := router.SendNotification(context.Background(), "user-a", "office-pc", statusNotification(office.Ref, "working", "blocked"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -693,18 +967,15 @@ func TestRouterUsesBriefBackgroundNoticeWhileUserIsActive(t *testing.T) {
 }
 
 func TestRouterBackgroundNoticeRefreshesActivityWindow(t *testing.T) {
-	router, gateway, _, _, office := directedRouterHarness(t)
+	router, gateway, relay, _, office := directedRouterHarness(t)
 	start := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	now := start
 	router.now = func() time.Time { return now }
 	router.Handle(context.Background(), routerMessage("request-help", "message-help-window", "user-a", "/help"))
-	content := panel.RenderPageWithTotal(session.Target{
-		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
-		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
-	}, 1, 1, []string{"后台输出"})
+	relay.fetchReply = terminalSnapshotResult(office.Ref, hprp.OutputModeText, "后台输出", 1, 1)
 	notify := func() {
 		t.Helper()
-		if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref, content)); err != nil {
+		if err := router.SendNotification(context.Background(), "user-a", "office-pc", statusNotification(office.Ref, "working", "blocked")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -727,14 +998,11 @@ func TestRouterBackgroundNoticeRefreshesActivityWindow(t *testing.T) {
 }
 
 func TestRouterCurrentOutputRefreshesSharedUserActivity(t *testing.T) {
-	router, gateway, _, home, office := directedRouterHarness(t)
+	router, gateway, relay, home, office := directedRouterHarness(t)
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	router.now = func() time.Time { return now }
-	currentContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: home.Session.SlotID, Agent: home.Session.Display.Agent,
-		Workspace: home.Session.Display.Workspace, Tab: home.Session.Display.Tab,
-	}, 1, 1, []string{"当前会话完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "home-mac", routerNotification(home.Ref, currentContent)); err != nil {
+	relay.fetchReply = terminalSnapshotResult(home.Ref, hprp.OutputModeText, "当前会话完整输出", 1, 1)
+	if err := router.SendNotification(context.Background(), "user-a", "home-mac", statusNotification(home.Ref, "working", "done")); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gateway.LastReply(), "当前会话完整输出") {
@@ -742,11 +1010,7 @@ func TestRouterCurrentOutputRefreshesSharedUserActivity(t *testing.T) {
 	}
 
 	now = now.Add(time.Minute)
-	backgroundContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
-		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
-	}, 1, 1, []string{"后台完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref, backgroundContent)); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", statusNotification(office.Ref, "working", "done")); err != nil {
 		t.Fatal(err)
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出") || strings.Contains(reply, "后台完整输出") {
@@ -758,11 +1022,7 @@ func TestRouterExecutePushStaysFullAndRefreshesActivity(t *testing.T) {
 	router, gateway, _, home, office := directedRouterHarness(t)
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	router.now = func() time.Time { return now }
-	pushContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: home.Session.SlotID, Agent: home.Session.Display.Agent,
-		Workspace: home.Session.Display.Workspace, Tab: home.Session.Display.Tab,
-	}, 1, 1, []string{"必须保留的后续分段"})
-	if err := router.SendCommandOutput(context.Background(), "user-a", routerCommandOutput(home.Ref, pushContent)); err != nil {
+	if err := router.SendCommandOutput(context.Background(), "user-a", routerTerminalCommandOutput(home.Ref, "必须保留的后续分段", 1, 1)); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gateway.LastReply(), "必须保留的后续分段") {
@@ -770,11 +1030,7 @@ func TestRouterExecutePushStaysFullAndRefreshesActivity(t *testing.T) {
 	}
 
 	now = now.Add(time.Minute)
-	backgroundContent := panel.RenderPageWithTotal(session.Target{
-		PaneID: office.Session.SlotID, Agent: office.Session.Display.Agent,
-		Workspace: office.Session.Display.Workspace, Tab: office.Session.Display.Tab,
-	}, 1, 1, []string{"不应发送的后台完整输出"})
-	if err := router.SendNotification(context.Background(), "user-a", "office-pc", routerNotification(office.Ref, backgroundContent)); err != nil {
+	if err := router.SendNotification(context.Background(), "user-a", "office-pc", statusNotification(office.Ref, "working", "done")); err != nil {
 		t.Fatal(err)
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "有新的输出") || strings.Contains(reply, "不应发送的后台完整输出") {
@@ -793,7 +1049,11 @@ func newRouterHarnessWithConfig(t *testing.T, config ConversationRouterConfig) (
 		t.Fatal(err)
 	}
 	gateway := &routerGateway{}
-	relay := &routerRelay{executeReply: RelayExecution{Content: "客户端已处理。"}}
+	text := hprp.Content{Type: hprp.ContentTypeText, Text: "客户端已处理。"}
+	relay := &routerRelay{
+		executeReply: RelayExecution{StructuredContent: &text},
+		capabilities: make(map[string]bool),
+	}
 	router, err := NewConversationRouterWithConfig(config, NewSessionCatalog(), NewUserExecutor(64), gateway, relay, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -844,16 +1104,71 @@ func routerCommandOutput(target hprp.Target, content string) hprp.CommandOutput 
 	}
 }
 
-func routerNotification(target hprp.Target, content string) hprp.NotificationEvent {
-	return hprp.NotificationEvent{
-		EventKey: "event-" + target.MachineID + "-" + target.SlotID, Sequence: 1, Kind: "agent.status", Target: target,
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
+func routerTerminalCommandOutput(target hprp.Target, content string, current, total int) hprp.CommandOutput {
+	return hprp.CommandOutput{
+		Target: target, Sequence: 1,
+		Content: hprp.Content{
+			Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeText, Text: content,
+			Page: &hprp.TerminalPage{Current: current, Total: total},
+		},
 	}
+}
+
+func statusNotification(target hprp.Target, previous, current string) hprp.NotificationEvent {
+	return hprp.NotificationEvent{
+		EventKey: "event-" + target.MachineID + "-" + target.SlotID,
+		Sequence: 1, Kind: hprp.NotificationKindAgentStatusChanged, Target: target,
+		SnapshotSequence: 1, OccurredAt: time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+		Data: &hprp.StatusChangeData{PreviousStatus: previous, Status: current},
+	}
+}
+
+func invalidatedNotification(target hprp.Target) hprp.NotificationEvent {
+	return hprp.NotificationEvent{
+		EventKey: "invalidated-" + target.MachineID + "-" + target.SlotID,
+		Sequence: 1, Kind: hprp.NotificationKindTargetInvalidated, Target: target,
+		SnapshotSequence: 2, OccurredAt: time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func terminalSnapshotResult(target hprp.Target, mode hprp.OutputMode, content string, current, total int) hprp.TerminalSnapshotResult {
+	terminal := hprp.Content{
+		Type: hprp.ContentTypeTerminal, Mode: mode, Text: content,
+		Page: &hprp.TerminalPage{Current: current, Total: total},
+	}
+	return hprp.TerminalSnapshotResult{Outcome: hprp.OutcomeOK, Target: target, Content: &terminal}
+}
+
+func terminalImageContent(content string, current, total int) hprp.Content {
+	return hprp.Content{
+		Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeImage, Text: content,
+		Page: &hprp.TerminalPage{Current: current, Total: total},
+		Image: &hprp.TerminalImage{
+			MediaType: "image/png", Encoding: "base64", Data: base64.StdEncoding.EncodeToString(testPNG),
+			Width: 1, Height: 1, ColorMode: "png8",
+		},
+	}
+}
+
+var testPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x03, 0x00, 0x00, 0x00, 0x28, 0xcb, 0x34,
+	0xbb, 0x00, 0x00, 0x00, 0x03, 0x50, 0x4c, 0x54,
+	0x45, 0x00, 0x00, 0x00, 0xa7, 0x7a, 0x3d, 0xda,
+	0x00, 0x00, 0x00, 0x01, 0x74, 0x52, 0x4e, 0x53,
+	0x00, 0x40, 0xe6, 0xd8, 0x66, 0x00, 0x00, 0x00,
+	0x0a, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63,
+	0x60, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2,
+	0x21, 0xbc, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49,
+	0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 }
 
 type routerGateway struct {
 	mu      sync.Mutex
 	replies []string
+	images  [][]byte
 }
 
 type failingRouterGateway struct {
@@ -882,6 +1197,13 @@ func (gateway *routerGateway) SendMarkdownTo(_ context.Context, _ string, conten
 	return nil
 }
 
+func (gateway *routerGateway) SendImageTo(_ context.Context, _ string, png []byte) error {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	gateway.images = append(gateway.images, append([]byte(nil), png...))
+	return nil
+}
+
 func (gateway *routerGateway) LastReply() string {
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
@@ -903,6 +1225,16 @@ func (gateway *routerGateway) Replies() []string {
 	return append([]string(nil), gateway.replies...)
 }
 
+func (gateway *routerGateway) Images() [][]byte {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	result := make([][]byte, len(gateway.images))
+	for index := range gateway.images {
+		result[index] = append([]byte(nil), gateway.images[index]...)
+	}
+	return result
+}
+
 type routerRelayCall struct {
 	kind    string
 	userID  string
@@ -910,12 +1242,23 @@ type routerRelayCall struct {
 	message im.IncomingText
 }
 
+type routerFetchCall struct {
+	userID   string
+	target   hprp.Target
+	mode     hprp.OutputMode
+	maxLines int
+}
+
 type routerRelay struct {
 	mu           sync.Mutex
 	calls        []routerRelayCall
+	fetchCalls   []routerFetchCall
 	selectErr    error
 	executeReply RelayExecution
 	execute      func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error)
+	capabilities map[string]bool
+	fetchReply   hprp.TerminalSnapshotResult
+	fetchErr     error
 }
 
 func (relay *routerRelay) Select(_ context.Context, userID string, target hprp.Target) error {
@@ -937,6 +1280,19 @@ func (relay *routerRelay) Execute(ctx context.Context, userID string, target hpr
 	return reply, nil
 }
 
+func (relay *routerRelay) SupportsCapability(_ string, _ hprp.Target, capability string) bool {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	return relay.capabilities[capability]
+}
+
+func (relay *routerRelay) FetchTerminalSnapshot(_ context.Context, userID string, target hprp.Target, mode hprp.OutputMode, maxLines int) (hprp.TerminalSnapshotResult, error) {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	relay.fetchCalls = append(relay.fetchCalls, routerFetchCall{userID: userID, target: target, mode: mode, maxLines: maxLines})
+	return relay.fetchReply, relay.fetchErr
+}
+
 func (relay *routerRelay) Calls() []routerRelayCall {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
@@ -944,6 +1300,12 @@ func (relay *routerRelay) Calls() []routerRelayCall {
 }
 
 func (relay *routerRelay) CallCount() int { return len(relay.Calls()) }
+
+func (relay *routerRelay) FetchCalls() []routerFetchCall {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	return append([]routerFetchCall(nil), relay.fetchCalls...)
+}
 
 type testDiscardWriter struct{}
 

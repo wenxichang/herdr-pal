@@ -290,11 +290,15 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 			connection.removeCommand(commandID)
 		}
 	}()
+	outputMode := hprp.OutputMode(message.OutputMode)
+	if outputMode == "" {
+		outputMode = hprp.OutputModeText
+	}
 	command := hprp.CommandExecute{
 		IdempotencyKey: message.MessageID,
 		Target:         target,
 		Content:        hprp.TextContent{Type: hprp.ContentTypeText, Text: message.Content},
-		OutputMode:     hprp.OutputMode(message.OutputMode),
+		OutputMode:     outputMode,
 	}
 	if err := hprp.ValidateCommandExecute(command); err != nil {
 		return RelayExecution{}, err
@@ -321,11 +325,7 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 		return RelayExecution{}, mapCommandFailure(result)
 	}
 	keepRoute = true
-	content := ""
-	if result.Content != nil {
-		content = result.Content.Text
-	}
-	return RelayExecution{Content: content, StructuredContent: result.Content, SelectedTarget: result.ReplacementTarget}, nil
+	return RelayExecution{StructuredContent: result.Content, SelectedTarget: result.ReplacementTarget}, nil
 }
 
 func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn, connectionID string, identity credential.Identity, key ClientKey, source netip.Addr) {

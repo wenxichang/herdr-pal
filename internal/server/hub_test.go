@@ -108,7 +108,7 @@ func TestHPRPHubSelectIsLocalAndExecuteUsesStableTarget(t *testing.T) {
 	})
 	select {
 	case got := <-done:
-		if got.err != nil || got.result.Content != "已发送" || got.result.StructuredContent == nil ||
+		if got.err != nil || got.result.StructuredContent == nil || got.result.StructuredContent.Text != "已发送" ||
 			got.result.StructuredContent.Type != hprp.ContentTypeTerminal || got.result.SelectedTarget != nil {
 			t.Fatalf("Execute() = %#v, %v", got.result, got.err)
 		}
@@ -234,9 +234,10 @@ func TestHPRPHubRejectsNotificationForAnotherMachine(t *testing.T) {
 	client := dialHPRPReady(t, server)
 	defer client.Close(websocket.StatusNormalClosure, "test complete")
 	writeHPRPTestEnvelope(t, client, hprp.TypeNotificationEvent, "notification-other-machine", "", hprp.NotificationEvent{
-		EventKey: "event-other-machine", Sequence: 1, Kind: "agent.status",
-		Target:  hprp.Target{MachineID: "office-pc", SlotID: "pane-1", SessionID: "session-1"},
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: "不应转发"},
+		EventKey: "event-other-machine", Sequence: 1, Kind: hprp.NotificationKindAgentStatusChanged,
+		Target:           hprp.Target{MachineID: "office-pc", SlotID: "pane-1", SessionID: "session-1"},
+		SnapshotSequence: 1, OccurredAt: time.Now().UTC(),
+		Data: &hprp.StatusChangeData{PreviousStatus: hprp.StatusWorking, Status: hprp.StatusDone},
 	})
 	select {
 	case notification := <-sink.notifications:

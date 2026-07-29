@@ -211,7 +211,7 @@ func TestHPRPClientAuthenticatesReportsSnapshotAndExecutesCommand(t *testing.T) 
 		t.Fatalf("entries = %#v", entries)
 	}
 	result, err := hub.Execute(context.Background(), "user-a", entries[0].Ref, imMessage("message-hprp", "prompt"))
-	if err != nil || result.Content != "handled: prompt" {
+	if err != nil || result.StructuredContent == nil || result.StructuredContent.Text != "handled: prompt" {
 		t.Fatalf("Execute() = %#v, %v", result, err)
 	}
 }
@@ -229,7 +229,9 @@ func TestHPRPClientReportsUnknownRequiredMessageBeforeDisconnect(t *testing.T) {
 			ConnectionID: "connection-1", MachineID: "home-mac", Capabilities: []string{}, Features: map[string]hprp.FeatureOffer{},
 			Limits: hprp.ServerLimits{
 				MaxMessageBytes: hprp.MaxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: 1,
-				MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes, IdempotencyWindowMS: 600_000,
+				MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes,
+				MaxTerminalTextBytes: hprp.MaxTerminalTextBytes, MaxTerminalImageBytes: hprp.MaxTerminalImageBytes,
+				IdempotencyWindowMS: 600_000,
 			},
 			Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
 		})
@@ -291,7 +293,9 @@ func TestHPRPClientRejectsInvalidServerHelloBeforeSnapshot(t *testing.T) {
 			ConnectionID: "connection-1", MachineID: "bad machine", Capabilities: []string{}, Features: map[string]hprp.FeatureOffer{},
 			Limits: hprp.ServerLimits{
 				MaxMessageBytes: hprp.MaxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: 1,
-				MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes, IdempotencyWindowMS: 600_000,
+				MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes,
+				MaxTerminalTextBytes: hprp.MaxTerminalTextBytes, MaxTerminalImageBytes: hprp.MaxTerminalImageBytes,
+				IdempotencyWindowMS: 600_000,
 			},
 			Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
 		}); err != nil {

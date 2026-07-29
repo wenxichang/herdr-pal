@@ -127,6 +127,8 @@ func serverActionName(kind serverActionKind) string {
 		return "select"
 	case serverActionHelp:
 		return "help"
+	case serverActionMode:
+		return "mode"
 	case serverActionDirected:
 		return "directed_execute"
 	default:

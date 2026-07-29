@@ -134,6 +134,24 @@ func TestValidateCommandExecuteRequiresStableTargetIdempotencyAndText(t *testing
 	if err := ValidateCommandExecute(invalidMode); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("invalid output mode error = %v", err)
 	}
+	missingMode := valid
+	missingMode.OutputMode = ""
+	if err := ValidateCommandExecute(missingMode); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("missing output mode error = %v", err)
+	}
+}
+
+func TestValidateServerHelloRequiresTerminalLimits(t *testing.T) {
+	hello := validServerHello()
+	hello.Limits.MaxTerminalTextBytes = 0
+	if err := ValidateServerHello(hello); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("missing text limit error = %v", err)
+	}
+	hello = validServerHello()
+	hello.Limits.MaxTerminalImageBytes = 0
+	if err := ValidateServerHello(hello); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("missing image limit error = %v", err)
+	}
 }
 
 func TestValidateTerminalContentRequiresPairedTextAndValidPNG(t *testing.T) {
@@ -266,11 +284,7 @@ func TestValidateTerminalSnapshotResultAllowsSameReadFallback(t *testing.T) {
 }
 
 func TestValidateNotificationEventRequiresIdentityOrderingAndTarget(t *testing.T) {
-	valid := NotificationEvent{
-		EventKey: "event-1", Sequence: 1, Kind: "agent.status",
-		Target:  Target{MachineID: "office-pc", SlotID: "w1:p1", SessionID: "session-1"},
-		Content: TextContent{Type: ContentTypeText, Text: "Agent 已完成"},
-	}
+	valid := validStatusEvent()
 	if err := ValidateNotificationEvent(valid); err != nil {
 		t.Fatalf("ValidateNotificationEvent() error = %v", err)
 	}
@@ -312,7 +326,9 @@ func validServerHello() ServerHello {
 		Capabilities: []string{CapabilityCommandOutputV1}, Features: map[string]FeatureOffer{},
 		Limits: ServerLimits{
 			MaxMessageBytes: MaxMessageBytes, MaxSessions: MaxSessions, MaxInflightCommands: 1,
-			MaxInflightFeatures: 0, MaxOutputBytes: MaxContentBytes, IdempotencyWindowMS: 600_000,
+			MaxInflightFeatures: 0, MaxOutputBytes: MaxContentBytes,
+			MaxTerminalTextBytes: MaxTerminalTextBytes, MaxTerminalImageBytes: MaxTerminalImageBytes,
+			IdempotencyWindowMS: 600_000,
 		},
 		Heartbeat: HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
 	}
