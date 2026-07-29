@@ -1,30 +1,44 @@
 package hprp
 
-import "encoding/json"
-
-const (
-	TypeHelloClient           Type = "hello.client"
-	TypeHelloServer           Type = "hello.server"
-	TypeSessionSnapshot       Type = "session.snapshot"
-	TypeSessionSnapshotResult Type = "session.snapshot.result"
-	TypeCommandExecute        Type = "command.execute"
-	TypeCommandResult         Type = "command.result"
-	TypeCommandOutput         Type = "command.output"
-	TypeNotificationEvent     Type = "notification.event"
-	TypeFeatureInvoke         Type = "feature.invoke"
-	TypeFeatureResult         Type = "feature.result"
-	TypeFeatureEvent          Type = "feature.event"
-	TypeFeatureCancel         Type = "feature.cancel"
-	TypeFeatureCancelResult   Type = "feature.cancel.result"
-	TypeProtocolError         Type = "protocol.error"
+import (
+	"encoding/json"
+	"time"
 )
 
 const (
-	CapabilityCommandOutputV1 = "command.output.v1"
-	CapabilityFeatureInvokeV1 = "feature.invoke.v1"
+	TypeHelloClient            Type = "hello.client"
+	TypeHelloServer            Type = "hello.server"
+	TypeSessionSnapshot        Type = "session.snapshot"
+	TypeSessionSnapshotResult  Type = "session.snapshot.result"
+	TypeCommandExecute         Type = "command.execute"
+	TypeCommandResult          Type = "command.result"
+	TypeCommandOutput          Type = "command.output"
+	TypeNotificationEvent      Type = "notification.event"
+	TypeFeatureInvoke          Type = "feature.invoke"
+	TypeFeatureResult          Type = "feature.result"
+	TypeFeatureEvent           Type = "feature.event"
+	TypeFeatureCancel          Type = "feature.cancel"
+	TypeFeatureCancelResult    Type = "feature.cancel.result"
+	TypeTerminalSnapshotGet    Type = "terminal.snapshot.get"
+	TypeTerminalSnapshotResult Type = "terminal.snapshot.result"
+	TypeProtocolError          Type = "protocol.error"
 )
 
-const ContentTypeText = "text/plain"
+const (
+	CapabilityCommandOutputV1    = "command.output.v1"
+	CapabilityFeatureInvokeV1    = "feature.invoke.v1"
+	CapabilityTerminalSnapshotV1 = "terminal.snapshot.v1"
+	CapabilityTerminalImageV1    = "terminal.image.v1"
+)
+
+const (
+	ContentTypeText     = "text/plain"
+	ContentTypeTerminal = "terminal.snapshot"
+
+	NotificationKindAgentStatusChanged  = "agent.status.changed"
+	NotificationKindTargetInvalidated   = "target.invalidated"
+	TerminalSnapshotPurposeNotification = "notification"
+)
 
 const (
 	StatusIdle    = "idle"
@@ -57,12 +71,14 @@ type ClientLimits struct {
 
 // ServerLimits 是本连接最终生效的服务端资源限制。
 type ServerLimits struct {
-	MaxMessageBytes     int   `json:"max_message_bytes"`
-	MaxSessions         int   `json:"max_sessions"`
-	MaxInflightCommands int   `json:"max_inflight_commands"`
-	MaxInflightFeatures int   `json:"max_inflight_features"`
-	MaxOutputBytes      int   `json:"max_output_bytes"`
-	IdempotencyWindowMS int64 `json:"idempotency_window_ms"`
+	MaxMessageBytes       int   `json:"max_message_bytes"`
+	MaxSessions           int   `json:"max_sessions"`
+	MaxInflightCommands   int   `json:"max_inflight_commands"`
+	MaxInflightFeatures   int   `json:"max_inflight_features"`
+	MaxOutputBytes        int   `json:"max_output_bytes"`
+	MaxTerminalTextBytes  int   `json:"max_terminal_text_bytes,omitempty"`
+	MaxTerminalImageBytes int   `json:"max_terminal_image_bytes,omitempty"`
+	IdempotencyWindowMS   int64 `json:"idempotency_window_ms"`
 }
 
 // HeartbeatConfig 是 hello 后固定的 WebSocket 心跳和空闲超时参数。
@@ -128,42 +144,100 @@ type SnapshotResult struct {
 	Error           *Error  `json:"error,omitempty"`
 }
 
-// TextContent 是 HPRP/1 基础命令和终端通知使用的文本内容。
-type TextContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+// OutputMode 指定单次命令或终端快照的展示形式。
+type OutputMode string
+
+const (
+	OutputModeText  OutputMode = "txt"
+	OutputModeImage OutputMode = "img"
+)
+
+// TerminalImage 是终端快照携带的内联图片。
+type TerminalImage struct {
+	MediaType string `json:"media_type"`
+	Encoding  string `json:"encoding"`
+	Data      string `json:"data"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	ColorMode string `json:"color_mode"`
 }
+
+// TerminalPage 描述终端快照所在分页。
+type TerminalPage struct {
+	Current int `json:"current"`
+	Total   int `json:"total"`
+}
+
+// Content 是 HPRP/1 文本或终端快照联合内容。
+type Content struct {
+	Type       string         `json:"type"`
+	Text       string         `json:"text"`
+	Mode       OutputMode     `json:"mode,omitempty"`
+	Image      *TerminalImage `json:"image,omitempty"`
+	Page       *TerminalPage  `json:"page,omitempty"`
+	CapturedAt *time.Time     `json:"captured_at,omitempty"`
+}
+
+// TextContent 是迁移期间保留的文本内容别名。
+type TextContent = Content
 
 // CommandExecute 请求 Pal 在稳定目标上执行一条基础 Agent 交互命令。
 type CommandExecute struct {
 	IdempotencyKey string      `json:"idempotency_key"`
 	Target         Target      `json:"target"`
 	Content        TextContent `json:"content"`
+	OutputMode     OutputMode  `json:"output_mode,omitempty"`
 }
 
 // CommandResult 是基础命令唯一的最终同步结果。
 type CommandResult struct {
-	Outcome           Outcome      `json:"outcome"`
-	Content           *TextContent `json:"content,omitempty"`
-	ReplacementTarget *Target      `json:"replacement_target,omitempty"`
-	Error             *Error       `json:"error,omitempty"`
+	Outcome           Outcome  `json:"outcome"`
+	Content           *Content `json:"content,omitempty"`
+	ReplacementTarget *Target  `json:"replacement_target,omitempty"`
+	Error             *Error   `json:"error,omitempty"`
 }
 
 // CommandOutput 是命令结果之后的有序终端输出分段。
 type CommandOutput struct {
-	Target   Target      `json:"target"`
-	Sequence uint64      `json:"sequence"`
-	Final    bool        `json:"final"`
-	Content  TextContent `json:"content"`
+	Target   Target  `json:"target"`
+	Sequence uint64  `json:"sequence"`
+	Final    bool    `json:"final"`
+	Content  Content `json:"content"`
 }
 
-// NotificationEvent 是不依赖当前命令的状态或终端主动通知。
+// StatusChangeData 描述 Agent 状态变化。
+type StatusChangeData struct {
+	PreviousStatus string `json:"previous_status"`
+	Status         string `json:"status"`
+}
+
+// NotificationEvent 是不依赖当前命令的结构化状态事件。
 type NotificationEvent struct {
-	EventKey string      `json:"event_key"`
-	Sequence uint64      `json:"sequence"`
-	Kind     string      `json:"kind"`
-	Target   Target      `json:"target"`
-	Content  TextContent `json:"content"`
+	EventKey         string            `json:"event_key"`
+	Sequence         uint64            `json:"sequence"`
+	Kind             string            `json:"kind"`
+	Target           Target            `json:"target"`
+	SnapshotSequence uint64            `json:"snapshot_sequence,omitempty"`
+	OccurredAt       time.Time         `json:"occurred_at,omitempty"`
+	Data             *StatusChangeData `json:"data,omitempty"`
+	Content          Content           `json:"content,omitempty"`
+}
+
+// TerminalSnapshotGet 请求 Pal 无副作用读取一次终端快照。
+type TerminalSnapshotGet struct {
+	Target   Target     `json:"target"`
+	Mode     OutputMode `json:"mode"`
+	Purpose  string     `json:"purpose"`
+	MaxLines int        `json:"max_lines"`
+}
+
+// TerminalSnapshotResult 返回终端快照或同次读取的文本降级内容。
+type TerminalSnapshotResult struct {
+	Outcome         Outcome  `json:"outcome"`
+	Target          Target   `json:"target"`
+	Content         *Content `json:"content,omitempty"`
+	FallbackContent *Content `json:"fallback_content,omitempty"`
+	Error           *Error   `json:"error,omitempty"`
 }
 
 // FeatureInvoke 发起一个已协商的用户功能，target 和 input 由 Feature Package 定义。

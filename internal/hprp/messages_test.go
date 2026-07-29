@@ -7,25 +7,36 @@ import (
 
 func TestMessageTypesUsePublishedNames(t *testing.T) {
 	want := map[Type]string{
-		TypeHelloClient:           "hello.client",
-		TypeHelloServer:           "hello.server",
-		TypeSessionSnapshot:       "session.snapshot",
-		TypeSessionSnapshotResult: "session.snapshot.result",
-		TypeCommandExecute:        "command.execute",
-		TypeCommandResult:         "command.result",
-		TypeCommandOutput:         "command.output",
-		TypeNotificationEvent:     "notification.event",
-		TypeFeatureInvoke:         "feature.invoke",
-		TypeFeatureResult:         "feature.result",
-		TypeFeatureEvent:          "feature.event",
-		TypeFeatureCancel:         "feature.cancel",
-		TypeFeatureCancelResult:   "feature.cancel.result",
-		TypeProtocolError:         "protocol.error",
+		TypeHelloClient:            "hello.client",
+		TypeHelloServer:            "hello.server",
+		TypeSessionSnapshot:        "session.snapshot",
+		TypeSessionSnapshotResult:  "session.snapshot.result",
+		TypeCommandExecute:         "command.execute",
+		TypeCommandResult:          "command.result",
+		TypeCommandOutput:          "command.output",
+		TypeNotificationEvent:      "notification.event",
+		TypeFeatureInvoke:          "feature.invoke",
+		TypeFeatureResult:          "feature.result",
+		TypeFeatureEvent:           "feature.event",
+		TypeFeatureCancel:          "feature.cancel",
+		TypeFeatureCancelResult:    "feature.cancel.result",
+		TypeTerminalSnapshotGet:    "terminal.snapshot.get",
+		TypeTerminalSnapshotResult: "terminal.snapshot.result",
+		TypeProtocolError:          "protocol.error",
 	}
 	for messageType, name := range want {
 		if string(messageType) != name {
 			t.Fatalf("message type = %q, want %q", messageType, name)
 		}
+	}
+}
+
+func TestTerminalCapabilitiesUsePublishedNames(t *testing.T) {
+	if CapabilityTerminalSnapshotV1 != "terminal.snapshot.v1" {
+		t.Fatalf("snapshot capability = %q", CapabilityTerminalSnapshotV1)
+	}
+	if CapabilityTerminalImageV1 != "terminal.image.v1" {
+		t.Fatalf("image capability = %q", CapabilityTerminalImageV1)
 	}
 }
 

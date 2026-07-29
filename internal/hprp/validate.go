@@ -2,9 +2,12 @@ package hprp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,11 +15,15 @@ import (
 )
 
 const (
-	MaxSessions           = 256
-	MaxMachineIDBytes     = 64
-	MaxLabelBytes         = 512
-	MaxExtensionNameBytes = 128
-	MaxContentBytes       = 1 << 18
+	MaxSessions              = 256
+	MaxMachineIDBytes        = 64
+	MaxLabelBytes            = 512
+	MaxExtensionNameBytes    = 128
+	MaxContentBytes          = 1 << 18
+	MaxTerminalTextBytes     = 1 << 18
+	MaxTerminalImageBytes    = 1 << 19
+	MaxTerminalDimension     = 16384
+	MaxTerminalSnapshotLines = 100
 )
 
 var (
@@ -134,7 +141,7 @@ func ValidateCommandResult(result CommandResult) error {
 		return ErrInvalidOutcome
 	}
 	if result.Content != nil {
-		if err := validateTextContent(*result.Content); err != nil {
+		if err := ValidateContent(*result.Content); err != nil {
 			return err
 		}
 	}
@@ -154,6 +161,9 @@ func ValidateCommandExecute(command CommandExecute) error {
 	if err := ValidateTarget(command.Target); err != nil {
 		return err
 	}
+	if command.OutputMode != "" && !validOutputMode(command.OutputMode) {
+		return fmt.Errorf("%w: output_mode 无效", ErrInvalidMessage)
+	}
 	return validateTextContent(command.Content)
 }
 
@@ -165,10 +175,10 @@ func ValidateCommandOutput(output CommandOutput) error {
 	if err := ValidateTarget(output.Target); err != nil {
 		return err
 	}
-	return validateTextContent(output.Content)
+	return ValidateContent(output.Content)
 }
 
-// ValidateNotificationEvent 校验主动通知的幂等键、顺序、类型、目标和文本内容。
+// ValidateNotificationEvent 校验主动通知的幂等键、顺序、类型和稳定目标。
 func ValidateNotificationEvent(event NotificationEvent) error {
 	if !validRequiredLabel(event.EventKey) || event.Sequence == 0 || !validRequiredLabel(event.Kind) {
 		return fmt.Errorf("%w: notification event 元数据无效", ErrInvalidMessage)
@@ -176,7 +186,76 @@ func ValidateNotificationEvent(event NotificationEvent) error {
 	if err := ValidateTarget(event.Target); err != nil {
 		return err
 	}
-	return validateTextContent(event.Content)
+	switch event.Kind {
+	case NotificationKindAgentStatusChanged:
+		if event.SnapshotSequence == 0 || event.OccurredAt.IsZero() || event.Data == nil ||
+			!validSessionStatus(event.Data.PreviousStatus) || !validSessionStatus(event.Data.Status) ||
+			event.Data.PreviousStatus == event.Data.Status || !contentIsZero(event.Content) {
+			return fmt.Errorf("%w: Agent 状态事件无效", ErrInvalidMessage)
+		}
+		return nil
+	case NotificationKindTargetInvalidated:
+		if event.SnapshotSequence == 0 || event.OccurredAt.IsZero() || event.Data != nil || !contentIsZero(event.Content) {
+			return fmt.Errorf("%w: 目标失效事件无效", ErrInvalidMessage)
+		}
+		return nil
+	default:
+		return validateTextContent(event.Content)
+	}
+}
+
+// ValidateContent 校验文本或终端快照联合内容。
+func ValidateContent(content Content) error {
+	switch content.Type {
+	case ContentTypeText:
+		return validateTextContent(content)
+	case ContentTypeTerminal:
+		return validateTerminalContent(content)
+	default:
+		return fmt.Errorf("%w: content type 无效", ErrInvalidMessage)
+	}
+}
+
+// ValidateTerminalSnapshotGet 校验一次无副作用终端读取请求。
+func ValidateTerminalSnapshotGet(request TerminalSnapshotGet) error {
+	if err := ValidateTarget(request.Target); err != nil {
+		return err
+	}
+	if !validOutputMode(request.Mode) || request.Purpose != TerminalSnapshotPurposeNotification ||
+		request.MaxLines <= 0 || request.MaxLines > MaxTerminalSnapshotLines {
+		return fmt.Errorf("%w: terminal snapshot request 无效", ErrInvalidMessage)
+	}
+	return nil
+}
+
+// ValidateTerminalSnapshotResult 校验终端快照结果及同次读取的文本降级内容。
+func ValidateTerminalSnapshotResult(result TerminalSnapshotResult) error {
+	if err := ValidateTarget(result.Target); err != nil {
+		return err
+	}
+	if !oneOfOutcome(result.Outcome, OutcomeOK, OutcomeRejected, OutcomeFailed, OutcomeIndeterminate) {
+		return ErrInvalidOutcome
+	}
+	if result.Outcome == OutcomeOK {
+		if result.Content == nil || result.FallbackContent != nil || result.Error != nil {
+			return fmt.Errorf("%w: terminal snapshot 成功结果无效", ErrInvalidMessage)
+		}
+		return ValidateContent(*result.Content)
+	}
+	if result.Content != nil || result.Error == nil {
+		return fmt.Errorf("%w: terminal snapshot 失败结果无效", ErrInvalidMessage)
+	}
+	if err := validateResultError(result.Outcome, result.Error); err != nil {
+		return err
+	}
+	if result.FallbackContent == nil {
+		return nil
+	}
+	if result.Outcome != OutcomeFailed || result.Error.Code != CodeTerminalImageFailed ||
+		result.FallbackContent.Type != ContentTypeTerminal || result.FallbackContent.Mode != OutputModeText {
+		return fmt.Errorf("%w: terminal snapshot fallback 无效", ErrInvalidMessage)
+	}
+	return ValidateContent(*result.FallbackContent)
 }
 
 // ValidateFeatureResult 校验 Feature 版本和通用最终 outcome。
@@ -199,10 +278,64 @@ func ValidateFeatureCancelResult(result FeatureCancelResult) error {
 }
 
 func validateTextContent(content TextContent) error {
-	if content.Type != ContentTypeText || !utf8.ValidString(content.Text) || len(content.Text) > MaxContentBytes {
+	if content.Type != ContentTypeText || !utf8.ValidString(content.Text) || len(content.Text) > MaxContentBytes ||
+		content.Mode != "" || content.Image != nil || content.Page != nil || content.CapturedAt != nil {
 		return fmt.Errorf("%w: text content 无效", ErrInvalidMessage)
 	}
 	return nil
+}
+
+func validateTerminalContent(content Content) error {
+	if !utf8.ValidString(content.Text) || len(content.Text) > MaxTerminalTextBytes || !validOutputMode(content.Mode) ||
+		content.CapturedAt == nil || content.CapturedAt.IsZero() {
+		return fmt.Errorf("%w: terminal content 元数据无效", ErrInvalidMessage)
+	}
+	if content.Page != nil && (content.Page.Current <= 0 || content.Page.Total <= 0 || content.Page.Current > content.Page.Total) {
+		return fmt.Errorf("%w: terminal page 无效", ErrInvalidMessage)
+	}
+	if content.Mode == OutputModeText {
+		if content.Image != nil {
+			return fmt.Errorf("%w: 文本终端内容不能包含图片", ErrInvalidMessage)
+		}
+		return nil
+	}
+	return validateTerminalImage(content.Image)
+}
+
+func validateTerminalImage(terminalImage *TerminalImage) error {
+	if terminalImage == nil || terminalImage.MediaType != "image/png" || terminalImage.Encoding != "base64" ||
+		terminalImage.ColorMode != "indexed-256" || terminalImage.Width <= 0 || terminalImage.Height <= 0 ||
+		terminalImage.Width > MaxTerminalDimension || terminalImage.Height > MaxTerminalDimension {
+		return fmt.Errorf("%w: terminal image 元数据无效", ErrInvalidMessage)
+	}
+	if len(terminalImage.Data) > base64.StdEncoding.EncodedLen(MaxTerminalImageBytes) {
+		return fmt.Errorf("%w: terminal image 超限", ErrInvalidMessage)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(terminalImage.Data)
+	if err != nil || len(decoded) > MaxTerminalImageBytes {
+		return fmt.Errorf("%w: terminal image Base64 无效", ErrInvalidMessage)
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(decoded))
+	if err != nil || config.Width != terminalImage.Width || config.Height != terminalImage.Height {
+		return fmt.Errorf("%w: terminal image PNG 无效", ErrInvalidMessage)
+	}
+	decodedImage, err := png.Decode(bytes.NewReader(decoded))
+	if err != nil {
+		return fmt.Errorf("%w: terminal image PNG 无效", ErrInvalidMessage)
+	}
+	if _, ok := decodedImage.(*image.Paletted); !ok {
+		return fmt.Errorf("%w: terminal image 不是 PNG8", ErrInvalidMessage)
+	}
+	return nil
+}
+
+func validOutputMode(mode OutputMode) bool {
+	return mode == OutputModeText || mode == OutputModeImage
+}
+
+func contentIsZero(content Content) bool {
+	return content.Type == "" && content.Text == "" && content.Mode == "" && content.Image == nil &&
+		content.Page == nil && content.CapturedAt == nil
 }
 
 func validateResultError(outcome Outcome, resultError *Error) error {
