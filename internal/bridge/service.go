@@ -19,10 +19,14 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
+	"github.com/wenxichang/herdr-pal/internal/terminalimage"
 )
 
 // ErrInvalidServiceDependency 表示 BridgeService 缺少必需依赖。
-var ErrInvalidServiceDependency = errors.New("BridgeService 依赖无效")
+var (
+	ErrInvalidServiceDependency = errors.New("BridgeService 依赖无效")
+	ErrTerminalImageUnsupported = errors.New("当前连接不支持终端图片")
+)
 
 const (
 	promptRecoveryTimeout = 5 * time.Second
@@ -40,6 +44,8 @@ type HerdrAPI interface {
 	GetAgent(ctx context.Context, target string) (herdr.AgentInfo, error)
 	// ReadRecent 读取目标的 recent_unwrapped 终端快照。
 	ReadRecent(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
+	// ReadRecentANSI 读取目标的 recent_unwrapped ANSI 终端快照。
+	ReadRecentANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
 	// PromptUntilStateChange 向目标发送普通文本并等待首次状态变化。
 	PromptUntilStateChange(ctx context.Context, target, text string) (herdr.AgentInfo, error)
 	// WaitForStateChange 等待目标的状态变化序列离开 baseline。
@@ -51,6 +57,11 @@ type HerdrAPI interface {
 // IMAdapter 是入站命令回复所需的平台中立能力。
 type IMAdapter interface {
 	im.ReplySink
+}
+
+// TerminalRenderer 把安全 ANSI 终端页渲染为 PNG8。
+type TerminalRenderer interface {
+	Render(ctx context.Context, safeANSI string) (terminalimage.Result, error)
 }
 
 // KeyAuditSink 同步接收已经过安全字段校验的显式按键审计记录。
@@ -74,6 +85,7 @@ type Service struct {
 	im       IMAdapter
 	keyAudit KeyAuditSink
 	logger   *slog.Logger
+	renderer TerminalRenderer
 
 	waitKeyInterval keyIntervalWaiter
 	waitKeyReadback keyIntervalWaiter
@@ -96,6 +108,20 @@ type Service struct {
 	// 仅供同包并发回归测试在关键临界区建立确定性同步点；nil 时没有运行时行为。
 	beforeInvalidateStateChange func()
 	beforePageDownReply         func()
+}
+
+// SetTerminalRenderer 设置 Relay 模式使用的终端图片渲染器。
+func (s *Service) SetTerminalRenderer(renderer TerminalRenderer) error {
+	if s == nil || renderer == nil {
+		return ErrInvalidServiceDependency
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.renderer != nil {
+		return ErrInvalidServiceDependency
+	}
+	s.renderer = renderer
+	return nil
 }
 
 // NewService 创建入站命令服务并校验全部依赖。
@@ -193,6 +219,50 @@ func (s *Service) SelectTarget(paneID, occupantKey string) error {
 	s.endInputBarrierLocked()
 	s.transitionMu.Unlock()
 	return err
+}
+
+// ReadTerminalSnapshot 无副作用读取稳定目标的一次终端快照。
+func (s *Service) ReadTerminalSnapshot(
+	ctx context.Context,
+	paneID, occupantKey string,
+	mode im.OutputMode,
+	maxLines int,
+) (im.TerminalContent, error) {
+	if s == nil || maxLines < 1 || maxLines > panel.MaxLines {
+		return im.TerminalContent{}, ErrInvalidServiceDependency
+	}
+	mode = normalizedOutputMode(mode)
+	if mode == "" {
+		return im.TerminalContent{}, ErrInvalidServiceDependency
+	}
+	client, release, ok := s.beginOperation(false)
+	if !ok {
+		return im.TerminalContent{}, herdr.ErrUnavailable
+	}
+	defer release()
+	target, err := s.registry.ResolveTarget(paneID, occupantKey)
+	if err != nil {
+		return im.TerminalContent{}, err
+	}
+	result, err := client.ReadRecentANSI(ctx, target.PaneID, maxLines)
+	if err != nil {
+		return im.TerminalContent{}, err
+	}
+	if result.PaneID != target.PaneID {
+		return im.TerminalContent{}, session.ErrListSnapshotExpired
+	}
+	if _, err := s.registry.ResolveTarget(paneID, occupantKey); err != nil {
+		return im.TerminalContent{}, err
+	}
+	lines := panel.NormalizeANSI(result.Text)
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	content, renderErr := s.buildTerminalContent(ctx, panel.Page{Lines: lines, Current: 1, Total: 1}, mode)
+	if _, err := s.registry.ResolveTarget(paneID, occupantKey); err != nil {
+		return im.TerminalContent{}, err
+	}
+	return content, renderErr
 }
 
 // ReplaceSnapshot 用新的 Herdr 会话快照原子替换目标索引。
@@ -564,7 +634,7 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 		s.reply(ctx, message.RequestID, keySequenceSummary(sent, len(keys), failureMessage)+"\n\n控制台刷新失败，请重新执行 /con。")
 		return
 	}
-	result, readErr := client.ReadRecent(ctx, target.PaneID, panel.PageSize)
+	result, readErr := client.ReadRecentANSI(ctx, target.PaneID, panel.PageSize)
 	release()
 	summary := keySequenceSummary(sent, len(keys), failureMessage)
 	if readErr != nil {
@@ -576,13 +646,12 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台目标已变化，请重新执行 /ls 和 /sel。")
 		return
 	}
-	lines, currentPage, totalPages, applyErr := s.applyRefresh(target, generation, panel.Normalize(result.Text))
+	page, applyErr := s.applyRefresh(target, generation, panel.NormalizeANSI(result.Text))
 	if applyErr != nil {
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台刷新失败："+readApplyErrorMessage(applyErr))
 		return
 	}
-	content := panel.RenderPageWithTotal(target, currentPage, totalPages, lines)
-	s.reply(ctx, message.RequestID, panel.AppendRenderedPageNote(content, summary))
+	s.replyPage(ctx, message.RequestID, target, page, message.OutputMode, summary)
 }
 
 func keySequenceSummary(sent, total int, failureMessage string) string {
@@ -648,7 +717,7 @@ func (s *Service) handleContent(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
-	result, err := client.ReadRecent(ctx, target.PaneID, panel.PageSize)
+	result, err := client.ReadRecentANSI(ctx, target.PaneID, panel.PageSize)
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -659,12 +728,12 @@ func (s *Service) handleContent(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	lines, currentPage, totalPages, err := s.applyRefresh(target, generation, panel.Normalize(result.Text))
+	page, err := s.applyRefresh(target, generation, panel.NormalizeANSI(result.Text))
 	if err != nil {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
 	}
-	s.replyPage(ctx, message.RequestID, target, currentPage, totalPages, lines)
+	s.replyPage(ctx, message.RequestID, target, page, message.OutputMode, "")
 }
 
 func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
@@ -679,7 +748,7 @@ func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
 	}
-	result, err := client.ReadRecent(ctx, target.PaneID, linesToRead)
+	result, err := client.ReadRecentANSI(ctx, target.PaneID, linesToRead)
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -690,12 +759,12 @@ func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	lines, currentPage, totalPages, err := s.applyExpand(target, generation, panel.Normalize(result.Text))
+	page, err := s.applyExpand(target, generation, panel.NormalizeANSI(result.Text))
 	if err != nil {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
 	}
-	s.replyPage(ctx, message.RequestID, target, currentPage, totalPages, lines)
+	s.replyPage(ctx, message.RequestID, target, page, message.OutputMode, "")
 }
 
 func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
@@ -707,15 +776,13 @@ func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
 	if err == nil && !s.panelReady {
 		err = panel.ErrPanelChanged
 	}
-	var lines []string
-	currentPage, totalPages := 0, 0
+	var page panel.Page
 	if err == nil {
 		err = s.panel.PageDown()
 		if err == nil {
 			s.page--
 			s.generation++
-			lines = s.panel.Render()
-			currentPage, totalPages = s.panel.PagePosition()
+			page = s.panel.RenderTerminal()
 		}
 	}
 	s.stateMu.Unlock()
@@ -727,7 +794,7 @@ func (s *Service) handlePageDown(ctx context.Context, message im.IncomingText) {
 		}
 		return
 	}
-	s.replyPage(ctx, message.RequestID, target, currentPage, totalPages, lines)
+	s.replyPage(ctx, message.RequestID, target, page, message.OutputMode, "")
 }
 
 func (s *Service) selectedTarget() (session.Target, error) {
@@ -789,43 +856,41 @@ func (s *Service) capturePageUpTarget() (session.Target, int, uint64, error) {
 	return target, lines, s.generation, err
 }
 
-func (s *Service) applyRefresh(expected session.Target, generation uint64, normalized []string) ([]string, int, int, error) {
+func (s *Service) applyRefresh(expected session.Target, generation uint64, normalized []panel.Line) (panel.Page, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	target, err := s.registry.ValidateSelected()
 	if err != nil {
-		return nil, 0, 0, err
+		return panel.Page{}, err
 	}
 	if s.generation != generation || !sameTarget(target, expected) {
-		return nil, 0, 0, panel.ErrPanelChanged
+		return panel.Page{}, panel.ErrPanelChanged
 	}
-	s.panel.Refresh(target.OccupantKey, normalized)
+	s.panel.RefreshTerminal(target.OccupantKey, normalized)
 	s.panelReady, s.page = true, 0
 	s.generation++
-	currentPage, totalPages := s.panel.PagePosition()
-	return s.panel.Render(), currentPage, totalPages, nil
+	return s.panel.RenderTerminal(), nil
 }
 
-func (s *Service) applyExpand(expected session.Target, generation uint64, normalized []string) ([]string, int, int, error) {
+func (s *Service) applyExpand(expected session.Target, generation uint64, normalized []panel.Line) (panel.Page, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	target, err := s.registry.ValidateSelected()
 	if err != nil {
-		return nil, 0, 0, err
+		return panel.Page{}, err
 	}
 	if s.generation != generation || !sameTarget(target, expected) || !s.panelReady {
-		return nil, 0, 0, panel.ErrPanelChanged
+		return panel.Page{}, panel.ErrPanelChanged
 	}
-	if err := s.panel.Expand(target.OccupantKey, normalized); err != nil {
+	if err := s.panel.ExpandTerminal(target.OccupantKey, normalized); err != nil {
 		if errors.Is(err, panel.ErrPanelChanged) {
 			s.resetPanelLocked()
 		}
-		return nil, 0, 0, err
+		return panel.Page{}, err
 	}
 	s.page++
 	s.generation++
-	currentPage, totalPages := s.panel.PagePosition()
-	return s.panel.Render(), currentPage, totalPages, nil
+	return s.panel.RenderTerminal(), nil
 }
 
 func (s *Service) beginOperation(input bool) (HerdrAPI, func(), bool) {
@@ -892,8 +957,82 @@ func (s *Service) resetPanelLocked() {
 	s.generation++
 }
 
-func (s *Service) replyPage(ctx context.Context, requestID string, target session.Target, currentPage, totalPages int, lines []string) {
-	s.reply(ctx, requestID, panel.RenderPageWithTotal(target, currentPage, totalPages, lines))
+func (s *Service) replyPage(ctx context.Context, requestID string, target session.Target, page panel.Page, mode im.OutputMode, note string) {
+	mode = normalizedOutputMode(mode)
+	content, err := s.buildTerminalContent(ctx, page, mode)
+	if err != nil {
+		s.reply(ctx, requestID, safeOperationError(err))
+		return
+	}
+	if sink, ok := s.im.(im.TerminalReplySink); ok {
+		if err := sink.RespondTerminal(ctx, requestID, content); err != nil {
+			s.logIMDeliveryFailure("IM 终端回复发送失败", requestID, 1, 1, len(content.Text), err)
+			return
+		}
+		if note != "" {
+			if err := s.im.SendMarkdown(ctx, note); err != nil {
+				s.logIMDeliveryFailure("IM 终端说明发送失败", requestID, 1, 1, len(note), err)
+			}
+		}
+		return
+	}
+	if mode == im.OutputModeImage {
+		s.reply(ctx, requestID, ErrTerminalImageUnsupported.Error())
+		return
+	}
+	lines := make([]string, len(page.Lines))
+	for index, line := range page.Lines {
+		lines[index] = line.Text
+	}
+	markdown := panel.RenderPageWithTotal(target, page.Current, page.Total, lines)
+	if note != "" {
+		markdown = panel.AppendRenderedPageNote(markdown, note)
+	}
+	s.reply(ctx, requestID, markdown)
+}
+
+func (s *Service) buildTerminalContent(ctx context.Context, page panel.Page, mode im.OutputMode) (im.TerminalContent, error) {
+	mode = normalizedOutputMode(mode)
+	if mode == "" {
+		return im.TerminalContent{}, ErrInvalidServiceDependency
+	}
+	if page.Current <= 0 || page.Total <= 0 {
+		page.Current, page.Total = 1, 1
+	}
+	content := im.TerminalContent{
+		Mode: mode, Text: panel.JoinText(page.Lines),
+		Page: &im.TerminalPage{Current: page.Current, Total: page.Total}, CapturedAt: time.Now().UTC(),
+	}
+	if mode == im.OutputModeText {
+		return content, nil
+	}
+	s.stateMu.Lock()
+	renderer := s.renderer
+	s.stateMu.Unlock()
+	if renderer == nil {
+		content.Mode = im.OutputModeText
+		return content, ErrTerminalImageUnsupported
+	}
+	result, err := renderer.Render(ctx, panel.JoinANSI(page.Lines))
+	if err != nil {
+		content.Mode = im.OutputModeText
+		return content, err
+	}
+	content.Image = &im.TerminalImage{
+		MediaType: "image/png", Data: append([]byte(nil), result.PNG...),
+		Width: result.Width, Height: result.Height, ColorMode: "indexed-256",
+	}
+	return content, nil
+}
+
+func normalizedOutputMode(mode im.OutputMode) im.OutputMode {
+	if mode == "" {
+		return im.OutputModeText
+	}
+	if mode == im.OutputModeText || mode == im.OutputModeImage {
+		return mode
+	}
+	return ""
 }
 
 func (s *Service) reply(ctx context.Context, requestID, content string) {

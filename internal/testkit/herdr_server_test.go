@@ -65,6 +65,20 @@ func TestHerdrServerRejectsInvalidPublicRequestShapes(t *testing.T) {
 	}
 }
 
+func TestHerdrServerSupportsANSIRecentRead(t *testing.T) {
+	server := NewHerdrServer(t, testkitSnapshot())
+	server.SetOutput([]string{"\x1b[31m红色\x1b[0m"})
+	client := herdr.NewClient(server.SocketPath(), nil, time.Second)
+
+	result, err := client.ReadRecentANSI(context.Background(), "pane-1", 100)
+	if err != nil {
+		t.Fatalf("ReadRecentANSI() error = %v", err)
+	}
+	if result.Text != "\x1b[31m红色\x1b[0m" {
+		t.Fatalf("ReadRecentANSI() = %#v", result)
+	}
+}
+
 func TestHerdrServerAgentTargetsRequirePaneIDOrUniqueName(t *testing.T) {
 	server := NewHerdrServer(t, testkitSnapshot())
 	validRequests := []struct {

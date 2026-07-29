@@ -370,9 +370,14 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 			Format    string `json:"format"`
 			StripANSI *bool  `json:"strip_ansi"`
 		}
-		if json.Unmarshal(request.Params, &params) != nil || strings.TrimSpace(params.Target) == "" ||
-			params.Source != "recent_unwrapped" || params.Lines < 1 || params.Lines > 1000 ||
-			params.Format != "text" || params.StripANSI == nil || !*params.StripANSI {
+		if json.Unmarshal(request.Params, &params) != nil {
+			s.writeError(connection, request.ID, "invalid_params", "invalid read")
+			return
+		}
+		validFormat := params.StripANSI != nil &&
+			(params.Format == "text" && *params.StripANSI || params.Format == "ansi" && !*params.StripANSI)
+		if strings.TrimSpace(params.Target) == "" ||
+			params.Source != "recent_unwrapped" || params.Lines < 1 || params.Lines > 1000 || !validFormat {
 			s.writeError(connection, request.ID, "invalid_params", "invalid read")
 			return
 		}
@@ -386,7 +391,7 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		}
 		result = map[string]any{"type": "pane_read", "read": map[string]any{
 			"pane_id": agent.PaneID, "workspace_id": agent.WorkspaceID, "tab_id": agent.TabID,
-			"source": "recent_unwrapped", "format": "text", "text": strings.Join(output, "\n"),
+			"source": "recent_unwrapped", "format": params.Format, "text": strings.Join(output, "\n"),
 			"revision": 0, "truncated": false,
 		}}
 	case "agent.prompt":

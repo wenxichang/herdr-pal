@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
+	"github.com/wenxichang/herdr-pal/internal/terminalimage"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
@@ -61,6 +63,100 @@ func TestServiceCurrentTargetsEmptyWhenHerdrUnavailable(t *testing.T) {
 	service.SetHerdr(nil)
 	if targets := service.CurrentTargets(); len(targets) != 0 {
 		t.Fatalf("degraded CurrentTargets() = %#v", targets)
+	}
+}
+
+func TestServiceImageConReturnsSamePageTextAndPNG(t *testing.T) {
+	service, fake := newTestService(t)
+	recorder := &terminalRecorder{}
+	service.im = recorder
+	renderer := &fakeTerminalRenderer{result: terminalimage.Result{PNG: []byte("png"), Width: 80, Height: 34}}
+	if err := service.SetTerminalRenderer(renderer); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[31m红色\x1b[0m\n第二行"}, nil)
+	message := incoming("image-con", "/con")
+	message.OutputMode = im.OutputModeImage
+	service.HandleMessage(context.Background(), message)
+
+	content := recorder.singleReply(t)
+	if content.Mode != im.OutputModeImage || content.Text != "红色\n第二行" || content.Image == nil ||
+		string(content.Image.Data) != "png" || content.Page == nil || content.Page.Current != 1 || content.Page.Total != 1 {
+		t.Fatalf("terminal reply = %#v", content)
+	}
+	if got := renderer.lastANSI(); got != "\x1b[31m红色\x1b[0m\n第二行" {
+		t.Fatalf("renderer ANSI = %q", got)
+	}
+}
+
+func TestServiceNotificationSnapshotDoesNotChangeInteractivePage(t *testing.T) {
+	service, fake := newTestService(t)
+	target := service.CurrentTargets()[0]
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: textLines(100, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("snapshot-con", "/con"))
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: textLines(0, 200)}, nil)
+	service.HandleMessage(context.Background(), incoming("snapshot-pageup", "/pageup"))
+
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "独立通知快照"}, nil)
+	content, err := service.ReadTerminalSnapshot(context.Background(), target.PaneID, target.OccupantKey, im.OutputModeText, panel.PageSize)
+	if err != nil || content.Text != "独立通知快照" {
+		t.Fatalf("ReadTerminalSnapshot() = %#v, %v", content, err)
+	}
+	service.HandleMessage(context.Background(), incoming("snapshot-pagedown", "/pagedn"))
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "line-100") {
+		t.Fatalf("notification snapshot changed interactive page: %q", reply)
+	}
+}
+
+func TestServiceImageRenderFailureReturnsSameReadText(t *testing.T) {
+	service, fake := newTestService(t)
+	renderErr := errors.New("render failed")
+	if err := service.SetTerminalRenderer(&fakeTerminalRenderer{err: renderErr}); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[32m可审计文本\x1b[0m"}, nil)
+	content, err := service.ReadTerminalSnapshot(context.Background(), target.PaneID, target.OccupantKey, im.OutputModeImage, panel.PageSize)
+	if !errors.Is(err, renderErr) || content.Mode != im.OutputModeText || content.Text != "可审计文本" || content.Image != nil {
+		t.Fatalf("ReadTerminalSnapshot() = %#v, %v", content, err)
+	}
+}
+
+func TestServiceNotificationSnapshotRejectsTargetChangedDuringRender(t *testing.T) {
+	service, fake := newTestService(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	renderer := &fakeTerminalRenderer{
+		result:  terminalimage.Result{PNG: []byte("png"), Width: 8, Height: 17},
+		started: started, block: release,
+	}
+	if err := service.SetTerminalRenderer(renderer); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "snapshot"}, nil)
+	type snapshotResult struct {
+		content im.TerminalContent
+		err     error
+	}
+	result := make(chan snapshotResult, 1)
+	go func() {
+		content, err := service.ReadTerminalSnapshot(context.Background(), target.PaneID, target.OccupantKey, im.OutputModeImage, panel.PageSize)
+		result <- snapshotResult{content: content, err: err}
+	}()
+	awaitSignal(t, started, "terminal renderer")
+	service.ReplaceSnapshot(replacedSnapshot(), false)
+	close(release)
+	got := <-result
+	if !errors.Is(got.err, session.ErrListSnapshotExpired) || got.content.Text != "" {
+		t.Fatalf("ReadTerminalSnapshot() = %#v, %v", got.content, got.err)
 	}
 }
 
@@ -1833,6 +1929,10 @@ func (f *fakeHerdr) ReadRecent(_ context.Context, target string, lines int) (her
 	}
 	return result, err
 }
+
+func (f *fakeHerdr) ReadRecentANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error) {
+	return f.ReadRecent(ctx, target, lines)
+}
 func (f *fakeHerdr) PromptUntilStateChange(_ context.Context, target, text string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
 	f.promptCalls = append(f.promptCalls, promptCall{target, text})
@@ -1961,6 +2061,66 @@ type fakeIM struct {
 	sendErr        error
 	blockRespond   chan struct{}
 	respondStarted chan struct{}
+}
+
+type terminalRecorder struct {
+	mu      sync.Mutex
+	replies []im.TerminalContent
+	pushes  []im.TerminalContent
+}
+
+func (r *terminalRecorder) RespondMarkdown(context.Context, string, string) error { return nil }
+func (r *terminalRecorder) SendMarkdown(context.Context, string) error            { return nil }
+func (r *terminalRecorder) RespondTerminal(_ context.Context, _ string, content im.TerminalContent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.replies = append(r.replies, content)
+	return nil
+}
+func (r *terminalRecorder) SendTerminal(_ context.Context, content im.TerminalContent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pushes = append(r.pushes, content)
+	return nil
+}
+func (r *terminalRecorder) singleReply(t *testing.T) im.TerminalContent {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.replies) != 1 {
+		t.Fatalf("terminal replies = %#v", r.replies)
+	}
+	return r.replies[0]
+}
+
+type fakeTerminalRenderer struct {
+	mu      sync.Mutex
+	result  terminalimage.Result
+	err     error
+	ansi    []string
+	started chan struct{}
+	block   chan struct{}
+}
+
+func (r *fakeTerminalRenderer) Render(_ context.Context, safeANSI string) (terminalimage.Result, error) {
+	r.mu.Lock()
+	r.ansi = append(r.ansi, safeANSI)
+	result, err, started, block := r.result, r.err, r.started, r.block
+	r.mu.Unlock()
+	signal(started)
+	if block != nil {
+		<-block
+	}
+	return result, err
+}
+
+func (r *fakeTerminalRenderer) lastANSI() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.ansi) == 0 {
+		return ""
+	}
+	return r.ansi[len(r.ansi)-1]
 }
 
 func (f *fakeIM) RespondMarkdown(_ context.Context, _ string, content string) error {

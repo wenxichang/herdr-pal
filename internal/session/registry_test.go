@@ -84,6 +84,26 @@ func TestSelectTargetRequiresMatchingPaneAndOccupant(t *testing.T) {
 	}
 }
 
+func TestResolveTargetDoesNotChangeSelectionOrListSnapshot(t *testing.T) {
+	registry := &Registry{}
+	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)
+	target := registry.CurrentTargets()[0]
+
+	resolved, err := registry.ResolveTarget(target.PaneID, target.OccupantKey)
+	if err != nil || resolved != target {
+		t.Fatalf("ResolveTarget() = %#v, %v", resolved, err)
+	}
+	if _, err := registry.ValidateSelected(); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("ResolveTarget() changed selection: %v", err)
+	}
+	if _, err := registry.Select(1); !errors.Is(err, ErrNoListSnapshot) {
+		t.Fatalf("ResolveTarget() changed list snapshot: %v", err)
+	}
+	if _, err := registry.ResolveTarget(target.PaneID, "stale"); !errors.Is(err, ErrListSnapshotExpired) {
+		t.Fatalf("ResolveTarget(stale) error = %v", err)
+	}
+}
+
 func TestSelectUsesMostRecentListSnapshot(t *testing.T) {
 	registry := &Registry{}
 	registry.Replace(testSnapshot(testAgentPane("pane-1", "terminal-1", "codex", nil)), false)

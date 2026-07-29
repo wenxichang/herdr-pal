@@ -2,8 +2,10 @@ package im
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestNotificationTargetPreservesStableIdentity(t *testing.T) {
@@ -29,3 +31,27 @@ func TestNotificationTargetPreservesStableIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestTerminalContentKeepsAuditTextWithImage(t *testing.T) {
+	now := time.Now().UTC()
+	content := TerminalContent{
+		Mode: OutputModeImage, Text: "terminal text",
+		Image: &TerminalImage{MediaType: "image/png", Data: []byte("png"), Width: 8, Height: 17, ColorMode: "indexed-256"},
+		Page:  &TerminalPage{Current: 1, Total: 2}, CapturedAt: now,
+	}
+	if content.Text != "terminal text" || content.Image == nil || content.Page.Total != 2 || content.CapturedAt.IsZero() {
+		t.Fatalf("TerminalContent = %#v", content)
+	}
+}
+
+func TestTerminalReplySinkContract(t *testing.T) {
+	var sink TerminalReplySink = terminalSinkStub{}
+	if err := sink.RespondTerminal(context.Background(), "request-1", TerminalContent{Mode: OutputModeText}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type terminalSinkStub struct{}
+
+func (terminalSinkStub) RespondTerminal(context.Context, string, TerminalContent) error { return nil }
+func (terminalSinkStub) SendTerminal(context.Context, TerminalContent) error            { return nil }

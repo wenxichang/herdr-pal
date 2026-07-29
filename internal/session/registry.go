@@ -182,6 +182,17 @@ func (r *Registry) CurrentTargets() []Target {
 	return sortedTargets(r.targets, r.orders)
 }
 
+// ResolveTarget 只读复核 pane 与 occupant 身份，不修改列表编号或当前选择。
+func (r *Registry) ResolveTarget(paneID, occupantKey string) (Target, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	target, found := r.targets[paneID]
+	if !found || target.OccupantKey != occupantKey {
+		return Target{}, fmt.Errorf("%w，请刷新会话列表", ErrListSnapshotExpired)
+	}
+	return target, nil
+}
+
 // SelectTarget 按 pane 和 occupant 稳定身份选择当前目标。
 func (r *Registry) SelectTarget(paneID, occupantKey string) (Target, error) {
 	r.mu.Lock()
