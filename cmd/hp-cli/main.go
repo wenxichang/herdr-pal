@@ -4,18 +4,14 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
-	"strings"
-	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminclient"
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
 	"github.com/wenxichang/herdr-pal/internal/config"
-	"github.com/wenxichang/herdr-pal/internal/version"
 )
 
 var errLocalConfig = errors.New("hp-cli 本地配置错误")
@@ -26,13 +22,6 @@ type Invocation struct {
 	Params any
 }
 
-type parsedOptions struct {
-	ConfigPath string
-	JSON       bool
-	Version    bool
-	Invocation Invocation
-}
-
 type executor func(context.Context, string, Invocation) (any, error)
 
 func main() {
@@ -40,273 +29,21 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute executor) int {
-	options, err := parseArgs(args)
-	if err != nil {
+	state := &commandState{ctx: ctx, stdout: stdout, stderr: stderr, execute: execute}
+	root := newRootCommand(state)
+	normalizedArgs := normalizeLegacyArgs(args)
+	root.SetArgs(normalizedArgs)
+	if err := root.ExecuteContext(ctx); err != nil {
+		var commandError *cliError
+		if errors.As(err, &commandError) {
+			fmt.Fprintln(stderr, commandError.prefix, commandError.cause)
+			return commandError.code
+		}
 		fmt.Fprintln(stderr, "参数错误：", err)
-		printUsage(stderr)
+		writeNearestCommandHelp(root, normalizedArgs, stderr)
 		return 2
 	}
-	if options.Version {
-		fmt.Fprintln(stdout, version.String())
-		return 0
-	}
-	configPath := options.ConfigPath
-	if configPath == "" {
-		configPath, err = config.DefaultServerPath()
-		if err != nil {
-			fmt.Fprintln(stderr, "无法确定默认服务端配置路径，请使用 -config。")
-			return 2
-		}
-	}
-	if execute == nil {
-		fmt.Fprintln(stderr, "管理执行器不可用。")
-		return 3
-	}
-	result, err := execute(ctx, configPath, options.Invocation)
-	if err != nil {
-		err = classifyExecutionError(err)
-		var serverError *adminclient.ServerError
-		switch {
-		case errors.As(err, &serverError):
-			fmt.Fprintln(stderr, "请求失败：", serverError)
-			return 1
-		case errors.Is(err, errLocalConfig), errors.Is(err, adminclient.ErrConfig):
-			fmt.Fprintln(stderr, "配置错误：", err)
-			return 2
-		default:
-			fmt.Fprintln(stderr, "Admin Socket 请求失败：", err)
-			return 3
-		}
-	}
-	if options.JSON {
-		err = adminclient.FormatJSON(stdout, result)
-	} else {
-		err = adminclient.FormatHuman(stdout, options.Invocation.Method, result)
-	}
-	if err != nil {
-		fmt.Fprintln(stderr, "输出失败：", err)
-		return 3
-	}
 	return 0
-}
-
-func parseArgs(args []string) (parsedOptions, error) {
-	options, commandArgs, err := extractGlobalOptions(args)
-	if err != nil {
-		return parsedOptions{}, err
-	}
-	if options.Version {
-		if len(commandArgs) != 0 || options.JSON || options.ConfigPath != "" {
-			return parsedOptions{}, errors.New("--version 不能与其他参数组合")
-		}
-		return options, nil
-	}
-	if len(commandArgs) < 2 {
-		return parsedOptions{}, errors.New("缺少管理命令")
-	}
-	invocation, err := parseInvocation(commandArgs)
-	if err != nil {
-		return parsedOptions{}, err
-	}
-	options.Invocation = invocation
-	return options, nil
-}
-
-func extractGlobalOptions(args []string) (parsedOptions, []string, error) {
-	var options parsedOptions
-	remaining := make([]string, 0, len(args))
-	for index := 0; index < len(args); index++ {
-		argument := args[index]
-		switch {
-		case argument == "--json":
-			if options.JSON {
-				return parsedOptions{}, nil, errors.New("--json 重复")
-			}
-			options.JSON = true
-		case argument == "--version" || argument == "-version":
-			if options.Version {
-				return parsedOptions{}, nil, errors.New("--version 重复")
-			}
-			options.Version = true
-		case argument == "-config" || argument == "--config":
-			if options.ConfigPath != "" || index+1 >= len(args) {
-				return parsedOptions{}, nil, errors.New("-config 无效或重复")
-			}
-			index++
-			options.ConfigPath = args[index]
-		case strings.HasPrefix(argument, "-config="):
-			if options.ConfigPath != "" {
-				return parsedOptions{}, nil, errors.New("-config 重复")
-			}
-			options.ConfigPath = strings.TrimPrefix(argument, "-config=")
-		default:
-			remaining = append(remaining, argument)
-		}
-	}
-	if strings.TrimSpace(options.ConfigPath) == "" && options.ConfigPath != "" {
-		return parsedOptions{}, nil, errors.New("-config 路径为空")
-	}
-	return options, remaining, nil
-}
-
-func parseInvocation(args []string) (Invocation, error) {
-	switch args[0] {
-	case "server":
-		return parseServer(args[1:])
-	case "key":
-		return parseKey(args[1:])
-	case "connection":
-		return parseConnection(args[1:])
-	case "session":
-		return parseSession(args[1:])
-	default:
-		return Invocation{}, fmt.Errorf("未知命令 %q", args[0])
-	}
-}
-
-func parseServer(args []string) (Invocation, error) {
-	if len(args) == 1 {
-		switch args[0] {
-		case "status":
-			return Invocation{Method: adminproto.MethodServerStatus, Params: adminproto.EmptyParams{}}, nil
-		case "stop":
-			return Invocation{Method: adminproto.MethodServerStop, Params: adminproto.EmptyParams{}}, nil
-		}
-	}
-	if len(args) == 2 && args[0] == "debug" {
-		switch args[1] {
-		case "enable":
-			return Invocation{Method: adminproto.MethodServerDebugEnable, Params: adminproto.EmptyParams{}}, nil
-		case "disable":
-			return Invocation{Method: adminproto.MethodServerDebugDisable, Params: adminproto.EmptyParams{}}, nil
-		}
-	}
-	return Invocation{}, errors.New("server 命令无效")
-}
-
-func parseKey(args []string) (Invocation, error) {
-	if len(args) == 0 {
-		return Invocation{}, errors.New("缺少 key 子命令")
-	}
-	switch args[0] {
-	case "issue":
-		return parseKeyIssue(args[1:])
-	case "list":
-		if len(args) != 1 {
-			return Invocation{}, errors.New("key list 不接受参数")
-		}
-		return Invocation{Method: adminproto.MethodKeyList, Params: adminproto.KeyListParams{}}, nil
-	case "show", "enable", "disable":
-		if len(args) != 2 {
-			return Invocation{}, errors.New("Key 命令需要一个 credential ID")
-		}
-		credentialID, err := parseCredentialID(args[1])
-		if err != nil {
-			return Invocation{}, err
-		}
-		method := map[string]adminproto.Method{"show": adminproto.MethodKeyShow, "enable": adminproto.MethodKeyEnable, "disable": adminproto.MethodKeyDisable}[args[0]]
-		return Invocation{Method: method, Params: adminproto.CredentialIDParams{CredentialID: credentialID}}, nil
-	case "delete":
-		return parseKeyDelete(args[1:])
-	case "source":
-		return parseKeySource(args[1:])
-	default:
-		return Invocation{}, errors.New("未知 key 子命令")
-	}
-}
-
-func parseKeyIssue(args []string) (Invocation, error) {
-	flags := flag.NewFlagSet("key issue", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	principalID := flags.String("principal-id", "", "")
-	machineID := flags.String("machine-id", "", "")
-	expiresAt := flags.String("expires-at", "", "")
-	var sources stringList
-	flags.Var(&sources, "source", "")
-	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || strings.TrimSpace(*principalID) == "" || strings.TrimSpace(*machineID) == "" || len(sources) == 0 {
-		return Invocation{}, errors.New("key issue 参数无效")
-	}
-	params := adminproto.KeyIssueParams{PrincipalID: *principalID, MachineID: *machineID, Sources: append([]string(nil), sources...)}
-	if *expiresAt != "" {
-		if _, err := time.Parse(time.RFC3339, *expiresAt); err != nil {
-			return Invocation{}, errors.New("--expires-at 必须是 RFC3339 时间")
-		}
-		params.ExpiresAt = expiresAt
-	}
-	return Invocation{Method: adminproto.MethodKeyIssue, Params: params}, nil
-}
-
-func parseKeyDelete(args []string) (Invocation, error) {
-	confirmed := false
-	values := make([]string, 0, len(args))
-	for _, argument := range args {
-		if argument == "--yes" {
-			confirmed = true
-			continue
-		}
-		values = append(values, argument)
-	}
-	if !confirmed || len(values) != 1 {
-		return Invocation{}, errors.New("key delete 必须提供 credential ID 和 --yes")
-	}
-	credentialID, err := parseCredentialID(values[0])
-	if err != nil {
-		return Invocation{}, err
-	}
-	return Invocation{Method: adminproto.MethodKeyDelete, Params: adminproto.KeyDeleteParams{CredentialID: credentialID, Confirm: true}}, nil
-}
-
-func parseKeySource(args []string) (Invocation, error) {
-	if len(args) < 2 {
-		return Invocation{}, errors.New("key source 命令无效")
-	}
-	credentialID, err := parseCredentialID(args[1])
-	if err != nil {
-		return Invocation{}, err
-	}
-	switch args[0] {
-	case "list":
-		if len(args) != 2 {
-			return Invocation{}, errors.New("key source list 只接受 credential ID")
-		}
-		return Invocation{Method: adminproto.MethodKeySourceList, Params: adminproto.CredentialIDParams{CredentialID: credentialID}}, nil
-	case "add", "remove", "set":
-		if len(args) < 3 {
-			return Invocation{}, errors.New("key source 修改至少需要一个来源")
-		}
-		method := map[string]adminproto.Method{"add": adminproto.MethodKeySourceAdd, "remove": adminproto.MethodKeySourceRemove, "set": adminproto.MethodKeySourceSet}[args[0]]
-		return Invocation{Method: method, Params: adminproto.KeySourceMutationParams{CredentialID: credentialID, Sources: append([]string(nil), args[2:]...)}}, nil
-	default:
-		return Invocation{}, errors.New("未知 key source 子命令")
-	}
-}
-
-func parseConnection(args []string) (Invocation, error) {
-	if len(args) == 1 && args[0] == "list" {
-		return Invocation{Method: adminproto.MethodConnectionList, Params: adminproto.ConnectionListParams{}}, nil
-	}
-	if len(args) == 2 && (args[0] == "show" || args[0] == "disconnect") && strings.TrimSpace(args[1]) != "" {
-		method := adminproto.MethodConnectionShow
-		if args[0] == "disconnect" {
-			method = adminproto.MethodConnectionDisconnect
-		}
-		return Invocation{Method: method, Params: adminproto.ConnectionIDParams{ConnectionID: args[1]}}, nil
-	}
-	return Invocation{}, errors.New("connection 命令无效")
-}
-
-func parseSession(args []string) (Invocation, error) {
-	if len(args) == 0 || args[0] != "list" {
-		return Invocation{}, errors.New("session 命令无效")
-	}
-	flags := flag.NewFlagSet("session list", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	principalID := flags.String("principal-id", "", "")
-	machineID := flags.String("machine-id", "", "")
-	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
-		return Invocation{}, errors.New("session list 参数无效")
-	}
-	return Invocation{Method: adminproto.MethodSessionList, Params: adminproto.SessionListParams{PrincipalID: *principalID, MachineID: *machineID}}, nil
 }
 
 func parseCredentialID(value string) (uint64, error) {
@@ -315,14 +52,6 @@ func parseCredentialID(value string) (uint64, error) {
 		return 0, errors.New("credential ID 必须是非零十进制整数")
 	}
 	return credentialID, nil
-}
-
-type stringList []string
-
-func (values *stringList) String() string { return strings.Join(*values, ",") }
-func (values *stringList) Set(value string) error {
-	*values = append(*values, value)
-	return nil
 }
 
 func executeInvocation(ctx context.Context, configPath string, invocation Invocation) (any, error) {
@@ -407,8 +136,3 @@ func dereferenceResult(value any) any {
 }
 
 func classifyExecutionError(err error) error { return err }
-
-func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "用法: hp-cli [-config server-config.json] [--json] <server|key|connection|session> ...")
-	fmt.Fprintln(writer, "      hp-cli --version")
-}

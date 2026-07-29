@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -15,7 +16,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
 
-func TestParseCommandsCoversManagementSurface(t *testing.T) {
+func TestCobraCommandsCoverManagementSurface(t *testing.T) {
 	tests := []struct {
 		args   []string
 		method adminproto.Method
@@ -40,31 +41,74 @@ func TestParseCommandsCoversManagementSurface(t *testing.T) {
 		{[]string{"session", "list", "--principal-id", "user", "--machine-id", "home"}, adminproto.MethodSessionList},
 	}
 	for _, test := range tests {
-		options, err := parseArgs(test.args)
-		if err != nil {
-			t.Fatalf("parseArgs(%v) error = %v", test.args, err)
-		}
-		if options.Invocation.Method != test.method {
-			t.Fatalf("parseArgs(%v) method = %s, want %s", test.args, options.Invocation.Method, test.method)
+		var got Invocation
+		code := run(context.Background(), test.args, io.Discard, io.Discard,
+			func(_ context.Context, _ string, invocation Invocation) (any, error) {
+				got = invocation
+				return emptyCLIResult(invocation.Method), nil
+			})
+		if code != 0 || got.Method != test.method {
+			t.Fatalf("run(%v) = code:%d invocation:%#v", test.args, code, got)
 		}
 	}
 }
 
-func TestParseIssueSourcesExpiryJSONAndConfig(t *testing.T) {
-	options, err := parseArgs([]string{
+func emptyCLIResult(method adminproto.Method) any {
+	switch method {
+	case adminproto.MethodServerStatus:
+		return adminproto.ServerStatusResult{}
+	case adminproto.MethodServerStop:
+		return adminproto.ServerStopResult{Stopping: true}
+	case adminproto.MethodServerDebugEnable, adminproto.MethodServerDebugDisable:
+		return adminproto.ServerDebugResult{}
+	case adminproto.MethodKeyIssue:
+		return adminproto.KeyIssueResult{}
+	case adminproto.MethodKeyList:
+		return adminproto.KeyListResult{}
+	case adminproto.MethodKeyShow:
+		return adminproto.CredentialResult{}
+	case adminproto.MethodKeyEnable, adminproto.MethodKeyDisable,
+		adminproto.MethodKeySourceAdd, adminproto.MethodKeySourceRemove, adminproto.MethodKeySourceSet:
+		return adminproto.CredentialMutationResult{}
+	case adminproto.MethodKeyDelete:
+		return adminproto.KeyDeleteResult{}
+	case adminproto.MethodKeySourceList:
+		return adminproto.KeySourceListResult{}
+	case adminproto.MethodConnectionList:
+		return adminproto.ConnectionListResult{}
+	case adminproto.MethodConnectionShow:
+		return adminproto.ConnectionResult{}
+	case adminproto.MethodConnectionDisconnect:
+		return adminproto.ConnectionDisconnectResult{}
+	case adminproto.MethodSessionList:
+		return adminproto.SessionListResult{}
+	default:
+		return struct{}{}
+	}
+}
+
+func TestCobraIssueSourcesExpiryJSONAndConfig(t *testing.T) {
+	var stdout bytes.Buffer
+	var gotPath string
+	var gotInvocation Invocation
+	code := run(context.Background(), []string{
 		"-config", "/tmp/server.json", "key", "issue", "--principal-id", "user", "--machine-id", "home",
 		"--source", "10.0.0.1,10.0.0.2", "--source", "192.168.1.0/24", "--expires-at", "2026-08-01T00:00:00+08:00", "--json",
+	}, &stdout, io.Discard, func(_ context.Context, configPath string, invocation Invocation) (any, error) {
+		gotPath = configPath
+		gotInvocation = invocation
+		return adminproto.KeyIssueResult{}, nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	params := options.Invocation.Params.(adminproto.KeyIssueParams)
-	if options.ConfigPath != "/tmp/server.json" || !options.JSON || len(params.Sources) != 2 || params.Sources[0] != "10.0.0.1,10.0.0.2" || params.ExpiresAt == nil {
-		t.Fatalf("parse options = %#v params=%#v", options, params)
+	params, ok := gotInvocation.Params.(adminproto.KeyIssueParams)
+	var result adminproto.KeyIssueResult
+	jsonErr := json.Unmarshal(stdout.Bytes(), &result)
+	if code != 0 || gotPath != "/tmp/server.json" || gotInvocation.Method != adminproto.MethodKeyIssue || !ok ||
+		len(params.Sources) != 2 || params.Sources[0] != "10.0.0.1,10.0.0.2" || params.ExpiresAt == nil || jsonErr != nil {
+		t.Fatalf("run issue = code:%d path:%q invocation:%#v stdout:%q", code, gotPath, gotInvocation, stdout.String())
 	}
 }
 
-func TestParseRejectsInvalidArguments(t *testing.T) {
+func TestCobraRejectsInvalidArguments(t *testing.T) {
 	tests := [][]string{
 		{"key", "show", "0"},
 		{"key", "show", "0x10"},
@@ -76,8 +120,13 @@ func TestParseRejectsInvalidArguments(t *testing.T) {
 		{"unknown"},
 	}
 	for _, args := range tests {
-		if _, err := parseArgs(args); err == nil {
-			t.Fatalf("parseArgs(%v) should fail", args)
+		called := false
+		code := run(context.Background(), args, io.Discard, io.Discard, func(context.Context, string, Invocation) (any, error) {
+			called = true
+			return nil, nil
+		})
+		if code != 2 || called {
+			t.Fatalf("run(%v) = code:%d called:%t, want parameter failure", args, code, called)
 		}
 	}
 }

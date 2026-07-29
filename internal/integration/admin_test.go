@@ -256,6 +256,21 @@ func TestHPCLIProcessUsesRunningServer(t *testing.T) {
 	}
 }
 
+func TestHPCLIProcessHelpDoesNotRequireServer(t *testing.T) {
+	binary := buildHPCLI(t)
+	for _, args := range [][]string{
+		{"--help"},
+		{"help", "key"},
+		{"key", "issue", "--help"},
+		{"help", "key", "source", "add"},
+	} {
+		result := runHPCLIArgs(t, binary, args...)
+		if result.exitCode != 0 || len(result.stdout) == 0 || len(result.stderr) != 0 {
+			t.Fatalf("hp-cli help %v = exit:%d stdout:%q stderr:%q", args, result.exitCode, result.stdout, result.stderr)
+		}
+	}
+}
+
 type hpapCLIResult struct {
 	stdout   []byte
 	stderr   []byte
@@ -282,10 +297,15 @@ func buildHPCLI(t *testing.T) string {
 
 func runHPCLI(t *testing.T, binary, configPath string, args ...string) hpapCLIResult {
 	t.Helper()
+	commandArgs := append([]string{"-config", configPath}, args...)
+	return runHPCLIArgs(t, binary, commandArgs...)
+}
+
+func runHPCLIArgs(t *testing.T, binary string, args ...string) hpapCLIResult {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	commandArgs := append([]string{"-config", configPath}, args...)
-	command := exec.CommandContext(ctx, binary, commandArgs...)
+	command := exec.CommandContext(ctx, binary, args...)
 	command.Env = []string{
 		"HOME=" + t.TempDir(),
 		"PATH=" + os.Getenv("PATH"),

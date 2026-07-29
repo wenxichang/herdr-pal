@@ -170,6 +170,17 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 `hp-cli` 默认读取同一个 `~/.config/herdr-pal/server-config.json` 来定位 Admin Socket，不
 需要企业微信 Secret。服务端使用其他配置文件时，给 `hp-cli` 传入相同的 `-config`。
 
+查看管理命令和参数帮助：
+
+```sh
+./dist/hp-cli --help
+./dist/hp-cli help key
+./dist/hp-cli key issue --help
+```
+
+顶层帮助会列出全部命令路径；子命令帮助会列出下一级命令，叶子命令帮助会说明位置参数、
+可选参数、格式约束和示例。帮助命令不读取配置，也不要求服务端正在运行。
+
 ## 第三步：获取用户 ID 并签发机器 Key
 
 服务端成功连接企业微信后，在自己的机器人单聊中发送：
