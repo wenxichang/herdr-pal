@@ -21,19 +21,31 @@ var (
 // Buffer 保存单个已选择目标的终端快照分页缓存。
 type Buffer struct {
 	targetKey string
-	lines     []string
+	lines     []Line
 	page      int
 	oldest    bool
 	newestLen int
 }
 
+// Page 是带分页位置的终端行副本。
+type Page struct {
+	Lines   []Line
+	Current int
+	Total   int
+}
+
 // Refresh 替换为最新 100 行并回到第 0 页。
 func (b *Buffer) Refresh(targetKey string, lines []string) {
+	b.RefreshTerminal(targetKey, textLines(lines))
+}
+
+// RefreshTerminal 替换为最新一页配对终端行并回到第 0 页。
+func (b *Buffer) RefreshTerminal(targetKey string, lines []Line) {
 	if len(lines) > PageSize {
 		lines = lines[len(lines)-PageSize:]
 	}
 	b.targetKey = targetKey
-	b.lines = append([]string(nil), lines...)
+	b.lines = cloneLines(lines)
 	b.page = 0
 	b.oldest = false
 	b.newestLen = len(b.lines)
@@ -59,6 +71,11 @@ func (b *Buffer) NextReadSize() (int, error) {
 // 同一缓存可能在新快照中重复出现，因此始终使用最后一次完整连续匹配，避免把较早的
 // 重复输出误认为最新缓存。锚点后的内容是读取期间产生的新输出，不进入当前分页缓存。
 func (b *Buffer) Expand(targetKey string, snapshot []string) error {
+	return b.ExpandTerminal(targetKey, textLines(snapshot))
+}
+
+// ExpandTerminal 用配对终端行扩充更早内容。
+func (b *Buffer) ExpandTerminal(targetKey string, snapshot []Line) error {
 	if targetKey != b.targetKey || len(b.lines) == 0 {
 		b.Reset()
 		return ErrPanelChanged
@@ -88,7 +105,7 @@ func (b *Buffer) Expand(targetKey string, snapshot []string) error {
 		b.oldest = true
 		return ErrOldestPage
 	}
-	b.lines = append(append([]string(nil), prefix...), b.lines...)
+	b.lines = append(cloneLines(prefix), b.lines...)
 	b.page++
 	b.oldest = len(b.lines) >= MaxLines
 	return nil
@@ -105,8 +122,21 @@ func (b *Buffer) PageDown() error {
 
 // Render 返回当前页的副本。
 func (b *Buffer) Render() []string {
-	if len(b.lines) == 0 {
+	page := b.RenderTerminal()
+	if page.Lines == nil {
 		return nil
+	}
+	lines := make([]string, len(page.Lines))
+	for index, line := range page.Lines {
+		lines[index] = line.Text
+	}
+	return lines
+}
+
+// RenderTerminal 返回当前页及分页位置的副本。
+func (b *Buffer) RenderTerminal() Page {
+	if len(b.lines) == 0 {
+		return Page{}
 	}
 	newestLen := b.latestPageLen()
 	end := len(b.lines)
@@ -114,7 +144,7 @@ func (b *Buffer) Render() []string {
 		end -= newestLen + (b.page-1)*PageSize
 	}
 	if end <= 0 {
-		return nil
+		return Page{}
 	}
 	pageSize := PageSize
 	if b.page == 0 {
@@ -124,7 +154,8 @@ func (b *Buffer) Render() []string {
 	if start < 0 {
 		start = 0
 	}
-	return append([]string(nil), b.lines[start:end]...)
+	current, total := b.PagePosition()
+	return Page{Lines: cloneLines(b.lines[start:end]), Current: current, Total: total}
 }
 
 // PagePosition 返回从最新页开始、从 1 起算的页码和当前缓存总页数。
@@ -157,14 +188,14 @@ func (b *Buffer) Reset() {
 	b.newestLen = 0
 }
 
-func lastContiguousIndex(snapshot, anchor []string) int {
+func lastContiguousIndex(snapshot, anchor []Line) int {
 	if len(anchor) == 0 || len(anchor) > len(snapshot) {
 		return -1
 	}
 	for index := len(snapshot) - len(anchor); index >= 0; index-- {
 		matched := true
 		for offset, line := range anchor {
-			if snapshot[index+offset] != line {
+			if snapshot[index+offset].Text != line.Text {
 				matched = false
 				break
 			}
@@ -176,14 +207,14 @@ func lastContiguousIndex(snapshot, anchor []string) int {
 	return -1
 }
 
-func isRolledForward(snapshot, previous []string) bool {
+func isRolledForward(snapshot, previous []Line) bool {
 	if len(snapshot) != MaxLines || len(previous) != MaxLines {
 		return false
 	}
 	for overlap := MaxLines - 1; overlap >= PageSize; overlap-- {
 		matched := true
 		for index := 0; index < overlap; index++ {
-			if snapshot[index] != previous[len(previous)-overlap+index] {
+			if snapshot[index].Text != previous[len(previous)-overlap+index].Text {
 				matched = false
 				break
 			}
@@ -193,4 +224,16 @@ func isRolledForward(snapshot, previous []string) bool {
 		}
 	}
 	return false
+}
+
+func textLines(lines []string) []Line {
+	paired := make([]Line, len(lines))
+	for index, line := range lines {
+		paired[index] = Line{Text: line, ANSI: line}
+	}
+	return paired
+}
+
+func cloneLines(lines []Line) []Line {
+	return append([]Line(nil), lines...)
 }

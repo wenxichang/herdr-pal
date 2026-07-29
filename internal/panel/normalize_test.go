@@ -166,6 +166,37 @@ func TestNormalizeDropsBareTrailingEscapePrefix(t *testing.T) {
 	}
 }
 
+func TestNormalizeANSIKeepsSGRAndRemovesUnsafeControls(t *testing.T) {
+	input := "\x1b]0;secret\x07\x1b[31m红色\x1b[0m\x1b[2J\n\x1b[34m──────────\x1b[0m"
+
+	got := panel.NormalizeANSI(input)
+	want := []panel.Line{
+		{Text: "红色", ANSI: "\x1b[31m红色\x1b[0m"},
+		{Text: "──────", ANSI: "\x1b[34m──────\x1b[0m"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeANSI() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeANSICarriageReturnResetsDiscardedStyle(t *testing.T) {
+	got := panel.NormalizeANSI("\x1b[31m旧内容\r新内容\x1b[0m")
+	want := []panel.Line{{Text: "新内容", ANSI: "\x1b[0m新内容\x1b[0m"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeANSI() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeANSIJoinFunctionsUsePairedLines(t *testing.T) {
+	lines := []panel.Line{{Text: "one", ANSI: "\x1b[31mone\x1b[0m"}, {Text: "two", ANSI: "two"}}
+	if got := panel.JoinText(lines); got != "one\ntwo" {
+		t.Fatalf("JoinText() = %q", got)
+	}
+	if got := panel.JoinANSI(lines); got != "\x1b[31mone\x1b[0m\ntwo" {
+		t.Fatalf("JoinANSI() = %q", got)
+	}
+}
+
 func TestBufferPageUpConsumesAllCachedHistoricalPages(t *testing.T) {
 	latest := externalLines(200, 230)
 	history := externalLines(50, 200)

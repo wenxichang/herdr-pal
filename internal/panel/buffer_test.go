@@ -48,6 +48,25 @@ func TestBufferPagePositionUsesCurrentCachedPages(t *testing.T) {
 	}
 }
 
+func TestBufferPagesTextAndANSIWithSameAnchor(t *testing.T) {
+	var buffer Buffer
+	buffer.RefreshTerminal("session", numberedTerminalLinesRange(100, 200))
+	if err := buffer.ExpandTerminal("session", numberedTerminalLinesRange(0, 200)); err != nil {
+		t.Fatal(err)
+	}
+	page := buffer.RenderTerminal()
+	if page.Current != 2 || page.Total != 2 || len(page.Lines) != PageSize {
+		t.Fatalf("RenderTerminal() = %#v", page)
+	}
+	if page.Lines[0].Text != "line-0000" || page.Lines[0].ANSI != "\x1b[31mline-0000\x1b[0m" {
+		t.Fatalf("first line = %#v", page.Lines[0])
+	}
+	page.Lines[0].Text = "changed"
+	if buffer.RenderTerminal().Lines[0].Text != "line-0000" {
+		t.Fatal("RenderTerminal() 暴露了内部缓存")
+	}
+}
+
 func TestBufferNextReadSizeIncreasesToMaximum(t *testing.T) {
 	var buffer Buffer
 	buffer.Refresh("target-a", numberedLines(100))
@@ -80,7 +99,7 @@ func TestBufferExpandUsesLastCompleteOverlapAndIgnoresNewerOutput(t *testing.T) 
 	if buffer.page != 1 {
 		t.Fatalf("page = %d, want 1", buffer.page)
 	}
-	want := append(append([]string(nil), snapshot[:300]...), anchor...)
+	want := textLines(append(append([]string(nil), snapshot[:300]...), anchor...))
 	if !reflect.DeepEqual(buffer.lines, want) {
 		t.Fatalf("lines = %#v, want %#v", buffer.lines, want)
 	}
@@ -115,7 +134,7 @@ func TestBufferExpandStopsAtOldestKnownContentAndMaximum(t *testing.T) {
 	}
 
 	buffer.Refresh("target-a", numberedLines(100))
-	buffer.lines = numberedLines(MaxLines)
+	buffer.lines = textLines(numberedLines(MaxLines))
 	buffer.newestLen = PageSize
 	buffer.page = 9
 	if err := buffer.Expand("target-a", numberedLines(MaxLines)); !errors.Is(err, ErrOldestPage) {
@@ -126,7 +145,7 @@ func TestBufferExpandStopsAtOldestKnownContentAndMaximum(t *testing.T) {
 func TestBufferRenderAllPagesAndPageDownUsesCache(t *testing.T) {
 	var buffer Buffer
 	buffer.targetKey = "target-a"
-	buffer.lines = numberedLines(MaxLines)
+	buffer.lines = textLines(numberedLines(MaxLines))
 	for page := 0; page < 10; page++ {
 		buffer.page = page
 		start := MaxLines - (page+1)*PageSize
@@ -220,6 +239,15 @@ func numberedLinesRange(start, end int) []string {
 	lines := make([]string, 0, end-start)
 	for index := start; index < end; index++ {
 		lines = append(lines, fmt.Sprintf("line-%04d", index))
+	}
+	return lines
+}
+
+func numberedTerminalLinesRange(start, end int) []Line {
+	lines := make([]Line, 0, end-start)
+	for index := start; index < end; index++ {
+		text := fmt.Sprintf("line-%04d", index)
+		lines = append(lines, Line{Text: text, ANSI: "\x1b[31m" + text + "\x1b[0m"})
 	}
 	return lines
 }

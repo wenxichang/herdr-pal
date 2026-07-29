@@ -608,6 +608,31 @@ func TestClientReadRecentSendsExactParametersAndDecodesRead(t *testing.T) {
 	}
 }
 
+func TestClientReadRecentANSIUsesPublicAgentRead(t *testing.T) {
+	readPayload := validReadResult(t)
+	readPayload["text"] = "\x1b[31m红色\x1b[0m"
+	readPayload["format"] = "ansi"
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, readPayload)+`}`, businessRequestCheck("agent.read", map[string]any{
+		"target": "p1", "source": "recent_unwrapped", "lines": float64(42), "format": "ansi", "strip_ansi": false,
+	}))
+
+	read, err := client.ReadRecentANSI(context.Background(), "p1", 42)
+	if err != nil {
+		t.Fatalf("ReadRecentANSI() 返回错误：%v", err)
+	}
+	if read.PaneID != "p1" || read.Text != "\x1b[31m红色\x1b[0m" {
+		t.Fatalf("ReadRecentANSI() = %+v", read)
+	}
+}
+
+func TestClientReadRecentANSIRejectsMismatchedFormat(t *testing.T) {
+	readPayload := validReadResult(t)
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, readPayload)+`}`, nil)
+	if _, err := client.ReadRecentANSI(context.Background(), "p1", 1); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("ReadRecentANSI() 错误 = %v，期望 ErrProtocol", err)
+	}
+}
+
 func TestClientReadRecentRejectsInvalidInputOrResult(t *testing.T) {
 	dialer := &pipeDialer{}
 	client := NewClient("/tmp/herdr.sock", dialer, time.Second)

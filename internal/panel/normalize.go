@@ -4,50 +4,111 @@ package panel
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
+
+// Line 保存同一终端逻辑行的纯文本与安全 ANSI 表示。
+type Line struct {
+	Text string
+	ANSI string
+}
 
 // Normalize 将终端近期快照转换为稳定的逻辑行。
 //
 // 它只移除终端控制序列和明显的重绘痕迹，不根据内容猜测或删除 Agent 语义。
 func Normalize(text string) []string {
-	text = strings.ToValidUTF8(text, "�")
-	text = stripANSI(text)
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = collapseHorizontalRules(text)
-
-	lines := strings.Split(text, "\n")
-	for index, line := range lines {
-		if redraw := strings.LastIndexByte(line, '\r'); redraw >= 0 {
-			line = line[redraw+1:]
-		}
-		lines[index] = strings.TrimRightFunc(line, unicode.IsSpace)
+	paired := NormalizeANSI(text)
+	lines := make([]string, len(paired))
+	for index, line := range paired {
+		lines[index] = line.Text
 	}
-	for len(lines) > 0 && lines[len(lines)-1] == "" {
+	return lines
+}
+
+// NormalizeANSI 清理危险控制序列，并保留用于终端图片渲染的 SGR 样式。
+func NormalizeANSI(text string) []Line {
+	text = strings.ToValidUTF8(text, "�")
+	text = sanitizeANSI(text)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+
+	physicalLines := strings.Split(text, "\n")
+	lines := make([]Line, 0, len(physicalLines))
+	for _, physicalLine := range physicalLines {
+		line := physicalLine
+		if redraw := strings.LastIndexByte(line, '\r'); redraw >= 0 {
+			line = "\x1b[0m" + line[redraw+1:]
+		}
+		line = collapseANSIHorizontalRules(line)
+		line = trimANSIRightWhitespace(line)
+		lines = append(lines, Line{Text: stripANSI(line), ANSI: line})
+	}
+	for len(lines) > 0 && lines[len(lines)-1].Text == "" {
 		lines = lines[:len(lines)-1]
 	}
 	return lines
 }
 
-func collapseHorizontalRules(text string) string {
+// JoinText 连接终端页的纯文本行。
+func JoinText(lines []Line) string {
+	joined := make([]string, len(lines))
+	for index, line := range lines {
+		joined[index] = line.Text
+	}
+	return strings.Join(joined, "\n")
+}
+
+// JoinANSI 连接终端页的安全 ANSI 行。
+func JoinANSI(lines []Line) string {
+	joined := make([]string, len(lines))
+	for index, line := range lines {
+		joined[index] = line.ANSI
+	}
+	return strings.Join(joined, "\n")
+}
+
+func collapseANSIHorizontalRules(text string) string {
 	const maximum = 6
 	var result strings.Builder
 	result.Grow(len(text))
 	run := 0
-	for _, current := range text {
+	for index := 0; index < len(text); {
+		if end, ok := sgrSequenceEnd(text, index); ok {
+			result.WriteString(text[index:end])
+			index = end
+			continue
+		}
+		current, size := utf8.DecodeRuneInString(text[index:])
 		if current == '─' {
 			run++
 			if run <= maximum {
 				result.WriteRune(current)
 			}
+			index += size
 			continue
 		}
 		run = 0
 		result.WriteRune(current)
+		index += size
 	}
 	return result.String()
 }
 
 func stripANSI(text string) string {
+	text = sanitizeANSI(text)
+	var result strings.Builder
+	result.Grow(len(text))
+	for index := 0; index < len(text); {
+		if end, ok := sgrSequenceEnd(text, index); ok {
+			index = end
+			continue
+		}
+		result.WriteByte(text[index])
+		index++
+	}
+	return result.String()
+}
+
+func sanitizeANSI(text string) string {
 	var result strings.Builder
 	result.Grow(len(text))
 	for index := 0; index < len(text); {
@@ -67,6 +128,7 @@ func stripANSI(text string) string {
 
 		switch text[index+1] {
 		case '[':
+			start := index
 			index += 2
 			for index < len(text) {
 				current := text[index]
@@ -75,6 +137,9 @@ func stripANSI(text string) string {
 				}
 				index++
 				if current >= 0x40 && current <= 0x7e {
+					if current == 'm' {
+						result.WriteString(text[start:index])
+					}
 					break
 				}
 			}
@@ -87,6 +152,62 @@ func stripANSI(text string) string {
 		}
 	}
 	return result.String()
+}
+
+type ansiToken struct {
+	raw     string
+	visible bool
+	space   bool
+}
+
+func trimANSIRightWhitespace(text string) string {
+	tokens := make([]ansiToken, 0, len(text))
+	lastVisible := -1
+	for index := 0; index < len(text); {
+		if end, ok := sgrSequenceEnd(text, index); ok {
+			tokens = append(tokens, ansiToken{raw: text[index:end]})
+			index = end
+			continue
+		}
+		current, size := utf8.DecodeRuneInString(text[index:])
+		tokens = append(tokens, ansiToken{raw: text[index : index+size], visible: true, space: unicode.IsSpace(current)})
+		if !unicode.IsSpace(current) {
+			lastVisible = len(tokens) - 1
+		}
+		index += size
+	}
+	if lastVisible < 0 {
+		return ""
+	}
+	var result strings.Builder
+	result.Grow(len(text))
+	for index, token := range tokens {
+		if token.visible && index > lastVisible && token.space {
+			continue
+		}
+		result.WriteString(token.raw)
+	}
+	return result.String()
+}
+
+func sgrSequenceEnd(text string, index int) (int, bool) {
+	if index+2 > len(text) || text[index] != 0x1b || text[index+1] != '[' {
+		return index, false
+	}
+	for current := index + 2; current < len(text); current++ {
+		value := text[current]
+		if value < 0x40 || value > 0x7e {
+			if value == '\n' || value == '\r' {
+				return index, false
+			}
+			continue
+		}
+		if value != 'm' {
+			return index, false
+		}
+		return current + 1, true
+	}
+	return index, false
 }
 
 func skipEscapeSequence(text string, index int) int {
