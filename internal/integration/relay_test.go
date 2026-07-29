@@ -3,6 +3,7 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -91,7 +92,7 @@ func TestRelayEndToEndRoutesMultipleUsersAndMachines(t *testing.T) {
 	}
 	eventuallyRelay(t, func() bool {
 		messages := strings.Join(gateway.Pushes("user-a"), "\n")
-		return strings.Contains(messages, "[home-mac/1] Codex — A 的任务") && strings.Contains(messages, "Agent 已阻塞")
+		return strings.Contains(messages, "[home-mac/1] Codex — A 的任务")
 	})
 }
 
@@ -199,6 +200,16 @@ func (executor *integrationRelayExecutor) HandleMessage(ctx context.Context, mes
 	}
 	executor.mu.Unlock()
 	_ = executor.sink.RespondMarkdown(ctx, message.RequestID, "已处理")
+}
+
+func (executor *integrationRelayExecutor) ReadTerminalSnapshot(
+	context.Context,
+	string,
+	string,
+	im.OutputMode,
+	int,
+) (im.TerminalContent, error) {
+	return im.TerminalContent{}, errors.New("integration terminal snapshot unavailable")
 }
 
 func (executor *integrationRelayExecutor) LastPrompt() string {

@@ -3,11 +3,17 @@ package relayclient
 import (
 	"bytes"
 	"context"
+	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +26,153 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/server"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
+
+func TestClientAdvertisesTerminalCapabilities(t *testing.T) {
+	helloReceived := make(chan hprp.ClientHello, 1)
+	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
+		helloEnvelope := readClientHPRPEnvelope(t, connection)
+		hello, err := hprp.DecodePayload[hprp.ClientHello](helloEnvelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completeClientHandshake(t, connection, helloEnvelope.ID, terminalCapabilities())
+		helloReceived <- hello
+		<-t.Context().Done()
+	})
+	client, executor, cancel, done := startScriptedClient(t, relayServer, &terminalExecutor{})
+	_ = client
+	_ = executor
+	defer stopScriptedClient(cancel, done)
+
+	hello := <-helloReceived
+	for _, capability := range terminalCapabilities() {
+		if !slices.Contains(hello.Capabilities, capability) {
+			t.Fatalf("hello.capabilities = %#v, missing %q", hello.Capabilities, capability)
+		}
+	}
+}
+
+func TestClientMapsImageTerminalReplyToCommandResult(t *testing.T) {
+	resultReceived := make(chan hprp.CommandResult, 1)
+	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
+		hello := readClientHPRPEnvelope(t, connection)
+		completeClientHandshake(t, connection, hello.ID, terminalCapabilities())
+		writeClientHPRPEnvelope(t, connection, hprp.TypeCommandExecute, "command-image", "", hprp.CommandExecute{
+			IdempotencyKey: "message-image",
+			Target:         hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"},
+			Content:        hprp.Content{Type: hprp.ContentTypeText, Text: "/con"},
+			OutputMode:     hprp.OutputModeImage,
+		}, true)
+		resultEnvelope := readClientHPRPEnvelope(t, connection)
+		result, err := hprp.DecodePayload[hprp.CommandResult](resultEnvelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resultReceived <- result
+	})
+	executor := &terminalExecutor{commandContent: imageTerminalContent(t, "审计文本")}
+	_, _, cancel, done := startScriptedClient(t, relayServer, executor)
+	defer stopScriptedClient(cancel, done)
+
+	result := <-resultReceived
+	if result.Outcome != hprp.OutcomeOK || result.Content == nil || result.Content.Type != hprp.ContentTypeTerminal ||
+		result.Content.Mode != hprp.OutputModeImage || result.Content.Text != "审计文本" || result.Content.Image == nil {
+		t.Fatalf("command result = %#v", result)
+	}
+}
+
+func TestClientStatusEventContainsConfirmedSnapshotSequenceAndNoContent(t *testing.T) {
+	envelopeReceived := make(chan hprp.Envelope, 1)
+	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
+		hello := readClientHPRPEnvelope(t, connection)
+		completeClientHandshake(t, connection, hello.ID, terminalCapabilities())
+		envelopeReceived <- readClientHPRPEnvelope(t, connection)
+	})
+	client, _, cancel, done := startScriptedClient(t, relayServer, &terminalExecutor{})
+	defer stopScriptedClient(cancel, done)
+	event := im.NotificationEvent{
+		Kind: im.NotificationKindAgentStatusChanged, PreviousStatus: hprp.StatusWorking,
+		Status: hprp.StatusDone, OccurredAt: time.Now().UTC(),
+	}
+	eventuallyClient(t, func() bool {
+		return client.SendNotification(context.Background(), im.NotificationTarget{
+			PaneID: "pane-1", OccupantHash: "session-1", Agent: "codex",
+		}, event) == nil
+	})
+
+	envelope := <-envelopeReceived
+	notification, err := hprp.DecodePayload[hprp.NotificationEvent](envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notification.Kind != hprp.NotificationKindAgentStatusChanged || notification.SnapshotSequence != 1 ||
+		notification.Data == nil || notification.Data.PreviousStatus != hprp.StatusWorking || notification.Data.Status != hprp.StatusDone {
+		t.Fatalf("notification = %#v", notification)
+	}
+	if bytes.Contains(envelope.Payload, []byte(`"content"`)) {
+		t.Fatalf("status event contains content: %s", envelope.Payload)
+	}
+}
+
+func TestClientHandlesTerminalSnapshotGetWithoutChangingSelection(t *testing.T) {
+	resultReceived := make(chan hprp.TerminalSnapshotResult, 1)
+	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
+		hello := readClientHPRPEnvelope(t, connection)
+		completeClientHandshake(t, connection, hello.ID, terminalCapabilities())
+		writeClientHPRPEnvelope(t, connection, hprp.TypeTerminalSnapshotGet, "snapshot-get", "", hprp.TerminalSnapshotGet{
+			Target: hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"},
+			Mode:   hprp.OutputModeImage, Purpose: hprp.TerminalSnapshotPurposeNotification, MaxLines: 100,
+		}, true)
+		resultEnvelope := readClientHPRPEnvelope(t, connection)
+		result, err := hprp.DecodePayload[hprp.TerminalSnapshotResult](resultEnvelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resultReceived <- result
+	})
+	executor := &terminalExecutor{snapshotContent: imageTerminalContent(t, "快照文本")}
+	executor.selected = fakeSelection{PaneID: "pane-1", OccupantHash: "session-1"}
+	_, _, cancel, done := startScriptedClient(t, relayServer, executor)
+	defer stopScriptedClient(cancel, done)
+
+	result := <-resultReceived
+	if result.Outcome != hprp.OutcomeOK || result.Content == nil || result.Content.Text != "快照文本" || result.Content.Image == nil {
+		t.Fatalf("terminal snapshot result = %#v", result)
+	}
+	if selected := executor.Selected(); selected != (fakeSelection{PaneID: "pane-1", OccupantHash: "session-1"}) {
+		t.Fatalf("terminal snapshot changed selection: %#v", selected)
+	}
+}
+
+func TestClientTerminalSnapshotImageFailureReturnsSameReadFallback(t *testing.T) {
+	resultReceived := make(chan hprp.TerminalSnapshotResult, 1)
+	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
+		hello := readClientHPRPEnvelope(t, connection)
+		completeClientHandshake(t, connection, hello.ID, terminalCapabilities())
+		writeClientHPRPEnvelope(t, connection, hprp.TypeTerminalSnapshotGet, "snapshot-fallback", "", hprp.TerminalSnapshotGet{
+			Target: hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"},
+			Mode:   hprp.OutputModeImage, Purpose: hprp.TerminalSnapshotPurposeNotification, MaxLines: 100,
+		}, true)
+		resultEnvelope := readClientHPRPEnvelope(t, connection)
+		result, err := hprp.DecodePayload[hprp.TerminalSnapshotResult](resultEnvelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resultReceived <- result
+	})
+	executor := &terminalExecutor{
+		snapshotContent: im.TerminalContent{Mode: im.OutputModeText, Text: "同次读取文本", Page: &im.TerminalPage{Current: 1, Total: 1}, CapturedAt: time.Now().UTC()},
+		snapshotErr:     errors.New("render failed"),
+	}
+	_, _, cancel, done := startScriptedClient(t, relayServer, executor)
+	defer stopScriptedClient(cancel, done)
+
+	result := <-resultReceived
+	if result.Outcome != hprp.OutcomeFailed || result.Error == nil || result.Error.Code != hprp.CodeTerminalImageFailed ||
+		result.FallbackContent == nil || result.FallbackContent.Text != "同次读取文本" || result.FallbackContent.Mode != hprp.OutputModeText {
+		t.Fatalf("terminal snapshot fallback = %#v", result)
+	}
+}
 
 func TestHPRPClientAuthenticatesReportsSnapshotAndExecutesCommand(t *testing.T) {
 	token, record, err := credential.Issue(1, "user-a", "home-mac", []credential.SourceRule{"127.0.0.1", "::1"}, nil, time.Now(), bytes.NewReader(make([]byte, 48)))
@@ -189,6 +342,165 @@ func TestHPRPClientRejectsInvalidServerHelloBeforeSnapshot(t *testing.T) {
 		if strings.Contains(output, forbidden) {
 			t.Fatalf("logs leaked %q: %s", forbidden, output)
 		}
+	}
+}
+
+func newScriptedRelayServer(t *testing.T, script func(*websocket.Conn)) *httptest.Server {
+	t.Helper()
+	var once sync.Once
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{Subprotocols: []string{hprp.Subprotocol}})
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		once.Do(func() { script(connection) })
+	})
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+	return server
+}
+
+func terminalCapabilities() []string {
+	return []string{
+		hprp.CapabilityCommandOutputV1,
+		hprp.CapabilityTerminalSnapshotV1,
+		hprp.CapabilityTerminalImageV1,
+	}
+}
+
+func completeClientHandshake(t *testing.T, connection *websocket.Conn, helloID string, capabilities []string) {
+	t.Helper()
+	writeClientHPRPEnvelope(t, connection, hprp.TypeHelloServer, "hello-server", helloID, hprp.ServerHello{
+		ConnectionID: "connection-1", MachineID: "home-mac", Capabilities: capabilities, Features: map[string]hprp.FeatureOffer{},
+		Limits: hprp.ServerLimits{
+			MaxMessageBytes: hprp.MaxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: 1,
+			MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes,
+			MaxTerminalTextBytes: hprp.MaxTerminalTextBytes, MaxTerminalImageBytes: hprp.MaxTerminalImageBytes,
+			IdempotencyWindowMS: 600_000,
+		},
+		Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
+	})
+	snapshot := readClientHPRPEnvelope(t, connection)
+	writeClientHPRPEnvelope(t, connection, hprp.TypeSessionSnapshotResult, "snapshot-result", snapshot.ID, hprp.SnapshotResult{
+		Outcome: hprp.OutcomeOK, AppliedSequence: 1,
+	})
+}
+
+func startScriptedClient(
+	t *testing.T,
+	server *httptest.Server,
+	executor *terminalExecutor,
+) (*Client, *terminalExecutor, context.CancelFunc, <-chan error) {
+	t.Helper()
+	if len(executor.targets) == 0 {
+		executor.targets = []session.Target{{
+			PaneID: "pane-1", TerminalID: "terminal-1", OccupantKey: "session-1", Agent: "codex",
+			DisplayAgent: "Codex", Status: herdr.AgentStatusIdle,
+		}}
+	}
+	client, err := New(Config{
+		URL: "wss" + strings.TrimPrefix(server.URL, "https"), Key: relayClientTestKey(t), SkipVerify: true,
+		Version: "test", PollInterval: time.Hour, SnapshotInterval: time.Hour,
+		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.sink = client
+	if err := client.SetExecutor(executor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	return client, executor, cancel, done
+}
+
+func stopScriptedClient(cancel context.CancelFunc, done <-chan error) {
+	cancel()
+	<-done
+}
+
+type terminalExecutor struct {
+	mu              sync.Mutex
+	targets         []session.Target
+	selected        fakeSelection
+	sink            any
+	commandContent  im.TerminalContent
+	snapshotContent im.TerminalContent
+	snapshotErr     error
+}
+
+func (executor *terminalExecutor) CurrentTargets() []session.Target {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return append([]session.Target(nil), executor.targets...)
+}
+
+func (executor *terminalExecutor) SelectedTarget() (session.Target, error) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	for _, target := range executor.targets {
+		if target.PaneID == executor.selected.PaneID && target.OccupantKey == executor.selected.OccupantHash {
+			return target, nil
+		}
+	}
+	return session.Target{}, session.ErrNoSelection
+}
+
+func (executor *terminalExecutor) SelectTarget(paneID, occupantHash string) error {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	for _, target := range executor.targets {
+		if target.PaneID == paneID && target.OccupantKey == occupantHash {
+			executor.selected = fakeSelection{PaneID: paneID, OccupantHash: occupantHash}
+			return nil
+		}
+	}
+	return session.ErrListSnapshotExpired
+}
+
+func (executor *terminalExecutor) HandleMessage(ctx context.Context, message im.IncomingText) {
+	if sink, ok := executor.sink.(im.TerminalReplySink); ok {
+		_ = sink.RespondTerminal(ctx, message.RequestID, executor.commandContent)
+		return
+	}
+	_ = executor.sink.(im.ReplySink).RespondMarkdown(ctx, message.RequestID, "terminal sink unavailable")
+}
+
+func (executor *terminalExecutor) ReadTerminalSnapshot(
+	context.Context,
+	string,
+	string,
+	im.OutputMode,
+	int,
+) (im.TerminalContent, error) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.snapshotContent, executor.snapshotErr
+}
+
+func (executor *terminalExecutor) Selected() fakeSelection {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.selected
+}
+
+func imageTerminalContent(t *testing.T, text string) im.TerminalContent {
+	t.Helper()
+	paletted := image.NewPaletted(image.Rect(0, 0, 2, 1), color.Palette{color.Black, color.White})
+	paletted.SetColorIndex(1, 0, 1)
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, paletted); err != nil {
+		t.Fatal(err)
+	}
+	return im.TerminalContent{
+		Mode: im.OutputModeImage, Text: text,
+		Image: &im.TerminalImage{
+			MediaType: "image/png", Data: encoded.Bytes(), Width: 2, Height: 1, ColorMode: "indexed-256",
+		},
+		Page: &im.TerminalPage{Current: 1, Total: 1}, CapturedAt: time.Now().UTC(),
 	}
 }
 

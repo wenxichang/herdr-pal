@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,7 +22,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/wenxichang/herdr-pal/internal/credential"
-	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/session"
@@ -93,6 +93,7 @@ type Executor interface {
 	SelectedTarget() (session.Target, error)
 	SelectTarget(paneID, occupantHash string) error
 	HandleMessage(ctx context.Context, message im.IncomingText)
+	ReadTerminalSnapshot(ctx context.Context, paneID, occupantHash string, mode im.OutputMode, maxLines int) (im.TerminalContent, error)
 }
 
 // Client 维护 HPRP/1 WSS、执行服务端命令并实现 Bridge 消息 sink。
@@ -111,7 +112,7 @@ type Client struct {
 	activeRequestID string
 	activeTarget    hprp.Target
 	activeCommand   hprp.CommandExecute
-	activeOutputs   []string
+	activeOutputs   []hprp.Content
 	activeResult    *hprp.CommandResult
 
 	notificationSequence atomic.Uint64
@@ -133,6 +134,7 @@ type clientSession struct {
 	writeMu          sync.Mutex
 	pendingMu        sync.Mutex
 	pending          map[string]clientPendingRequest
+	snapshotSequence atomic.Uint64
 }
 
 type remoteProtocolError struct {
@@ -226,6 +228,19 @@ func (client *Client) Run(ctx context.Context) error {
 
 // RespondMarkdown 把 Bridge 首段回复写成 command.result。
 func (client *Client) RespondMarkdown(ctx context.Context, requestID, content string) error {
+	return client.respondContent(ctx, requestID, hprp.Content{Type: hprp.ContentTypeText, Text: content})
+}
+
+// RespondTerminal 把 Bridge 首段结构化终端回复写成 command.result。
+func (client *Client) RespondTerminal(ctx context.Context, requestID string, content im.TerminalContent) error {
+	encoded, err := encodeTerminalContent(content)
+	if err != nil {
+		return err
+	}
+	return client.respondContent(ctx, requestID, encoded)
+}
+
+func (client *Client) respondContent(ctx context.Context, requestID string, content hprp.Content) error {
 	client.executionMu.Lock()
 	if client.activeRequestID != requestID || requestID == "" {
 		client.executionMu.Unlock()
@@ -236,7 +251,7 @@ func (client *Client) RespondMarkdown(ctx context.Context, requestID, content st
 
 	result := hprp.CommandResult{
 		Outcome: hprp.OutcomeOK,
-		Content: &hprp.TextContent{Type: hprp.ContentTypeText, Text: content},
+		Content: &content,
 	}
 	if selected, err := client.selectedTarget(); err == nil && selected.MachineID == activeTarget.MachineID &&
 		selected.SlotID == activeTarget.SlotID && selected.SessionID != activeTarget.SessionID {
@@ -263,12 +278,25 @@ func (client *Client) RespondMarkdown(ctx context.Context, requestID, content st
 
 // SendMarkdown 缓冲当前命令的后续输出，在本地处理结束后按 HPRP 顺序发送。
 func (client *Client) SendMarkdown(_ context.Context, content string) error {
+	return client.sendContent(hprp.Content{Type: hprp.ContentTypeText, Text: content})
+}
+
+// SendTerminal 缓冲当前命令的后续结构化终端输出。
+func (client *Client) SendTerminal(_ context.Context, content im.TerminalContent) error {
+	encoded, err := encodeTerminalContent(content)
+	if err != nil {
+		return err
+	}
+	return client.sendContent(encoded)
+}
+
+func (client *Client) sendContent(content hprp.Content) error {
 	client.executionMu.Lock()
 	defer client.executionMu.Unlock()
 	if client.activeRequestID == "" {
 		return ErrUnavailable
 	}
-	client.activeOutputs = append(client.activeOutputs, content)
+	client.activeOutputs = append(client.activeOutputs, cloneHPRPContent(content))
 	return nil
 }
 
@@ -282,31 +310,28 @@ func (client *Client) SendNotification(ctx context.Context, target im.Notificati
 		return err
 	}
 	sequence := client.notificationSequence.Add(1)
+	occurredAt := event.OccurredAt.UTC()
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
 	notification := hprp.NotificationEvent{
-		EventKey: randomClientID(),
-		Sequence: sequence, Kind: "agent.status",
-		Target:  hprp.Target{MachineID: current.machineID, SlotID: target.PaneID, SessionID: target.OccupantHash},
-		Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: relayNotificationText(event)},
+		EventKey: randomClientID(), Sequence: sequence,
+		Target:           hprp.Target{MachineID: current.machineID, SlotID: target.PaneID, SessionID: target.OccupantHash},
+		SnapshotSequence: current.snapshotSequence.Load(), OccurredAt: occurredAt,
+	}
+	switch event.Kind {
+	case im.NotificationKindAgentStatusChanged:
+		notification.Kind = hprp.NotificationKindAgentStatusChanged
+		notification.Data = &hprp.StatusChangeData{PreviousStatus: event.PreviousStatus, Status: event.Status}
+	case im.NotificationKindTargetInvalidated:
+		notification.Kind = hprp.NotificationKindTargetInvalidated
+	default:
+		return hprp.ErrInvalidMessage
+	}
+	if err := hprp.ValidateNotificationEvent(notification); err != nil {
+		return err
 	}
 	return current.write(ctx, hprp.TypeNotificationEvent, randomClientID(), "", false, notification)
-}
-
-func relayNotificationText(event im.NotificationEvent) string {
-	if event.Kind == im.NotificationKindTargetInvalidated {
-		return "Agent 目标已失效，请重新执行 /ls 和 /sel。"
-	}
-	switch herdr.AgentStatus(event.Status) {
-	case herdr.AgentStatusWorking:
-		return "Agent 开始工作。"
-	case herdr.AgentStatusBlocked:
-		return "Agent 已阻塞，需要你的处理。"
-	case herdr.AgentStatusDone:
-		return "Agent 已完成。"
-	case herdr.AgentStatusIdle:
-		return "Agent 已空闲。"
-	default:
-		return "Agent 状态无法可靠识别，请在 Herdr 中确认。"
-	}
 }
 
 func (client *Client) runSession(parent context.Context, onReady func()) error {
@@ -339,7 +364,11 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 	helloID := randomClientID()
 	if err := current.write(parent, hprp.TypeHelloClient, helloID, "", true, hprp.ClientHello{
 		Implementation: hprp.Implementation{Name: "herdr-pal", Version: client.config.Version, OS: runtime.GOOS, Arch: runtime.GOARCH},
-		Capabilities:   []string{hprp.CapabilityCommandOutputV1}, Features: map[string]hprp.FeatureOffer{},
+		Capabilities: []string{
+			hprp.CapabilityCommandOutputV1,
+			hprp.CapabilityTerminalSnapshotV1,
+			hprp.CapabilityTerminalImageV1,
+		}, Features: map[string]hprp.FeatureOffer{},
 		Limits: hprp.ClientLimits{
 			MaxReceiveMessageBytes: hprp.MaxMessageBytes, MaxInflightCommands: 1, MaxInflightFeatures: 0,
 			IdempotencyWindowMS: defaultIdempotencyWindow.Milliseconds(),
@@ -387,6 +416,7 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 	if err := validateSnapshotAcknowledgement(snapshotEnvelope, initialID, initial.Sequence); err != nil {
 		return withRelayStage("initial_snapshot_result", err)
 	}
+	current.snapshotSequence.Store(initial.Sequence)
 	fingerprint := SnapshotFingerprint(initial)
 	readResult := make(chan error, 1)
 	go func() { readResult <- client.readLoop(current) }()
@@ -420,6 +450,7 @@ func (client *Client) runSession(parent context.Context, onReady func()) error {
 			return withRelayStage("snapshot_result", err)
 		}
 		sequence++
+		current.snapshotSequence.Store(candidate.Sequence)
 		fingerprint = candidateFingerprint
 		client.logger.Debug("HPRP 会话快照已确认",
 			"credential_id", client.config.CredentialID, "machine_id", current.machineID, "connection_id", serverHello.ConnectionID,
@@ -466,6 +497,8 @@ func (client *Client) readLoop(current *clientSession) error {
 			}
 		case hprp.TypeCommandExecute:
 			go client.handleCommand(current, envelope)
+		case hprp.TypeTerminalSnapshotGet:
+			go client.handleTerminalSnapshot(current, envelope)
 		case hprp.TypeProtocolError:
 			return decodeHPRPProtocolError(envelope)
 		default:
@@ -490,6 +523,16 @@ func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelo
 	}
 	if err != nil {
 		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false, rejectedCommand(hprp.CodeProtocolInvalidMessage, "命令格式无效"))
+		return
+	}
+	mode := command.OutputMode
+	if mode == "" {
+		mode = hprp.OutputModeText
+	}
+	if mode == hprp.OutputModeImage && !current.supportsCapability(hprp.CapabilityTerminalImageV1) {
+		_ = current.write(current.ctx, hprp.TypeCommandResult, randomClientID(), envelope.ID, false,
+			rejectedCommand(hprp.CodeTerminalImageUnsupported, "当前连接未协商终端图片能力"))
+		client.logCommandResult(envelope.ID, command, "image_unsupported")
 		return
 	}
 	switch cached, state := client.resultCache.Lookup(command); state {
@@ -524,11 +567,103 @@ func (client *Client) handleCommand(current *clientSession, envelope hprp.Envelo
 
 	message := im.IncomingText{
 		RequestID: envelope.ID, MessageID: command.IdempotencyKey, UserID: strconv.FormatUint(client.config.CredentialID, 10),
-		ChatType: "single", Content: command.Content.Text,
+		ChatType: "single", Content: command.Content.Text, OutputMode: im.OutputMode(mode),
 	}
 	client.localExecutor().HandleMessage(current.ctx, message)
 	client.finishCommand(current, envelope.ID)
 	client.logCommandResult(envelope.ID, command, "success")
+}
+
+func (client *Client) handleTerminalSnapshot(current *clientSession, envelope hprp.Envelope) {
+	request, err := hprp.DecodePayload[hprp.TerminalSnapshotGet](envelope)
+	if err == nil {
+		err = hprp.ValidateTerminalSnapshotGet(request)
+	}
+	if err != nil {
+		client.writeProtocolError(current, envelope.ID, hprp.CodeProtocolInvalidMessage, "终端快照请求格式无效")
+		return
+	}
+	if !current.supportsCapability(hprp.CapabilityTerminalSnapshotV1) {
+		client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+			Outcome: hprp.OutcomeRejected, Target: request.Target,
+			Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotUnsupported, Message: "当前连接未协商终端快照能力", Retryable: false},
+		})
+		return
+	}
+	if request.Mode == hprp.OutputModeImage && !current.supportsCapability(hprp.CapabilityTerminalImageV1) {
+		client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+			Outcome: hprp.OutcomeRejected, Target: request.Target,
+			Error: &hprp.Error{Code: hprp.CodeTerminalImageUnsupported, Message: "当前连接未协商终端图片能力", Retryable: false},
+		})
+		return
+	}
+	if request.Target.MachineID != current.machineID {
+		client.writeTerminalSnapshotResult(current, envelope.ID, terminalTargetChangedResult(request.Target))
+		return
+	}
+	if _, err := client.resolveLocalTarget(current.machineID, request.Target.SlotID, request.Target.SessionID); err != nil {
+		client.writeTerminalSnapshotResult(current, envelope.ID, terminalTargetChangedResult(request.Target))
+		return
+	}
+
+	content, readErr := client.localExecutor().ReadTerminalSnapshot(
+		current.ctx,
+		request.Target.SlotID,
+		request.Target.SessionID,
+		im.OutputMode(request.Mode),
+		request.MaxLines,
+	)
+	if readErr == nil {
+		encoded, encodeErr := encodeTerminalContent(content)
+		if encodeErr == nil {
+			client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+				Outcome: hprp.OutcomeOK, Target: request.Target, Content: &encoded,
+			})
+			return
+		}
+		readErr = encodeErr
+	}
+	if request.Mode == hprp.OutputModeImage && content.Text != "" {
+		content.Mode = im.OutputModeText
+		content.Image = nil
+		fallback, fallbackErr := encodeTerminalContent(content)
+		if fallbackErr == nil {
+			client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+				Outcome: hprp.OutcomeFailed, Target: request.Target, FallbackContent: &fallback,
+				Error: &hprp.Error{Code: hprp.CodeTerminalImageFailed, Message: "终端图片生成失败", Retryable: false},
+			})
+			return
+		}
+	}
+	if errors.Is(readErr, session.ErrListSnapshotExpired) || errors.Is(readErr, session.ErrSelectionInvalid) {
+		client.writeTerminalSnapshotResult(current, envelope.ID, terminalTargetChangedResult(request.Target))
+		return
+	}
+	client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeFailed, Target: request.Target,
+		Error: &hprp.Error{Code: hprp.CodeTerminalSnapshotFailed, Message: "终端快照读取失败", Retryable: true},
+	})
+}
+
+func (client *Client) writeTerminalSnapshotResult(current *clientSession, replyTo string, result hprp.TerminalSnapshotResult) {
+	if err := hprp.ValidateTerminalSnapshotResult(result); err != nil {
+		client.writeProtocolError(current, replyTo, hprp.CodeServerInternal, "终端快照结果无效")
+		return
+	}
+	_ = current.write(current.ctx, hprp.TypeTerminalSnapshotResult, randomClientID(), replyTo, false, result)
+}
+
+func (client *Client) writeProtocolError(current *clientSession, replyTo string, code hprp.ErrorCode, message string) {
+	_ = current.write(current.ctx, hprp.TypeProtocolError, randomClientID(), replyTo, false, hprp.ProtocolError{
+		Error: hprp.Error{Code: code, Message: message, Retryable: false}, Close: false,
+	})
+}
+
+func terminalTargetChangedResult(target hprp.Target) hprp.TerminalSnapshotResult {
+	return hprp.TerminalSnapshotResult{
+		Outcome: hprp.OutcomeRejected, Target: target,
+		Error: &hprp.Error{Code: hprp.CodeTargetSessionChanged, Message: "目标 Agent 已变化", Retryable: false},
+	}
 }
 
 func (client *Client) finishCommand(current *clientSession, requestID string) {
@@ -539,7 +674,7 @@ func (client *Client) finishCommand(current *clientSession, requestID string) {
 	}
 	target := client.activeTarget
 	command := client.activeCommand
-	outputs := append([]string(nil), client.activeOutputs...)
+	outputs := cloneHPRPContents(client.activeOutputs)
 	result := client.activeResult
 	client.activeRequestID = ""
 	client.activeTarget = hprp.Target{}
@@ -566,7 +701,7 @@ func (client *Client) finishCommand(current *clientSession, requestID string) {
 	for index, output := range outputs {
 		if err := current.write(current.ctx, hprp.TypeCommandOutput, randomClientID(), requestID, false, hprp.CommandOutput{
 			Target: target, Sequence: uint64(index + 1), Final: index == len(outputs)-1,
-			Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: output},
+			Content: output,
 		}); err != nil {
 			return
 		}
@@ -587,7 +722,7 @@ func (client *Client) writeCachedCommand(current *clientSession, requestID strin
 	for index, output := range cached.outputs {
 		if err := current.write(current.ctx, hprp.TypeCommandOutput, randomClientID(), requestID, false, hprp.CommandOutput{
 			Target: target, Sequence: uint64(index + 1), Final: index == len(cached.outputs)-1,
-			Content: hprp.TextContent{Type: hprp.ContentTypeText, Text: output},
+			Content: output,
 		}); err != nil {
 			return
 		}
@@ -605,6 +740,55 @@ func (client *Client) logCommandResult(requestID string, command hprp.CommandExe
 
 func rejectedCommand(code hprp.ErrorCode, message string) hprp.CommandResult {
 	return hprp.CommandResult{Outcome: hprp.OutcomeRejected, Error: &hprp.Error{Code: code, Message: message, Retryable: false}}
+}
+
+func encodeTerminalContent(content im.TerminalContent) (hprp.Content, error) {
+	mode := hprp.OutputMode(content.Mode)
+	if mode != hprp.OutputModeText && mode != hprp.OutputModeImage {
+		return hprp.Content{}, hprp.ErrInvalidMessage
+	}
+	capturedAt := content.CapturedAt.UTC()
+	result := hprp.Content{
+		Type: hprp.ContentTypeTerminal, Text: content.Text, Mode: mode, CapturedAt: &capturedAt,
+	}
+	if content.Page != nil {
+		result.Page = &hprp.TerminalPage{Current: content.Page.Current, Total: content.Page.Total}
+	}
+	if content.Image != nil {
+		result.Image = &hprp.TerminalImage{
+			MediaType: content.Image.MediaType, Encoding: "base64",
+			Data: base64.StdEncoding.EncodeToString(content.Image.Data), Width: content.Image.Width,
+			Height: content.Image.Height, ColorMode: content.Image.ColorMode,
+		}
+	}
+	if err := hprp.ValidateContent(result); err != nil {
+		return hprp.Content{}, err
+	}
+	return result, nil
+}
+
+func cloneHPRPContents(contents []hprp.Content) []hprp.Content {
+	result := make([]hprp.Content, len(contents))
+	for index, content := range contents {
+		result[index] = cloneHPRPContent(content)
+	}
+	return result
+}
+
+func cloneHPRPContent(content hprp.Content) hprp.Content {
+	if content.Image != nil {
+		imageCopy := *content.Image
+		content.Image = &imageCopy
+	}
+	if content.Page != nil {
+		pageCopy := *content.Page
+		content.Page = &pageCopy
+	}
+	if content.CapturedAt != nil {
+		capturedAtCopy := *content.CapturedAt
+		content.CapturedAt = &capturedAtCopy
+	}
+	return content
 }
 
 func (client *Client) writeCurrent(ctx context.Context, messageType hprp.Type, id, replyTo string, mustUnderstand bool, payload any) error {

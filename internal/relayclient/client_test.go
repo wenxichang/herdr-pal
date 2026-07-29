@@ -3,6 +3,7 @@ package relayclient
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http/httptest"
@@ -541,6 +542,16 @@ func (executor *fakeExecutor) HandleMessage(ctx context.Context, message im.Inco
 	if executor.pushContent != "" {
 		_ = executor.sink.SendMarkdown(ctx, executor.pushContent)
 	}
+}
+
+func (executor *fakeExecutor) ReadTerminalSnapshot(
+	context.Context,
+	string,
+	string,
+	im.OutputMode,
+	int,
+) (im.TerminalContent, error) {
+	return im.TerminalContent{}, errors.New("fake terminal snapshot unavailable")
 }
 
 func (executor *fakeExecutor) HandleCount() int {

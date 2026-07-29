@@ -223,6 +223,29 @@ type NotificationEvent struct {
 	Content          Content           `json:"content,omitempty"`
 }
 
+// MarshalJSON 在迁移期间仅为旧文本通知保留 content；结构化事件不会输出空正文对象。
+func (event NotificationEvent) MarshalJSON() ([]byte, error) {
+	type notificationEventWire struct {
+		EventKey         string            `json:"event_key"`
+		Sequence         uint64            `json:"sequence"`
+		Kind             string            `json:"kind"`
+		Target           Target            `json:"target"`
+		SnapshotSequence uint64            `json:"snapshot_sequence,omitempty"`
+		OccurredAt       time.Time         `json:"occurred_at,omitempty"`
+		Data             *StatusChangeData `json:"data,omitempty"`
+		Content          *Content          `json:"content,omitempty"`
+	}
+	wire := notificationEventWire{
+		EventKey: event.EventKey, Sequence: event.Sequence, Kind: event.Kind, Target: event.Target,
+		SnapshotSequence: event.SnapshotSequence, OccurredAt: event.OccurredAt, Data: event.Data,
+	}
+	if event.Content.Type != "" || event.Content.Text != "" || event.Content.Mode != "" || event.Content.Image != nil || event.Content.Page != nil || event.Content.CapturedAt != nil {
+		content := event.Content
+		wire.Content = &content
+	}
+	return json.Marshal(wire)
+}
+
 // TerminalSnapshotGet 请求 Pal 无副作用读取一次终端快照。
 type TerminalSnapshotGet struct {
 	Target   Target     `json:"target"`

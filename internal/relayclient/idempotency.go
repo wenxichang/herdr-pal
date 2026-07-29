@@ -18,7 +18,7 @@ const (
 type cachedCommandResult struct {
 	command   hprp.CommandExecute
 	result    hprp.CommandResult
-	outputs   []string
+	outputs   []hprp.Content
 	expiresAt time.Time
 	createdAt time.Time
 }
@@ -53,7 +53,7 @@ func (cache *commandResultCache) Lookup(command hprp.CommandExecute) (cachedComm
 	if !exists {
 		return cachedCommandResult{}, commandCacheMiss
 	}
-	if entry.command.Target != command.Target || entry.command.Content != command.Content {
+	if entry.command.Target != command.Target || entry.command.Content != command.Content || entry.command.OutputMode != command.OutputMode {
 		return cachedCommandResult{}, commandCacheConflict
 	}
 	return cloneCachedCommandResult(entry), commandCacheHit
@@ -67,8 +67,8 @@ func (cache *commandResultCache) Store(command hprp.CommandExecute, result cache
 	if len(cache.entries) >= cache.capacity {
 		cache.evictOldestLocked()
 	}
+	result = cloneCachedCommandResult(result)
 	result.command = command
-	result.outputs = append([]string(nil), result.outputs...)
 	result.createdAt = now
 	result.expiresAt = now.Add(cache.ttl)
 	cache.entries[command.IdempotencyKey] = result
@@ -95,6 +95,14 @@ func (cache *commandResultCache) evictOldestLocked() {
 }
 
 func cloneCachedCommandResult(entry cachedCommandResult) cachedCommandResult {
-	entry.outputs = append([]string(nil), entry.outputs...)
+	entry.outputs = cloneHPRPContents(entry.outputs)
+	if entry.result.Content != nil {
+		content := cloneHPRPContent(*entry.result.Content)
+		entry.result.Content = &content
+	}
+	if entry.result.ReplacementTarget != nil {
+		target := *entry.result.ReplacementTarget
+		entry.result.ReplacementTarget = &target
+	}
 	return entry
 }

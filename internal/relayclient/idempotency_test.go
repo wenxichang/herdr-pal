@@ -15,9 +15,19 @@ func TestCommandResultCacheReplaysEquivalentCommandAndRejectsConflict(t *testing
 		Target:         hprp.Target{MachineID: "home", SlotID: "pane-1", SessionID: "session-1"},
 		Content:        hprp.TextContent{Type: hprp.ContentTypeText, Text: "prompt"},
 	}
+	capturedAt := now.UTC()
 	want := cachedCommandResult{
-		result:  hprp.CommandResult{Outcome: hprp.OutcomeOK},
-		outputs: []string{"part-1", "part-2"},
+		result: hprp.CommandResult{Outcome: hprp.OutcomeOK, Content: &hprp.Content{
+			Type: hprp.ContentTypeTerminal, Text: "result", Mode: hprp.OutputModeText, CapturedAt: &capturedAt,
+		}},
+		outputs: []hprp.Content{
+			{
+				Type: hprp.ContentTypeTerminal, Text: "part-1", Mode: hprp.OutputModeImage,
+				Image: &hprp.TerminalImage{MediaType: "image/png", Encoding: "base64", Data: "data", Width: 2, Height: 1, ColorMode: "indexed-256"},
+				Page:  &hprp.TerminalPage{Current: 1, Total: 1}, CapturedAt: &capturedAt,
+			},
+			{Type: hprp.ContentTypeText, Text: "part-2"},
+		},
 	}
 	cache.Store(command, want)
 
@@ -25,9 +35,11 @@ func TestCommandResultCacheReplaysEquivalentCommandAndRejectsConflict(t *testing
 	if state != commandCacheHit || got.result.Outcome != hprp.OutcomeOK || len(got.outputs) != 2 {
 		t.Fatalf("Lookup(hit) = %#v, %v", got, state)
 	}
-	got.outputs[0] = "changed"
+	got.outputs[0].Text = "changed"
+	got.outputs[0].Image.Data = "changed"
+	got.result.Content.Text = "changed"
 	replayed, _ := cache.Lookup(command)
-	if replayed.outputs[0] != "part-1" {
+	if replayed.outputs[0].Text != "part-1" || replayed.outputs[0].Image.Data != "data" || replayed.result.Content.Text != "result" {
 		t.Fatal("cached outputs were not cloned")
 	}
 
@@ -35,6 +47,11 @@ func TestCommandResultCacheReplaysEquivalentCommandAndRejectsConflict(t *testing
 	conflict.Content.Text = "different"
 	if _, state := cache.Lookup(conflict); state != commandCacheConflict {
 		t.Fatalf("Lookup(conflict) state = %v", state)
+	}
+	modeConflict := command
+	modeConflict.OutputMode = hprp.OutputModeImage
+	if _, state := cache.Lookup(modeConflict); state != commandCacheConflict {
+		t.Fatalf("Lookup(mode conflict) state = %v", state)
 	}
 	now = now.Add(time.Minute)
 	if _, state := cache.Lookup(command); state != commandCacheMiss {
