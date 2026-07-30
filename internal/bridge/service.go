@@ -44,7 +44,7 @@ type HerdrAPI interface {
 	GetAgent(ctx context.Context, target string) (herdr.AgentInfo, error)
 	// ReadRecent 读取目标的 recent_unwrapped 终端快照。
 	ReadRecent(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
-	// ReadRecentANSI 读取目标的 recent_unwrapped ANSI 终端快照。
+	// ReadRecentANSI 读取目标保留物理渲染行的 recent ANSI 终端快照。
 	ReadRecentANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
 	// PromptUntilStateChange 向目标发送普通文本并等待首次状态变化。
 	PromptUntilStateChange(ctx context.Context, target, text string) (herdr.AgentInfo, error)

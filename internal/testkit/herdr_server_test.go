@@ -47,7 +47,7 @@ func TestHerdrServerRejectsInvalidPublicRequestShapes(t *testing.T) {
 		method string
 		params any
 	}{
-		{name: "read source", method: "agent.read", params: map[string]any{"target": "terminal-1", "source": "recent", "lines": 100, "format": "text", "strip_ansi": true}},
+		{name: "read source", method: "agent.read", params: map[string]any{"target": "terminal-1", "source": "visible", "lines": 100, "format": "text", "strip_ansi": true}},
 		{name: "unknown subscription", method: "events.subscribe", params: map[string]any{"subscriptions": []map[string]any{{"type": "pane.output_changed"}}}},
 		{name: "status without pane", method: "events.subscribe", params: map[string]any{"subscriptions": []map[string]any{{"type": "pane.agent_status_changed"}}}},
 		{name: "prompt missing text", method: "agent.prompt", params: map[string]any{"target": "terminal-1"}},

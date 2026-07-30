@@ -162,23 +162,23 @@ func (c *Client) GetAgent(ctx context.Context, target string) (AgentInfo, error)
 
 // ReadRecent 读取 target 的 recent_unwrapped 纯文本终端快照。
 func (c *Client) ReadRecent(ctx context.Context, target string, lines int) (ReadResult, error) {
-	return c.readRecent(ctx, target, lines, "text", true)
+	return c.readRecent(ctx, target, lines, "recent_unwrapped", "text", true)
 }
 
-// ReadRecentANSI 读取 target 的 recent_unwrapped ANSI 终端快照。
+// ReadRecentANSI 读取 target 保留物理渲染行的 recent ANSI 终端快照。
 func (c *Client) ReadRecentANSI(ctx context.Context, target string, lines int) (ReadResult, error) {
-	return c.readRecent(ctx, target, lines, "ansi", false)
+	return c.readRecent(ctx, target, lines, "recent", "ansi", false)
 }
 
-func (c *Client) readRecent(ctx context.Context, target string, lines int, format string, stripANSI bool) (ReadResult, error) {
+func (c *Client) readRecent(ctx context.Context, target string, lines int, source, format string, stripANSI bool) (ReadResult, error) {
 	if err := validateTarget(target); err != nil {
 		return ReadResult{}, err
 	}
 	if lines < 1 || lines > 1000 {
-		return ReadResult{}, protocolError("recent_unwrapped 行数必须在 1 到 1000 之间")
+		return ReadResult{}, protocolError("终端快照行数必须在 1 到 1000 之间")
 	}
 	var result paneReadResult
-	params := agentReadParams{Target: target, Source: "recent_unwrapped", Lines: lines, Format: format, StripANSI: stripANSI}
+	params := agentReadParams{Target: target, Source: source, Lines: lines, Format: format, StripANSI: stripANSI}
 	if err := c.call(ctx, "agent.read", params, &result); err != nil {
 		return ReadResult{}, err
 	}
@@ -193,7 +193,7 @@ func (c *Client) readRecent(ctx context.Context, target string, lines int, forma
 	if err != nil {
 		return ReadResult{}, err
 	}
-	if decoded.Source != "recent_unwrapped" || decoded.Format != format {
+	if decoded.Source != source || decoded.Format != format {
 		return ReadResult{}, protocolError("pane_read 返回来源或格式与请求不一致")
 	}
 	return decoded.Result, nil

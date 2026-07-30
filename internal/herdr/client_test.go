@@ -611,9 +611,10 @@ func TestClientReadRecentSendsExactParametersAndDecodesRead(t *testing.T) {
 func TestClientReadRecentANSIUsesPublicAgentRead(t *testing.T) {
 	readPayload := validReadResult(t)
 	readPayload["text"] = "\x1b[31m红色\x1b[0m"
+	readPayload["source"] = "recent"
 	readPayload["format"] = "ansi"
 	client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, readPayload)+`}`, businessRequestCheck("agent.read", map[string]any{
-		"target": "p1", "source": "recent_unwrapped", "lines": float64(42), "format": "ansi", "strip_ansi": false,
+		"target": "p1", "source": "recent", "lines": float64(42), "format": "ansi", "strip_ansi": false,
 	}))
 
 	read, err := client.ReadRecentANSI(context.Background(), "p1", 42)

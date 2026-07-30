@@ -376,8 +376,9 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		}
 		validFormat := params.StripANSI != nil &&
 			(params.Format == "text" && *params.StripANSI || params.Format == "ansi" && !*params.StripANSI)
+		validSource := params.Source == "recent" || params.Source == "recent_unwrapped"
 		if strings.TrimSpace(params.Target) == "" ||
-			params.Source != "recent_unwrapped" || params.Lines < 1 || params.Lines > 1000 || !validFormat {
+			!validSource || params.Lines < 1 || params.Lines > 1000 || !validFormat {
 			s.writeError(connection, request.ID, "invalid_params", "invalid read")
 			return
 		}
@@ -391,7 +392,7 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		}
 		result = map[string]any{"type": "pane_read", "read": map[string]any{
 			"pane_id": agent.PaneID, "workspace_id": agent.WorkspaceID, "tab_id": agent.TabID,
-			"source": "recent_unwrapped", "format": params.Format, "text": strings.Join(output, "\n"),
+			"source": params.Source, "format": params.Format, "text": strings.Join(output, "\n"),
 			"revision": 0, "truncated": false,
 		}}
 	case "agent.prompt":

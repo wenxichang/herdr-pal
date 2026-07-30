@@ -169,7 +169,7 @@ type Snapshot struct {
 	Agents []AgentInfo `json:"agents"`
 }
 
-// ReadResult 表示 recent_unwrapped 文本读取结果。
+// ReadResult 表示一次 Herdr 终端快照读取结果。
 type ReadResult struct {
 	// PaneID 是读取来源面板标识。
 	PaneID string `json:"pane_id"`
