@@ -22,6 +22,9 @@ func TestOTLPExporterSendsProtobufLogsWithHeaders(t *testing.T) {
 		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/x-protobuf" {
 			t.Errorf("request = %s content-type=%q", request.Method, request.Header.Get("Content-Type"))
 		}
+		if request.URL.Path != "/otlp/v1/logs" {
+			t.Errorf("path = %q", request.URL.Path)
+		}
 		if request.Header.Get("Authorization") != "Bearer collector-token" {
 			t.Errorf("Authorization = %q", request.Header.Get("Authorization"))
 		}
@@ -45,7 +48,7 @@ func TestOTLPExporterSendsProtobufLogsWithHeaders(t *testing.T) {
 	defer server.Close()
 
 	exporter, err := NewOTLPExporter(OTLPConfig{
-		Endpoint: server.URL + "/v1/logs", Headers: map[string]string{"Authorization": "Bearer collector-token"},
+		Endpoint: server.URL + "/otlp/v1/logs", Headers: map[string]string{"Authorization": "Bearer collector-token"},
 		ServiceVersion: "v-test", HostName: "host-test", ProcessID: 42,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

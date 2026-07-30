@@ -72,7 +72,7 @@ Router 以企业微信用户 ID 为隔离边界：
 同一队列，确保“终端标题 + 图片”不会被同一用户其他机器的消息插入；队列容量有界。
 
 审计输出与 Router 解耦：stderr 和 OTLP/HTTP protobuf 各自使用独立有界异步队列。队列满、
-Collector 不可用或关闭刷新超时都按 fail-open 处理，不改变企业微信操作结果；审计正文在
+OTLP 服务不可用或关闭刷新超时都按 fail-open 处理，不改变企业微信操作结果；审计正文在
 入队前移除 Bot Secret、OTLP Header 值、机器 Key 和常见认证 Header。
 
 ### 3.3 CredentialStore

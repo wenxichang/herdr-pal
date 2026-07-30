@@ -140,10 +140,11 @@ Pal 在 10 分钟有界窗口内保存轻量幂等索引。相同 Key 与等价�
 - 同一用户最近 2 分钟有过任一方向交互时，其他会话通知降级为简短提醒。
 - 断线期间的输出和通知直接失败，不排队等待下次连接。
 
-Server 可把用户输入和终端文本作为 OTLP Logs 审计事件发送到外部 Collector，也可独立输出
-stderr JSON Lines。审计使用每个目标独立的有界异步队列并始终 fail-open；图片模式记录配套
-纯文本而不是 PNG。Bot Secret、OTLP Header、`hpk_...` 和常见认证 Header 在审计入队前
-脱敏，但剩余正文仍是敏感数据。
+Server 可把用户输入和终端文本作为 OTLP Logs 审计事件发送到配置的完整 HTTP(S) endpoint，
+包括 Collector 的 `/v1/logs` 或 Loki 的 `/otlp/v1/logs`，也可独立输出 stderr JSON Lines。
+审计使用每个目标独立的有界异步队列并始终 fail-open；图片模式记录配套纯文本而不是 PNG。
+Bot Secret、OTLP Header、`hpk_...` 和常见认证 Header 在审计入队前脱敏，但剩余正文仍是
+敏感数据。
 
 ## 5. Herdr API 关键事实
 
@@ -210,7 +211,7 @@ go test -race ./internal/hprp ./internal/credential ./internal/server \
 - 服务器发来的内容仍必须经过 Pal 的 `PolicyGuard`，不构成自动授权。
 - 当前 Key 是逻辑机器绑定，不提供硬件证明；复制 Key 仍可能在其他设备使用。
 - 当前适合受信任内网。Server 已提供基础按用户输入限速和可选 OTLP 审计；互联网部署仍应
-  补充证书信任、边界防护、Collector 访问控制和数据保留策略。Key 的动态禁用、删除和来源
+  补充证书信任、边界防护、OTLP 服务访问控制和数据保留策略。Key 的动态禁用、删除和来源
   收紧已经由 HPAP 提供。
 - 后续 Feature 必须按用户功能建模，由 Pal 展开为多个 Herdr 公共 API 操作，不提供通用
   Herdr RPC 透传。

@@ -56,7 +56,7 @@ type OTLPExporter struct {
 // NewOTLPExporter 创建 OTLP/HTTP protobuf 输出器。
 func NewOTLPExporter(config OTLPConfig, logger *slog.Logger) (*OTLPExporter, error) {
 	parsed, err := url.Parse(strings.TrimSpace(config.Endpoint))
-	if err != nil || !parsed.IsAbs() || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Path != "/v1/logs" {
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("%w: endpoint 无效", ErrOTLPExport)
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
@@ -82,7 +82,7 @@ func NewOTLPExporter(config OTLPConfig, logger *slog.Logger) (*OTLPExporter, err
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if config.SkipVerify {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // 仅在用户显式配置后用于内网自签名 Collector。
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // 仅在用户显式配置后用于内网自签名 OTLP 服务。
 	}
 	return &OTLPExporter{
 		config: config,

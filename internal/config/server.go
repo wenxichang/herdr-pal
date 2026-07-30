@@ -211,9 +211,6 @@ func validateAudit(config *AuditConfig) error {
 	if parsed.Fragment != "" {
 		return fmt.Errorf("audit.endpoint 不允许包含 fragment")
 	}
-	if parsed.Path != "/v1/logs" {
-		return fmt.Errorf("audit.endpoint 路径必须是 /v1/logs")
-	}
 	if config.SkipVerify && parsed.Scheme != "https" {
 		return fmt.Errorf("audit.skip_verify 只允许用于 HTTPS")
 	}

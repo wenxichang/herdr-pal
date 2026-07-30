@@ -152,7 +152,7 @@ func TestLoadServerAcceptsOTLPAuditAndParsesHeaders(t *testing.T) {
   "server": {"listen": "127.0.0.1:9443"},
   "audit": {
     "type": "otlp",
-    "endpoint": "https://collector.example:4318/v1/logs",
+    "endpoint": "https://loki.example:3100/otlp/v1/logs",
     "skip_verify": true,
     "stderr": true
   },
@@ -171,7 +171,7 @@ func TestLoadServerAcceptsOTLPAuditAndParsesHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadServer() error = %v", err)
 	}
-	if loaded.Audit.Type != "otlp" || loaded.Audit.Endpoint != "https://collector.example:4318/v1/logs" || !loaded.Audit.SkipVerify || !loaded.Audit.Stderr {
+	if loaded.Audit.Type != "otlp" || loaded.Audit.Endpoint != "https://loki.example:3100/otlp/v1/logs" || !loaded.Audit.SkipVerify || !loaded.Audit.Stderr {
 		t.Fatalf("audit = %#v", loaded.Audit)
 	}
 	if loaded.Audit.Headers["Authorization"] != "Bearer token" || loaded.Audit.Headers["X-Tenant"] != "team,one" {
@@ -190,7 +190,6 @@ func TestLoadServerRejectsInvalidAudit(t *testing.T) {
 		{name: "userinfo", audit: `{"type":"otlp","endpoint":"https://user:pass@collector/v1/logs"}`, want: "userinfo"},
 		{name: "query", audit: `{"type":"otlp","endpoint":"https://collector/v1/logs?q=1"}`, want: "query"},
 		{name: "fragment", audit: `{"type":"otlp","endpoint":"https://collector/v1/logs#x"}`, want: "fragment"},
-		{name: "wrong path", audit: `{"type":"otlp","endpoint":"https://collector/"}`, want: "/v1/logs"},
 		{name: "wrong scheme", audit: `{"type":"otlp","endpoint":"ftp://collector/v1/logs"}`, want: "http"},
 		{name: "http skip verify", audit: `{"type":"otlp","endpoint":"http://collector/v1/logs","skip_verify":true}`, want: "skip_verify"},
 		{name: "none endpoint", audit: `{"type":"none","endpoint":"https://collector/v1/logs"}`, want: "audit.endpoint"},

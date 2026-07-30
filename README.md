@@ -137,17 +137,21 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
 `rate_limit` 按企业微信用户限制唯一输入，默认每秒 1 条、滚动 60 秒内 20 条。字段缺省使用
 默认值，显式设置为 `0` 会关闭对应窗口；重复投递的同一企业微信消息不会重复计数。
 
-`audit.type` 只支持 `none` 或 `otlp`。使用 OTLP/HTTP protobuf Logs 时填写完整
-`http://.../v1/logs` 或 `https://.../v1/logs` 地址，例如：
+`audit.type` 只支持 `none` 或 `otlp`。使用 OTLP/HTTP protobuf Logs 时填写完整目标地址，
+Server 会原样使用其中的路径。可以直连 Loki 原生 OTLP 接口：
 
 ```json
 "audit": {
   "type": "otlp",
-  "endpoint": "https://otel-collector.internal:4318/v1/logs",
+  "endpoint": "http://127.0.0.1:3100/otlp/v1/logs",
   "skip_verify": false,
   "stderr": false
 }
 ```
+
+使用 OpenTelemetry Collector 时通常配置为
+`https://otel-collector.internal:4318/v1/logs`。endpoint 必须是绝对 HTTP(S) URL，且不能
+包含 userinfo、query 或 fragment。
 
 需要认证 Header 时使用 OpenTelemetry 标准环境变量，值按 URL 编码：
 
