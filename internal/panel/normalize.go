@@ -38,9 +38,9 @@ func NormalizeANSI(text string) []Line {
 		if redraw := strings.LastIndexByte(line, '\r'); redraw >= 0 {
 			line = "\x1b[0m" + line[redraw+1:]
 		}
-		line = collapseANSIHorizontalRules(line)
 		line = trimANSIRightWhitespace(line)
-		lines = append(lines, Line{Text: stripANSI(line), ANSI: line})
+		textLine := collapseANSIHorizontalRules(line)
+		lines = append(lines, Line{Text: stripANSI(textLine), ANSI: line})
 	}
 	for len(lines) > 0 && lines[len(lines)-1].Text == "" {
 		lines = lines[:len(lines)-1]

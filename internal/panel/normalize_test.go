@@ -182,7 +182,7 @@ func TestNormalizeANSIKeepsSGRAndRemovesUnsafeControls(t *testing.T) {
 	got := panel.NormalizeANSI(input)
 	want := []panel.Line{
 		{Text: "红色", ANSI: "\x1b[31m红色\x1b[0m"},
-		{Text: "──────", ANSI: "\x1b[34m──────\x1b[0m"},
+		{Text: "──────", ANSI: "\x1b[34m──────────\x1b[0m"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NormalizeANSI() = %#v, want %#v", got, want)
