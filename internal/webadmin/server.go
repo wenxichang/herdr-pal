@@ -34,13 +34,14 @@ type Config struct {
 
 // Server 提供同源 HTTPS 管理页面和版本化 JSON API。
 type Server struct {
-	admin      *adminservice.Service
-	auth       *adminauth.Store
-	sessions   *adminauth.SessionManager
-	loginGuard *adminauth.LoginGuard
-	logger     *slog.Logger
-	random     io.Reader
-	now        func() time.Time
+	admin           *adminservice.Service
+	auth            *adminauth.Store
+	sessions        *adminauth.SessionManager
+	loginGuard      *adminauth.LoginGuard
+	automationLimit *automationLimiter
+	logger          *slog.Logger
+	random          io.Reader
+	now             func() time.Time
 
 	randomMu sync.Mutex
 	handler  http.Handler
@@ -82,11 +83,13 @@ func New(config Config) (*Server, error) {
 	server := &Server{
 		admin: config.Admin, auth: config.Auth, sessions: config.Sessions,
 		loginGuard: config.LoginGuard, logger: config.Logger, random: config.Random, now: config.Now,
-		routes: make(map[string]*methodRouter),
+		automationLimit: newAutomationLimiter(), routes: make(map[string]*methodRouter),
 	}
 	mux := http.NewServeMux()
 	server.registerAuthRoutes(mux)
 	server.registerManagementRoutes(mux)
+	server.registerAdminRoutes(mux)
+	server.registerAutomationRoutes(mux)
 	mux.HandleFunc("/admin/api/v1/", func(writer http.ResponseWriter, request *http.Request) {
 		setRequestRoute(request, "/admin/api/v1/*")
 		_ = writeAPIError(writer, request, http.StatusNotFound, "not_found", "管理接口不存在")

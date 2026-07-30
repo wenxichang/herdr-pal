@@ -19,6 +19,7 @@ type requestMetadata struct {
 	actor     string
 	route     string
 	target    string
+	tokenID   string
 	errorCode string
 }
 
@@ -129,6 +130,7 @@ func (server *Server) managementLog(next http.Handler) http.Handler {
 			"method", request.Method,
 			"route", metadata.route,
 			"target", metadata.target,
+			"token_id", metadata.tokenID,
 			"outcome", outcome,
 			"error_code", metadata.errorCode,
 			"status", status,
@@ -217,6 +219,10 @@ func setRequestActor(request *http.Request, actor string) {
 
 func setRequestTarget(request *http.Request, target string) {
 	requestMetadataFrom(request).target = target
+}
+
+func setRequestAutomationToken(request *http.Request, tokenID string) {
+	requestMetadataFrom(request).tokenID = tokenID
 }
 
 func setRequestError(request *http.Request, code string) {

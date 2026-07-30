@@ -216,8 +216,9 @@ func assertManagementError(t *testing.T, response *httptest.ResponseRecorder, st
 }
 
 type managementConnections struct {
-	views        []server.ConnectionView
-	disconnected []string
+	views                 []server.ConnectionView
+	disconnected          []string
+	credentialDisconnects int
 }
 
 func (connections *managementConnections) Connections() []server.ConnectionView {
@@ -238,7 +239,10 @@ func (connections *managementConnections) DisconnectConnection(id, _ string) boo
 	connections.disconnected = append(connections.disconnected, id)
 	return true
 }
-func (*managementConnections) DisconnectCredential(uint64, string) int { return 1 }
+func (connections *managementConnections) DisconnectCredential(uint64, string) int {
+	connections.credentialDisconnects++
+	return 1
+}
 func (*managementConnections) RevalidateCredentialSource(uint64, []credential.SourceRule, string) int {
 	return 1
 }

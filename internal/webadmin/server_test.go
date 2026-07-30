@@ -82,11 +82,16 @@ type webTestDependencies struct {
 	Connections adminservice.ConnectionManager
 	Sessions    adminservice.SessionInspector
 	Runtime     adminservice.RuntimeController
+	Now         func() time.Time
 }
 
 func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependencies) (*Server, adminauth.Bootstrap, *strings.Builder) {
 	t.Helper()
-	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	now := dependencies.Now
+	if now == nil {
+		fixed := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+		now = func() time.Time { return fixed }
+	}
 	credentialStore, err := credential.LoadStore(filepath.Join(t.TempDir(), "credentials.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -105,19 +110,19 @@ func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependen
 		Connections: dependencies.Connections,
 		Sessions:    dependencies.Sessions,
 		Runtime:     dependencies.Runtime,
-		Now:         func() time.Time { return now },
+		Now:         now,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	authStore, bootstrap, err := adminauth.Load(filepath.Join(t.TempDir(), "server-auth.json"), adminauth.Options{
-		Now: func() time.Time { return now }, Random: &webIncrementingReader{next: 1},
+		Now: now, Random: &webIncrementingReader{next: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sessions, err := adminauth.NewSessionManager(adminauth.SessionConfig{
-		Now: func() time.Time { return now }, Random: &webIncrementingReader{next: 80},
+		Now: now, Random: &webIncrementingReader{next: 80},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -125,10 +130,10 @@ func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependen
 	logs := &strings.Builder{}
 	web, err := New(Config{
 		Admin: adminService, Auth: authStore, Sessions: sessions,
-		LoginGuard: adminauth.NewLoginGuard(func() time.Time { return now }),
+		LoginGuard: adminauth.NewLoginGuard(now),
 		Logger:     slog.New(slog.NewTextHandler(logs, nil)),
 		Random:     &webIncrementingReader{next: 160},
-		Now:        func() time.Time { return now },
+		Now:        now,
 	})
 	if err != nil {
 		t.Fatal(err)
