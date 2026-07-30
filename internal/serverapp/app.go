@@ -18,15 +18,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/adminauth"
 	"github.com/wenxichang/herdr-pal/internal/adminserver"
 	"github.com/wenxichang/herdr-pal/internal/adminservice"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
+	"github.com/wenxichang/herdr-pal/internal/lokiquery"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/server"
 	"github.com/wenxichang/herdr-pal/internal/version"
+	"github.com/wenxichang/herdr-pal/internal/webadmin"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
@@ -38,8 +41,11 @@ var _ server.WeComImageGateway = (*wecom.Client)(nil)
 type Options struct {
 	ConfigPath string
 	Getenv     func(string) string
+	Stdout     io.Writer
 	Stderr     io.Writer
 	Verbose    bool
+	// AuthFile 覆盖固定管理员认证文件路径；只供本机自动化测试隔离状态。
+	AuthFile string
 	// WeComEndpoint 覆盖企业微信长连接地址；CLI 和配置文件不暴露该入口。
 	WeComEndpoint string
 }
@@ -61,26 +67,10 @@ func Run(ctx context.Context, options Options) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	runtimeSecrets := []string{loaded.WeCom.Secret}
-	for _, value := range loaded.Audit.Headers {
-		runtimeSecrets = append(runtimeSecrets, value)
+	stdout := options.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
 	}
-	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, runtimeSecrets...)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
-	}
-	logger := runtimeLogger.Logger
-	businessAuditor, auditRedactor, err := newBusinessAuditor(loaded.Audit, stderr, logger, loaded.WeCom.Secret, version.Version)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
-	}
-	defer func() {
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := businessAuditor.Shutdown(shutdownContext); err != nil {
-			logger.Warn("关闭业务审计输出超时", "error_type", "audit_shutdown_timeout")
-		}
-	}()
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return err
@@ -94,6 +84,42 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	defer lock.Release()
+	authFile := loaded.Admin.AuthFile
+	if strings.TrimSpace(options.AuthFile) != "" {
+		authFile = filepath.Clean(strings.TrimSpace(options.AuthFile))
+	}
+	authStore, bootstrap, err := adminauth.Load(authFile, adminauth.Options{})
+	if err != nil {
+		return fmt.Errorf("加载管理员认证文件 %q: %w", authFile, err)
+	}
+	runtimeSecrets := []string{loaded.WeCom.Secret, bootstrap.InitialPassword, bootstrap.AutomationToken}
+	for _, value := range loaded.Audit.Headers {
+		runtimeSecrets = append(runtimeSecrets, value)
+	}
+	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, runtimeSecrets...)
+	if err != nil {
+		if bootstrap.Created {
+			_ = printAdminBootstrap(stdout, bootstrap)
+		}
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	logger := runtimeLogger.Logger
+	if bootstrap.Created {
+		if err := printAdminBootstrap(stdout, bootstrap); err != nil {
+			return fmt.Errorf("输出初始管理员凭据: %w", err)
+		}
+	}
+	businessAuditor, auditRedactor, err := newBusinessAuditor(loaded.Audit, stderr, logger, loaded.WeCom.Secret, version.Version)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	defer func() {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := businessAuditor.Shutdown(shutdownContext); err != nil {
+			logger.Warn("关闭业务审计输出超时", "error_type", "audit_shutdown_timeout")
+		}
+	}()
 	tlsBundle, err := server.EnsureTLS(server.TLSConfig{CertFile: loaded.Server.CertFile, KeyFile: loaded.Server.KeyFile, StateDir: loaded.Server.StateDir})
 	if err != nil {
 		return fmt.Errorf("准备 Relay TLS: %w", err)
@@ -144,20 +170,27 @@ func Run(ctx context.Context, options Options) error {
 		return fmt.Errorf("监听 Relay 地址: %w", err)
 	}
 	defer listener.Close()
-	httpServer := &http.Server{Handler: hub, TLSConfig: tlsBundle.Config, ReadHeaderTimeout: 10 * time.Second}
-	tlsListener := tls.NewListener(listener, tlsBundle.Config)
 	adminListener, err := adminserver.Listen(adminserver.ListenerConfig{StateDir: loaded.Server.StateDir})
 	if err != nil {
 		return fmt.Errorf("监听 HPAP Admin Socket: %w", err)
 	}
 	defer adminListener.Close()
+	webListener, err := net.Listen("tcp", loaded.Admin.Listen)
+	if err != nil {
+		return fmt.Errorf("监听 Web 管理地址: %w", err)
+	}
+	defer webListener.Close()
+	relayTLSConfig := tlsBundle.Config.Clone()
+	relayHTTPServer := &http.Server{Handler: hub, TLSConfig: relayTLSConfig, ReadHeaderTimeout: 10 * time.Second}
+	relayTLSListener := tls.NewListener(listener, relayTLSConfig)
 
 	stopRequested := make(chan struct{})
 	var stopOnce sync.Once
 	requestStop := func() { stopOnce.Do(func() { close(stopRequested) }) }
 	runtimeInspector, err := NewRuntimeInspector(RuntimeConfig{
-		StartedAt: time.Now(), RelayListen: loaded.Server.Listen,
-		AdminSocket: loaded.Server.AdminSocketPath, TLS: tlsBundle.Info, Stop: requestStop,
+		StartedAt: time.Now(), RelayListen: listener.Addr().String(),
+		AdminSocket: loaded.Server.AdminSocketPath, WebAdminListen: webListener.Addr().String(),
+		TLS: tlsBundle.Info, Stop: requestStop,
 	}, runtimeLogger, weComClient, hub, catalog, credentialStore)
 	if err != nil {
 		return fmt.Errorf("创建服务运行状态: %w", err)
@@ -172,6 +205,31 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("创建共享管理服务: %w", err)
 	}
+	adminSessions, err := adminauth.NewSessionManager(adminauth.SessionConfig{})
+	if err != nil {
+		return fmt.Errorf("创建管理员会话管理器: %w", err)
+	}
+	var auditQuerier webadmin.AuditQuerier
+	if loaded.Admin.LokiURL != "" {
+		auditQuerier, err = lokiquery.New(lokiquery.Config{BaseURL: loaded.Admin.LokiURL})
+		if err != nil {
+			return fmt.Errorf("%w: 创建 Loki 查询客户端: %v", ErrConfig, err)
+		}
+	}
+	webRuntime, err := webadmin.New(webadmin.Config{
+		Admin: adminService, Auth: authStore, Sessions: adminSessions,
+		LoginGuard: adminauth.NewLoginGuard(time.Now), Logger: logger, Audit: auditQuerier,
+	})
+	if err != nil {
+		return fmt.Errorf("创建 Web 管理服务: %w", err)
+	}
+	webTLSConfig := tlsBundle.Config.Clone()
+	webHTTPServer := &http.Server{
+		Handler: webRuntime.Handler(), TLSConfig: webTLSConfig,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
+		WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
+	}
+	webTLSListener := tls.NewListener(webListener, webTLSConfig)
 	keyHandler, err := adminserver.NewKeyHandler(adminService, logger)
 	if err != nil {
 		return fmt.Errorf("创建 HPAP Key Handler: %w", err)
@@ -202,15 +260,19 @@ func Run(ctx context.Context, options Options) error {
 		{name: "wecom_event_loop", run: func(componentContext context.Context) error {
 			return runWeComEventLoop(componentContext, weComClient, router)
 		}},
-		{name: "relay_http", run: func(context.Context) error { return httpServer.Serve(tlsListener) }},
+		{name: "relay_http", run: func(context.Context) error { return relayHTTPServer.Serve(relayTLSListener) }},
 		{name: "admin", run: func(componentContext context.Context) error {
 			return adminRuntime.Serve(componentContext, adminListener)
 		}},
+		{name: "web_admin", run: func(context.Context) error { return webHTTPServer.Serve(webTLSListener) }},
 	}
 	shutdown := func(shutdownContext context.Context) {
 		_ = adminListener.Close()
+		webShutdownContext, cancelWebShutdown := context.WithTimeout(shutdownContext, 5*time.Second)
+		_ = webHTTPServer.Shutdown(webShutdownContext)
+		cancelWebShutdown()
 		hub.BeginShutdown()
-		_ = httpServer.Shutdown(shutdownContext)
+		_ = relayHTTPServer.Shutdown(shutdownContext)
 		hub.DisconnectAll("server shutdown")
 		if err := hub.Wait(shutdownContext); err != nil && logger != nil {
 			logger.Warn("等待 HPRP 连接退出超时", "error_type", "shutdown_timeout")
@@ -218,8 +280,9 @@ func Run(ctx context.Context, options Options) error {
 	}
 	logger.Info("Herdr Pal Server 启动",
 		"bot_hash", shortHash(loaded.WeCom.BotID),
-		"listen", loaded.Server.Listen,
+		"listen", listener.Addr().String(),
 		"admin_socket", loaded.Server.AdminSocketPath,
+		"web_admin_listen", webListener.Addr().String(),
 		"verbose", options.Verbose,
 		"rate_limit_per_second", loaded.RateLimit.PerSecond,
 		"rate_limit_per_minute", loaded.RateLimit.PerMinute,
@@ -383,6 +446,17 @@ func safeRuntimeReason(err error) string {
 		reason = reason[:240] + "…"
 	}
 	return reason
+}
+
+func printAdminBootstrap(writer io.Writer, bootstrap adminauth.Bootstrap) error {
+	if writer == nil || !bootstrap.Created {
+		return nil
+	}
+	_, err := fmt.Fprintf(writer,
+		"已创建 Herdr Pal Server 初始管理员，请立即登录并修改密码。\n管理员：%s\n初始密码：%s\n自动化 Token：%s\n",
+		bootstrap.Username, bootstrap.InitialPassword, bootstrap.AutomationToken,
+	)
+	return err
 }
 
 func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) (*RuntimeLogger, error) {

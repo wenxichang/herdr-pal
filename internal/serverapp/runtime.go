@@ -64,18 +64,19 @@ func (logger *RuntimeLogger) DisableDebug() {
 
 // RuntimeConfig 提供服务运行状态中不属于动态组件快照的元数据。
 type RuntimeConfig struct {
-	StartedAt   time.Time
-	Now         func() time.Time
-	PID         int
-	GOOS        string
-	GOARCH      string
-	Version     string
-	Commit      string
-	BuiltAt     string
-	RelayListen string
-	AdminSocket string
-	TLS         server.TLSInfo
-	Stop        func()
+	StartedAt      time.Time
+	Now            func() time.Time
+	PID            int
+	GOOS           string
+	GOARCH         string
+	Version        string
+	Commit         string
+	BuiltAt        string
+	RelayListen    string
+	AdminSocket    string
+	WebAdminListen string
+	TLS            server.TLSInfo
+	Stop           func()
 }
 
 // CredentialCounts 是共享管理服务凭据统计 DTO 的兼容别名。
@@ -175,6 +176,7 @@ func (inspector *RuntimeInspector) Status() RuntimeStatus {
 		PID: inspector.config.PID, GOOS: inspector.config.GOOS, GOARCH: inspector.config.GOARCH,
 		HPAP: adminproto.Protocol, HPRP: hprp.ProtocolVersion,
 		RelayListen: inspector.config.RelayListen, AdminSocket: inspector.config.AdminSocket,
+		WebAdminListen: inspector.config.WebAdminListen,
 		TLS: adminservice.TLSStatus{
 			Mode: inspector.config.TLS.Mode, NotAfter: inspector.config.TLS.NotAfter,
 			SHA256Fingerprint: inspector.config.TLS.SHA256Fingerprint,

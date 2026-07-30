@@ -97,16 +97,17 @@ func TestRuntimeServerStatusAggregatesSafeSnapshots(t *testing.T) {
 	}
 	stops := 0
 	inspector, err := NewRuntimeInspector(RuntimeConfig{
-		StartedAt:   startedAt,
-		Now:         func() time.Time { return now },
-		PID:         4321,
-		GOOS:        "test-os",
-		GOARCH:      "test-arch",
-		Version:     "v9.8.7",
-		Commit:      "abcdef0",
-		BuiltAt:     "2026-07-28T08:00:00Z",
-		RelayListen: "0.0.0.0:9443",
-		AdminSocket: "/state/admin.sock",
+		StartedAt:      startedAt,
+		Now:            func() time.Time { return now },
+		PID:            4321,
+		GOOS:           "test-os",
+		GOARCH:         "test-arch",
+		Version:        "v9.8.7",
+		Commit:         "abcdef0",
+		BuiltAt:        "2026-07-28T08:00:00Z",
+		RelayListen:    "0.0.0.0:9443",
+		AdminSocket:    "/state/admin.sock",
+		WebAdminListen: "0.0.0.0:4001",
 		TLS: server.TLSInfo{
 			Mode:              server.TLSModeAutomatic,
 			NotAfter:          now.Add(24 * time.Hour),
@@ -125,7 +126,7 @@ func TestRuntimeServerStatusAggregatesSafeSnapshots(t *testing.T) {
 	if status.Version != "v9.8.7" || status.Commit != "abcdef0" || status.BuiltAt != "2026-07-28T08:00:00Z" || status.PID != 4321 || status.GOOS != "test-os" || status.GOARCH != "test-arch" {
 		t.Fatalf("runtime build info = %#v", status)
 	}
-	if status.HPAP != adminproto.Protocol || status.HPRP != hprp.ProtocolVersion || status.RelayListen != "0.0.0.0:9443" || status.AdminSocket != "/state/admin.sock" {
+	if status.HPAP != adminproto.Protocol || status.HPRP != hprp.ProtocolVersion || status.RelayListen != "0.0.0.0:9443" || status.AdminSocket != "/state/admin.sock" || status.WebAdminListen != "0.0.0.0:4001" {
 		t.Fatalf("runtime protocol/listener info = %#v", status)
 	}
 	if status.TLS.Mode != server.TLSModeAutomatic || status.WeCom.State != string(weComStatus.State) || status.WeCom.ChangedAt != weComStatus.ChangedAt || status.WeCom.LastErrorType != weComStatus.LastErrorType {

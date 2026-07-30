@@ -62,7 +62,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, execute a
 			return 2
 		}
 	}
-	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stderr: stderr, Verbose: *verbose})
+	err := execute(ctx, serverapp.Options{ConfigPath: resolvedConfigPath, Getenv: os.Getenv, Stdout: stdout, Stderr: stderr, Verbose: *verbose})
 	return finishRun(ctx, err, resolvedConfigPath, stderr)
 }
 

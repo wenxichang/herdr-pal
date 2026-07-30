@@ -362,7 +362,7 @@ func newHPAPHarness(t *testing.T) *hpapHarness {
 	secret := fmt.Sprintf("secret-hpap-%d", time.Now().UnixNano())
 	weComServer := testkit.NewWeComServer(t, botID, secret)
 	configPath := filepath.Join(t.TempDir(), "server.json")
-	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q},"server":{"listen":%q,"addr_hint":"127.0.0.1","state_dir":%q},"log":{"level":"debug"}}`, botID, listenAddress, stateDir)
+	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q},"server":{"listen":%q,"addr_hint":"127.0.0.1","state_dir":%q},"admin":{"listen":"127.0.0.1:0"},"log":{"level":"debug"}}`, botID, listenAddress, stateDir)
 	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,8 @@ func (harness *hpapHarness) startServer(t *testing.T) {
 	go func() {
 		done <- serverapp.Run(ctx, serverapp.Options{
 			ConfigPath: harness.configPath, Getenv: func(string) string { return harness.secret },
-			Stderr: harness.logs, WeComEndpoint: harness.wecom.Endpoint(),
+			Stdout: io.Discard, Stderr: harness.logs, WeComEndpoint: harness.wecom.Endpoint(),
+			AuthFile: filepath.Join(harness.stateDir, "server-auth.json"),
 		})
 	}()
 }

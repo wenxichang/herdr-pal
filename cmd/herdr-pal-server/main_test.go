@@ -38,6 +38,9 @@ func TestRunServerParsesConfigAndVersion(t *testing.T) {
 	if code != 0 || gotDefault.ConfigPath != wantDefault {
 		t.Fatalf("default run() = %d, config path %q, want %q", code, gotDefault.ConfigPath, wantDefault)
 	}
+	if gotDefault.Stdout != &stdout {
+		t.Fatal("default run did not pass stdout to serverapp")
+	}
 
 	stdout.Reset()
 	stderr.Reset()
