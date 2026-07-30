@@ -71,14 +71,16 @@ func TestNewLoggerVerboseForcesDebugAndRedactsSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtimeLogger.Logger.Debug("服务端详细诊断", "reason", "upstream rejected secret-sensitive")
+	machineKey := "hpk_12_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	automationToken := "hpa_0123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	runtimeLogger.Logger.Debug("服务端详细诊断", "reason", "upstream rejected secret-sensitive", "machine_key", machineKey, "automation_token", automationToken)
 	output := logs.String()
 	for _, want := range []string{"level=DEBUG", "服务端详细诊断", "reason=\"upstream rejected [REDACTED]\""} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("logs = %q, want %q", output, want)
 		}
 	}
-	if strings.Contains(output, "secret-sensitive") {
+	if strings.Contains(output, "secret-sensitive") || strings.Contains(output, machineKey) || strings.Contains(output, automationToken) {
 		t.Fatalf("logs leaked secret: %q", output)
 	}
 }

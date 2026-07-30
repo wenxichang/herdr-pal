@@ -24,12 +24,27 @@ func TestBuildLogQLUsesOnlyEscapedControlledFilters(t *testing.T) {
 	}
 	for _, want := range []string{
 		`{service_name="herdr-pal-server"}`,
+		`herdr_pal_audit_schema_version="1"`,
 		`herdr_pal_audit_principal_id="u\"} |= \"leak"`,
 		`herdr_pal_audit_machine_id=~"(?i).*HOME\\.\\*.*"`,
 		`|~ "(?i)Error\\[0-9\\]"`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("query = %q, want %q", query, want)
+		}
+	}
+}
+
+func TestClientRejectsOversizedAuditFilters(t *testing.T) {
+	client := &Client{httpClient: http.DefaultClient, now: time.Now}
+	for _, query := range []Query{
+		{PrincipalID: strings.Repeat("u", MaxPrincipalIDBytes+1)},
+		{MachineID: strings.Repeat("m", MaxMachineIDBytes+1)},
+		{Keyword: strings.Repeat("k", MaxKeywordBytes+1)},
+		{Keyword: "line\nbreak"},
+	} {
+		if _, err := client.normalizeQuery(query); !errors.Is(err, ErrInvalidQuery) {
+			t.Fatalf("query %#v error = %v", query, err)
 		}
 	}
 }

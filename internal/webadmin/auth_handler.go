@@ -49,21 +49,29 @@ func (server *Server) login(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	setRequestActor(request, safeLoginActor(input.Username))
-	if !server.loginGuard.Allow(input.Username, source) {
+	if !server.loginGuard.Begin(input.Username, source) {
 		_ = writeAPIError(writer, request, http.StatusTooManyRequests, "login_locked", "登录失败次数过多，请稍后重试")
 		return
 	}
+	attemptFinished := false
+	defer func() {
+		if !attemptFinished {
+			server.loginGuard.Finish(input.Username, source, false)
+		}
+	}()
 	admin, err := server.auth.Authenticate(input.Username, input.Password)
 	if err != nil {
-		server.loginGuard.Failure(input.Username, source)
-		if !server.loginGuard.Allow(input.Username, source) {
+		locked := server.loginGuard.Finish(input.Username, source, false)
+		attemptFinished = true
+		if locked {
 			_ = writeAPIError(writer, request, http.StatusTooManyRequests, "login_locked", "登录失败次数过多，请稍后重试")
 			return
 		}
 		_ = writeAPIError(writer, request, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
-	server.loginGuard.Success(admin.Username, source)
+	server.loginGuard.Finish(admin.Username, source, true)
+	attemptFinished = true
 	credentials, err := server.sessions.Create(admin.Username)
 	if err != nil {
 		server.logger.Error("创建 Web 管理会话失败", "request_id", requestIDFrom(request), "error_type", safeHandlerError(err))

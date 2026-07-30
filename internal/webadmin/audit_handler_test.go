@@ -62,6 +62,9 @@ func TestAuditLogsRejectsInvalidQueryParameters(t *testing.T) {
 		"/admin/api/v1/audit/logs?limit=501",
 		"/admin/api/v1/audit/logs?userid=a&userid=b",
 		"/admin/api/v1/audit/logs?unknown=value",
+		"/admin/api/v1/audit/logs?userid=" + strings.Repeat("u", lokiquery.MaxPrincipalIDBytes+1),
+		"/admin/api/v1/audit/logs?machine_id=" + strings.Repeat("m", lokiquery.MaxMachineIDBytes+1),
+		"/admin/api/v1/audit/logs?keyword=" + strings.Repeat("k", lokiquery.MaxKeywordBytes+1),
 	}
 	for _, target := range targets {
 		response := managementRequest(t, web, cookie, "", http.MethodGet, target, "")

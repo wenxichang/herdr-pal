@@ -68,6 +68,9 @@ func parseAuditQuery(values url.Values, now time.Time) (lokiquery.Query, error) 
 		Cursor:      values.Get("cursor"),
 		Limit:       defaultAuditLimit,
 	}
+	if err := lokiquery.ValidateFilters(query); err != nil {
+		return lokiquery.Query{}, lokiquery.ErrInvalidQuery
+	}
 	var err error
 	if raw := strings.TrimSpace(values.Get("end")); raw != "" {
 		query.End, err = time.Parse(time.RFC3339Nano, raw)

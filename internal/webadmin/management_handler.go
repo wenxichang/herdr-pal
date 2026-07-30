@@ -141,7 +141,7 @@ func (server *Server) issueCredential(writer http.ResponseWriter, request *http.
 		parsed = parsed.UTC()
 		expiresAt = &parsed
 	}
-	setRequestTarget(request, "machine_id="+safeTargetValue(input.MachineID))
+	setRequestTarget(request, "machine_id_hash="+shortTargetHash(input.MachineID))
 	result, err := server.admin.IssueCredential(adminservice.IssueCredentialInput{
 		PrincipalID: input.PrincipalID, MachineID: input.MachineID, Sources: input.Sources, ExpiresAt: expiresAt,
 	})
@@ -336,7 +336,7 @@ func (server *Server) listSessions(writer http.ResponseWriter, request *http.Req
 		targetParts = append(targetParts, "userid_hash="+shortTargetHash(principalID))
 	}
 	if machineID != "" {
-		targetParts = append(targetParts, "machine_id="+safeTargetValue(machineID))
+		targetParts = append(targetParts, "machine_id_hash="+shortTargetHash(machineID))
 	}
 	setRequestTarget(request, strings.Join(targetParts, " "))
 	all := server.admin.ListSessions(adminservice.SessionFilter{PrincipalID: principalID, MachineID: machineID})

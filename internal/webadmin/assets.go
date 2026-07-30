@@ -45,6 +45,9 @@ func loadTemplates() (*template.Template, error) {
 
 func (server *Server) registerPageRoutes(mux *http.ServeMux) {
 	server.handleMethod(mux, "/admin/login", http.MethodGet, http.HandlerFunc(server.loginPage))
+	server.handleMethod(mux, "/admin/{$}", http.MethodGet, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		server.adminPage(writer, request, "overview", "概览")
+	}))
 	for _, configured := range adminPages {
 		view := configured
 		server.handleMethod(mux, view.Path, http.MethodGet, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

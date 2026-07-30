@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -22,6 +23,12 @@ const (
 	maxRange         = 31 * 24 * time.Hour
 	requestTimeout   = 10 * time.Second
 	maxResponseBytes = 16 * 1024 * 1024
+	// MaxPrincipalIDBytes 限制审计用户 ID 查询条件的 UTF-8 字节数。
+	MaxPrincipalIDBytes = 512
+	// MaxMachineIDBytes 限制审计机器标识查询条件的 UTF-8 字节数。
+	MaxMachineIDBytes = 64
+	// MaxKeywordBytes 限制审计正文关键字查询条件的 UTF-8 字节数。
+	MaxKeywordBytes = 512
 )
 
 var (
@@ -139,6 +146,9 @@ func (client *Client) Query(ctx context.Context, query Query) (Page, error) {
 }
 
 func (client *Client) normalizeQuery(query Query) (Query, error) {
+	if err := ValidateFilters(query); err != nil {
+		return Query{}, err
+	}
 	if query.Limit == 0 {
 		query.Limit = defaultLimit
 	}
@@ -168,8 +178,16 @@ func (client *Client) normalizeQuery(query Query) (Query, error) {
 	return query, nil
 }
 
+// ValidateFilters 校验用户、机器和关键字查询条件的编码、控制字符和长度边界。
+func ValidateFilters(query Query) error {
+	if !validAuditFilter(query.PrincipalID, MaxPrincipalIDBytes) || !validAuditFilter(query.MachineID, MaxMachineIDBytes) || !validAuditFilter(query.Keyword, MaxKeywordBytes) {
+		return ErrInvalidQuery
+	}
+	return nil
+}
+
 func buildLogQL(query Query) (string, error) {
-	parts := []string{`{service_name="herdr-pal-server"}`}
+	parts := []string{`{service_name="herdr-pal-server"}`, `| herdr_pal_audit_schema_version="1"`}
 	if query.PrincipalID != "" {
 		parts = append(parts, `| herdr_pal_audit_principal_id=`+strconv.Quote(query.PrincipalID))
 	}
@@ -182,6 +200,18 @@ func buildLogQL(query Query) (string, error) {
 		parts = append(parts, `|~ `+strconv.Quote(pattern))
 	}
 	return strings.Join(parts, " "), nil
+}
+
+func validAuditFilter(value string, maxBytes int) bool {
+	if !utf8.ValidString(value) || len(value) > maxBytes {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f || character >= 0x80 && character <= 0x9f {
+			return false
+		}
+	}
+	return true
 }
 
 func parseResponse(body []byte, limit int) (Page, error) {

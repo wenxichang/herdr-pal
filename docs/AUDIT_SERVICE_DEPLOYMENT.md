@@ -105,6 +105,10 @@ curl -fsS http://127.0.0.1:3000/api/health
 修改默认配置 `~/.config/herdr-pal/server-config.json`，增加或替换以下部分：
 
 ```json
+"admin": {
+  "listen": "0.0.0.0:4001",
+  "loki_url": "http://127.0.0.1:3100"
+},
 "audit": {
   "type": "otlp",
   "endpoint": "http://127.0.0.1:3100/otlp/v1/logs",
@@ -112,6 +116,10 @@ curl -fsS http://127.0.0.1:3000/api/health
   "stderr": false
 }
 ```
+
+`audit.endpoint` 是业务审计写入地址；`admin.loki_url` 是 Web 管理台查询使用的 Loki 基础
+地址，两者用途不同。管理台会自行追加 `/loki/api/v1/query_range`，因此不要在
+`admin.loki_url` 中填写 API 路径、query 或 fragment。
 
 本机回环 Loki 不需要认证 Header。若以后把 OTLP 服务独立部署到其他机器，应使用 HTTPS
 和认证，并通过标准环境变量配置请求头：
@@ -124,6 +132,9 @@ export OTEL_EXPORTER_OTLP_LOGS_HEADERS='Authorization=Bearer%20你的令牌'
 Loki 临时不可用不会阻断企业微信操作，但在服务端内存队列和重试窗口耗尽后可能丢失
 审计事件。
 
+Loki 查询同样隔离故障：`admin.loki_url` 留空、Loki 超时或返回协议错误时，只有管理台
+“审计日志”页返回暂不可用；企业微信、HPRP、HPAP、其他管理页面和 OTLP 写入不受影响。
+
 如果需要更长时间的转发重试、批处理或额外转换，可以启动模板中保留的 Collector：
 
 ```sh
@@ -134,7 +145,17 @@ sudo docker compose --profile collector --env-file .env up -d otel-collector
 
 ## 5. 访问与查询
 
-从管理电脑建立 SSH 隧道：
+Herdr Pal 内嵌管理台可以直接执行日常审计查询。访问：
+
+```text
+https://SERVER:4001/admin/audit
+```
+
+登录后可按企业微信用户 ID 精确匹配，按 `machine_id` 和关键字进行不区分大小写的包含
+匹配，并限制开始/结束时间。查询由 Server 构造固定 LogQL，不接受任意 LogQL。管理台只把
+正文保留在当前页面 DOM 中，关闭详情或切页后清除，不写入浏览器持久化存储。
+
+需要使用 Grafana 进行自由探索时，再从管理电脑建立 SSH 隧道：
 
 ```sh
 ssh -L 3000:127.0.0.1:3000 用户名@服务器地址

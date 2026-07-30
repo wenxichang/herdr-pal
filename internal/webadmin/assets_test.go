@@ -30,7 +30,7 @@ func TestPagesRedirectUnauthenticatedUsersAndRenderLogin(t *testing.T) {
 
 func TestPagesRenderSevenNavigationEntriesForAuthenticatedAdmin(t *testing.T) {
 	web, cookie, _, _ := authenticatedManagementServer(t, webTestDependencies{})
-	pages := []string{"/admin", "/admin/credentials", "/admin/connections", "/admin/sessions", "/admin/audit", "/admin/administrators", "/admin/system"}
+	pages := []string{"/admin", "/admin/", "/admin/credentials", "/admin/connections", "/admin/sessions", "/admin/audit", "/admin/administrators", "/admin/system"}
 	for _, target := range pages {
 		request := newTLSRequest(http.MethodGet, target, nil)
 		request.AddCookie(cookie)
@@ -88,6 +88,9 @@ func TestAssetsHaveContentTypesCachePolicyAndNoPersistentAuditStorage(t *testing
 			}
 			if !strings.Contains(body, "audit-detail") || !strings.Contains(body, "replaceChildren") {
 				t.Fatalf("app.js does not clear audit DOM details")
+			}
+			if !strings.Contains(body, "pageState.username") || !strings.Contains(body, `window.location.assign("/admin/login")`) {
+				t.Fatalf("app.js does not preserve self-reset one-time password flow")
 			}
 		}
 	}

@@ -10,9 +10,10 @@ import (
 const RedactedValue = "[REDACTED]"
 
 var (
-	machineKeyPattern = regexp.MustCompile(`\bhpk_[0-9]+_[A-Za-z0-9_-]{20,}\b`)
-	bearerPattern     = regexp.MustCompile(`(?i)(Authorization\s*:\s*Bearer\s+)[^\s\r\n]+`)
-	cookiePattern     = regexp.MustCompile(`(?i)\b(Set-Cookie|Cookie)\s*:\s*[^\r\n]+`)
+	machineKeyPattern      = regexp.MustCompile(`\bhpk_[0-9]+_[A-Za-z0-9_-]{20,}\b`)
+	automationTokenPattern = regexp.MustCompile(`\bhpa_[0-9a-f]{16}_[A-Za-z0-9_-]{20,}\b`)
+	bearerPattern          = regexp.MustCompile(`(?i)(Authorization\s*:\s*Bearer\s+)[^\s\r\n]+`)
+	cookiePattern          = regexp.MustCompile(`(?i)\b(Set-Cookie|Cookie)\s*:\s*[^\r\n]+`)
 )
 
 // Redactor 对审计正文执行有限、确定的凭据脱敏。
@@ -36,7 +37,7 @@ func NewRedactor(values []string) *Redactor {
 	return &Redactor{values: ordered}
 }
 
-// Redact 替换已知凭据、机器 Key 和常见认证 Header 值。
+// Redact 替换已知凭据、机器 Key、管理员自动化 Token 和常见认证 Header 值。
 func (redactor *Redactor) Redact(content string) string {
 	content = bearerPattern.ReplaceAllString(content, `${1}`+RedactedValue)
 	content = cookiePattern.ReplaceAllStringFunc(content, func(header string) string {
@@ -47,6 +48,7 @@ func (redactor *Redactor) Redact(content string) string {
 		return header[:separator+1] + " " + RedactedValue
 	})
 	content = machineKeyPattern.ReplaceAllString(content, RedactedValue)
+	content = automationTokenPattern.ReplaceAllString(content, RedactedValue)
 	if redactor == nil {
 		return content
 	}

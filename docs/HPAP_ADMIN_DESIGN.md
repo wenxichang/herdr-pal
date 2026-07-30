@@ -7,7 +7,7 @@
 
 本地管理协议命名为 Herdr Pal Administration Protocol，首个版本为 `HPAP/1`。HPAP 只在
 Server 主机的 Unix Domain Socket 上使用，与 Pal/Server 远程通讯所使用的 HPRP/1 完全
-隔离。
+隔离。Server 另有 HTTPS Web 管理入口，但它不承载或转发 HPAP 信封。
 
 ## 2. 目标与非目标
 
@@ -23,7 +23,7 @@ Server 主机的 Unix Domain Socket 上使用，与 Pal/Server 远程通讯所�
 
 ### 2.2 非目标
 
-- 不提供远程 TCP 管理端口、浏览器管理后台或公网管理 API。
+- HPAP/1 本身不扩展为远程 TCP 或浏览器协议；HTTPS 管理台使用独立 JSON API。
 - 不通过 HPAP 发送 Agent prompt、按键或其他 Herdr 操作。
 - 不读取 `/con`、终端内容、Cookie、Bot Secret 或 Key Secret。
 - 不支持热加载普通配置、替换 TLS 证书或切换企业微信机器人。
@@ -39,14 +39,20 @@ hp-cli
   │ Unix Socket
   ▼
 AdminServer
+  │
+  ├───────────────┐
+  ▼               ▼
+AdminService ◀── WebAdmin / HTTPS
   ├── RuntimeInspector ── Server / WeCom / TLS / 日志状态
-  ├── CredentialManager ─ CredentialStore
-  ├── ConnectionManager ─ ClientHub
-  └── SessionInspector ── SessionCatalog
+  ├── CredentialStore
+  ├── ClientHub
+  └── SessionCatalog
 ```
 
 `AdminServer` 是 `herdr-pal-server` 的内部运行组件，与企业微信连接、HPRP Listener 共用
-生命周期。它只依赖窄接口，不直接持有或操作所有 Server 内部对象。
+生命周期。HPAP Handler 与 Web Handler 都调用协议无关的 `AdminService`，不会互相通过
+Socket 或 HTTP 自调用。这样 HPAP/1 保持现有 JSON 和错误语义，Web 可以独立增加页面认证、
+CSRF、管理员和 Loki 查询能力。
 
 默认管理 Socket 位于：
 
@@ -406,14 +412,19 @@ Bearer Secret、状态、过期时间和来源地址必须全部通过，才能�
 - `internal/adminproto`：HPAP/1 信封、方法、结果、错误和严格编解码。
 - `internal/adminclient`：Unix Socket 连接、超时、分页和请求关联。
 - `internal/adminserver`：Socket 安全、peer UID、方法分发、背压和审计。
+- `internal/adminservice`：HPAP 与 Web 共享的凭据、连接、会话和运行控制规则。
+- `internal/adminauth`：Web 多管理员密码摘要、自动化 Token 摘要和浏览器 Session。
+- `internal/webadmin`：内嵌页面、同源 HTTPS JSON API 和 Web 安全中间件。
+- `internal/lokiquery`：只接受受控字段的 Loki 只读查询客户端。
 - `internal/credential`：Key CRUD、来源规则和原子文件存储。
 - `internal/server.ClientHub`：连接快照、按 connection/credential 撤下和断连。
 - `internal/server.SessionCatalog`：不改变路由状态的管理只读快照。
 - `internal/wecom.Client`：线程安全的连接状态快照。
 - `internal/serverapp`：组件装配、运行元数据、动态日志级别和优雅停止。
 
-AdminServer 通过 `RuntimeInspector`、`CredentialManager`、`ConnectionManager` 和
-`SessionInspector` 接口访问能力，不能成为直接依赖所有内部类型的 god object。
+`AdminService` 通过 `RuntimeInspector`、`CredentialManager`、`ConnectionManager` 和
+`SessionInspector` 窄接口访问能力。AdminServer 和 WebAdmin 只承担各自的传输、认证和
+DTO 转换，不能成为直接依赖所有内部类型的 god object。
 
 ## 12. 审计日志
 

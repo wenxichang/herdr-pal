@@ -79,7 +79,7 @@ func (server *Server) recoverPanic(next http.Handler) http.Handler {
 
 func (server *Server) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		metadata := &requestMetadata{requestID: server.nextRequestID(), route: request.URL.Path}
+		metadata := &requestMetadata{requestID: server.nextRequestID(), route: "unmatched"}
 		writer.Header().Set("X-Request-ID", metadata.requestID)
 		next.ServeHTTP(writer, request.WithContext(context.WithValue(request.Context(), requestContextKey{}, metadata)))
 	})

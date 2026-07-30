@@ -21,6 +21,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/adminauth"
 	"github.com/wenxichang/herdr-pal/internal/adminserver"
 	"github.com/wenxichang/herdr-pal/internal/adminservice"
+	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
@@ -480,7 +481,7 @@ func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) 
 		runtimeLogger.level.Set(minimum)
 	}
 	runtimeLogger.Logger = slog.New(slog.NewTextHandler(
-		redactingWriter{destination: writer, secrets: compactSecrets(secrets)},
+		redactingWriter{destination: writer, redactor: audit.NewRedactor(compactSecrets(secrets))},
 		&slog.HandlerOptions{Level: &runtimeLogger.level},
 	))
 	return runtimeLogger, nil
@@ -488,14 +489,11 @@ func newLogger(writer io.Writer, level string, verbose bool, secrets ...string) 
 
 type redactingWriter struct {
 	destination io.Writer
-	secrets     []string
+	redactor    *audit.Redactor
 }
 
 func (writer redactingWriter) Write(data []byte) (int, error) {
-	redacted := string(data)
-	for _, secret := range writer.secrets {
-		redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
-	}
+	redacted := writer.redactor.Redact(string(data))
 	if writer.destination == nil {
 		return len(data), nil
 	}

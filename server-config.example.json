@@ -12,7 +12,7 @@
   },
   "admin": {
     "listen": "0.0.0.0:4001",
-    "loki_url": "http://127.0.0.1:3100"
+    "loki_url": ""
   },
   "rate_limit": {
     "per_second": 1,

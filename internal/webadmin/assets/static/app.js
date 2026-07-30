@@ -2,6 +2,7 @@
 
 const pageState = {
   csrf: "",
+  username: "",
   credentialsCursor: "",
   connectionsCursor: "",
   sessionsCursor: "",
@@ -23,6 +24,7 @@ async function startPage() {
   try {
     const session = await api("/admin/api/v1/auth/session");
     pageState.csrf = session.csrf_token;
+    pageState.username = session.username;
   } catch (error) {
     window.location.assign("/admin/login");
     return;
@@ -325,6 +327,10 @@ function administratorRow(item) {
     actionButton("重置密码", async () => {
       if (!window.confirm(`确认重置管理员 ${username} 的密码？`)) return;
       const result = await api(`/admin/api/v1/administrators/${encodeURIComponent(username)}/reset-password`, { method: "POST", body: { confirm: true } });
+      if (username === pageState.username) {
+        showSecret(`管理员 ${username} 的新初始密码`, result.initial_password, () => window.location.assign("/admin/login"));
+        return;
+      }
       showSecret(`管理员 ${username} 的新初始密码`, result.initial_password);
       await loadAdministrators();
     }),
@@ -457,7 +463,7 @@ function formatDuration(milliseconds) {
   return `${days}天 ${hours}小时 ${minutes}分钟`;
 }
 
-function showSecret(title, value) {
+function showSecret(title, value, onClose) {
   const dialog = document.querySelector("#secret-modal");
   const titleNode = document.querySelector("#secret-title");
   const valueNode = document.querySelector("#secret-value");
@@ -466,13 +472,18 @@ function showSecret(title, value) {
   valueNode.replaceChildren(document.createTextNode(value));
   const copy = document.querySelector("#secret-copy");
   const copyValue = async () => {
-    await navigator.clipboard.writeText(valueNode.textContent || "");
-    notify("已复制到剪贴板");
+    try {
+      await navigator.clipboard.writeText(valueNode.textContent || "");
+      notify("已复制到剪贴板");
+    } catch (_) {
+      notify("浏览器拒绝访问剪贴板，请手工复制", true);
+    }
   };
   copy?.addEventListener("click", copyValue);
   dialog.addEventListener("close", () => {
     copy?.removeEventListener("click", copyValue);
     valueNode.replaceChildren();
+    if (onClose) onClose();
   }, { once: true });
   dialog.showModal();
 }

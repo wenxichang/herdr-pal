@@ -8,7 +8,8 @@ Herdr Pal 由中央 Server 与每机 Pal sidecar 组成。Server 集中持有企
 ```text
 企业微信智能机器人 ──▶ herdr-pal-server
                        ├── WeComClient / ConversationRouter / UserExecutor
-hp-cli ── HPAP/1 ────▶ ├── AdminServer / CredentialStore
+hp-cli ── HPAP/1 ────▶ ├── AdminServer ─┐
+HTTPS 管理台 ─────────▶ ├── WebAdmin ────┴── AdminService / CredentialStore
                        └── ClientHub / SessionCatalog
                                   │ HPRP/1 WSS
                      ┌────────────┴────────────┐
@@ -87,11 +88,18 @@ hp-cli key issue --principal-id USERID --machine-id MACHINE --source 192.168.1.2
 凭据存储默认位于 `state_dir/credentials.json`，文件权限受限。验证使用常量时间摘要比较，并
 同时核验 TLS 连接的真实来源地址。`hp-cli` 只连接 `<state_dir>/admin.sock`，不直接修改文件。
 
-### 3.4 AdminServer
+### 3.4 管理面
 
-AdminServer 通过 HPAP/1 Unix Socket 向同一系统用户提供 Key CRUD、来源策略、连接与会话
-查询、动态 debug 和优雅停止。它不提供远程管理端口，不读取终端内容，也不能发送 Agent
-输入。Windows 当前不构建 Server 或 `hp-cli`。
+`AdminService` 集中实现 Key CRUD、来源策略、连接与会话查询、动态 debug 和优雅停止的
+业务规则。两个传输入口复用该服务：
+
+- `AdminServer` 通过 HPAP/1 Unix Socket 向 Server 主机上的同一系统用户提供完整管理能力。
+- `WebAdmin` 在独立 HTTPS 端口提供多管理员页面和受控 JSON API，并复用 Relay 的 TLS
+  证书。浏览器使用密码、Session、同源与 CSRF 防护；自动化 Token 只允许签发和删除 Key。
+
+Web 管理台不通过 Unix Socket 自调用 HPAP，HPAP/1 协议保持不变。两个入口都不发送 Agent
+输入；只有审计查询会读取 Loki 中已经保存的用户输入和终端文本。Windows 当前不构建
+Server 或 `hp-cli`。
 
 ### 3.5 ClientHub
 

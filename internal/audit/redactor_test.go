@@ -13,12 +13,14 @@ func TestRedactorRemovesConfiguredAndKnownCredentials(t *testing.T) {
 		"Cookie: session=secret-cookie",
 		"Set-Cookie: refresh=secret-refresh; Secure",
 		"machine hpk_12_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		"automation hpa_0123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		"collector Bearer collector-token",
 	}, "\n")
 	output := redactor.Redact(input)
 	for _, forbidden := range []string{
 		"bot-secret-value", "user-access-token", "secret-cookie", "secret-refresh",
 		"hpk_12_", "collector-token",
+		"hpa_0123456789abcdef_",
 	} {
 		if strings.Contains(output, forbidden) {
 			t.Fatalf("Redact() leaked %q in %q", forbidden, output)

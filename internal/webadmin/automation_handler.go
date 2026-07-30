@@ -101,7 +101,7 @@ func (server *Server) automationIssueCredential(writer http.ResponseWriter, requ
 		parsed = parsed.UTC()
 		expiresAt = &parsed
 	}
-	setRequestTarget(request, "machine_id="+safeTargetValue(input.MachineID))
+	setRequestTarget(request, "machine_id_hash="+shortTargetHash(input.MachineID))
 	result, err := server.admin.IssueCredential(adminservice.IssueCredentialInput{
 		PrincipalID: input.PrincipalID, MachineID: input.MachineID, Sources: input.Sources, ExpiresAt: expiresAt,
 	})

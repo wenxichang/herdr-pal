@@ -114,6 +114,10 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
     "state_dir": "",
     "credentials_file": ""
   },
+  "admin": {
+    "listen": "0.0.0.0:4001",
+    "loki_url": ""
+  },
   "rate_limit": {
     "per_second": 1,
     "per_minute": 20
@@ -170,6 +174,31 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 ./dist/herdr-pal-server
 ```
 
+首次启动时，Server 会在标准输出中创建并显示一次默认管理员 `admin` 的随机初始密码和
+自动化 Token。请立即保存；后续启动不会再次显示。浏览器访问：
+
+```text
+https://服务端地址:4001/admin/
+```
+
+证书路径留空时，管理台与 Relay 共用 Server 自动生成的自签名证书，浏览器会出现证书告警；
+确认指纹和服务端身份后再继续。首次登录只能修改初始密码，改密后即可：
+
+- 签发、启用、禁用和删除机器 Key，维护来源地址规则。
+- 查看 HPRP 在线连接与各用户、各机器上的 Agent 会话。
+- 创建其他管理员，重置密码并轮换或禁用自动化 Token。
+- 切换详细日志、查看运行状态和优雅停止 Server。
+- 配置 `admin.loki_url` 后按用户、机器、日期范围和关键字查询审计日志。
+
+管理员认证文件固定为 `~/.config/herdr-pal/server-auth.json`，只保存 Argon2id 密码摘要和
+自动化 Token 摘要，Unix 权限必须保持 `0600`。文件损坏、版本无效或权限过宽时 Server 会
+拒绝启动并明确报告路径；不要手工编辑其内容。忘记密码时应使用另一个管理员重置，或在
+明确接受重建全部管理员身份的情况下先备份再移走该文件并重启。
+
+`admin.listen` 默认是 `0.0.0.0:4001`，只提供 HTTPS。`admin.loki_url` 是 Loki 基础地址，
+例如 `http://127.0.0.1:3100`；留空时只有审计查询页不可用，不影响企业微信、HPRP、HPAP
+和 OTLP 审计写入。
+
 需要排查连接、会话上报或企微消息转发问题时，使用详细日志模式：
 
 ```sh
@@ -220,6 +249,32 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 
 顶层帮助会列出全部命令路径；子命令帮助会列出下一级命令，叶子命令帮助会说明位置参数、
 可选参数、格式约束和示例。帮助命令不读取配置，也不要求服务端正在运行。
+
+### 自动化签发与删除
+
+每个管理员都有独立的 `hpa_...` 自动化 Token。Token 仅允许签发和删除机器凭据，不能查询
+运行数据或修改管理员。把 Token 放入受控环境变量，不要写入脚本或命令历史：
+
+```sh
+export HERDR_PAL_ADMIN_TOKEN='管理员界面中一次性显示的 hpa_ Token'
+
+curl -k --fail-with-body \
+  -H "Authorization: Bearer ${HERDR_PAL_ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"principal_id":"企业微信用户 ID","machine_id":"office-pc","sources":["192.168.1.20"]}' \
+  https://服务端地址:4001/admin/api/v1/automation/credentials
+```
+
+签发响应中的 `hpk_...` 机器 Key 同样只返回一次。删除凭据会立即使 Key 失效并断开对应 Pal：
+
+```sh
+curl -k --fail-with-body -X DELETE \
+  -H "Authorization: Bearer ${HERDR_PAL_ADMIN_TOKEN}" \
+  https://服务端地址:4001/admin/api/v1/automation/credentials/凭据ID
+```
+
+自动化接口按 Token 限制为每秒 5 次、滚动一分钟 100 次。浏览器管理操作继续使用管理员
+Session、同源校验和 CSRF 防护，不能用自动化 Token 代替浏览器登录。
 
 ## 第三步：获取用户 ID 并签发机器 Key
 

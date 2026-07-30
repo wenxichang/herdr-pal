@@ -74,6 +74,36 @@ func TestServerRecoversPanicWithoutLeakingDetails(t *testing.T) {
 	}
 }
 
+func TestServerLogsCanonicalRoutesAndHashesMachineTargets(t *testing.T) {
+	web, cookie, csrf, logs := authenticatedManagementServer(t, webTestDependencies{})
+	pathToken := "hpa_0123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	unknown := newTLSRequest(http.MethodGet, "/admin/"+pathToken, nil)
+	unknownResponse := httptest.NewRecorder()
+	web.Handler().ServeHTTP(unknownResponse, unknown)
+	if unknownResponse.Code != http.StatusNotFound {
+		t.Fatalf("unknown status=%d body=%s", unknownResponse.Code, unknownResponse.Body.String())
+	}
+	machineToken := "hpk_1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	body := `{"principal_id":"user-a","machine_id":"` + machineToken + `","sources":["127.0.0.1"]}`
+	issued := managementRequest(t, web, cookie, csrf, http.MethodPost, "/admin/api/v1/credentials", body)
+	if issued.Code != http.StatusCreated {
+		t.Fatalf("issue status=%d body=%s", issued.Code, issued.Body.String())
+	}
+	duplicate := managementRequest(t, web, cookie, csrf, http.MethodPost, "/admin/api/v1/credentials", body)
+	if duplicate.Code == http.StatusCreated {
+		t.Fatalf("duplicate status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	output := logs.String()
+	for _, secret := range []string{pathToken, machineToken} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("management logs leaked %q: %s", secret, output)
+		}
+	}
+	if !strings.Contains(output, "route=unmatched") || !strings.Contains(output, "machine_id_hash=") {
+		t.Fatalf("management logs missing safe metadata: %s", output)
+	}
+}
+
 func newTestWebServer(t *testing.T) (*Server, adminauth.Bootstrap, *strings.Builder) {
 	return newTestWebServerWithDependencies(t, webTestDependencies{})
 }
