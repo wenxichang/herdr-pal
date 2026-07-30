@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image/color"
 	"image/png"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -144,6 +145,7 @@ func normalizeScreen(safeANSI string) (string, int, int, error) {
 	input := strings.ReplaceAll(safeANSI, "\r\n", "\n")
 	input = strings.ReplaceAll(input, "\r", "")
 	input = strings.TrimSuffix(input, "\n")
+	input = filterTextimgSGR(input)
 	plain := stripSGR(input)
 	lines := strings.Split(plain, "\n")
 	if plain == "" {
@@ -160,6 +162,115 @@ func normalizeScreen(safeANSI string) (string, int, int, error) {
 		return "", 0, 0, ErrScreenTooLarge
 	}
 	return input, columns, rows, nil
+}
+
+func filterTextimgSGR(input string) string {
+	var result strings.Builder
+	result.Grow(len(input))
+	for index := 0; index < len(input); {
+		if input[index] != 0x1b || index+1 >= len(input) || input[index+1] != '[' {
+			result.WriteByte(input[index])
+			index++
+			continue
+		}
+		end := index + 2
+		for end < len(input) && (input[end] < 0x40 || input[end] > 0x7e) {
+			end++
+		}
+		if end >= len(input) || input[end] != 'm' {
+			result.WriteByte(input[index])
+			index++
+			continue
+		}
+		if parameters := supportedTextimgSGR(input[index+2 : end]); parameters != "" {
+			result.WriteString("\x1b[")
+			result.WriteString(parameters)
+			result.WriteByte('m')
+		}
+		index = end + 1
+	}
+	return result.String()
+}
+
+func supportedTextimgSGR(parameters string) string {
+	if parameters == "" {
+		return "0"
+	}
+	fields := strings.Split(parameters, ";")
+	supported := make([]string, 0, len(fields))
+	for index := 0; index < len(fields); {
+		code, ok := sgrNumber(fields[index])
+		if !ok {
+			index++
+			continue
+		}
+		if code == 38 || code == 48 {
+			group, consumed := supportedExtendedColor(code, fields[index+1:])
+			if consumed == 0 {
+				break
+			}
+			if group != nil {
+				supported = append(supported, group...)
+			}
+			index += consumed + 1
+			continue
+		}
+		if isSupportedTextimgSGR(code) {
+			supported = append(supported, strconv.Itoa(code))
+		}
+		index++
+	}
+	return strings.Join(supported, ";")
+}
+
+func supportedExtendedColor(code int, fields []string) ([]string, int) {
+	if len(fields) < 2 {
+		return nil, 0
+	}
+	mode, ok := sgrNumber(fields[0])
+	if !ok {
+		return nil, 0
+	}
+	switch mode {
+	case 5:
+		value, valid := sgrByte(fields[1])
+		if !valid {
+			return nil, 2
+		}
+		return []string{strconv.Itoa(code), "5", strconv.Itoa(value)}, 2
+	case 2:
+		if len(fields) < 4 {
+			return nil, 0
+		}
+		red, redOK := sgrByte(fields[1])
+		green, greenOK := sgrByte(fields[2])
+		blue, blueOK := sgrByte(fields[3])
+		if !redOK || !greenOK || !blueOK {
+			return nil, 4
+		}
+		return []string{strconv.Itoa(code), "2", strconv.Itoa(red), strconv.Itoa(green), strconv.Itoa(blue)}, 4
+	default:
+		return nil, 0
+	}
+}
+
+func sgrNumber(value string) (int, bool) {
+	if value == "" {
+		return 0, true
+	}
+	number, err := strconv.Atoi(value)
+	return number, err == nil && number >= 0
+}
+
+func sgrByte(value string) (int, bool) {
+	number, ok := sgrNumber(value)
+	return number, ok && number <= 255
+}
+
+func isSupportedTextimgSGR(code int) bool {
+	return code == 0 || code == 1 || code == 4 || code == 5 || code == 7 || code == 8 ||
+		code >= 30 && code <= 37 || code == 39 || code >= 40 && code <= 47 || code == 49 ||
+		code >= 90 && code <= 97 || code >= 100 && code <= 107
 }
 
 func stripSGR(input string) string {

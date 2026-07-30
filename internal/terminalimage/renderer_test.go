@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jiro4989/textimg/v3/parser"
 	"golang.org/x/image/font/sfnt"
 )
 
@@ -50,6 +51,29 @@ func TestRendererUsesEmbeddedFontForRepresentativeTerminalRunes(t *testing.T) {
 		if glyph == 0 {
 			t.Fatalf("embedded font missing %q", current)
 		}
+	}
+}
+
+func TestNormalizeScreenFiltersUnsupportedTextimgSGRWithoutChangingWidth(t *testing.T) {
+	text := strings.Repeat("x", 301)
+	input := "\x1b[2;38;5;244m" + text + "\x1b[3;7m!\x1b[0m"
+	normalized, columns, rows, err := normalizeScreen(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\x1b[38;5;244m" + text + "\x1b[7m!\x1b[0m"
+	if normalized != want {
+		t.Fatalf("normalizeScreen() input = %q, want %q", normalized, want)
+	}
+	tokens, err := parser.Parse(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedWidth := tokens.MaxStringWidth(); parsedWidth != columns {
+		t.Fatalf("textimg width = %d, canvas columns = %d", parsedWidth, columns)
+	}
+	if rows != 1 {
+		t.Fatalf("normalizeScreen() rows = %d, want 1", rows)
 	}
 }
 
