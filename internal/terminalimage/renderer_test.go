@@ -59,12 +59,23 @@ func TestRendererRejectsUnboundedScreen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, input := range []string{
-		strings.Repeat("x", maxColumns+1),
+		strings.Repeat(strings.Repeat("x", 301)+"\n", maxRows-1) + strings.Repeat("x", 301),
 		strings.Repeat("line\n", maxRows) + "line",
 	} {
 		if _, err := renderer.Render(context.Background(), input); !errors.Is(err, ErrScreenTooLarge) {
 			t.Fatalf("Render() error = %v", err)
 		}
+	}
+}
+
+func TestNormalizeScreenAllowsWideShortPageWithinPixelBudget(t *testing.T) {
+	input := strings.Repeat(strings.Repeat("x", 301)+"\n", 63) + strings.Repeat("x", 301)
+	_, columns, rows, err := normalizeScreen(input)
+	if err != nil {
+		t.Fatalf("normalizeScreen() error = %v", err)
+	}
+	if columns != 301 || rows != 64 {
+		t.Fatalf("normalizeScreen() size = %dx%d, want 301x64", columns, rows)
 	}
 }
 

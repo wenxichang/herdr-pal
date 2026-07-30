@@ -23,8 +23,9 @@ const (
 	fontSize     = 16
 	cellWidth    = 8
 	cellHeight   = 17
-	maxColumns   = 300
 	maxRows      = 100
+	maxDimension = 16384
+	maxPixels    = 2400 * 1700
 	maxANSIBytes = 256 * 1024
 	maxPNGBytes  = 512 * 1024
 )
@@ -154,7 +155,8 @@ func normalizeScreen(safeANSI string) (string, int, int, error) {
 		columns = max(columns, runewidth.StringWidth(line))
 	}
 	rows := len(lines)
-	if columns > maxColumns || rows > maxRows {
+	width, height := columns*cellWidth, rows*cellHeight
+	if rows > maxRows || width > maxDimension || height > maxDimension || width > maxPixels/height {
 		return "", 0, 0, ErrScreenTooLarge
 	}
 	return input, columns, rows, nil
