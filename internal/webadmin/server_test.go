@@ -82,6 +82,7 @@ type webTestDependencies struct {
 	Connections adminservice.ConnectionManager
 	Sessions    adminservice.SessionInspector
 	Runtime     adminservice.RuntimeController
+	Audit       AuditQuerier
 	Now         func() time.Time
 }
 
@@ -134,6 +135,7 @@ func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependen
 		Logger:     slog.New(slog.NewTextHandler(logs, nil)),
 		Random:     &webIncrementingReader{next: 160},
 		Now:        now,
+		Audit:      dependencies.Audit,
 	})
 	if err != nil {
 		t.Fatal(err)

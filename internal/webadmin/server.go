@@ -2,6 +2,7 @@
 package webadmin
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -15,11 +16,17 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/adminauth"
 	"github.com/wenxichang/herdr-pal/internal/adminservice"
+	"github.com/wenxichang/herdr-pal/internal/lokiquery"
 )
 
 var ErrInvalidConfig = errors.New("Web 管理台配置无效")
 
 const sessionCookieName = "herdr_pal_admin_session"
+
+// AuditQuerier 查询用户输入和终端文本审计记录。
+type AuditQuerier interface {
+	Query(context.Context, lokiquery.Query) (lokiquery.Page, error)
+}
 
 // Config 指定 Web 管理台共享服务、认证状态和运行依赖。
 type Config struct {
@@ -30,6 +37,7 @@ type Config struct {
 	Logger     *slog.Logger
 	Random     io.Reader
 	Now        func() time.Time
+	Audit      AuditQuerier
 }
 
 // Server 提供同源 HTTPS 管理页面和版本化 JSON API。
@@ -39,6 +47,7 @@ type Server struct {
 	sessions        *adminauth.SessionManager
 	loginGuard      *adminauth.LoginGuard
 	automationLimit *automationLimiter
+	audit           AuditQuerier
 	logger          *slog.Logger
 	random          io.Reader
 	now             func() time.Time
@@ -83,13 +92,14 @@ func New(config Config) (*Server, error) {
 	server := &Server{
 		admin: config.Admin, auth: config.Auth, sessions: config.Sessions,
 		loginGuard: config.LoginGuard, logger: config.Logger, random: config.Random, now: config.Now,
-		automationLimit: newAutomationLimiter(), routes: make(map[string]*methodRouter),
+		automationLimit: newAutomationLimiter(), audit: config.Audit, routes: make(map[string]*methodRouter),
 	}
 	mux := http.NewServeMux()
 	server.registerAuthRoutes(mux)
 	server.registerManagementRoutes(mux)
 	server.registerAdminRoutes(mux)
 	server.registerAutomationRoutes(mux)
+	server.registerAuditRoutes(mux)
 	mux.HandleFunc("/admin/api/v1/", func(writer http.ResponseWriter, request *http.Request) {
 		setRequestRoute(request, "/admin/api/v1/*")
 		_ = writeAPIError(writer, request, http.StatusNotFound, "not_found", "管理接口不存在")
