@@ -347,7 +347,11 @@ func TestClientSendImageToUploadsAndSendsMediaID(t *testing.T) {
 	if commandOf(t, finishRequest).Cmd != "aibot_upload_media_finish" {
 		t.Fatalf("finish command = %s", finishRequest)
 	}
-	socket.push(responseWithBodyJSON(requestIDOf(t, finishRequest), 0, map[string]any{"media_id": "media-1"}))
+	socket.push(responseWithBodyJSON(requestIDOf(t, finishRequest), 0, map[string]any{
+		"type":       "file",
+		"media_id":   "media-1",
+		"created_at": 1380000000,
+	}))
 
 	sendRequest := socket.nextWrite(t)
 	var send struct {

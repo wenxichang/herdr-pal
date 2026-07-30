@@ -429,7 +429,7 @@ func (s *WeComServer) completeRequest(request WeComRequest) (any, bool) {
 			return nil, false
 		}
 		return map[string]any{
-			"type": upload.mediaType, "media_id": "media-" + request.UploadID, "created_at": time.Now().UTC().Format(time.RFC3339),
+			"type": "file", "media_id": "media-" + request.UploadID, "created_at": time.Now().Unix(),
 		}, true
 	default:
 		return nil, true

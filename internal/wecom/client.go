@@ -507,12 +507,12 @@ func (c *Client) UploadImage(ctx context.Context, png []byte) (string, error) {
 		return "", err
 	}
 	var finishBody struct {
-		Type      string `json:"type,omitempty"`
-		MediaID   string `json:"media_id"`
-		CreatedAt string `json:"created_at,omitempty"`
+		Type      string          `json:"type,omitempty"`
+		MediaID   string          `json:"media_id"`
+		CreatedAt json.RawMessage `json:"created_at,omitempty"`
 	}
 	if err := decodeTypedResponseBody(response, &finishBody); err != nil || strings.TrimSpace(finishBody.MediaID) == "" ||
-		(finishBody.Type != "" && finishBody.Type != "image") {
+		(finishBody.Type != "" && finishBody.Type != "file" && finishBody.Type != "image") {
 		if err == nil {
 			err = newProtocolError(requestID, 0, "上传完成响应无效")
 		}
