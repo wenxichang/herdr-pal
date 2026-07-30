@@ -114,6 +114,16 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
     "state_dir": "",
     "credentials_file": ""
   },
+  "rate_limit": {
+    "per_second": 1,
+    "per_minute": 20
+  },
+  "audit": {
+    "type": "none",
+    "endpoint": "",
+    "skip_verify": false,
+    "stderr": false
+  },
   "log": {
     "level": "info"
   }
@@ -123,6 +133,31 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
 `addr_hint` 填写客户端机器能够访问的服务端主机名或 IP，不要包含 `wss://`、端口或路径。
 服务端会自动使用 `listen` 中的端口，在企业微信 `/help` 的客户端配置示例中生成
 `wss://10.1.3.4:9443`。留空时 `/help` 继续显示需要向管理员获取地址的占位提示。
+
+`rate_limit` 按企业微信用户限制唯一输入，默认每秒 1 条、滚动 60 秒内 20 条。字段缺省使用
+默认值，显式设置为 `0` 会关闭对应窗口；重复投递的同一企业微信消息不会重复计数。
+
+`audit.type` 只支持 `none` 或 `otlp`。使用 OTLP/HTTP protobuf Logs 时填写完整
+`http://.../v1/logs` 或 `https://.../v1/logs` 地址，例如：
+
+```json
+"audit": {
+  "type": "otlp",
+  "endpoint": "https://otel-collector.internal:4318/v1/logs",
+  "skip_verify": false,
+  "stderr": false
+}
+```
+
+需要认证 Header 时使用 OpenTelemetry 标准环境变量，值按 URL 编码：
+
+```sh
+export OTEL_EXPORTER_OTLP_LOGS_HEADERS='Authorization=Bearer%20collector-token,x-tenant=team-a'
+```
+
+审计记录用户输入和终端文本输出；图片模式只记录图片配套文本，不记录 PNG。OTLP 不可用、
+队列满或关闭刷新超时都不会阻断用户操作。`audit.stderr=true` 会额外向 stderr 输出包含完整
+审计正文的 JSON Lines，只应在受控调试环境启用。
 
 设置 Secret 并启动：
 
@@ -140,7 +175,8 @@ export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
 `--verbose` 会把服务端日志级别临时提升为 `debug`，记录 Relay 握手阶段、客户端版本、快照
 序号和会话数量、心跳、企微交互动作、路由目标、消息分段及错误码。日志只记录消息长度、
 credential ID，以及用户/message/session 的摘要，不记录 prompt、终端快照正文、完整用户 ID
-或机器 Key；当前 Bot Secret 即使出现在底层错误中也会替换为 `[REDACTED]`。
+或机器 Key；当前 Bot Secret 和 OTLP Header 值即使出现在底层错误中也会替换为
+`[REDACTED]`。启用的业务审计流属于独立敏感输出，不受这条普通运行日志规则影响。
 
 未指定 `-config` 时，服务端默认读取：
 

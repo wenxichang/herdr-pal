@@ -64,9 +64,16 @@ Router 以企业微信用户 ID 为隔离边界：
 - 为输出补充机器、全局序号、Workspace/Tab、pane 和状态信息。
 - 维护同一用户 2 分钟双向活跃窗口，减少后台会话的大段输出打断。
 - 根据状态事件决定是否请求无副作用终端快照，并负责图片发送失败后的同页文本降级。
+- 在企业微信消息幂等去重后、进入用户队列前执行按用户滚动窗口限速，默认每秒 1 条、
+  每分钟 20 条。
+- 为已接受或被限速的用户输入、最终完成投递的终端文本生成审计事件；图片只审计配套文本。
 
 每个用户由 `UserExecutor` 串行处理，不同用户并行；用户输入、状态通知和命令后续输出使用
 同一队列，确保“终端标题 + 图片”不会被同一用户其他机器的消息插入；队列容量有界。
+
+审计输出与 Router 解耦：stderr 和 OTLP/HTTP protobuf 各自使用独立有界异步队列。队列满、
+Collector 不可用或关闭刷新超时都按 fail-open 处理，不改变企业微信操作结果；审计正文在
+入队前移除 Bot Secret、OTLP Header 值、机器 Key 和常见认证 Header。
 
 ### 3.3 CredentialStore
 
@@ -213,10 +220,11 @@ protocol.error
 
 - Bot Secret 只在 Server 环境变量中；机器 Key 只在对应 Pal 配置中。
 - Server 只能向 Key 所属用户与机器路由命令；Pal 仍执行本地 `PolicyGuard`。
-- 日志不记录完整 Key、Secret、Cookie、prompt 或终端快照。
+- 普通运行日志不记录完整 Key、Secret、Cookie、prompt 或终端快照；显式启用的业务审计流
+  会包含脱敏后的完整用户输入和终端文本，必须单独控制访问权限。
 - 默认拒绝未知用户、未知 IM 会话、未绑定目标、失效 occupant 和 degraded Herdr。
 - 不提供 `server.stop`、`pane.close`、任意 `pane.send_input`、通用 Herdr RPC 或自动审批。
-- `skip_verify=true` 只适合受信任内网；正式公网部署必须验证证书并增加认证限流。
+- `skip_verify=true` 只适合受信任内网；正式公网部署必须验证证书并评估更严格的输入策略。
 
 ## 8. 测试策略
 

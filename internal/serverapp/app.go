@@ -25,6 +25,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/server"
+	"github.com/wenxichang/herdr-pal/internal/version"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
@@ -59,11 +60,26 @@ func Run(ctx context.Context, options Options) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, loaded.WeCom.Secret)
+	runtimeSecrets := []string{loaded.WeCom.Secret}
+	for _, value := range loaded.Audit.Headers {
+		runtimeSecrets = append(runtimeSecrets, value)
+	}
+	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, runtimeSecrets...)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
 	logger := runtimeLogger.Logger
+	businessAuditor, auditRedactor, err := newBusinessAuditor(loaded.Audit, stderr, logger, loaded.WeCom.Secret, version.Version)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrConfig, err)
+	}
+	defer func() {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := businessAuditor.Shutdown(shutdownContext); err != nil {
+			logger.Warn("关闭业务审计输出超时", "error_type", "audit_shutdown_timeout")
+		}
+	}()
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return err
@@ -109,7 +125,11 @@ func Run(ctx context.Context, options Options) error {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
 	router, err := server.NewConversationRouterWithConfig(
-		server.ConversationRouterConfig{RelayURL: relayURL},
+		server.ConversationRouterConfig{
+			RelayURL:    relayURL,
+			RateLimiter: server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
+			Auditor:     businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
+		},
 		catalog, server.NewUserExecutor(64), weComClient, hub, deduper, logger,
 	)
 	if err != nil {
@@ -190,6 +210,10 @@ func Run(ctx context.Context, options Options) error {
 		"listen", loaded.Server.Listen,
 		"admin_socket", loaded.Server.AdminSocketPath,
 		"verbose", options.Verbose,
+		"rate_limit_per_second", loaded.RateLimit.PerSecond,
+		"rate_limit_per_minute", loaded.RateLimit.PerMinute,
+		"audit_type", loaded.Audit.Type,
+		"audit_stderr", loaded.Audit.Stderr,
 	)
 	return runServerComponents(ctx, stopRequested, components, shutdown, logger)
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
@@ -29,6 +30,65 @@ func TestRouterHandlesUserIDWithoutOnlineClient(t *testing.T) {
 	}
 	if relay.CallCount() != 0 {
 		t.Fatal("/userid should not reach relay")
+	}
+}
+
+func TestConversationRouterRateLimitsUniqueUserInputBeforeExecution(t *testing.T) {
+	now := time.Unix(1000, 0)
+	collector := &routerAuditCollector{}
+	router, gateway, relay := newRouterHarnessWithConfig(t, ConversationRouterConfig{
+		RateLimiter:   NewUserRateLimiter(1, 20, func() time.Time { return now }),
+		Auditor:       collector,
+		AuditRedactor: audit.NewRedactor([]string{"bot-secret"}),
+		BotIDHash:     "bot-hash",
+	})
+	router.now = func() time.Time { return now }
+	router.Handle(context.Background(), routerMessage("request-1", "message-1", "user-a", "/help bot-secret"))
+	router.Handle(context.Background(), routerMessage("request-2", "message-2", "user-a", "/help"))
+	if reply := gateway.LastReply(); reply != "输入过于频繁，请在 1 秒后重试。" {
+		t.Fatalf("reply = %q", reply)
+	}
+	if relay.CallCount() != 0 {
+		t.Fatalf("relay calls = %d", relay.CallCount())
+	}
+	events := collector.Events()
+	if len(events) != 2 || events[0].Outcome != "accepted" || events[1].Outcome != "rate_limited" {
+		t.Fatalf("events = %#v", events)
+	}
+	if events[0].Body != "/help "+audit.RedactedValue || events[0].PrincipalID != "user-a" || events[0].BotIDHash != "bot-hash" {
+		t.Fatalf("accepted event = %#v", events[0])
+	}
+	if events[1].Attributes["limit.window"] != "second" || events[1].Attributes["limit.retry_after_ms"] != "1000" {
+		t.Fatalf("limited event = %#v", events[1])
+	}
+}
+
+func TestConversationRouterDuplicateMessageDoesNotConsumeQuotaOrRepeatAudit(t *testing.T) {
+	now := time.Unix(1100, 0)
+	collector := &routerAuditCollector{}
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{
+		RateLimiter: NewUserRateLimiter(1, 0, func() time.Time { return now }), Auditor: collector,
+	})
+	message := routerMessage("request-1", "message-1", "user-a", "/help")
+	router.Handle(context.Background(), message)
+	router.Handle(context.Background(), message)
+	if len(collector.Events()) != 1 || gateway.ReplyCount() != 1 {
+		t.Fatalf("events = %#v, replies = %#v", collector.Events(), gateway.Replies())
+	}
+	now = now.Add(time.Second)
+	router.Handle(context.Background(), routerMessage("request-2", "message-2", "user-a", "/userid"))
+	if len(collector.Events()) != 2 || gateway.LastReply() != "user-a" {
+		t.Fatalf("events = %#v, reply = %q", collector.Events(), gateway.LastReply())
+	}
+}
+
+func TestConversationRouterAuditsInvalidAndNoSessionInputs(t *testing.T) {
+	collector := &routerAuditCollector{}
+	router, _, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{Auditor: collector})
+	router.Handle(context.Background(), routerMessage("request-invalid", "message-invalid", "user-a", "/mode png"))
+	events := collector.Events()
+	if len(events) != 1 || events[0].Action != "invalid" || events[0].Outcome != "accepted" || events[0].Body != "/mode png" {
+		t.Fatalf("events = %#v", events)
 	}
 }
 
@@ -903,6 +963,102 @@ func TestRouterTerminalPushUsesSourceAndAppendsDifferentCurrentSelection(t *test
 	}
 }
 
+func TestConversationRouterTerminalAuditRecordsTextReply(t *testing.T) {
+	collector := &routerAuditCollector{}
+	router, _, relay := newRouterHarnessWithConfig(t, ConversationRouterConfig{Auditor: collector})
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	})
+	entry := router.catalog.CreateNumberedSnapshot("user-a")[0]
+	if err := router.catalog.SetSelection("user-a", entry.Ref); err != nil {
+		t.Fatal(err)
+	}
+	terminal := hprp.Content{Type: hprp.ContentTypeTerminal, Mode: hprp.OutputModeText, Text: "终端原始文本", Page: &hprp.TerminalPage{Current: 1, Total: 1}}
+	relay.executeReply = RelayExecution{StructuredContent: &terminal}
+	router.Handle(context.Background(), routerMessage("request-1", "message-1", "user-a", "/con"))
+	events := terminalAuditEvents(collector.Events())
+	if len(events) != 1 {
+		t.Fatalf("events = %#v", collector.Events())
+	}
+	event := events[0]
+	if event.Action != "command_result" || event.Outcome != "delivered" || event.Presentation != "txt" || event.Delivery != "reply" || event.Body != "终端原始文本" {
+		t.Fatalf("event = %#v", event)
+	}
+	if event.MachineID != "home-mac" || event.PaneID != "w1:p1" || event.SessionIDHash == "" || event.MessageIDHash == "" || event.RequestIDHash == "" {
+		t.Fatalf("target event = %#v", event)
+	}
+}
+
+func TestConversationRouterTerminalAuditRecordsImagePushAndFallbackText(t *testing.T) {
+	tests := []struct {
+		name             string
+		gateway          WeComGateway
+		wantPresentation string
+	}{
+		{name: "image", gateway: &routerGateway{}, wantPresentation: "img"},
+		{name: "fallback", gateway: &imageFallbackGateway{}, wantPresentation: "txt"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			collector := &routerAuditCollector{}
+			deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			router, err := NewConversationRouterWithConfig(ConversationRouterConfig{Auditor: collector}, NewSessionCatalog(), NewUserExecutor(64), test.gateway, &routerRelay{capabilities: make(map[string]bool)}, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+				Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+			})
+			target := hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"}
+			if err := router.SendCommandOutput(context.Background(), "user-a", hprp.CommandOutput{Target: target, Content: terminalImageContent("图片配套审计文本", 1, 1)}); err != nil {
+				t.Fatal(err)
+			}
+			events := terminalAuditEvents(collector.Events())
+			if len(events) != 1 || events[0].Action != "command_output" || events[0].Outcome != "delivered" || events[0].Presentation != test.wantPresentation || events[0].Delivery != "push" || events[0].Body != "图片配套审计文本" {
+				t.Fatalf("events = %#v", events)
+			}
+		})
+	}
+}
+
+func TestConversationRouterTerminalAuditRecordsFinalDeliveryFailure(t *testing.T) {
+	collector := &routerAuditCollector{}
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := failingRouterGateway{err: errors.New("delivery failed")}
+	router, err := NewConversationRouterWithConfig(ConversationRouterConfig{Auditor: collector}, NewSessionCatalog(), NewUserExecutor(64), gateway, &routerRelay{capabilities: make(map[string]bool)}, deduper, slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	})
+	target := hprp.Target{MachineID: "home-mac", SlotID: "w1:p1", SessionID: "occ-1"}
+	err = router.SendCommandOutput(context.Background(), "user-a", routerTerminalCommandOutput(target, "失败前的终端文本", 1, 1))
+	if err == nil {
+		t.Fatal("SendCommandOutput() error = nil")
+	}
+	events := terminalAuditEvents(collector.Events())
+	if len(events) != 1 || events[0].Outcome != "delivery_failed" || events[0].Presentation != "txt" || events[0].Body != "失败前的终端文本" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func terminalAuditEvents(events []audit.Event) []audit.Event {
+	filtered := make([]audit.Event, 0, len(events))
+	for _, event := range events {
+		if event.EventName == audit.EventNameTerminalOutput {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
 func TestRouterSerializesOutboundImageAndTextForSameUser(t *testing.T) {
 	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
 	if err != nil {
@@ -1246,6 +1402,25 @@ type routerGateway struct {
 	images  [][]byte
 }
 
+type routerAuditCollector struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (collector *routerAuditCollector) Emit(event audit.Event) {
+	collector.mu.Lock()
+	collector.events = append(collector.events, event)
+	collector.mu.Unlock()
+}
+
+func (collector *routerAuditCollector) Shutdown(context.Context) error { return nil }
+
+func (collector *routerAuditCollector) Events() []audit.Event {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	return append([]audit.Event(nil), collector.events...)
+}
+
 type failingRouterGateway struct {
 	err error
 }
@@ -1253,6 +1428,14 @@ type failingRouterGateway struct {
 type failingImageHeaderGateway struct {
 	err        error
 	imageCalls int
+}
+
+type imageFallbackGateway struct{}
+
+func (*imageFallbackGateway) RespondMarkdown(context.Context, string, string) error { return nil }
+func (*imageFallbackGateway) SendMarkdownTo(context.Context, string, string) error  { return nil }
+func (*imageFallbackGateway) SendImageTo(context.Context, string, []byte) error {
+	return errors.New("image upload failed")
 }
 
 func (gateway *failingImageHeaderGateway) RespondMarkdown(context.Context, string, string) error {

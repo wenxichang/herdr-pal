@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +95,133 @@ func TestLoadServerReadsSecretAndDefaultsCredentialPath(t *testing.T) {
 	}
 	if loaded.Server.AdminSocketPath != filepath.Join(loaded.Server.StateDir, "admin.sock") {
 		t.Fatalf("admin socket = %q, want under %q", loaded.Server.AdminSocketPath, loaded.Server.StateDir)
+	}
+	if loaded.RateLimit.PerSecond != 1 || loaded.RateLimit.PerMinute != 20 {
+		t.Fatalf("rate limit defaults = %#v", loaded.RateLimit)
+	}
+	if loaded.Audit.Type != "none" || loaded.Audit.Stderr || len(loaded.Audit.Headers) != 0 {
+		t.Fatalf("audit defaults = %#v", loaded.Audit)
+	}
+}
+
+func TestLoadServerAcceptsExplicitRateLimitDisable(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom": {"bot_id": "bot-1"},
+  "server": {"listen": "127.0.0.1:9443"},
+  "rate_limit": {"per_second": 0, "per_minute": 0},
+  "audit": {"type": "none", "stderr": true},
+  "log": {}
+}`)
+	loaded, err := LoadServer(path, func(string) string { return "secret-value" })
+	if err != nil {
+		t.Fatalf("LoadServer() error = %v", err)
+	}
+	if loaded.RateLimit.PerSecond != 0 || loaded.RateLimit.PerMinute != 0 {
+		t.Fatalf("rate limit = %#v", loaded.RateLimit)
+	}
+	if loaded.Audit.Type != "none" || !loaded.Audit.Stderr {
+		t.Fatalf("audit = %#v", loaded.Audit)
+	}
+}
+
+func TestLoadServerRejectsInvalidRateLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value int
+	}{
+		{name: "negative second", field: "per_second", value: -1},
+		{name: "large second", field: "per_second", value: 10001},
+		{name: "negative minute", field: "per_minute", value: -1},
+		{name: "large minute", field: "per_minute", value: 10001},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"rate_limit":{"` + test.field + `":` + fmt.Sprint(test.value) + `},"log":{}}`
+			_, err := LoadServer(writeConfig(t, raw), func(string) string { return "secret" })
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("LoadServer() error = %v, want %q", err, test.field)
+			}
+		})
+	}
+}
+
+func TestLoadServerAcceptsOTLPAuditAndParsesHeaders(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom": {"bot_id": "bot-1"},
+  "server": {"listen": "127.0.0.1:9443"},
+  "audit": {
+    "type": "otlp",
+    "endpoint": "https://collector.example:4318/v1/logs",
+    "skip_verify": true,
+    "stderr": true
+  },
+  "log": {}
+}`)
+	loaded, err := LoadServer(path, func(name string) string {
+		switch name {
+		case SecretEnvName:
+			return "secret-value"
+		case OTLPLogsHeadersEnvName:
+			return "Authorization=Bearer%20token,x-tenant=team%2Cone"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("LoadServer() error = %v", err)
+	}
+	if loaded.Audit.Type != "otlp" || loaded.Audit.Endpoint != "https://collector.example:4318/v1/logs" || !loaded.Audit.SkipVerify || !loaded.Audit.Stderr {
+		t.Fatalf("audit = %#v", loaded.Audit)
+	}
+	if loaded.Audit.Headers["Authorization"] != "Bearer token" || loaded.Audit.Headers["X-Tenant"] != "team,one" {
+		t.Fatalf("headers = %#v", loaded.Audit.Headers)
+	}
+}
+
+func TestLoadServerRejectsInvalidAudit(t *testing.T) {
+	tests := []struct {
+		name  string
+		audit string
+		want  string
+	}{
+		{name: "unknown type", audit: `{"type":"file"}`, want: "audit.type"},
+		{name: "missing endpoint", audit: `{"type":"otlp"}`, want: "audit.endpoint"},
+		{name: "userinfo", audit: `{"type":"otlp","endpoint":"https://user:pass@collector/v1/logs"}`, want: "userinfo"},
+		{name: "query", audit: `{"type":"otlp","endpoint":"https://collector/v1/logs?q=1"}`, want: "query"},
+		{name: "fragment", audit: `{"type":"otlp","endpoint":"https://collector/v1/logs#x"}`, want: "fragment"},
+		{name: "wrong path", audit: `{"type":"otlp","endpoint":"https://collector/"}`, want: "/v1/logs"},
+		{name: "wrong scheme", audit: `{"type":"otlp","endpoint":"ftp://collector/v1/logs"}`, want: "http"},
+		{name: "http skip verify", audit: `{"type":"otlp","endpoint":"http://collector/v1/logs","skip_verify":true}`, want: "skip_verify"},
+		{name: "none endpoint", audit: `{"type":"none","endpoint":"https://collector/v1/logs"}`, want: "audit.endpoint"},
+		{name: "none skip verify", audit: `{"type":"none","skip_verify":true}`, want: "skip_verify"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"audit":` + test.audit + `,"log":{}}`
+			_, err := LoadServer(writeConfig(t, raw), func(string) string { return "secret" })
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadServer() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadServerRejectsMalformedOTLPHeaders(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom": {"bot_id": "bot-1"},
+  "server": {"listen": "127.0.0.1:9443"},
+  "audit": {"type": "otlp", "endpoint": "https://collector/v1/logs"},
+  "log": {}
+}`)
+	_, err := LoadServer(path, func(name string) string {
+		if name == SecretEnvName {
+			return "secret"
+		}
+		return "missing-equals"
+	})
+	if err == nil || !strings.Contains(err.Error(), OTLPLogsHeadersEnvName) || strings.Contains(err.Error(), "missing-equals") {
+		t.Fatalf("LoadServer() error = %v", err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
@@ -161,7 +162,7 @@ func (router *ConversationRouter) sendCommandOutput(ctx context.Context, userID 
 		return err
 	}
 	router.activity.Touch(userID, router.now())
-	return router.sendContentPush(ctx, userID, entry, output.Content)
+	return router.sendContentPush(ctx, userID, entry, output.Content, "command_output")
 }
 
 // SendNotification 根据结构化状态事件决定是否拉取并发送终端快照。
@@ -220,7 +221,7 @@ func (router *ConversationRouter) sendNotification(ctx context.Context, userID, 
 	if content == nil {
 		return nil
 	}
-	if err := router.sendContentPush(ctx, userID, entry, *content); err != nil {
+	if err := router.sendContentPush(ctx, userID, entry, *content, "status_notification"); err != nil {
 		router.logger.Warn("Agent 状态通知终端发送失败", append(append([]any{"user_hash", routerHash(userID), "status", notification.Data.Status}, targetLogArgs(entry.Ref)...), serverErrorLogArgs(err)...)...)
 		return nil
 	}
@@ -239,12 +240,24 @@ type ConversationRouter struct {
 	requestTimeout time.Duration
 	activity       *userActivityTracker
 	now            func() time.Time
+	rateLimiter    *UserRateLimiter
+	auditor        audit.Auditor
+	auditRedactor  *audit.Redactor
+	botIDHash      string
 }
 
 // ConversationRouterConfig 是服务端会话路由器的展示配置。
 type ConversationRouterConfig struct {
 	// RelayURL 是在 /help 客户端配置示例中展示的 WSS 地址。
 	RelayURL string
+	// RateLimiter 在消息去重后限制单个用户的唯一输入频率；nil 表示禁用。
+	RateLimiter *UserRateLimiter
+	// Auditor 接收用户输入和终端文本审计事件；nil 表示不输出。
+	Auditor audit.Auditor
+	// AuditRedactor 在正文离开 Router 前移除 Server 持有的凭据。
+	AuditRedactor *audit.Redactor
+	// BotIDHash 用于跨事件关联机器人，但不暴露 Bot ID 原文。
+	BotIDHash string
 }
 
 // NewConversationRouter 创建多用户会话路由器。
@@ -257,10 +270,20 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 	if catalog == nil || executor == nil || gateway == nil || relay == nil || deduper == nil || logger == nil {
 		return nil, ErrInvalidRouterDependency
 	}
+	if config.RateLimiter == nil {
+		config.RateLimiter = NewUserRateLimiter(0, 0, time.Now)
+	}
+	if config.Auditor == nil {
+		config.Auditor = audit.NoopAuditor{}
+	}
+	if config.AuditRedactor == nil {
+		config.AuditRedactor = audit.NewRedactor(nil)
+	}
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
 		deduper: deduper, logger: logger, helpText: buildServerHelpText(config.RelayURL), requestTimeout: defaultRelayRequestTimeout,
-		activity: newUserActivityTracker(), now: time.Now,
+		activity: newUserActivityTracker(), now: time.Now, rateLimiter: config.RateLimiter,
+		auditor: config.Auditor, auditRedactor: config.AuditRedactor, botIDHash: config.BotIDHash,
 	}, nil
 }
 
@@ -288,6 +311,29 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 		router.logger.Info("企业微信重复消息已忽略", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "reason", "消息幂等标识已处理")
 		return
 	}
+	decision := router.rateLimiter.Allow(message.UserID)
+	router.emitUserInputAudit(message, decision)
+	if !decision.Allowed {
+		perSecond, perMinute := router.rateLimiter.Limits()
+		retryMilliseconds := decision.RetryAfter.Milliseconds()
+		if retryMilliseconds < 1 {
+			retryMilliseconds = 1
+		}
+		router.logger.Warn("企业微信消息触发输入限速",
+			"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID),
+			"window", decision.Window, "per_second", perSecond, "per_minute", perMinute,
+			"retry_after_ms", retryMilliseconds,
+		)
+		retrySeconds := int(decision.RetryAfter / time.Second)
+		if decision.RetryAfter%time.Second != 0 {
+			retrySeconds++
+		}
+		if retrySeconds < 1 {
+			retrySeconds = 1
+		}
+		router.reply(ctx, message, fmt.Sprintf("输入过于频繁，请在 %d 秒后重试。", retrySeconds))
+		return
+	}
 	err := router.executor.Submit(ctx, message.UserID, func(taskContext context.Context) error {
 		router.handleAuthorized(taskContext, message)
 		return nil
@@ -298,6 +344,41 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 	} else if err != nil && ctx.Err() == nil {
 		router.logger.Warn("用户消息执行失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
 	}
+}
+
+func (router *ConversationRouter) emitUserInputAudit(message im.IncomingText, decision RateLimitDecision) {
+	actionName := "invalid"
+	if action, err := parseServerAction(message.Content); err == nil {
+		actionName = serverActionName(action.kind)
+	}
+	outcome := "accepted"
+	attributes := make(map[string]string)
+	if !decision.Allowed {
+		outcome = "rate_limited"
+		perSecond, perMinute := router.rateLimiter.Limits()
+		attributes["limit.window"] = decision.Window
+		attributes["limit.retry_after_ms"] = strconv.FormatInt(maxInt64(decision.RetryAfter.Milliseconds(), 1), 10)
+		attributes["limit.per_second"] = strconv.Itoa(perSecond)
+		attributes["limit.per_minute"] = strconv.Itoa(perMinute)
+	}
+	now := router.now()
+	event, err := audit.PrepareEvent(audit.Event{
+		EventName: audit.EventNameUserInput, Timestamp: now, PrincipalID: message.UserID,
+		BotIDHash: router.botIDHash, MessageID: message.MessageID, RequestID: message.RequestID,
+		Action: actionName, Outcome: outcome, Body: router.auditRedactor.Redact(message.Content), Attributes: attributes,
+	}, now, nil)
+	if err != nil {
+		router.logger.Warn("用户输入审计事件构造失败", "error_type", "event_id_generation")
+		return
+	}
+	router.auditor.Emit(event)
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func (router *ConversationRouter) handleAuthorized(ctx context.Context, message im.IncomingText) {
@@ -414,7 +495,7 @@ func (router *ConversationRouter) handleSelect(ctx context.Context, message im.I
 		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"。")
 		return
 	}
-	if err := router.sendContentReply(ctx, message, entry, *result.StructuredContent); err != nil {
+	if err := router.sendContentReply(ctx, message, entry, *result.StructuredContent, "select_console"); err != nil {
 		router.logInteractionError(message, "select", "send_console", entry.Ref, err)
 		router.reply(ctx, message, "已选择 "+catalogTargetLabel(entry)+"，但"+safeRouterError(err))
 	}
@@ -452,7 +533,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 		router.reply(ctx, message, "客户端已处理。")
 		return
 	}
-	if err := router.sendContentReply(ctx, message, entry, *result.StructuredContent); err != nil {
+	if err := router.sendContentReply(ctx, message, entry, *result.StructuredContent, "command_result"); err != nil {
 		router.logInteractionError(message, "execute", "send_response", entry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 	}
@@ -520,7 +601,7 @@ func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, mes
 		router.reply(ctx, message, "客户端已处理。")
 		return
 	}
-	if err := router.sendContentReply(ctx, message, finalEntry, *result.StructuredContent); err != nil {
+	if err := router.sendContentReply(ctx, message, finalEntry, *result.StructuredContent, "command_result"); err != nil {
 		router.logInteractionError(message, "directed_execute", "send_response", finalEntry.Ref, err)
 		router.reply(ctx, message, safeRouterError(err))
 	}
@@ -598,7 +679,7 @@ func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, u
 	return router.catalog.ResolveTarget(userID, replacement)
 }
 
-func (router *ConversationRouter) sendContentReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
+func (router *ConversationRouter) sendContentReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content, action string) error {
 	if content.Type == hprp.ContentTypeText {
 		if strings.TrimSpace(content.Text) == "" {
 			return router.reply(ctx, message, "客户端已处理。")
@@ -609,58 +690,73 @@ func (router *ConversationRouter) sendContentReply(ctx context.Context, message 
 	if content.Type != hprp.ContentTypeTerminal {
 		return hprp.ErrInvalidMessage
 	}
+	presentation := hprp.OutputModeText
+	var sendErr error
 	if content.Mode == hprp.OutputModeImage && content.Image != nil {
-		return router.sendTerminalImageReply(ctx, message, source, content)
+		presentation, sendErr = router.sendTerminalImageReplyResult(ctx, message, source, content)
+	} else {
+		var text string
+		text, sendErr = router.renderTerminalText(message.UserID, source, content)
+		if sendErr == nil {
+			sendErr = router.reply(ctx, message, text)
+		}
 	}
-	text, err := router.renderTerminalText(message.UserID, source, content)
-	if err != nil {
-		return err
-	}
-	return router.reply(ctx, message, text)
+	router.emitTerminalAudit(message.UserID, message.MessageID, message.RequestID, source, content, action, "reply", presentation, sendErr)
+	return sendErr
 }
 
-func (router *ConversationRouter) sendContentPush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
+func (router *ConversationRouter) sendContentPush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content, action string) error {
 	if content.Type == hprp.ContentTypeText {
 		return router.sendMarkdownTo(ctx, userID, content.Text)
 	}
 	if content.Type != hprp.ContentTypeTerminal {
 		return hprp.ErrInvalidMessage
 	}
+	presentation := hprp.OutputModeText
+	var sendErr error
 	if content.Mode == hprp.OutputModeImage && content.Image != nil {
-		return router.sendTerminalImagePush(ctx, userID, source, content)
+		presentation, sendErr = router.sendTerminalImagePushResult(ctx, userID, source, content)
+	} else {
+		var text string
+		text, sendErr = router.renderTerminalText(userID, source, content)
+		if sendErr == nil {
+			sendErr = router.sendMarkdownTo(ctx, userID, text)
+		}
 	}
-	text, err := router.renderTerminalText(userID, source, content)
-	if err != nil {
-		return err
-	}
-	return router.sendMarkdownTo(ctx, userID, text)
+	router.emitTerminalAudit(userID, "", "", source, content, action, "push", presentation, sendErr)
+	return sendErr
 }
 
 func (router *ConversationRouter) sendTerminalImageReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
+	_, err := router.sendTerminalImageReplyResult(ctx, message, source, content)
+	return err
+}
+
+func (router *ConversationRouter) sendTerminalImageReplyResult(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) (hprp.OutputMode, error) {
 	imageGateway, ok := router.gateway.(WeComImageGateway)
 	if !ok {
-		return router.sendTerminalTextFallbackReply(ctx, message, source, content)
+		return hprp.OutputModeText, router.sendTerminalTextFallbackReply(ctx, message, source, content)
 	}
 	png, err := decodeTerminalPNG(content)
 	if err != nil {
-		return router.sendTerminalTextFallbackReply(ctx, message, source, content)
+		return hprp.OutputModeText, router.sendTerminalTextFallbackReply(ctx, message, source, content)
 	}
 	header, err := router.terminalHeader(message.UserID, source, content)
 	if err != nil {
-		return err
+		return hprp.OutputModeImage, err
 	}
 	if err := router.reply(ctx, message, header); err != nil {
-		return err
+		return hprp.OutputModeImage, err
 	}
 	if err := imageGateway.SendImageTo(ctx, message.UserID, png); err != nil {
 		router.logger.Warn("企业微信终端图片发送失败，降级为文本", append(append([]any{"user_hash", routerHash(message.UserID)}, targetLogArgs(source.Ref)...), serverErrorLogArgs(err)...)...)
 		text, renderErr := router.renderTerminalText(message.UserID, source, content)
 		if renderErr != nil {
-			return renderErr
+			return hprp.OutputModeText, renderErr
 		}
-		return router.sendMarkdownTo(ctx, message.UserID, text)
+		return hprp.OutputModeText, router.sendMarkdownTo(ctx, message.UserID, text)
 	}
-	return nil
+	return hprp.OutputModeImage, nil
 }
 
 func (router *ConversationRouter) sendTerminalTextFallbackReply(ctx context.Context, message im.IncomingText, source CatalogEntry, content hprp.Content) error {
@@ -672,26 +768,31 @@ func (router *ConversationRouter) sendTerminalTextFallbackReply(ctx context.Cont
 }
 
 func (router *ConversationRouter) sendTerminalImagePush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
+	_, err := router.sendTerminalImagePushResult(ctx, userID, source, content)
+	return err
+}
+
+func (router *ConversationRouter) sendTerminalImagePushResult(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) (hprp.OutputMode, error) {
 	imageGateway, ok := router.gateway.(WeComImageGateway)
 	if !ok {
-		return router.sendTerminalTextFallbackPush(ctx, userID, source, content)
+		return hprp.OutputModeText, router.sendTerminalTextFallbackPush(ctx, userID, source, content)
 	}
 	png, err := decodeTerminalPNG(content)
 	if err != nil {
-		return router.sendTerminalTextFallbackPush(ctx, userID, source, content)
+		return hprp.OutputModeText, router.sendTerminalTextFallbackPush(ctx, userID, source, content)
 	}
 	header, err := router.terminalHeader(userID, source, content)
 	if err != nil {
-		return err
+		return hprp.OutputModeImage, err
 	}
 	if err := router.sendMarkdownTo(ctx, userID, header); err != nil {
-		return err
+		return hprp.OutputModeImage, err
 	}
 	if err := imageGateway.SendImageTo(ctx, userID, png); err != nil {
 		router.logger.Warn("企业微信终端图片发送失败，降级为文本", append(append([]any{"user_hash", routerHash(userID)}, targetLogArgs(source.Ref)...), serverErrorLogArgs(err)...)...)
-		return router.sendTerminalTextFallbackPush(ctx, userID, source, content)
+		return hprp.OutputModeText, router.sendTerminalTextFallbackPush(ctx, userID, source, content)
 	}
-	return nil
+	return hprp.OutputModeImage, nil
 }
 
 func (router *ConversationRouter) sendTerminalTextFallbackPush(ctx context.Context, userID string, source CatalogEntry, content hprp.Content) error {
@@ -700,6 +801,39 @@ func (router *ConversationRouter) sendTerminalTextFallbackPush(ctx context.Conte
 		return err
 	}
 	return router.sendMarkdownTo(ctx, userID, text)
+}
+
+func (router *ConversationRouter) emitTerminalAudit(userID, messageID, requestID string, source CatalogEntry, content hprp.Content, action, delivery string, presentation hprp.OutputMode, sendErr error) {
+	outcome := "delivered"
+	if sendErr != nil {
+		outcome = "delivery_failed"
+	}
+	requestedPresentation := content.Mode
+	if requestedPresentation == "" {
+		requestedPresentation = hprp.OutputModeText
+	}
+	attributes := map[string]string{"requested_presentation": string(requestedPresentation)}
+	if content.Page != nil {
+		attributes["page.current"] = strconv.Itoa(content.Page.Current)
+		attributes["page.total"] = strconv.Itoa(content.Page.Total)
+	}
+	timestamp := router.now()
+	if content.CapturedAt != nil && !content.CapturedAt.IsZero() {
+		timestamp = *content.CapturedAt
+	}
+	observedAt := router.now()
+	event, err := audit.PrepareEvent(audit.Event{
+		EventName: audit.EventNameTerminalOutput, Timestamp: timestamp, PrincipalID: userID,
+		BotIDHash: router.botIDHash, MessageID: messageID, RequestID: requestID,
+		Action: action, Outcome: outcome, MachineID: source.Ref.MachineID, PaneID: source.Ref.SlotID,
+		SessionID: source.Ref.SessionID, Presentation: string(presentation), Delivery: delivery,
+		Body: router.auditRedactor.Redact(content.Text), Attributes: attributes,
+	}, observedAt, nil)
+	if err != nil {
+		router.logger.Warn("终端输出审计事件构造失败", "error_type", "event_id_generation")
+		return
+	}
+	router.auditor.Emit(event)
 }
 
 func (router *ConversationRouter) renderTerminalText(userID string, source CatalogEntry, content hprp.Content) (string, error) {

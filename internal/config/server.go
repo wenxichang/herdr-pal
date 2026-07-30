@@ -1,7 +1,11 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,11 +13,26 @@ import (
 
 const maxAdminSocketPathBytes = 103
 
+const maxRateLimit = 10000
+
+// OTLPLogsHeadersEnvName 是 OTLP Logs 请求头使用的标准环境变量名。
+const OTLPLogsHeadersEnvName = "OTEL_EXPORTER_OTLP_LOGS_HEADERS"
+
 // ServerConfig 是 herdr-pal-server 的完整配置。
 type ServerConfig struct {
-	WeCom  ServerWeComConfig `json:"wecom"`
-	Server ListenerConfig    `json:"server"`
-	Log    LogConfig         `json:"log"`
+	WeCom     ServerWeComConfig `json:"wecom"`
+	Server    ListenerConfig    `json:"server"`
+	RateLimit RateLimitConfig   `json:"rate_limit"`
+	Audit     AuditConfig       `json:"audit"`
+	Log       LogConfig         `json:"log"`
+}
+
+type serverConfigFile struct {
+	WeCom     ServerWeComConfig `json:"wecom"`
+	Server    ListenerConfig    `json:"server"`
+	RateLimit *RateLimitConfig  `json:"rate_limit"`
+	Audit     AuditConfig       `json:"audit"`
+	Log       LogConfig         `json:"log"`
 }
 
 // ServerWeComConfig 是服务端独占的企业微信机器人配置。
@@ -33,6 +52,43 @@ type ListenerConfig struct {
 	AdminSocketPath string `json:"-"`
 }
 
+// RateLimitConfig 定义单个企业微信用户的滚动窗口输入限额。
+type RateLimitConfig struct {
+	PerSecond int `json:"per_second"`
+	PerMinute int `json:"per_minute"`
+}
+
+// UnmarshalJSON 保留显式零值，并为缺失字段应用稳定默认值。
+func (config *RateLimitConfig) UnmarshalJSON(data []byte) error {
+	raw := struct {
+		PerSecond *int `json:"per_second"`
+		PerMinute *int `json:"per_minute"`
+	}{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	config.PerSecond = 1
+	config.PerMinute = 20
+	if raw.PerSecond != nil {
+		config.PerSecond = *raw.PerSecond
+	}
+	if raw.PerMinute != nil {
+		config.PerMinute = *raw.PerMinute
+	}
+	return nil
+}
+
+// AuditConfig 定义业务审计事件的输出方式。
+type AuditConfig struct {
+	Type       string            `json:"type"`
+	Endpoint   string            `json:"endpoint"`
+	SkipVerify bool              `json:"skip_verify"`
+	Stderr     bool              `json:"stderr"`
+	Headers    map[string]string `json:"-"`
+}
+
 // LoadServer 加载服务端配置并从环境读取企业微信 Secret。
 func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 	loaded, err := LoadServerAdmin(path)
@@ -43,6 +99,13 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 		getenv = os.Getenv
 	}
 	loaded.WeCom.Secret = getenv(SecretEnvName)
+	if loaded.Audit.Type == "otlp" {
+		headers, err := parseOTLPHeaders(getenv(OTLPLogsHeadersEnvName))
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("环境变量 %s 无效", OTLPLogsHeadersEnvName)
+		}
+		loaded.Audit.Headers = headers
+	}
 	if strings.TrimSpace(loaded.WeCom.BotID) == "" {
 		return ServerConfig{}, fmt.Errorf("缺少必填字段 bot_id")
 	}
@@ -57,9 +120,16 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 
 // LoadServerAdmin 加载不依赖企业微信 Secret 的服务端管理配置。
 func LoadServerAdmin(path string) (ServerConfig, error) {
-	loaded, err := decodeFile[ServerConfig](path)
+	raw, err := decodeFile[serverConfigFile](path)
 	if err != nil {
 		return ServerConfig{}, err
+	}
+	loaded := ServerConfig{
+		WeCom: raw.WeCom, Server: raw.Server, Audit: raw.Audit, Log: raw.Log,
+		RateLimit: RateLimitConfig{PerSecond: 1, PerMinute: 20},
+	}
+	if raw.RateLimit != nil {
+		loaded.RateLimit = *raw.RateLimit
 	}
 	if strings.TrimSpace(loaded.Server.StateDir) == "" {
 		configDir, err := os.UserConfigDir()
@@ -84,7 +154,101 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 	if strings.TrimSpace(loaded.Log.Level) == "" {
 		loaded.Log.Level = "info"
 	}
+	if err := validateRateLimit(loaded.RateLimit); err != nil {
+		return ServerConfig{}, err
+	}
+	if err := validateAudit(&loaded.Audit); err != nil {
+		return ServerConfig{}, err
+	}
 	return loaded, nil
+}
+
+func validateRateLimit(config RateLimitConfig) error {
+	if config.PerSecond < 0 || config.PerSecond > maxRateLimit {
+		return fmt.Errorf("rate_limit.per_second 必须在 0 到 %d 之间", maxRateLimit)
+	}
+	if config.PerMinute < 0 || config.PerMinute > maxRateLimit {
+		return fmt.Errorf("rate_limit.per_minute 必须在 0 到 %d 之间", maxRateLimit)
+	}
+	return nil
+}
+
+func validateAudit(config *AuditConfig) error {
+	config.Type = strings.ToLower(strings.TrimSpace(config.Type))
+	config.Endpoint = strings.TrimSpace(config.Endpoint)
+	if config.Type == "" {
+		config.Type = "none"
+	}
+	switch config.Type {
+	case "none":
+		if config.Endpoint != "" {
+			return fmt.Errorf("audit.endpoint 只能在 audit.type=otlp 时配置")
+		}
+		if config.SkipVerify {
+			return fmt.Errorf("audit.skip_verify 只能在 audit.type=otlp 且使用 HTTPS 时配置")
+		}
+		return nil
+	case "otlp":
+	default:
+		return fmt.Errorf("audit.type 只支持 none 或 otlp")
+	}
+	if config.Endpoint == "" {
+		return fmt.Errorf("audit.endpoint 在 audit.type=otlp 时必填")
+	}
+	parsed, err := url.Parse(config.Endpoint)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return fmt.Errorf("audit.endpoint 必须是绝对 HTTP(S) URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("audit.endpoint 只支持 http 或 https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("audit.endpoint 不允许包含 userinfo")
+	}
+	if parsed.RawQuery != "" {
+		return fmt.Errorf("audit.endpoint 不允许包含 query")
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("audit.endpoint 不允许包含 fragment")
+	}
+	if parsed.Path != "/v1/logs" {
+		return fmt.Errorf("audit.endpoint 路径必须是 /v1/logs")
+	}
+	if config.SkipVerify && parsed.Scheme != "https" {
+		return fmt.Errorf("audit.skip_verify 只允许用于 HTTPS")
+	}
+	return nil
+}
+
+func parseOTLPHeaders(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	headers := make(map[string]string)
+	for _, item := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("header 格式无效")
+		}
+		name, err := url.QueryUnescape(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("header 名称编码无效")
+		}
+		value, err := url.QueryUnescape(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, fmt.Errorf("header 值编码无效")
+		}
+		canonicalName := textproto.CanonicalMIMEHeaderKey(name)
+		if canonicalName == "" || strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("header 名称或值无效")
+		}
+		if _, exists := headers[canonicalName]; exists {
+			return nil, fmt.Errorf("header 重复")
+		}
+		headers[canonicalName] = value
+	}
+	return headers, nil
 }
 
 // AdminSocketPath 根据唯一的 state directory 推导本机 HPAP Socket 路径。
