@@ -32,18 +32,6 @@ func (server *Server) registerAuthRoutes(mux *http.ServeMux) {
 	server.handleMethod(mux, "/admin/api/v1/auth/password", http.MethodPost, server.browserHandler(http.HandlerFunc(server.changePassword), browserPolicy{AllowMustChange: true, RequireCSRF: true}))
 }
 
-func (server *Server) handleMethod(mux *http.ServeMux, route, method string, handler http.Handler) {
-	mux.Handle(route, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		setRequestRoute(request, route)
-		if request.Method != method {
-			writer.Header().Set("Allow", method)
-			_ = writeAPIError(writer, request, http.StatusMethodNotAllowed, "method_not_allowed", "HTTP 方法不受支持")
-			return
-		}
-		handler.ServeHTTP(writer, request)
-	}))
-}
-
 func (server *Server) login(writer http.ResponseWriter, request *http.Request) {
 	setRequestRoute(request, "/admin/api/v1/auth/login")
 	if !sameOrigin(request) {

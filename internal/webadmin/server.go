@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +44,28 @@ type Server struct {
 
 	randomMu sync.Mutex
 	handler  http.Handler
+	routes   map[string]*methodRouter
+}
+
+type methodRouter struct {
+	route    string
+	handlers map[string]http.Handler
+}
+
+func (router *methodRouter) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	setRequestRoute(request, router.route)
+	handler := router.handlers[request.Method]
+	if handler == nil {
+		methods := make([]string, 0, len(router.handlers))
+		for method := range router.handlers {
+			methods = append(methods, method)
+		}
+		sort.Strings(methods)
+		writer.Header().Set("Allow", strings.Join(methods, ", "))
+		_ = writeAPIError(writer, request, http.StatusMethodNotAllowed, "method_not_allowed", "HTTP 方法不受支持")
+		return
+	}
+	handler.ServeHTTP(writer, request)
 }
 
 // New 创建 Web 管理 Server 并注册认证路由。
@@ -58,15 +82,27 @@ func New(config Config) (*Server, error) {
 	server := &Server{
 		admin: config.Admin, auth: config.Auth, sessions: config.Sessions,
 		loginGuard: config.LoginGuard, logger: config.Logger, random: config.Random, now: config.Now,
+		routes: make(map[string]*methodRouter),
 	}
 	mux := http.NewServeMux()
 	server.registerAuthRoutes(mux)
+	server.registerManagementRoutes(mux)
 	mux.HandleFunc("/admin/api/v1/", func(writer http.ResponseWriter, request *http.Request) {
 		setRequestRoute(request, "/admin/api/v1/*")
 		_ = writeAPIError(writer, request, http.StatusNotFound, "not_found", "管理接口不存在")
 	})
 	server.handler = server.middleware(mux)
 	return server, nil
+}
+
+func (server *Server) handleMethod(mux *http.ServeMux, route, method string, handler http.Handler) {
+	router := server.routes[route]
+	if router == nil {
+		router = &methodRouter{route: route, handlers: make(map[string]http.Handler)}
+		server.routes[route] = router
+		mux.Handle(route, router)
+	}
+	router.handlers[method] = handler
 }
 
 // Handler 返回包含完整安全中间件链的 HTTP Handler。

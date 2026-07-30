@@ -75,17 +75,36 @@ func TestServerRecoversPanicWithoutLeakingDetails(t *testing.T) {
 }
 
 func newTestWebServer(t *testing.T) (*Server, adminauth.Bootstrap, *strings.Builder) {
+	return newTestWebServerWithDependencies(t, webTestDependencies{})
+}
+
+type webTestDependencies struct {
+	Connections adminservice.ConnectionManager
+	Sessions    adminservice.SessionInspector
+	Runtime     adminservice.RuntimeController
+}
+
+func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependencies) (*Server, adminauth.Bootstrap, *strings.Builder) {
 	t.Helper()
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	credentialStore, err := credential.LoadStore(filepath.Join(t.TempDir(), "credentials.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if dependencies.Connections == nil {
+		dependencies.Connections = emptyWebConnections{}
+	}
+	if dependencies.Sessions == nil {
+		dependencies.Sessions = emptyWebSessions{}
+	}
+	if dependencies.Runtime == nil {
+		dependencies.Runtime = &emptyWebRuntime{}
+	}
 	adminService, err := adminservice.New(adminservice.Config{
 		Credentials: credentialStore,
-		Connections: emptyWebConnections{},
-		Sessions:    emptyWebSessions{},
-		Runtime:     &emptyWebRuntime{},
+		Connections: dependencies.Connections,
+		Sessions:    dependencies.Sessions,
+		Runtime:     dependencies.Runtime,
 		Now:         func() time.Time { return now },
 	})
 	if err != nil {

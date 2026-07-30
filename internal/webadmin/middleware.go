@@ -215,6 +215,10 @@ func setRequestActor(request *http.Request, actor string) {
 	requestMetadataFrom(request).actor = actor
 }
 
+func setRequestTarget(request *http.Request, target string) {
+	requestMetadataFrom(request).target = target
+}
+
 func setRequestError(request *http.Request, code string) {
 	requestMetadataFrom(request).errorCode = code
 }
