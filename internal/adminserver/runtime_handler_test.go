@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
+	"github.com/wenxichang/herdr-pal/internal/adminservice"
 )
 
 func TestServerRuntimeHandlerStatusDebugAndStopAfterWrite(t *testing.T) {
@@ -18,7 +19,7 @@ func TestServerRuntimeHandlerStatusDebugAndStopAfterWrite(t *testing.T) {
 		TLS:          adminproto.TLSStatus{Mode: "automatic", SHA256Fingerprint: strings.Repeat("a", 64)},
 		BaseLogLevel: "warn",
 	}}
-	handler, err := NewRuntimeHandler(runtime)
+	handler, err := NewRuntimeHandler(newAdminServiceForTest(t, nil, nil, nil, runtime, func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func TestServerRuntimeHandlerStatusDebugAndStopAfterWrite(t *testing.T) {
 
 func TestServerRuntimeHandlerRejectsUnexpectedParams(t *testing.T) {
 	runtime := &fakeRuntimeInspector{}
-	handler, err := NewRuntimeHandler(runtime)
+	handler, err := NewRuntimeHandler(newAdminServiceForTest(t, nil, nil, nil, runtime, time.Now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +81,7 @@ func TestServerRuntimeHandlerRejectsUnexpectedParams(t *testing.T) {
 
 func TestServerRuntimeHandlerReleasesStopReservationWhenResponseWriteFails(t *testing.T) {
 	runtime := &fakeRuntimeInspector{}
-	handler, err := NewRuntimeHandler(runtime)
+	handler, err := NewRuntimeHandler(newAdminServiceForTest(t, nil, nil, nil, runtime, time.Now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,13 +114,13 @@ func handleRuntimeRequest(t *testing.T, handler *RuntimeHandler, method adminpro
 }
 
 type fakeRuntimeInspector struct {
-	status       adminproto.ServerStatusResult
+	status       adminservice.ServerStatus
 	enableCalls  int
 	disableCalls int
 	stopCalls    int
 }
 
-func (runtime *fakeRuntimeInspector) Status() adminproto.ServerStatusResult { return runtime.status }
+func (runtime *fakeRuntimeInspector) Status() adminservice.ServerStatus { return runtime.status }
 func (runtime *fakeRuntimeInspector) EnableDebug() {
 	runtime.enableCalls++
 	runtime.status.DebugEnabled = true

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminserver"
+	"github.com/wenxichang/herdr-pal/internal/adminservice"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
@@ -161,19 +162,29 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("创建服务运行状态: %w", err)
 	}
-	keyHandler, err := adminserver.NewKeyHandler(credentialStore, hub, logger, time.Now)
+	adminService, err := adminservice.New(adminservice.Config{
+		Credentials: credentialStore,
+		Connections: hub,
+		Sessions:    catalog,
+		Runtime:     runtimeInspector,
+		Now:         time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("创建共享管理服务: %w", err)
+	}
+	keyHandler, err := adminserver.NewKeyHandler(adminService, logger)
 	if err != nil {
 		return fmt.Errorf("创建 HPAP Key Handler: %w", err)
 	}
-	runtimeHandler, err := adminserver.NewRuntimeHandler(runtimeInspector)
+	runtimeHandler, err := adminserver.NewRuntimeHandler(adminService)
 	if err != nil {
 		return fmt.Errorf("创建 HPAP Runtime Handler: %w", err)
 	}
-	connectionHandler, err := adminserver.NewConnectionHandler(hub, time.Now)
+	connectionHandler, err := adminserver.NewConnectionHandler(adminService)
 	if err != nil {
 		return fmt.Errorf("创建 HPAP Connection Handler: %w", err)
 	}
-	sessionHandler, err := adminserver.NewSessionHandler(catalog, time.Now)
+	sessionHandler, err := adminserver.NewSessionHandler(adminService)
 	if err != nil {
 		return fmt.Errorf("创建 HPAP Session Handler: %w", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
+	"github.com/wenxichang/herdr-pal/internal/adminservice"
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/server"
@@ -77,11 +78,11 @@ type RuntimeConfig struct {
 	Stop        func()
 }
 
-// CredentialCounts 是 HPAP 凭据统计 DTO 的兼容别名。
-type CredentialCounts = adminproto.CredentialCounts
+// CredentialCounts 是共享管理服务凭据统计 DTO 的兼容别名。
+type CredentialCounts = adminservice.CredentialCounts
 
-// RuntimeStatus 是 HPAP server.status DTO 的兼容别名。
-type RuntimeStatus = adminproto.ServerStatusResult
+// RuntimeStatus 是共享管理服务 server.status DTO 的兼容别名。
+type RuntimeStatus = adminservice.ServerStatus
 
 // WeComStatusProvider 提供不包含凭据和消息正文的企业微信状态快照。
 type WeComStatusProvider interface {
@@ -174,11 +175,11 @@ func (inspector *RuntimeInspector) Status() RuntimeStatus {
 		PID: inspector.config.PID, GOOS: inspector.config.GOOS, GOARCH: inspector.config.GOARCH,
 		HPAP: adminproto.Protocol, HPRP: hprp.ProtocolVersion,
 		RelayListen: inspector.config.RelayListen, AdminSocket: inspector.config.AdminSocket,
-		TLS: adminproto.TLSStatus{
+		TLS: adminservice.TLSStatus{
 			Mode: inspector.config.TLS.Mode, NotAfter: inspector.config.TLS.NotAfter,
 			SHA256Fingerprint: inspector.config.TLS.SHA256Fingerprint,
 		},
-		WeCom: adminproto.WeComStatus{
+		WeCom: adminservice.WeComStatus{
 			State: string(weComStatus.State), ChangedAt: weComStatus.ChangedAt,
 			LastErrorType: weComStatus.LastErrorType, LastErrorCode: weComStatus.LastErrorCode,
 			LastHTTPStatus: weComStatus.LastHTTPStatus,

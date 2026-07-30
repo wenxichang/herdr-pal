@@ -9,28 +9,23 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
-	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/adminservice"
 )
 
 var errInvalidKeyHandler = errors.New("HPAP Key Handler 依赖无效")
 
-// KeyHandler 处理 Key 生命周期、来源策略和列表查询方法。
+// KeyHandler 把 HPAP Key 请求适配到共享管理服务。
 type KeyHandler struct {
-	credentials CredentialManager
-	connections ConnectionManager
-	logger      *slog.Logger
-	now         func() time.Time
+	service *adminservice.Service
+	logger  *slog.Logger
 }
 
-// NewKeyHandler 创建可动态修改当前 CredentialStore 的 Key 管理处理器。
-func NewKeyHandler(credentials CredentialManager, connections ConnectionManager, logger *slog.Logger, now func() time.Time) (*KeyHandler, error) {
-	if credentials == nil || connections == nil || logger == nil {
+// NewKeyHandler 创建只负责 HPAP 参数、分页和响应编码的 Key 处理器。
+func NewKeyHandler(service *adminservice.Service, logger *slog.Logger) (*KeyHandler, error) {
+	if service == nil || logger == nil {
 		return nil, errInvalidKeyHandler
 	}
-	if now == nil {
-		now = time.Now
-	}
-	return &KeyHandler{credentials: credentials, connections: connections, logger: logger, now: now}, nil
+	return &KeyHandler{service: service, logger: logger}, nil
 }
 
 // Methods 返回当前处理器负责的固定 HPAP 方法集合。
@@ -49,9 +44,9 @@ func (handler *KeyHandler) Methods() []adminproto.Method {
 	}
 }
 
-// Handle 校验具体参数，并保证持久化成功后才执行连接撤下。
+// Handle 解码 HPAP 请求并委托共享管理服务执行实际业务规则。
 func (handler *KeyHandler) Handle(_ context.Context, request adminproto.Request) (HandleResult, error) {
-	if handler == nil {
+	if handler == nil || handler.service == nil {
 		return HandleResult{}, errInvalidKeyHandler
 	}
 	switch request.Method {
@@ -62,19 +57,19 @@ func (handler *KeyHandler) Handle(_ context.Context, request adminproto.Request)
 	case adminproto.MethodKeyShow:
 		return handler.show(request)
 	case adminproto.MethodKeyEnable:
-		return handler.enable(request)
+		return handler.setEnabled(request, true)
 	case adminproto.MethodKeyDisable:
-		return handler.disable(request)
+		return handler.setEnabled(request, false)
 	case adminproto.MethodKeyDelete:
 		return handler.delete(request)
 	case adminproto.MethodKeySourceList:
 		return handler.sourceList(request)
 	case adminproto.MethodKeySourceAdd:
-		return handler.sourceMutate(request, "add")
+		return handler.sourceMutate(request, adminservice.SourceAdd)
 	case adminproto.MethodKeySourceRemove:
-		return handler.sourceMutate(request, "remove")
+		return handler.sourceMutate(request, adminservice.SourceRemove)
 	case adminproto.MethodKeySourceSet:
-		return handler.sourceMutate(request, "set")
+		return handler.sourceMutate(request, adminservice.SourceSet)
 	default:
 		return HandleResult{}, fmt.Errorf("%w: %s", errInvalidKeyHandler, request.Method)
 	}
@@ -94,12 +89,16 @@ func (handler *KeyHandler) issue(request adminproto.Request) (HandleResult, erro
 		parsed = parsed.UTC()
 		expiresAt = &parsed
 	}
-	token, record, err := handler.credentials.Issue(params.PrincipalID, params.MachineID, params.Sources, expiresAt)
+	result, err := handler.service.IssueCredential(adminservice.IssueCredentialInput{
+		PrincipalID: params.PrincipalID,
+		MachineID:   params.MachineID,
+		Sources:     params.Sources,
+		ExpiresAt:   expiresAt,
+	})
 	if err != nil {
-		return handler.credentialFailure(request, err)
+		return handler.serviceFailure(request, err)
 	}
-	result := adminproto.KeyIssueResult{Token: token, Credential: credentialView(record)}
-	return keySuccess(request.ID, result, credentialAuditTarget(record.CredentialID))
+	return keySuccess(request.ID, result, credentialAuditTarget(result.Credential.CredentialID))
 }
 
 func (handler *KeyHandler) list(request adminproto.Request) (HandleResult, error) {
@@ -115,22 +114,22 @@ func (handler *KeyHandler) list(request adminproto.Request) (HandleResult, error
 	if err != nil {
 		return keyError(request.ID, adminproto.CodeArgumentInvalid, "page_token 无效"), nil
 	}
-	records := handler.credentials.List()
+	credentials := handler.service.ListCredentials()
 	items := make([]adminproto.Credential, 0, limit)
 	var lastID uint64
 	more := false
-	for _, record := range records {
-		if record.CredentialID <= anchor {
+	for _, current := range credentials {
+		if current.CredentialID <= anchor {
 			continue
 		}
 		if len(items) == limit {
 			more = true
 			break
 		}
-		items = append(items, credentialView(record))
-		lastID = record.CredentialID
+		items = append(items, current)
+		lastID = current.CredentialID
 	}
-	result := adminproto.KeyListResult{ObservedAt: handler.now().UTC(), Items: items}
+	result := adminproto.KeyListResult{ObservedAt: handler.service.ObservedAt(), Items: items}
 	if more {
 		result.NextPageToken, err = encodeCredentialPageToken(request.Method, lastID)
 		if err != nil {
@@ -145,38 +144,23 @@ func (handler *KeyHandler) show(request adminproto.Request) (HandleResult, error
 	if result.Response.Error != nil {
 		return result, nil
 	}
-	record, err := handler.credentials.Show(params.CredentialID)
+	credentialView, err := handler.service.ShowCredential(params.CredentialID)
 	if err != nil {
-		return handler.credentialFailure(request, err)
+		return handler.serviceFailure(request, err)
 	}
-	return keySuccess(request.ID, adminproto.CredentialResult{Credential: credentialView(record)}, credentialAuditTarget(record.CredentialID))
+	return keySuccess(request.ID, adminproto.CredentialResult{Credential: credentialView}, credentialAuditTarget(credentialView.CredentialID))
 }
 
-func (handler *KeyHandler) enable(request adminproto.Request) (HandleResult, error) {
+func (handler *KeyHandler) setEnabled(request adminproto.Request, enabled bool) (HandleResult, error) {
 	params, result := decodeCredentialID(request)
 	if result.Response.Error != nil {
 		return result, nil
 	}
-	record, err := handler.credentials.Enable(params.CredentialID)
+	mutation, err := handler.service.SetCredentialEnabled(params.CredentialID, enabled)
 	if err != nil {
-		return handler.credentialFailure(request, err)
+		return handler.serviceFailure(request, err)
 	}
-	return keySuccess(request.ID, adminproto.CredentialMutationResult{Credential: credentialView(record)}, credentialAuditTarget(record.CredentialID))
-}
-
-func (handler *KeyHandler) disable(request adminproto.Request) (HandleResult, error) {
-	params, result := decodeCredentialID(request)
-	if result.Response.Error != nil {
-		return result, nil
-	}
-	record, err := handler.credentials.Disable(params.CredentialID)
-	if err != nil {
-		return handler.credentialFailure(request, err)
-	}
-	disconnected := handler.connections.DisconnectCredential(record.CredentialID, "credential disabled")
-	return keySuccess(request.ID, adminproto.CredentialMutationResult{
-		Credential: credentialView(record), DisconnectedConnections: disconnected,
-	}, credentialAuditTarget(record.CredentialID))
+	return keySuccess(request.ID, mutation, credentialAuditTarget(mutation.Credential.CredentialID))
 }
 
 func (handler *KeyHandler) delete(request adminproto.Request) (HandleResult, error) {
@@ -184,14 +168,11 @@ func (handler *KeyHandler) delete(request adminproto.Request) (HandleResult, err
 	if err := adminproto.DecodeParams(request.Params, &params); err != nil || params.CredentialID == 0 || !params.Confirm {
 		return keyError(request.ID, adminproto.CodeArgumentInvalid, "删除 Key 必须指定 credential_id 并确认"), nil
 	}
-	record, err := handler.credentials.Delete(params.CredentialID)
+	result, err := handler.service.DeleteCredential(params.CredentialID)
 	if err != nil {
-		return handler.credentialFailure(request, err)
+		return handler.serviceFailure(request, err)
 	}
-	disconnected := handler.connections.DisconnectCredential(record.CredentialID, "credential deleted")
-	return keySuccess(request.ID, adminproto.KeyDeleteResult{
-		CredentialID: record.CredentialID, Deleted: true, DisconnectedConnections: disconnected,
-	}, credentialAuditTarget(record.CredentialID))
+	return keySuccess(request.ID, result, credentialAuditTarget(result.CredentialID))
 }
 
 func (handler *KeyHandler) sourceList(request adminproto.Request) (HandleResult, error) {
@@ -199,16 +180,14 @@ func (handler *KeyHandler) sourceList(request adminproto.Request) (HandleResult,
 	if result.Response.Error != nil {
 		return result, nil
 	}
-	record, err := handler.credentials.Show(params.CredentialID)
+	sources, err := handler.service.ListSources(params.CredentialID)
 	if err != nil {
-		return handler.credentialFailure(request, err)
+		return handler.serviceFailure(request, err)
 	}
-	return keySuccess(request.ID, adminproto.KeySourceListResult{
-		CredentialID: record.CredentialID, Sources: sourceStrings(record.AllowedSources),
-	}, credentialAuditTarget(record.CredentialID))
+	return keySuccess(request.ID, adminproto.KeySourceListResult{CredentialID: params.CredentialID, Sources: sources}, credentialAuditTarget(params.CredentialID))
 }
 
-func (handler *KeyHandler) sourceMutate(request adminproto.Request, operation string) (HandleResult, error) {
+func (handler *KeyHandler) sourceMutate(request adminproto.Request, operation adminservice.SourceOperation) (HandleResult, error) {
 	var params adminproto.KeySourceMutationParams
 	if err := adminproto.DecodeParams(request.Params, &params); err != nil || params.CredentialID == 0 {
 		return keyError(request.ID, adminproto.CodeArgumentInvalid, "Key 来源参数无效"), nil
@@ -216,30 +195,11 @@ func (handler *KeyHandler) sourceMutate(request adminproto.Request, operation st
 	if len(params.Sources) == 0 {
 		return keyError(request.ID, adminproto.CodeCredentialSourceRequired, "Key 至少需要一个来源规则"), nil
 	}
-	var (
-		record credential.Record
-		err    error
-	)
-	switch operation {
-	case "add":
-		record, err = handler.credentials.AddSources(params.CredentialID, params.Sources)
-	case "remove":
-		record, err = handler.credentials.RemoveSources(params.CredentialID, params.Sources)
-	case "set":
-		record, err = handler.credentials.SetSources(params.CredentialID, params.Sources)
-	default:
-		return HandleResult{}, errInvalidKeyHandler
-	}
+	result, err := handler.service.MutateSources(params.CredentialID, operation, params.Sources)
 	if err != nil {
-		return handler.credentialFailure(request, err)
+		return handler.serviceFailure(request, err)
 	}
-	disconnected := 0
-	if operation != "add" {
-		disconnected = handler.connections.RevalidateCredentialSource(record.CredentialID, record.AllowedSources, "credential source policy changed")
-	}
-	return keySuccess(request.ID, adminproto.CredentialMutationResult{
-		Credential: credentialView(record), DisconnectedConnections: disconnected,
-	}, credentialAuditTarget(record.CredentialID))
+	return keySuccess(request.ID, result, credentialAuditTarget(result.Credential.CredentialID))
 }
 
 func decodeCredentialID(request adminproto.Request) (adminproto.CredentialIDParams, HandleResult) {
@@ -250,30 +210,43 @@ func decodeCredentialID(request adminproto.Request) (adminproto.CredentialIDPara
 	return params, HandleResult{}
 }
 
-func (handler *KeyHandler) credentialFailure(request adminproto.Request, err error) (HandleResult, error) {
-	switch {
-	case errors.Is(err, credential.ErrCredentialNotFound):
-		return keyError(request.ID, adminproto.CodeCredentialNotFound, "Key 不存在"), nil
-	case errors.Is(err, credential.ErrCredentialConflict):
-		return keyError(request.ID, adminproto.CodeCredentialConflict, "Key 冲突"), nil
-	case errors.Is(err, credential.ErrSourceRequired):
-		return keyError(request.ID, adminproto.CodeCredentialSourceRequired, "Key 至少需要一个来源规则"), nil
-	case errors.Is(err, credential.ErrSourceInvalid):
-		return keyError(request.ID, adminproto.CodeCredentialSourceInvalid, "Key 来源规则无效"), nil
-	case errors.Is(err, credential.ErrInvalidRecord):
-		return keyError(request.ID, adminproto.CodeArgumentInvalid, "Key 参数无效"), nil
-	case errors.Is(err, credential.ErrCredentialIDExhausted):
-		return keyError(request.ID, adminproto.CodeServerBusy, "Key ID 已耗尽"), nil
-	default:
+func (handler *KeyHandler) serviceFailure(request adminproto.Request, err error) (HandleResult, error) {
+	code, message := hpapServiceError(err)
+	if adminservice.ErrorCodeOf(err) == adminservice.CodeServerBusy {
+		message = "Key ID 已耗尽"
+	}
+	if code == adminproto.CodeServerInternal {
 		return handler.internalFailure(request, err)
 	}
+	return keyError(request.ID, code, message), nil
 }
 
 func (handler *KeyHandler) internalFailure(request adminproto.Request, err error) (HandleResult, error) {
 	if handler.logger != nil {
-		handler.logger.Error("HPAP Key 管理失败", "method", request.Method, "request_hash", auditRequestHash(request.ID), "error_type", fmt.Sprintf("%T", err), "reason", "CredentialStore 操作失败")
+		handler.logger.Error("HPAP Key 管理失败", "method", request.Method, "request_hash", auditRequestHash(request.ID), "error_type", fmt.Sprintf("%T", err), "reason", "AdminService 操作失败")
 	}
 	return keyError(request.ID, adminproto.CodeServerInternal, "Key 管理失败"), nil
+}
+
+func hpapServiceError(err error) (adminproto.ErrorCode, string) {
+	switch adminservice.ErrorCodeOf(err) {
+	case adminservice.CodeInvalidArgument:
+		return adminproto.CodeArgumentInvalid, "Key 参数无效"
+	case adminservice.CodeCredentialNotFound:
+		return adminproto.CodeCredentialNotFound, "Key 不存在"
+	case adminservice.CodeCredentialConflict:
+		return adminproto.CodeCredentialConflict, "Key 冲突"
+	case adminservice.CodeSourceRequired:
+		return adminproto.CodeCredentialSourceRequired, "Key 至少需要一个来源规则"
+	case adminservice.CodeSourceInvalid:
+		return adminproto.CodeCredentialSourceInvalid, "Key 来源规则无效"
+	case adminservice.CodeConnectionNotFound:
+		return adminproto.CodeConnectionNotFound, "连接不存在"
+	case adminservice.CodeServerBusy:
+		return adminproto.CodeServerBusy, "服务端正忙"
+	default:
+		return adminproto.CodeServerInternal, "管理操作失败"
+	}
 }
 
 func keySuccess(requestID string, value any, target string) (HandleResult, error) {
@@ -290,27 +263,6 @@ func keyError(requestID string, code adminproto.ErrorCode, message string) Handl
 		return HandleResult{}
 	}
 	return HandleResult{Response: response}
-}
-
-func credentialView(record credential.Record) adminproto.Credential {
-	var expiresAt *time.Time
-	if record.ExpiresAt != nil {
-		value := record.ExpiresAt.UTC()
-		expiresAt = &value
-	}
-	return adminproto.Credential{
-		CredentialID: record.CredentialID, PrincipalID: record.PrincipalID, MachineID: record.MachineID,
-		Status: string(record.Status), AllowedSources: sourceStrings(record.AllowedSources), ExpiresAt: expiresAt,
-		CreatedAt: record.CreatedAt.UTC(), UpdatedAt: record.UpdatedAt.UTC(),
-	}
-}
-
-func sourceStrings(rules []credential.SourceRule) []string {
-	values := make([]string, len(rules))
-	for index, rule := range rules {
-		values[index] = string(rule)
-	}
-	return values
 }
 
 func credentialAuditTarget(credentialID uint64) string {

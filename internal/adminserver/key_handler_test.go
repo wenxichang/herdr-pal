@@ -186,6 +186,15 @@ func TestKeyHandlerMapsInvalidArgumentsNotFoundAndPageToken(t *testing.T) {
 	assertKeyError(t, handleKeyRequest(t, handler, adminproto.MethodKeyIssue, adminproto.KeyIssueParams{PrincipalID: "user", MachineID: "machine"}), adminproto.CodeCredentialSourceRequired)
 }
 
+func TestKeyHandlerRejectsDuplicatePrincipalAndMachine(t *testing.T) {
+	store, _ := seededCredentialStore(t, "192.168.1.10")
+	handler := newTestKeyHandler(t, store, &trackingConnectionManager{}, time.Now)
+	response := handleKeyRequest(t, handler, adminproto.MethodKeyIssue, adminproto.KeyIssueParams{
+		PrincipalID: "user-a", MachineID: "home", Sources: []string{"10.0.0.1"},
+	})
+	assertKeyError(t, response, adminproto.CodeCredentialConflict)
+}
+
 func seededCredentialStore(t *testing.T, sources ...string) (*credential.Store, credential.Record) {
 	t.Helper()
 	store, err := credential.LoadStore(filepath.Join(t.TempDir(), "credentials.json"))
@@ -201,7 +210,8 @@ func seededCredentialStore(t *testing.T, sources ...string) (*credential.Store, 
 
 func newTestKeyHandler(t *testing.T, credentials CredentialManager, connections ConnectionManager, now func() time.Time) *KeyHandler {
 	t.Helper()
-	handler, err := NewKeyHandler(credentials, connections, slog.New(slog.NewTextHandler(io.Discard, nil)), now)
+	service := newAdminServiceForTest(t, credentials, connections, nil, nil, now)
+	handler, err := NewKeyHandler(service, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

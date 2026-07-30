@@ -17,7 +17,7 @@ func TestConnectionHandlerListShowDisconnectAndPagination(t *testing.T) {
 		managementConnectionView("c-2", 2, "user-a", "office"),
 		managementConnectionView("c-3", 3, "user-b", "home"),
 	}}
-	handler, err := NewConnectionHandler(manager, func() time.Time { return now })
+	handler, err := NewConnectionHandler(newAdminServiceForTest(t, nil, manager, nil, nil, func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestConnectionHandlerListShowDisconnectAndPagination(t *testing.T) {
 }
 
 func TestConnectionHandlerRejectsInvalidParamsAndPageToken(t *testing.T) {
-	handler, err := NewConnectionHandler(&fakeConnectionManager{}, time.Now)
+	handler, err := NewConnectionHandler(newAdminServiceForTest(t, nil, &fakeConnectionManager{}, nil, nil, time.Now))
 	if err != nil {
 		t.Fatal(err)
 	}

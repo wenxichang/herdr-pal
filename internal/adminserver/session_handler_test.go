@@ -18,7 +18,7 @@ func TestSessionHandlerListsFullDisplayTargetFiltersAndPagination(t *testing.T) 
 		managementSessionView("user-a", 2, "office", "w2:p2", "session-2", hprp.StatusBlocked),
 		managementSessionView("user-b", 1, "home", "w3:p3", "session-3", hprp.StatusDone),
 	}}
-	handler, err := NewSessionHandler(inspector, func() time.Time { return now })
+	handler, err := NewSessionHandler(newAdminServiceForTest(t, nil, nil, inspector, nil, func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestSessionHandlerListsFullDisplayTargetFiltersAndPagination(t *testing.T) 
 
 func TestSessionHandlerRejectsUnknownParamsAndDoesNotNeedOutputReader(t *testing.T) {
 	inspector := &fakeSessionInspector{}
-	handler, err := NewSessionHandler(inspector, time.Now)
+	handler, err := NewSessionHandler(newAdminServiceForTest(t, nil, nil, inspector, nil, time.Now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestSessionHandlerDoesNotModifyCatalogNumberingOrSelection(t *testing.T) {
 	if err := catalog.SetSelection("user-a", target); err != nil {
 		t.Fatal(err)
 	}
-	handler, err := NewSessionHandler(catalog, time.Now)
+	handler, err := NewSessionHandler(newAdminServiceForTest(t, nil, nil, catalog, nil, time.Now))
 	if err != nil {
 		t.Fatal(err)
 	}

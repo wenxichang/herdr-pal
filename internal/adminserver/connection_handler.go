@@ -3,31 +3,25 @@ package adminserver
 import (
 	"context"
 	"errors"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
-	"github.com/wenxichang/herdr-pal/internal/server"
+	"github.com/wenxichang/herdr-pal/internal/adminservice"
 )
 
 var errInvalidConnectionHandler = errors.New("HPAP Connection Handler 依赖无效")
 
-// ConnectionHandler 处理 HPRP 活动连接的只读查询和显式断开。
+// ConnectionHandler 把 HPAP 连接管理请求适配到共享管理服务。
 type ConnectionHandler struct {
-	connections ConnectionManager
-	now         func() time.Time
+	service *adminservice.Service
 }
 
-// NewConnectionHandler 创建 HPRP 连接管理处理器。
-func NewConnectionHandler(connections ConnectionManager, now func() time.Time) (*ConnectionHandler, error) {
-	if connections == nil {
+// NewConnectionHandler 创建只负责 HPAP 参数、分页和响应编码的连接处理器。
+func NewConnectionHandler(service *adminservice.Service) (*ConnectionHandler, error) {
+	if service == nil {
 		return nil, errInvalidConnectionHandler
 	}
-	if now == nil {
-		now = time.Now
-	}
-	return &ConnectionHandler{connections: connections, now: now}, nil
+	return &ConnectionHandler{service: service}, nil
 }
 
 // Methods 返回当前处理器负责的 Connection 方法。
@@ -39,9 +33,9 @@ func (handler *ConnectionHandler) Methods() []adminproto.Method {
 	}
 }
 
-// Handle 执行连接查询或只撤下当前连接的管理动作。
+// Handle 解码 HPAP 请求并委托共享管理服务执行连接操作。
 func (handler *ConnectionHandler) Handle(_ context.Context, request adminproto.Request) (HandleResult, error) {
-	if handler == nil {
+	if handler == nil || handler.service == nil {
 		return HandleResult{}, errInvalidConnectionHandler
 	}
 	switch request.Method {
@@ -69,13 +63,12 @@ func (handler *ConnectionHandler) list(request adminproto.Request) (HandleResult
 	if err != nil {
 		return keyError(request.ID, adminproto.CodeArgumentInvalid, "page_token 无效"), nil
 	}
-	views := handler.connections.Connections()
-	sort.Slice(views, func(left, right int) bool { return connectionSortKey(views[left]) < connectionSortKey(views[right]) })
+	connections := handler.service.ListConnections()
 	items := make([]adminproto.Connection, 0, limit)
 	lastKey := ""
 	more := false
-	for _, view := range views {
-		key := connectionSortKey(view)
+	for _, connection := range connections {
+		key := connectionSortKey(connection)
 		if anchor != "" && key <= anchor {
 			continue
 		}
@@ -83,10 +76,10 @@ func (handler *ConnectionHandler) list(request adminproto.Request) (HandleResult
 			more = true
 			break
 		}
-		items = append(items, connectionView(view))
+		items = append(items, connection)
 		lastKey = key
 	}
-	result := adminproto.ConnectionListResult{ObservedAt: handler.now().UTC(), Items: items}
+	result := adminproto.ConnectionListResult{ObservedAt: handler.service.ObservedAt(), Items: items}
 	if more {
 		result.NextPageToken, err = encodePageToken(request.Method, lastKey)
 		if err != nil {
@@ -101,11 +94,12 @@ func (handler *ConnectionHandler) show(request adminproto.Request) (HandleResult
 	if result.Response.Error != nil {
 		return result, nil
 	}
-	view, exists := handler.connections.Connection(params.ConnectionID)
-	if !exists {
-		return keyError(request.ID, adminproto.CodeConnectionNotFound, "连接不存在"), nil
+	connection, err := handler.service.ShowConnection(params.ConnectionID)
+	if err != nil {
+		code, message := hpapServiceError(err)
+		return keyError(request.ID, code, message), nil
 	}
-	return keySuccess(request.ID, adminproto.ConnectionResult{ObservedAt: handler.now().UTC(), Connection: connectionView(view)}, connectionAuditTarget(params.ConnectionID))
+	return keySuccess(request.ID, adminproto.ConnectionResult{ObservedAt: handler.service.ObservedAt(), Connection: connection}, connectionAuditTarget(params.ConnectionID))
 }
 
 func (handler *ConnectionHandler) disconnect(request adminproto.Request) (HandleResult, error) {
@@ -113,11 +107,12 @@ func (handler *ConnectionHandler) disconnect(request adminproto.Request) (Handle
 	if result.Response.Error != nil {
 		return result, nil
 	}
-	if !handler.connections.DisconnectConnection(params.ConnectionID, "admin request") {
-		return keyError(request.ID, adminproto.CodeConnectionNotFound, "连接不存在"), nil
+	if err := handler.service.DisconnectConnection(params.ConnectionID); err != nil {
+		code, message := hpapServiceError(err)
+		return keyError(request.ID, code, message), nil
 	}
 	return keySuccess(request.ID, adminproto.ConnectionDisconnectResult{
-		ObservedAt: handler.now().UTC(), ConnectionID: params.ConnectionID, Disconnected: true,
+		ObservedAt: handler.service.ObservedAt(), ConnectionID: params.ConnectionID, Disconnected: true,
 	}, connectionAuditTarget(params.ConnectionID))
 }
 
@@ -129,20 +124,7 @@ func decodeConnectionID(request adminproto.Request) (adminproto.ConnectionIDPara
 	return params, HandleResult{}
 }
 
-func connectionView(view server.ConnectionView) adminproto.Connection {
-	return adminproto.Connection{
-		ConnectionID: view.ConnectionID, CredentialID: view.CredentialID, PrincipalID: view.PrincipalID, MachineID: view.MachineID,
-		Implementation: adminproto.Implementation{
-			Name: view.Implementation.Name, Version: view.Implementation.Version,
-			OS: view.Implementation.OS, Arch: view.Implementation.Arch,
-		},
-		SourceIP: view.SourceIP, ConnectedAt: view.ConnectedAt.UTC(), LastHeartbeatAt: view.LastHeartbeatAt.UTC(),
-		LastSnapshotAt: view.LastSnapshotAt.UTC(), SnapshotSequence: view.SnapshotSequence,
-		SessionCount: view.SessionCount, Capabilities: append([]string(nil), view.Capabilities...), Ready: view.Ready,
-	}
-}
-
-func connectionSortKey(view server.ConnectionView) string {
+func connectionSortKey(view adminservice.Connection) string {
 	return view.PrincipalID + "\x00" + view.MachineID + "\x00" + view.ConnectionID
 }
 

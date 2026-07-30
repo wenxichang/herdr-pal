@@ -84,6 +84,14 @@ func New(config Config) (*Service, error) {
 	}, nil
 }
 
+// ObservedAt 返回管理适配器生成同一响应快照时使用的 UTC 时间。
+func (service *Service) ObservedAt() time.Time {
+	if service == nil || service.now == nil {
+		return time.Now().UTC()
+	}
+	return service.now().UTC()
+}
+
 // IssueCredential 持久化签发一条机器凭据并返回一次明文 Key。
 func (service *Service) IssueCredential(input IssueCredentialInput) (CredentialIssueResult, error) {
 	if service == nil {

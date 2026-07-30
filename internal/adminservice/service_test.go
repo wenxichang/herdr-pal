@@ -112,6 +112,23 @@ func TestServiceListSourcesValidatesCredentialID(t *testing.T) {
 	}
 }
 
+func TestServiceObservedAtUsesInjectedClockAndUTC(t *testing.T) {
+	want := time.Date(2026, 7, 30, 8, 30, 0, 0, time.FixedZone("CST", 8*60*60))
+	service, err := New(Config{
+		Credentials: emptyCredentialManager{},
+		Connections: &fakeConnections{},
+		Sessions:    fakeSessions{},
+		Runtime:     &fakeRuntime{},
+		Now:         func() time.Time { return want },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := service.ObservedAt(); got.Location() != time.UTC || !got.Equal(want) {
+		t.Fatalf("ObservedAt() = %v (%v), want %v UTC", got, got.Location(), want)
+	}
+}
+
 func TestServicePrepareStopCommitsOnlyAfterResponse(t *testing.T) {
 	runtime := &fakeRuntime{}
 	service := newTestService(t, emptyCredentialManager{}, &fakeConnections{}, runtime)

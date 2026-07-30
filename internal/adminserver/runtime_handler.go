@@ -3,25 +3,24 @@ package adminserver
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
+	"github.com/wenxichang/herdr-pal/internal/adminservice"
 )
 
 var errInvalidRuntimeHandler = errors.New("HPAP Runtime Handler 依赖无效")
 
-// RuntimeHandler 处理服务状态、动态 debug 和响应后停止请求。
+// RuntimeHandler 把 HPAP 运行控制请求适配到共享管理服务。
 type RuntimeHandler struct {
-	runtime  RuntimeInspector
-	stopping atomic.Bool
+	service *adminservice.Service
 }
 
 // NewRuntimeHandler 创建服务运行管理处理器。
-func NewRuntimeHandler(runtime RuntimeInspector) (*RuntimeHandler, error) {
-	if runtime == nil {
+func NewRuntimeHandler(service *adminservice.Service) (*RuntimeHandler, error) {
+	if service == nil {
 		return nil, errInvalidRuntimeHandler
 	}
-	return &RuntimeHandler{runtime: runtime}, nil
+	return &RuntimeHandler{service: service}, nil
 }
 
 // Methods 返回当前处理器负责的 Server 方法。
@@ -36,7 +35,7 @@ func (handler *RuntimeHandler) Methods() []adminproto.Method {
 
 // Handle 执行不持久化配置的 Server 管理动作。
 func (handler *RuntimeHandler) Handle(_ context.Context, request adminproto.Request) (HandleResult, error) {
-	if handler == nil {
+	if handler == nil || handler.service == nil {
 		return HandleResult{}, errInvalidRuntimeHandler
 	}
 	if err := decodeEmptyParams(request); err != nil {
@@ -44,26 +43,27 @@ func (handler *RuntimeHandler) Handle(_ context.Context, request adminproto.Requ
 	}
 	switch request.Method {
 	case adminproto.MethodServerStatus:
-		return keySuccess(request.ID, handler.runtime.Status(), "server")
+		return keySuccess(request.ID, handler.service.Status(), "server")
 	case adminproto.MethodServerDebugEnable:
-		handler.runtime.EnableDebug()
-		status := handler.runtime.Status()
-		return keySuccess(request.ID, adminproto.ServerDebugResult{DebugEnabled: status.DebugEnabled, BaseLogLevel: status.BaseLogLevel}, "server")
+		return keySuccess(request.ID, handler.service.SetDebug(true), "server")
 	case adminproto.MethodServerDebugDisable:
-		handler.runtime.DisableDebug()
-		status := handler.runtime.Status()
-		return keySuccess(request.ID, adminproto.ServerDebugResult{DebugEnabled: status.DebugEnabled, BaseLogLevel: status.BaseLogLevel}, "server")
+		return keySuccess(request.ID, handler.service.SetDebug(false), "server")
 	case adminproto.MethodServerStop:
-		if !handler.stopping.CompareAndSwap(false, true) {
-			return keyError(request.ID, adminproto.CodeServerBusy, "服务端已经开始停止"), nil
+		action, err := handler.service.PrepareStop()
+		if err != nil {
+			code, message := hpapServiceError(err)
+			if code == adminproto.CodeServerBusy {
+				message = "服务端已经开始停止"
+			}
+			return keyError(request.ID, code, message), nil
 		}
 		result, err := keySuccess(request.ID, adminproto.ServerStopResult{Stopping: true}, "server")
 		if err != nil {
-			handler.stopping.Store(false)
+			action.Rollback()
 			return HandleResult{}, err
 		}
-		result.AfterWrite = func() { handler.runtime.RequestStop() }
-		result.AfterWriteFailure = func() { handler.stopping.Store(false) }
+		result.AfterWrite = action.Commit
+		result.AfterWriteFailure = action.Rollback
 		return result, nil
 	default:
 		return HandleResult{}, errInvalidRuntimeHandler
