@@ -18,6 +18,11 @@ func DefaultServerPath() (string, error) {
 	return defaultPath("server-config.json")
 }
 
+// DefaultServerAuthPath 返回 Web 管理员摘要文件的固定路径。
+func DefaultServerAuthPath() (string, error) {
+	return defaultPath("server-auth.json")
+}
+
 func defaultPath(name string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {

@@ -10,6 +10,10 @@
     "state_dir": "",
     "credentials_file": ""
   },
+  "admin": {
+    "listen": "0.0.0.0:4001",
+    "loki_url": "http://127.0.0.1:3100"
+  },
   "rate_limit": {
     "per_second": 1,
     "per_minute": 20

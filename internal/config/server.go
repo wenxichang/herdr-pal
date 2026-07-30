@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 const maxAdminSocketPathBytes = 103
 
 const maxRateLimit = 10000
+
+const defaultWebAdminListen = "0.0.0.0:4001"
 
 // OTLPLogsHeadersEnvName 是 OTLP Logs 请求头使用的标准环境变量名。
 const OTLPLogsHeadersEnvName = "OTEL_EXPORTER_OTLP_LOGS_HEADERS"
@@ -22,6 +26,7 @@ const OTLPLogsHeadersEnvName = "OTEL_EXPORTER_OTLP_LOGS_HEADERS"
 type ServerConfig struct {
 	WeCom     ServerWeComConfig `json:"wecom"`
 	Server    ListenerConfig    `json:"server"`
+	Admin     AdminConfig       `json:"admin"`
 	RateLimit RateLimitConfig   `json:"rate_limit"`
 	Audit     AuditConfig       `json:"audit"`
 	Log       LogConfig         `json:"log"`
@@ -30,6 +35,7 @@ type ServerConfig struct {
 type serverConfigFile struct {
 	WeCom     ServerWeComConfig `json:"wecom"`
 	Server    ListenerConfig    `json:"server"`
+	Admin     AdminConfig       `json:"admin"`
 	RateLimit *RateLimitConfig  `json:"rate_limit"`
 	Audit     AuditConfig       `json:"audit"`
 	Log       LogConfig         `json:"log"`
@@ -50,6 +56,13 @@ type ListenerConfig struct {
 	StateDir        string `json:"state_dir"`
 	CredentialsFile string `json:"credentials_file"`
 	AdminSocketPath string `json:"-"`
+}
+
+// AdminConfig 定义内嵌 HTTPS 管理台的监听地址和 Loki 查询地址。
+type AdminConfig struct {
+	Listen   string `json:"listen"`
+	LokiURL  string `json:"loki_url"`
+	AuthFile string `json:"-"`
 }
 
 // RateLimitConfig 定义单个企业微信用户的滚动窗口输入限额。
@@ -125,7 +138,7 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 		return ServerConfig{}, err
 	}
 	loaded := ServerConfig{
-		WeCom: raw.WeCom, Server: raw.Server, Audit: raw.Audit, Log: raw.Log,
+		WeCom: raw.WeCom, Server: raw.Server, Admin: raw.Admin, Audit: raw.Audit, Log: raw.Log,
 		RateLimit: RateLimitConfig{PerSecond: 1, PerMinute: 20},
 	}
 	if raw.RateLimit != nil {
@@ -146,6 +159,15 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 	if strings.TrimSpace(loaded.Server.CredentialsFile) == "" {
 		loaded.Server.CredentialsFile = filepath.Join(loaded.Server.StateDir, "credentials.json")
 	}
+	loaded.Admin.Listen = strings.TrimSpace(loaded.Admin.Listen)
+	if loaded.Admin.Listen == "" {
+		loaded.Admin.Listen = defaultWebAdminListen
+	}
+	loaded.Admin.LokiURL = strings.TrimSpace(loaded.Admin.LokiURL)
+	loaded.Admin.AuthFile, err = DefaultServerAuthPath()
+	if err != nil {
+		return ServerConfig{}, err
+	}
 	certConfigured := strings.TrimSpace(loaded.Server.CertFile) != ""
 	keyConfigured := strings.TrimSpace(loaded.Server.KeyFile) != ""
 	if certConfigured != keyConfigured {
@@ -160,7 +182,44 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 	if err := validateAudit(&loaded.Audit); err != nil {
 		return ServerConfig{}, err
 	}
+	if err := validateAdmin(loaded.Admin); err != nil {
+		return ServerConfig{}, err
+	}
 	return loaded, nil
+}
+
+func validateAdmin(config AdminConfig) error {
+	_, port, err := net.SplitHostPort(config.Listen)
+	if err != nil {
+		return fmt.Errorf("admin.listen 必须是 host:port")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 0 || portNumber > 65535 {
+		return fmt.Errorf("admin.listen 端口无效")
+	}
+	if config.LokiURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(config.LokiURL)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return fmt.Errorf("admin.loki_url 必须是绝对 HTTP(S) URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("admin.loki_url 只支持 http 或 https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("admin.loki_url 不允许包含 userinfo")
+	}
+	if parsed.RawQuery != "" {
+		return fmt.Errorf("admin.loki_url 不允许包含 query")
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("admin.loki_url 不允许包含 fragment")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return fmt.Errorf("admin.loki_url 不允许包含 path")
+	}
+	return nil
 }
 
 func validateRateLimit(config RateLimitConfig) error {

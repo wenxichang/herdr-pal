@@ -104,6 +104,65 @@ func TestLoadServerReadsSecretAndDefaultsCredentialPath(t *testing.T) {
 	}
 }
 
+func TestLoadServerAppliesWebAdminDefaults(t *testing.T) {
+	loaded, err := LoadServer(writeConfig(t, `{
+  "wecom":{"bot_id":"bot"},
+  "server":{"listen":"127.0.0.1:9443"},
+  "log":{}
+}`), func(string) string { return "secret" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Admin.Listen != "0.0.0.0:4001" {
+		t.Fatalf("admin listen = %q", loaded.Admin.Listen)
+	}
+	if loaded.Admin.LokiURL != "" {
+		t.Fatalf("admin loki URL = %q", loaded.Admin.LokiURL)
+	}
+	if !strings.HasSuffix(loaded.Admin.AuthFile, filepath.Join(".config", "herdr-pal", "server-auth.json")) {
+		t.Fatalf("auth file = %q", loaded.Admin.AuthFile)
+	}
+}
+
+func TestLoadServerAcceptsWebAdminConfiguration(t *testing.T) {
+	loaded, err := LoadServer(writeConfig(t, `{
+  "wecom":{"bot_id":"bot"},
+  "server":{"listen":"127.0.0.1:9443"},
+  "admin":{"listen":"127.0.0.1:0","loki_url":"https://loki.internal:3100/"},
+  "log":{}
+}`), func(string) string { return "secret" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Admin.Listen != "127.0.0.1:0" || loaded.Admin.LokiURL != "https://loki.internal:3100/" {
+		t.Fatalf("admin config = %#v", loaded.Admin)
+	}
+}
+
+func TestLoadServerRejectsInvalidWebAdminConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		admin string
+		want  string
+	}{
+		{name: "listen without port", admin: `{"listen":"127.0.0.1"}`, want: "admin.listen"},
+		{name: "wrong loki scheme", admin: `{"loki_url":"ftp://127.0.0.1"}`, want: "admin.loki_url"},
+		{name: "loki userinfo", admin: `{"loki_url":"http://user@127.0.0.1"}`, want: "userinfo"},
+		{name: "loki query", admin: `{"loki_url":"http://127.0.0.1?q=1"}`, want: "query"},
+		{name: "loki fragment", admin: `{"loki_url":"http://127.0.0.1#x"}`, want: "fragment"},
+		{name: "loki path", admin: `{"loki_url":"http://127.0.0.1/loki"}`, want: "path"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"admin":` + test.admin + `,"log":{}}`
+			_, err := LoadServer(writeConfig(t, raw), func(string) string { return "secret" })
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadServer() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadServerAcceptsExplicitRateLimitDisable(t *testing.T) {
 	path := writeConfig(t, `{
   "wecom": {"bot_id": "bot-1"},
