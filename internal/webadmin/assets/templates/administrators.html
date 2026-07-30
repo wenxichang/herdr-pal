@@ -1,0 +1,4 @@
+{{define "administrators-content"}}<section id="administrators-page" class="page-section">
+  <section class="panel"><div class="panel-heading"><h2>添加管理员</h2></div><form id="administrator-form" class="inline-form"><label>用户名<input name="username" pattern="[a-zA-Z0-9._-]+" required></label><button class="primary" type="submit">创建</button></form></section>
+  <section class="panel"><div class="panel-heading"><h2>管理员列表</h2><button class="secondary" data-action="refresh-administrators">刷新</button></div><div class="table-wrap"><table><thead><tr><th>用户名</th><th>密码状态</th><th>自动化 Token</th><th>Token ID</th><th>操作</th></tr></thead><tbody id="administrators-body"></tbody></table></div></section>
+</section>{{end}}

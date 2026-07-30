@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
@@ -51,6 +52,7 @@ type Server struct {
 	logger          *slog.Logger
 	random          io.Reader
 	now             func() time.Time
+	templates       *template.Template
 
 	randomMu sync.Mutex
 	handler  http.Handler
@@ -89,10 +91,14 @@ func New(config Config) (*Server, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	templates, err := loadTemplates()
+	if err != nil {
+		return nil, errors.Join(ErrInvalidConfig, err)
+	}
 	server := &Server{
 		admin: config.Admin, auth: config.Auth, sessions: config.Sessions,
 		loginGuard: config.LoginGuard, logger: config.Logger, random: config.Random, now: config.Now,
-		automationLimit: newAutomationLimiter(), audit: config.Audit, routes: make(map[string]*methodRouter),
+		automationLimit: newAutomationLimiter(), audit: config.Audit, templates: templates, routes: make(map[string]*methodRouter),
 	}
 	mux := http.NewServeMux()
 	server.registerAuthRoutes(mux)
@@ -100,6 +106,7 @@ func New(config Config) (*Server, error) {
 	server.registerAdminRoutes(mux)
 	server.registerAutomationRoutes(mux)
 	server.registerAuditRoutes(mux)
+	server.registerPageRoutes(mux)
 	mux.HandleFunc("/admin/api/v1/", func(writer http.ResponseWriter, request *http.Request) {
 		setRequestRoute(request, "/admin/api/v1/*")
 		_ = writeAPIError(writer, request, http.StatusNotFound, "not_found", "管理接口不存在")

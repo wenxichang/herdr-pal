@@ -1,0 +1,6 @@
+{{define "audit-content"}}<section id="audit-page" class="page-section">
+  <div class="sensitive-banner">审计日志包含用户输入和终端文本，正文属于敏感数据。图片本身不进入审计。</div>
+  <section class="panel"><form id="audit-filter" class="filter-form"><label>用户 ID（精确）<input name="userid"></label><label>机器标识（包含）<input name="machine_id"></label><label>关键字（不区分大小写）<input name="keyword"></label><label>开始时间<input name="start" type="datetime-local"></label><label>结束时间<input name="end" type="datetime-local"></label><button class="primary" type="submit">查询</button></form></section>
+  <section class="panel"><div class="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>用户</th><th>机器</th><th>Agent</th><th>结果</th><th>正文</th></tr></thead><tbody id="audit-body"></tbody></table></div><button id="audit-next" class="secondary" hidden>下一页</button></section>
+  <dialog id="audit-detail"><form method="dialog"><div class="panel-heading"><h2>审计正文</h2><button value="close" class="secondary">关闭并清除</button></div><pre id="audit-detail-body"></pre></form></dialog>
+</section>{{end}}

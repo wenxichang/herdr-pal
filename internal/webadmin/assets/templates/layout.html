@@ -1,0 +1,58 @@
+{{define "layout.html"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · Herdr Pal</title>
+  <link rel="stylesheet" href="/admin/static/app.css">
+  <script src="/admin/static/app.js" defer></script>
+</head>
+<body data-page="{{.Page}}">
+{{if .MustChangePassword}}
+  <main class="login-card password-card">
+    <p class="eyebrow">首次登录</p>
+    <h1>请先修改初始密码</h1>
+    <p class="muted">修改成功后才能进入管理功能。</p>
+    <form id="password-change-form" class="stack-form">
+      <label>当前密码<input name="current_password" type="password" autocomplete="current-password" required></label>
+      <label>新密码<input name="new_password" type="password" autocomplete="new-password" minlength="12" required></label>
+      <button type="submit" class="primary">修改密码</button>
+    </form>
+    <button id="logout-button" class="text-button" type="button">退出登录</button>
+    <p id="form-error" class="error-message" role="alert"></p>
+  </main>
+{{else}}
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">HP</span><span><strong>Herdr Pal</strong><small>Server Console</small></span></div>
+      <nav aria-label="管理导航">
+        <a class="nav-link {{if active .Page "overview"}}active{{end}}" href="/admin">概览</a>
+        <a class="nav-link {{if active .Page "credentials"}}active{{end}}" href="/admin/credentials">机器凭据</a>
+        <a class="nav-link {{if active .Page "connections"}}active{{end}}" href="/admin/connections">在线连接</a>
+        <a class="nav-link {{if active .Page "sessions"}}active{{end}}" href="/admin/sessions">Agent 会话</a>
+        <a class="nav-link {{if active .Page "audit"}}active{{end}}" href="/admin/audit">审计日志</a>
+        <a class="nav-link {{if active .Page "administrators"}}active{{end}}" href="/admin/administrators">管理员</a>
+        <a class="nav-link {{if active .Page "system"}}active{{end}}" href="/admin/system">系统</a>
+      </nav>
+    </aside>
+    <section class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">管理控制台</p><h1>{{.Title}}</h1></div>
+        <div class="admin-menu"><span>{{.Username}}</span><button id="logout-button" class="secondary" type="button">退出</button></div>
+      </header>
+      <main class="content">
+        {{if active .Page "overview"}}{{template "overview-content" .}}{{end}}
+        {{if active .Page "credentials"}}{{template "credentials-content" .}}{{end}}
+        {{if active .Page "connections"}}{{template "connections-content" .}}{{end}}
+        {{if active .Page "sessions"}}{{template "sessions-content" .}}{{end}}
+        {{if active .Page "audit"}}{{template "audit-content" .}}{{end}}
+        {{if active .Page "administrators"}}{{template "administrators-content" .}}{{end}}
+        {{if active .Page "system"}}{{template "system-content" .}}{{end}}
+      </main>
+    </section>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="secret-modal"><form method="dialog"><h2 id="secret-title">一次性凭据</h2><p>请立即复制并安全保存，关闭后页面不再保留明文。</p><pre id="secret-value"></pre><div class="button-row"><button id="secret-copy" class="secondary" type="button">复制</button><button id="secret-close" class="primary" value="close">已保存并关闭</button></div></form></dialog>
+{{end}}
+</body>
+</html>{{end}}

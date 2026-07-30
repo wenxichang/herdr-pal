@@ -1,0 +1,23 @@
+{{define "login.html"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · Herdr Pal</title>
+  <link rel="stylesheet" href="/admin/static/app.css">
+  <script src="/admin/static/app.js" defer></script>
+</head>
+<body data-page="login" class="login-body">
+  <main class="login-card">
+    <p class="eyebrow">HERDR PAL SERVER</p>
+    <h1>管理员登录</h1>
+    <p class="muted">管理机器凭据、在线会话和用户审计记录。</p>
+    <form id="login-form" class="stack-form">
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit" class="primary">登录</button>
+    </form>
+    <p id="form-error" class="error-message" role="alert"></p>
+  </main>
+</body>
+</html>{{end}}
