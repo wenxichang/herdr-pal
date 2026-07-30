@@ -47,7 +47,7 @@ func TestHerdrServerRejectsInvalidPublicRequestShapes(t *testing.T) {
 		method string
 		params any
 	}{
-		{name: "read source", method: "agent.read", params: map[string]any{"target": "terminal-1", "source": "visible", "lines": 100, "format": "text", "strip_ansi": true}},
+		{name: "read source", method: "agent.read", params: map[string]any{"target": "terminal-1", "source": "unknown", "lines": 100, "format": "text", "strip_ansi": true}},
 		{name: "unknown subscription", method: "events.subscribe", params: map[string]any{"subscriptions": []map[string]any{{"type": "pane.output_changed"}}}},
 		{name: "status without pane", method: "events.subscribe", params: map[string]any{"subscriptions": []map[string]any{{"type": "pane.agent_status_changed"}}}},
 		{name: "prompt missing text", method: "agent.prompt", params: map[string]any{"target": "terminal-1"}},
@@ -76,6 +76,36 @@ func TestHerdrServerSupportsANSIRecentRead(t *testing.T) {
 	}
 	if result.Text != "\x1b[31m红色\x1b[0m" {
 		t.Fatalf("ReadRecentANSI() = %#v", result)
+	}
+}
+
+func TestHerdrServerSupportsANSIVisibleRead(t *testing.T) {
+	server := NewHerdrServer(t, testkitSnapshot())
+	server.SetOutput([]string{"\x1b[32m当前页面\x1b[0m"})
+	client := herdr.NewClient(server.SocketPath(), nil, time.Second)
+
+	result, err := client.ReadVisibleANSI(context.Background(), "pane-1", 100)
+	if err != nil {
+		t.Fatalf("ReadVisibleANSI() error = %v", err)
+	}
+	if result.Text != "\x1b[32m当前页面\x1b[0m" {
+		t.Fatalf("ReadVisibleANSI() = %#v", result)
+	}
+}
+
+func TestHerdrServerSnapshotPreservesPaneGeometry(t *testing.T) {
+	snapshot := testkitSnapshot()
+	snapshot.Panes[0].Columns = 250
+	snapshot.Panes[0].Rows = 65
+	server := NewHerdrServer(t, snapshot)
+	client := herdr.NewClient(server.SocketPath(), nil, time.Second)
+
+	result, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if len(result.Panes) != 1 || result.Panes[0].Columns != 250 || result.Panes[0].Rows != 65 {
+		t.Fatalf("Snapshot().Panes = %#v", result.Panes)
 	}
 }
 

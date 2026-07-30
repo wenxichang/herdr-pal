@@ -170,6 +170,11 @@ func (c *Client) ReadRecentANSI(ctx context.Context, target string, lines int) (
 	return c.readRecent(ctx, target, lines, "recent", "ansi", false)
 }
 
+// ReadVisibleANSI 读取 target 当前可见终端页面的 ANSI 快照。
+func (c *Client) ReadVisibleANSI(ctx context.Context, target string, lines int) (ReadResult, error) {
+	return c.readRecent(ctx, target, lines, "visible", "ansi", false)
+}
+
 func (c *Client) readRecent(ctx context.Context, target string, lines int, source, format string, stripANSI bool) (ReadResult, error) {
 	if err := validateTarget(target); err != nil {
 		return ReadResult{}, err

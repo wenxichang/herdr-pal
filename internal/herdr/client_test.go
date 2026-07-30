@@ -416,6 +416,27 @@ func TestClientSnapshotAcceptsZeroNumbersAndEmptyLabels(t *testing.T) {
 	}
 }
 
+func TestClientSnapshotDecodesPaneLayoutGeometry(t *testing.T) {
+	client := newBusinessTestClient(t, snapshotResultJSON(t, func(snapshot map[string]any) {
+		snapshot["layouts"] = []any{map[string]any{
+			"workspace_id": "w1",
+			"tab_id":       "t1",
+			"panes": []any{map[string]any{
+				"pane_id": "p1",
+				"rect":    map[string]any{"x": 30, "y": 1, "width": 250, "height": 65},
+			}},
+		}}
+	}), nil)
+
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() 返回错误：%v", err)
+	}
+	if len(snapshot.Panes) != 1 || snapshot.Panes[0].Columns != 250 || snapshot.Panes[0].Rows != 65 {
+		t.Fatalf("Snapshot().Panes = %#v", snapshot.Panes)
+	}
+}
+
 func TestClientSnapshotRejectsMissingProtocol17RequiredFields(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -623,6 +644,24 @@ func TestClientReadRecentANSIUsesPublicAgentRead(t *testing.T) {
 	}
 	if read.PaneID != "p1" || read.Text != "\x1b[31m红色\x1b[0m" {
 		t.Fatalf("ReadRecentANSI() = %+v", read)
+	}
+}
+
+func TestClientReadVisibleANSIUsesCurrentViewport(t *testing.T) {
+	readPayload := validReadResult(t)
+	readPayload["text"] = "\x1b[32m当前屏幕\x1b[0m"
+	readPayload["source"] = "visible"
+	readPayload["format"] = "ansi"
+	client := newBusinessTestClient(t, `{"type":"pane_read","read":`+mustJSON(t, readPayload)+`}`, businessRequestCheck("agent.read", map[string]any{
+		"target": "p1", "source": "visible", "lines": float64(80), "format": "ansi", "strip_ansi": false,
+	}))
+
+	read, err := client.ReadVisibleANSI(context.Background(), "p1", 80)
+	if err != nil {
+		t.Fatalf("ReadVisibleANSI() 返回错误：%v", err)
+	}
+	if read.PaneID != "p1" || read.Text != "\x1b[32m当前屏幕\x1b[0m" {
+		t.Fatalf("ReadVisibleANSI() = %+v", read)
 	}
 }
 

@@ -157,9 +157,13 @@ Herdr 不可用时向 HPRP 暴露空会话。
 ### 4.3 Service、PolicyGuard 与 Notifier
 
 Service 解析 `/con`、分页、`/key`、`/enter`、`/slash` 和普通 prompt。普通文本只允许
-实时 `idle` 或 `done`；prompt stalled 时最多补发一次经过目标复核的 Enter。交互终端页
-同时保存规范化纯文本与安全 ANSI；图片模式由 Pal 侧内嵌字体渲染为 16px PNG8，并限制
-ANSI 字节数、可见行列和 PNG 大小。
+实时 `idle` 或 `done`；prompt stalled 时最多补发一次经过目标复核的 Enter。图片模式先
+重新读取 `session.snapshot` 获取当前 pane 几何，再把 `visible` ANSI 快照直接渲染为
+16px PNG8，不以交互 Panel Buffer 作为图片输入；随后独立读取 `recent_unwrapped` 纯文本
+作为审计和降级内容。交互缓存只维护分页状态，`/pageup` 继续使用 `recent` 快照保留历史
+分页能力。图片渲染限制 ANSI 字节数、可见行列和 PNG 大小。
+终端列宽计算固定使用非 East Asian ambiguous 规则，确保框线字符在中文 locale 下仍按
+真实终端中的单列宽度处理，不能依赖 Pal 启动环境的 `LANG`、`LC_ALL`。
 安全 ANSI 只保留换行、回车重绘、Tab、可打印 Unicode 和合法 SGR；其余 C0/C1 控制字符
 全部删除。
 

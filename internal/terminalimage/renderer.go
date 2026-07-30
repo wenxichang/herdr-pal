@@ -43,6 +43,11 @@ var (
 	embeddedFont []byte
 
 	benchmarkPNG []byte
+
+	terminalWidthCondition = &runewidth.Condition{
+		EastAsianWidth:     false,
+		StrictEmojiNeutral: false,
+	}
 )
 
 // Result 是一次终端图片渲染结果。
@@ -69,6 +74,10 @@ func New() (*Renderer, error) {
 		return nil, fmt.Errorf("创建终端字体面: %w", err)
 	}
 	return &Renderer{face: face}, nil
+}
+
+func init() {
+	configureTerminalRunewidth()
 }
 
 // Render 把安全 ANSI 终端页渲染为最多 256 色的 PNG8。
@@ -154,7 +163,7 @@ func normalizeScreen(safeANSI string) (string, int, int, error) {
 	}
 	columns := 1
 	for _, line := range lines {
-		columns = max(columns, runewidth.StringWidth(line))
+		columns = max(columns, terminalWidthCondition.StringWidth(line))
 	}
 	rows := len(lines)
 	width, height := columns*cellWidth, rows*cellHeight
@@ -162,6 +171,12 @@ func normalizeScreen(safeANSI string) (string, int, int, error) {
 		return "", 0, 0, ErrScreenTooLarge
 	}
 	return input, columns, rows, nil
+}
+
+func configureTerminalRunewidth() {
+	runewidth.EastAsianWidth = false
+	runewidth.DefaultCondition.EastAsianWidth = false
+	runewidth.DefaultCondition.StrictEmojiNeutral = false
 }
 
 func filterTextimgSGR(input string) string {

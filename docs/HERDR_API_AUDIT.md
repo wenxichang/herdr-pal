@@ -427,7 +427,13 @@ Herdr 提供的精确增量游标。
 
 ```text
 状态变化事件
-    → 读取保留物理行的 recent ANSI 快照，并从同次快照派生文本与图片
+    → 重新读取 session.snapshot，确认稳定目标并取得当前 pane 几何
+    → 图片模式读取当前 viewport 的 visible ANSI 快照
+    → 使用 session.snapshot 公开布局中的 pane 列宽恢复 VT formatter 丢失的软换行
+    → 按与 locale 无关的终端窄字符规则计算框线等 ambiguous 字符宽度
+    → 直接生成图片，不经过交互 Panel Buffer
+    → 随后独立读取 recent_unwrapped 纯文本用于审计和降级
+    → 文本模式和历史分页读取 recent ANSI 快照
     → 取最近 100 行并规范化
     → 对整份快照做 hash 去重、分段和安全截断
     → 发送终端近期快照到消息入口

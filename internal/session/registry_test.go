@@ -33,6 +33,19 @@ func TestReplaceBuildsSortedAgentTargets(t *testing.T) {
 	}
 }
 
+func TestReplaceCarriesPaneGeometryIntoTarget(t *testing.T) {
+	registry := &Registry{}
+	pane := testAgentPane("pane-1", "terminal-1", "opencode", nil)
+	pane.Columns = 250
+	pane.Rows = 65
+	registry.Replace(testSnapshot(pane), false)
+
+	targets := registry.CurrentTargets()
+	if len(targets) != 1 || targets[0].Columns != 250 || targets[0].Rows != 65 {
+		t.Fatalf("CurrentTargets() = %#v", targets)
+	}
+}
+
 func TestCreateListSnapshotSortsByWorkspaceAndTabNumbers(t *testing.T) {
 	registry := &Registry{}
 	snapshot := herdr.Snapshot{

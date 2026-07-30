@@ -376,7 +376,7 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 		}
 		validFormat := params.StripANSI != nil &&
 			(params.Format == "text" && *params.StripANSI || params.Format == "ansi" && !*params.StripANSI)
-		validSource := params.Source == "recent" || params.Source == "recent_unwrapped"
+		validSource := params.Source == "recent" || params.Source == "recent_unwrapped" || params.Source == "visible"
 		if strings.TrimSpace(params.Target) == "" ||
 			!validSource || params.Lines < 1 || params.Lines > 1000 || !validFormat {
 			s.writeError(connection, request.ID, "invalid_params", "invalid read")
@@ -674,13 +674,46 @@ func snapshotWire(snapshot herdr.Snapshot) map[string]any {
 	for _, pane := range snapshot.Panes {
 		panes = append(panes, paneWire(pane))
 	}
+	layouts := make([]any, 0, len(snapshot.Tabs))
+	for _, tab := range snapshot.Tabs {
+		layoutPanes := make([]any, 0)
+		width, height := 80, 24
+		focusedPaneID := ""
+		for _, pane := range snapshot.Panes {
+			if pane.TabID != tab.TabID {
+				continue
+			}
+			paneWidth, paneHeight := pane.Columns, pane.Rows
+			if paneWidth <= 0 {
+				paneWidth = 80
+			}
+			if paneHeight <= 0 {
+				paneHeight = 24
+			}
+			if focusedPaneID == "" {
+				focusedPaneID = pane.PaneID
+			}
+			width, height = max(width, paneWidth), max(height, paneHeight)
+			layoutPanes = append(layoutPanes, map[string]any{
+				"pane_id": pane.PaneID, "focused": pane.PaneID == focusedPaneID,
+				"rect": map[string]any{"x": 0, "y": 0, "width": paneWidth, "height": paneHeight},
+			})
+		}
+		if len(layoutPanes) > 0 {
+			layouts = append(layouts, map[string]any{
+				"workspace_id": tab.WorkspaceID, "tab_id": tab.TabID, "zoomed": false,
+				"area":            map[string]any{"x": 0, "y": 0, "width": width, "height": height},
+				"focused_pane_id": focusedPaneID, "panes": layoutPanes, "splits": []any{},
+			})
+		}
+	}
 	agents := make([]any, 0, len(snapshot.Agents))
 	for _, agent := range snapshot.Agents {
 		agents = append(agents, agentWire(agent))
 	}
 	return map[string]any{
 		"version": snapshot.Version, "protocol": snapshot.Protocol,
-		"workspaces": workspaces, "tabs": tabs, "panes": panes, "layouts": []any{}, "agents": agents,
+		"workspaces": workspaces, "tabs": tabs, "panes": panes, "layouts": layouts, "agents": agents,
 	}
 }
 

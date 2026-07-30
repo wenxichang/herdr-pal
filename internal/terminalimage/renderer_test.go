@@ -6,10 +6,13 @@ import (
 	"errors"
 	"image"
 	"image/png"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/jiro4989/textimg/v3/parser"
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/image/font/sfnt"
 )
 
@@ -34,6 +37,34 @@ func TestRendererProducesIndexedPNGWithCJKAndANSI(t *testing.T) {
 	}
 	if decoded.Bounds().Dx() != result.Width || decoded.Bounds().Dy() != result.Height {
 		t.Fatalf("decoded bounds = %v, result = %dx%d", decoded.Bounds(), result.Width, result.Height)
+	}
+}
+
+func TestRendererUsesNarrowAmbiguousWidthRegardlessLocale(t *testing.T) {
+	if os.Getenv("HERDR_PAL_TEST_EAST_ASIAN_WIDTH") == "1" {
+		if runewidth.EastAsianWidth || runewidth.DefaultCondition.EastAsianWidth {
+			t.Fatalf("EastAsianWidth = %t, condition = %t", runewidth.EastAsianWidth, runewidth.DefaultCondition.EastAsianWidth)
+		}
+
+		renderer, err := New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := strings.Repeat("─", 10)
+		result, err := renderer.Render(context.Background(), input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Width != 10*cellWidth {
+			t.Fatalf("locale-independent width = %d", result.Width)
+		}
+		return
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=^TestRendererUsesNarrowAmbiguousWidthRegardlessLocale$")
+	command.Env = append(os.Environ(), "RUNEWIDTH_EASTASIAN=1", "HERDR_PAL_TEST_EAST_ASIAN_WIDTH=1")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("subprocess error = %v\n%s", err, output)
 	}
 }
 

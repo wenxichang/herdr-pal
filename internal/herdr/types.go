@@ -151,6 +151,10 @@ type Pane struct {
 	AgentStatus AgentStatus `json:"agent_status"`
 	// AgentSession 是可选的 Agent 恢复会话标识。
 	AgentSession *AgentSession `json:"agent_session"`
+	// Columns 是从公开布局快照派生的终端列数；布局不可用时为 0。
+	Columns int `json:"columns"`
+	// Rows 是从公开布局快照派生的终端行数；布局不可用时为 0。
+	Rows int `json:"rows"`
 }
 
 // Snapshot 表示 Herdr session.snapshot 返回的最小会话视图。
@@ -184,13 +188,27 @@ type ReadResult struct {
 }
 
 type wireSnapshot struct {
-	Version    *string            `json:"version"`
-	Protocol   *uint32            `json:"protocol"`
-	Workspaces []wireWorkspace    `json:"workspaces"`
-	Tabs       []wireTab          `json:"tabs"`
-	Panes      []wirePane         `json:"panes"`
-	Layouts    *[]json.RawMessage `json:"layouts"`
-	Agents     []wireAgentInfo    `json:"agents"`
+	Version    *string         `json:"version"`
+	Protocol   *uint32         `json:"protocol"`
+	Workspaces []wireWorkspace `json:"workspaces"`
+	Tabs       []wireTab       `json:"tabs"`
+	Panes      []wirePane      `json:"panes"`
+	Layouts    *[]wireLayout   `json:"layouts"`
+	Agents     []wireAgentInfo `json:"agents"`
+}
+
+type wireLayout struct {
+	Panes []wireLayoutPane `json:"panes"`
+}
+
+type wireLayoutPane struct {
+	PaneID *string         `json:"pane_id"`
+	Rect   *wireLayoutRect `json:"rect"`
+}
+
+type wireLayoutRect struct {
+	Width  *uint64 `json:"width"`
+	Height *uint64 `json:"height"`
 }
 
 type wireWorkspace struct {
@@ -277,6 +295,10 @@ func snapshotFromWire(wire wireSnapshot) (Snapshot, error) {
 	if wire.Workspaces == nil || wire.Tabs == nil || wire.Panes == nil || wire.Layouts == nil || wire.Agents == nil {
 		return Snapshot{}, protocolError("session_snapshot 缺少资源列表")
 	}
+	geometry, err := paneGeometryFromWire(*wire.Layouts)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	snapshot := Snapshot{Version: *wire.Version, Protocol: *wire.Protocol, Workspaces: make([]Workspace, 0, len(wire.Workspaces)), Tabs: make([]Tab, 0, len(wire.Tabs)), Panes: make([]Pane, 0, len(wire.Panes)), Agents: make([]AgentInfo, 0, len(wire.Agents))}
 	for _, workspace := range wire.Workspaces {
 		converted, err := workspaceFromWire(workspace)
@@ -297,6 +319,10 @@ func snapshotFromWire(wire wireSnapshot) (Snapshot, error) {
 		if err != nil {
 			return Snapshot{}, err
 		}
+		if size, ok := geometry[converted.PaneID]; ok {
+			converted.Columns = size.columns
+			converted.Rows = size.rows
+		}
 		snapshot.Panes = append(snapshot.Panes, converted)
 	}
 	for _, agent := range wire.Agents {
@@ -307,6 +333,35 @@ func snapshotFromWire(wire wireSnapshot) (Snapshot, error) {
 		snapshot.Agents = append(snapshot.Agents, converted)
 	}
 	return snapshot, nil
+}
+
+type paneGeometry struct {
+	columns int
+	rows    int
+}
+
+func paneGeometryFromWire(layouts []wireLayout) (map[string]paneGeometry, error) {
+	geometry := make(map[string]paneGeometry)
+	for _, layout := range layouts {
+		for _, pane := range layout.Panes {
+			if pane.PaneID == nil || strings.TrimSpace(*pane.PaneID) == "" || pane.Rect == nil || pane.Rect.Width == nil || pane.Rect.Height == nil {
+				return nil, protocolError("layout pane 信息缺少必填字段")
+			}
+			columns, err := uint64ToInt(*pane.Rect.Width)
+			if err != nil {
+				return nil, err
+			}
+			rows, err := uint64ToInt(*pane.Rect.Height)
+			if err != nil {
+				return nil, err
+			}
+			if columns <= 0 || rows <= 0 {
+				return nil, protocolError("layout pane 尺寸无效")
+			}
+			geometry[*pane.PaneID] = paneGeometry{columns: columns, rows: rows}
+		}
+	}
+	return geometry, nil
 }
 
 func workspaceFromWire(wire wireWorkspace) (Workspace, error) {

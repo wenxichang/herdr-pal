@@ -5,7 +5,14 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
+
+var terminalWidthCondition = &runewidth.Condition{
+	EastAsianWidth:     false,
+	StrictEmojiNeutral: false,
+}
 
 // Line 保存同一终端逻辑行的纯文本与安全 ANSI 表示。
 type Line struct {
@@ -46,6 +53,72 @@ func NormalizeANSI(text string) []Line {
 		lines = lines[:len(lines)-1]
 	}
 	return lines
+}
+
+// NormalizeANSIWidth 按终端列宽恢复 ANSI 快照中丢失的软换行。
+func NormalizeANSIWidth(text string, columns int) []Line {
+	lines := NormalizeANSI(text)
+	if columns <= 0 {
+		return lines
+	}
+	wrapped := make([]Line, 0, len(lines))
+	for _, line := range lines {
+		for _, segment := range splitANSIWidth(line.ANSI, columns) {
+			segment = trimANSIRightWhitespace(segment)
+			textSegment := collapseANSIHorizontalRules(segment)
+			wrapped = append(wrapped, Line{Text: stripANSI(textSegment), ANSI: segment})
+		}
+	}
+	for len(wrapped) > 0 && wrapped[len(wrapped)-1].Text == "" {
+		wrapped = wrapped[:len(wrapped)-1]
+	}
+	return wrapped
+}
+
+func splitANSIWidth(text string, columns int) []string {
+	if columns <= 0 || text == "" {
+		return []string{text}
+	}
+	segments := make([]string, 0, 1)
+	var current strings.Builder
+	current.Grow(len(text))
+	column := 0
+	pendingWrap := false
+	flush := func() {
+		segments = append(segments, current.String())
+		current.Reset()
+		column = 0
+		pendingWrap = false
+	}
+	for index := 0; index < len(text); {
+		if end, ok := sgrSequenceEnd(text, index); ok {
+			current.WriteString(text[index:end])
+			index = end
+			continue
+		}
+		value, size := utf8.DecodeRuneInString(text[index:])
+		width := terminalWidthCondition.RuneWidth(value)
+		if value == '\t' {
+			width = 8 - column%8
+		}
+		if width < 0 {
+			width = 0
+		}
+		if width > 0 && pendingWrap {
+			flush()
+		}
+		if width > 0 && column > 0 && column+width > columns {
+			flush()
+		}
+		current.WriteString(text[index : index+size])
+		column += width
+		pendingWrap = column >= columns
+		index += size
+	}
+	if current.Len() > 0 || len(segments) == 0 {
+		segments = append(segments, current.String())
+	}
+	return segments
 }
 
 // JoinText 连接终端页的纯文本行。

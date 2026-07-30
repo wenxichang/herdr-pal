@@ -66,7 +66,7 @@ func TestServiceCurrentTargetsEmptyWhenHerdrUnavailable(t *testing.T) {
 	}
 }
 
-func TestServiceImageConReturnsSamePageTextAndPNG(t *testing.T) {
+func TestServiceImageConRendersFreshVisibleSnapshotAndReadsAuditTextSeparately(t *testing.T) {
 	service, fake := newTestService(t)
 	recorder := &terminalRecorder{}
 	service.im = recorder
@@ -78,18 +78,138 @@ func TestServiceImageConReturnsSamePageTextAndPNG(t *testing.T) {
 	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
 		t.Fatal(err)
 	}
-	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[31m红色\x1b[0m\n第二行"}, nil)
+	fresh := testSnapshot()
+	fresh.Panes[0].Columns = 6
+	fresh.Panes[0].Rows = 4
+	fake.setSnapshot(fresh)
+	fake.setReadResults(
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[31mAB中文CD\x1b[0m"}},
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "审计第一行\n审计第二行"}},
+	)
 	message := incoming("image-con", "/con")
 	message.OutputMode = im.OutputModeImage
 	service.HandleMessage(context.Background(), message)
 
 	content := recorder.singleReply(t)
-	if content.Mode != im.OutputModeImage || content.Text != "红色\n第二行" || content.Image == nil ||
+	if content.Mode != im.OutputModeImage || content.Text != "审计第一行\n审计第二行" || content.Image == nil ||
 		string(content.Image.Data) != "png" || content.Page == nil || content.Page.Current != 1 || content.Page.Total != 1 {
 		t.Fatalf("terminal reply = %#v", content)
 	}
-	if got := renderer.lastANSI(); got != "\x1b[31m红色\x1b[0m\n第二行" {
+	if got := renderer.lastANSI(); got != "\x1b[31mAB中文\nCD\x1b[0m" {
 		t.Fatalf("renderer ANSI = %q", got)
+	}
+	if got := fake.readSourceCalls(); len(got) != 2 || got[0] != "visible" || got[1] != "recent_unwrapped" {
+		t.Fatalf("图片 /con 读取源 = %#v，期望 [visible recent_unwrapped]", got)
+	}
+	if got := fake.snapshotCount(); got != 1 {
+		t.Fatalf("图片 /con snapshot 调用次数 = %d，期望 1", got)
+	}
+}
+
+func TestServiceImageConReadsAuditOnlyAfterDirectRender(t *testing.T) {
+	service, fake := newTestService(t)
+	recorder := &terminalRecorder{}
+	service.im = recorder
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	renderer := &fakeTerminalRenderer{
+		result:  terminalimage.Result{PNG: []byte("png"), Width: 80, Height: 34},
+		started: started, block: release,
+	}
+	if err := service.SetTerminalRenderer(renderer); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fake.setReadResults(
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "图片 ANSI"}},
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "审计文本"}},
+	)
+	message := incoming("image-render-before-audit", "/con")
+	message.OutputMode = im.OutputModeImage
+	done := make(chan struct{})
+	go func() {
+		service.HandleMessage(context.Background(), message)
+		close(done)
+	}()
+
+	awaitSignal(t, started, "direct terminal renderer")
+	if got := fake.readSourceCalls(); len(got) != 1 || got[0] != "visible" {
+		t.Fatalf("渲染阻塞期间读取源 = %#v，期望仅 visible", got)
+	}
+	close(release)
+	awaitSignal(t, done, "image con completion")
+	if got := fake.readSourceCalls(); len(got) != 2 || got[1] != "recent_unwrapped" {
+		t.Fatalf("渲染完成后的读取源 = %#v，期望追加 recent_unwrapped", got)
+	}
+	if content := recorder.singleReply(t); content.Text != "审计文本" || content.Image == nil {
+		t.Fatalf("terminal reply = %#v", content)
+	}
+}
+
+func TestServiceImageConRestoresSoftWrapAtPaneColumns(t *testing.T) {
+	service, fake := newTestService(t)
+	recorder := &terminalRecorder{}
+	service.im = recorder
+	renderer := &fakeTerminalRenderer{result: terminalimage.Result{PNG: []byte("png"), Width: 48, Height: 34}}
+	if err := service.SetTerminalRenderer(renderer); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fresh := testSnapshot()
+	fresh.Panes[0].Columns = 6
+	fake.setSnapshot(fresh)
+	fake.setReadResults(
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[31mAB中文CD\x1b[0m"}},
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "审计文本"}},
+	)
+	message := incoming("image-soft-wrap", "/con")
+	message.OutputMode = im.OutputModeImage
+
+	service.HandleMessage(context.Background(), message)
+
+	if got := renderer.lastANSI(); got != "\x1b[31mAB中文\nCD\x1b[0m" {
+		t.Fatalf("renderer ANSI = %q", got)
+	}
+	if content := recorder.singleReply(t); content.Text != "审计文本" {
+		t.Fatalf("terminal reply = %#v", content)
+	}
+}
+
+func TestServiceImagePageUpUsesRecentHistoryAfterVisibleCon(t *testing.T) {
+	service, fake := newTestService(t)
+	recorder := &terminalRecorder{}
+	service.im = recorder
+	if err := service.SetTerminalRenderer(&fakeTerminalRenderer{result: terminalimage.Result{PNG: []byte("png"), Width: 80, Height: 34}}); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: textLines(100, 200)}, nil)
+	con := incoming("image-history-con", "/con")
+	con.OutputMode = im.OutputModeImage
+	service.HandleMessage(context.Background(), con)
+
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: textLines(0, 200)}, nil)
+	pageUp := incoming("image-history-pageup", "/pageup")
+	pageUp.OutputMode = im.OutputModeImage
+	service.HandleMessage(context.Background(), pageUp)
+
+	if got := fake.readSourceCalls(); len(got) != 3 || got[0] != "visible" || got[1] != "recent_unwrapped" || got[2] != "recent" {
+		t.Fatalf("图片分页读取源 = %#v，期望 [visible recent_unwrapped recent]", got)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.replies) != 2 || recorder.replies[1].Mode != im.OutputModeImage ||
+		!strings.Contains(recorder.replies[1].Text, "line-000") || strings.Contains(recorder.replies[1].Text, "line-100") {
+		t.Fatalf("图片分页回复 = %#v", recorder.replies)
 	}
 }
 
@@ -109,23 +229,63 @@ func TestServiceNotificationSnapshotDoesNotChangeInteractivePage(t *testing.T) {
 	if err != nil || content.Text != "独立通知快照" {
 		t.Fatalf("ReadTerminalSnapshot() = %#v, %v", content, err)
 	}
+	if got := fake.readSourceCalls(); got[len(got)-1] != "recent" {
+		t.Fatalf("文本通知快照读取源 = %#v，期望 recent", got)
+	}
 	service.HandleMessage(context.Background(), incoming("snapshot-pagedown", "/pagedn"))
 	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "line-100") {
 		t.Fatalf("notification snapshot changed interactive page: %q", reply)
 	}
 }
 
-func TestServiceImageRenderFailureReturnsSameReadText(t *testing.T) {
+func TestServiceImageRenderFailureReturnsSeparateAuditText(t *testing.T) {
 	service, fake := newTestService(t)
 	renderErr := errors.New("render failed")
 	if err := service.SetTerminalRenderer(&fakeTerminalRenderer{err: renderErr}); err != nil {
 		t.Fatal(err)
 	}
 	target := service.CurrentTargets()[0]
-	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[32m可审计文本\x1b[0m"}, nil)
+	fake.setReadResults(
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "\x1b[32m图片文本\x1b[0m"}},
+		readResult{result: herdr.ReadResult{PaneID: target.PaneID, Text: "独立审计文本"}},
+	)
 	content, err := service.ReadTerminalSnapshot(context.Background(), target.PaneID, target.OccupantKey, im.OutputModeImage, panel.PageSize)
-	if !errors.Is(err, renderErr) || content.Mode != im.OutputModeText || content.Text != "可审计文本" || content.Image != nil {
+	if !errors.Is(err, renderErr) || content.Mode != im.OutputModeText || content.Text != "独立审计文本" || content.Image != nil {
 		t.Fatalf("ReadTerminalSnapshot() = %#v, %v", content, err)
+	}
+	if got := fake.readSourceCalls(); len(got) != 2 || got[0] != "visible" || got[1] != "recent_unwrapped" {
+		t.Fatalf("图片通知快照读取源 = %#v，期望 [visible recent_unwrapped]", got)
+	}
+}
+
+func TestServiceLogsImageReadSourceAndRenderedDimensions(t *testing.T) {
+	var logs bytes.Buffer
+	service, fake := newTestServiceWithLogger(t, slog.New(slog.NewTextHandler(&logs, nil)))
+	service.im = &terminalRecorder{}
+	if err := service.SetTerminalRenderer(&fakeTerminalRenderer{result: terminalimage.Result{PNG: []byte("png"), Width: 1968, Height: 1088}}); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	if err := service.SelectTarget(target.PaneID, target.OccupantKey); err != nil {
+		t.Fatal(err)
+	}
+	fake.setRead(herdr.ReadResult{PaneID: target.PaneID, Text: "private-terminal-content"}, nil)
+	message := incoming("image-log", "/con")
+	message.OutputMode = im.OutputModeImage
+
+	service.HandleMessage(context.Background(), message)
+
+	output := logs.String()
+	for _, want := range []string{
+		"终端 ANSI 快照已读取", "pane_id=pane-1", "output_mode=img", "source=visible",
+		"终端图片已生成", "image_width=1968", "image_height=1088", "image_bytes=3",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("终端图片日志缺少 %q：\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "private-terminal-content") {
+		t.Fatalf("终端图片日志泄露终端正文：\n%s", output)
 	}
 }
 
@@ -738,6 +898,29 @@ func TestServiceKeySequenceWaitsAfterLastKeyBeforeRefreshingContent(t *testing.T
 	}
 	if got := fake.reads(); len(got) != 1 {
 		t.Fatalf("read calls = %#v, want one call after delay", got)
+	}
+}
+
+func TestServiceImageKeyReadbackUsesVisibleANSI(t *testing.T) {
+	service, fake := newTestService(t)
+	if err := service.SetTerminalRenderer(&fakeTerminalRenderer{result: terminalimage.Result{PNG: []byte("png"), Width: 80, Height: 34}}); err != nil {
+		t.Fatal(err)
+	}
+	selectTarget(t, service)
+	recorder := &terminalRecorder{}
+	service.im = recorder
+	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: "console-after-key"}, nil)
+	service.waitKeyReadback = func(context.Context, time.Duration) error { return nil }
+	message := incoming("image-key-readback", "/key down")
+	message.OutputMode = im.OutputModeImage
+
+	service.HandleMessage(context.Background(), message)
+
+	if got := fake.readSourceCalls(); len(got) != 2 || got[0] != "visible" || got[1] != "recent_unwrapped" {
+		t.Fatalf("图片按键回读源 = %#v，期望 [visible recent_unwrapped]", got)
+	}
+	if content := recorder.singleReply(t); content.Mode != im.OutputModeImage || content.Image == nil {
+		t.Fatalf("terminal reply = %#v", content)
 	}
 }
 
@@ -1846,6 +2029,11 @@ type readCall struct {
 	lines  int
 }
 
+type readResult struct {
+	result herdr.ReadResult
+	err    error
+}
+
 type fakeHerdr struct {
 	mu            sync.Mutex
 	snapshot      herdr.Snapshot
@@ -1856,6 +2044,7 @@ type fakeHerdr struct {
 	getResults    []agentGetResult
 	read          herdr.ReadResult
 	readErr       error
+	readResults   []readResult
 	promptErr     error
 	promptResult  herdr.AgentInfo
 	waitErr       error
@@ -1864,6 +2053,7 @@ type fakeHerdr struct {
 	keyErrors     []error
 	getCalls      []string
 	readCalls     []readCall
+	readSources   []string
 	promptCalls   []promptCall
 	waitCalls     []waitCall
 	keyCalls      []keyCall
@@ -1918,20 +2108,33 @@ func (f *fakeHerdr) Snapshot(context.Context) (herdr.Snapshot, error) {
 	return f.snapshot, f.snapshotErr
 }
 func (f *fakeHerdr) ReadRecent(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
+	return f.readWithSource(target, lines, "recent_unwrapped")
+}
+
+func (f *fakeHerdr) ReadRecentANSI(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
+	return f.readWithSource(target, lines, "recent")
+}
+
+func (f *fakeHerdr) ReadVisibleANSI(_ context.Context, target string, lines int) (herdr.ReadResult, error) {
+	return f.readWithSource(target, lines, "visible")
+}
+
+func (f *fakeHerdr) readWithSource(target string, lines int, source string) (herdr.ReadResult, error) {
 	f.mu.Lock()
 	f.readCalls = append(f.readCalls, readCall{target, lines})
+	f.readSources = append(f.readSources, source)
 	f.order = append(f.order, "read")
 	result, err, block, started := f.read, f.readErr, f.blockRead, f.readStarted
+	if len(f.readResults) > 0 {
+		result, err = f.readResults[0].result, f.readResults[0].err
+		f.readResults = f.readResults[1:]
+	}
 	f.mu.Unlock()
 	signal(started)
 	if block != nil {
 		<-block
 	}
 	return result, err
-}
-
-func (f *fakeHerdr) ReadRecentANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error) {
-	return f.ReadRecent(ctx, target, lines)
 }
 func (f *fakeHerdr) PromptUntilStateChange(_ context.Context, target, text string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
@@ -2000,6 +2203,11 @@ func (f *fakeHerdr) setRead(result herdr.ReadResult, block chan struct{}) {
 	f.read = result
 	f.blockRead = block
 }
+func (f *fakeHerdr) setReadResults(results ...readResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readResults = append([]readResult(nil), results...)
+}
 func (f *fakeHerdr) prompts() []promptCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2020,10 +2228,16 @@ func (f *fakeHerdr) reads() []readCall {
 	defer f.mu.Unlock()
 	return append([]readCall(nil), f.readCalls...)
 }
+func (f *fakeHerdr) readSourceCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.readSources...)
+}
 func (f *fakeHerdr) clearReads() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readCalls = nil
+	f.readSources = nil
 	kept := f.order[:0]
 	for _, call := range f.order {
 		if call != "read" {

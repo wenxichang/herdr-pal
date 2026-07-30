@@ -49,6 +49,10 @@ type Target struct {
 	Workspace string
 	// Tab 是面向用户展示的标签页名称。
 	Tab string
+	// Columns 是当前 pane 的终端列数；布局不可用时为 0。
+	Columns int
+	// Rows 是当前 pane 的终端行数；布局不可用时为 0。
+	Rows int
 }
 
 // ChangeSet 描述完整快照替换后 Agent 集合和选择状态的变化。
@@ -386,6 +390,8 @@ func targetsFromSnapshot(snapshot herdr.Snapshot) (map[string]Target, map[string
 			Status:       pane.AgentStatus,
 			Workspace:    labelOrID(workspace.Label, pane.WorkspaceID),
 			Tab:          labelOrID(tab.Label, pane.TabID),
+			Columns:      pane.Columns,
+			Rows:         pane.Rows,
 		}
 		orders[pane.PaneID] = targetOrder{workspaceNumber: workspace.Number, tabNumber: tab.Number}
 	}

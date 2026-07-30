@@ -46,6 +46,8 @@ type HerdrAPI interface {
 	ReadRecent(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
 	// ReadRecentANSI 读取目标保留物理渲染行的 recent ANSI 终端快照。
 	ReadRecentANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
+	// ReadVisibleANSI 读取目标当前可见终端页面的 ANSI 快照。
+	ReadVisibleANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
 	// PromptUntilStateChange 向目标发送普通文本并等待首次状态变化。
 	PromptUntilStateChange(ctx context.Context, target, text string) (herdr.AgentInfo, error)
 	// WaitForStateChange 等待目标的状态变化序列离开 baseline。
@@ -244,7 +246,14 @@ func (s *Service) ReadTerminalSnapshot(
 	if err != nil {
 		return im.TerminalContent{}, err
 	}
-	result, err := client.ReadRecentANSI(ctx, target.PaneID, maxLines)
+	if mode == im.OutputModeImage {
+		capture, captureErr := s.captureDirectTerminalImage(ctx, client, target, maxLines)
+		if _, err := s.registry.ResolveTarget(paneID, occupantKey); err != nil {
+			return im.TerminalContent{}, err
+		}
+		return capture.content, captureErr
+	}
+	result, err := s.readLatestANSI(ctx, client, target.PaneID, maxLines, mode)
 	if err != nil {
 		return im.TerminalContent{}, err
 	}
@@ -254,7 +263,7 @@ func (s *Service) ReadTerminalSnapshot(
 	if _, err := s.registry.ResolveTarget(paneID, occupantKey); err != nil {
 		return im.TerminalContent{}, err
 	}
-	lines := panel.NormalizeANSI(result.Text)
+	lines := normalizeTerminalANSI(result.Text, mode, target.Columns)
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
@@ -634,9 +643,25 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 		s.reply(ctx, message.RequestID, keySequenceSummary(sent, len(keys), failureMessage)+"\n\n控制台刷新失败，请重新执行 /con。")
 		return
 	}
-	result, readErr := client.ReadRecentANSI(ctx, target.PaneID, panel.PageSize)
-	release()
 	summary := keySequenceSummary(sent, len(keys), failureMessage)
+	if normalizedOutputMode(message.OutputMode) == im.OutputModeImage {
+		capture, captureErr := s.captureDirectTerminalImage(ctx, client, target, panel.PageSize)
+		release()
+		if captureErr != nil {
+			s.reply(ctx, message.RequestID, summary+"\n\n控制台读取失败，请执行 /con 重试。")
+			return
+		}
+		page, applyErr := s.applyRefresh(target, generation, capture.imageLines)
+		if applyErr != nil {
+			s.reply(ctx, message.RequestID, summary+"\n\n控制台刷新失败："+readApplyErrorMessage(applyErr))
+			return
+		}
+		capture.content.Page = &im.TerminalPage{Current: page.Current, Total: page.Total}
+		s.replyTerminalContent(ctx, message.RequestID, target, capture.content, summary)
+		return
+	}
+	result, readErr := s.readLatestANSI(ctx, client, target.PaneID, panel.PageSize, message.OutputMode)
+	release()
 	if readErr != nil {
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台读取失败，请执行 /con 重试。")
 		return
@@ -646,7 +671,7 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台目标已变化，请重新执行 /ls 和 /sel。")
 		return
 	}
-	page, applyErr := s.applyRefresh(target, generation, panel.NormalizeANSI(result.Text))
+	page, applyErr := s.applyRefresh(target, generation, normalizeTerminalANSI(result.Text, message.OutputMode, target.Columns))
 	if applyErr != nil {
 		s.reply(ctx, message.RequestID, summary+"\n\n控制台刷新失败："+readApplyErrorMessage(applyErr))
 		return
@@ -717,7 +742,23 @@ func (s *Service) handleContent(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, safeOperationError(err))
 		return
 	}
-	result, err := client.ReadRecentANSI(ctx, target.PaneID, panel.PageSize)
+	if normalizedOutputMode(message.OutputMode) == im.OutputModeImage {
+		capture, captureErr := s.captureDirectTerminalImage(ctx, client, target, panel.PageSize)
+		release()
+		if captureErr != nil {
+			s.reply(ctx, message.RequestID, safeOperationError(captureErr))
+			return
+		}
+		page, applyErr := s.applyRefresh(target, generation, capture.imageLines)
+		if applyErr != nil {
+			s.reply(ctx, message.RequestID, readApplyErrorMessage(applyErr))
+			return
+		}
+		capture.content.Page = &im.TerminalPage{Current: page.Current, Total: page.Total}
+		s.replyTerminalContent(ctx, message.RequestID, target, capture.content, "")
+		return
+	}
+	result, err := s.readLatestANSI(ctx, client, target.PaneID, panel.PageSize, message.OutputMode)
 	release()
 	if err != nil {
 		s.reply(ctx, message.RequestID, unavailableMessage)
@@ -728,7 +769,7 @@ func (s *Service) handleContent(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	page, err := s.applyRefresh(target, generation, panel.NormalizeANSI(result.Text))
+	page, err := s.applyRefresh(target, generation, normalizeTerminalANSI(result.Text, message.OutputMode, target.Columns))
 	if err != nil {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
@@ -759,7 +800,7 @@ func (s *Service) handlePageUp(ctx context.Context, message im.IncomingText) {
 		s.reply(ctx, message.RequestID, targetChangedMessage)
 		return
 	}
-	page, err := s.applyExpand(target, generation, panel.NormalizeANSI(result.Text))
+	page, err := s.applyExpand(target, generation, normalizeTerminalANSI(result.Text, message.OutputMode, target.Columns))
 	if err != nil {
 		s.reply(ctx, message.RequestID, readApplyErrorMessage(err))
 		return
@@ -964,6 +1005,10 @@ func (s *Service) replyPage(ctx context.Context, requestID string, target sessio
 		s.reply(ctx, requestID, safeOperationError(err))
 		return
 	}
+	s.replyTerminalContent(ctx, requestID, target, content, note)
+}
+
+func (s *Service) replyTerminalContent(ctx context.Context, requestID string, target session.Target, content im.TerminalContent, note string) {
 	if sink, ok := s.im.(im.TerminalReplySink); ok {
 		if err := sink.RespondTerminal(ctx, requestID, content); err != nil {
 			s.logIMDeliveryFailure("IM 终端回复发送失败", requestID, 1, 1, len(content.Text), err)
@@ -976,19 +1021,140 @@ func (s *Service) replyPage(ctx context.Context, requestID string, target sessio
 		}
 		return
 	}
-	if mode == im.OutputModeImage {
+	if content.Mode == im.OutputModeImage {
 		s.reply(ctx, requestID, ErrTerminalImageUnsupported.Error())
 		return
 	}
-	lines := make([]string, len(page.Lines))
-	for index, line := range page.Lines {
-		lines[index] = line.Text
+	current, total := 1, 1
+	if content.Page != nil {
+		current, total = content.Page.Current, content.Page.Total
 	}
-	markdown := panel.RenderPageWithTotal(target, page.Current, page.Total, lines)
+	markdown := panel.RenderPageWithTotal(target, current, total, strings.Split(content.Text, "\n"))
 	if note != "" {
 		markdown = panel.AppendRenderedPageNote(markdown, note)
 	}
 	s.reply(ctx, requestID, markdown)
+}
+
+type directTerminalImageCapture struct {
+	content    im.TerminalContent
+	imageLines []panel.Line
+}
+
+func (s *Service) captureDirectTerminalImage(
+	ctx context.Context,
+	client HerdrAPI,
+	expected session.Target,
+	maxLines int,
+) (directTerminalImageCapture, error) {
+	snapshot, err := client.Snapshot(ctx)
+	if err != nil {
+		s.logger.Warn("终端图片几何快照读取失败", "pane_id", expected.PaneID, "reason", safeOperationError(err))
+		return directTerminalImageCapture{}, err
+	}
+	freshRegistry := &session.Registry{}
+	freshRegistry.Replace(snapshot, false)
+	freshTarget, err := freshRegistry.ResolveTarget(expected.PaneID, expected.OccupantKey)
+	if err != nil {
+		return directTerminalImageCapture{}, err
+	}
+	s.logger.Info("终端图片几何快照已读取",
+		"pane_id", freshTarget.PaneID,
+		"columns", freshTarget.Columns,
+		"rows", freshTarget.Rows,
+		"geometry_source", "session.snapshot",
+	)
+
+	visible, err := s.readLatestANSI(ctx, client, freshTarget.PaneID, maxLines, im.OutputModeImage)
+	if err != nil {
+		return directTerminalImageCapture{}, err
+	}
+	if visible.PaneID != freshTarget.PaneID {
+		return directTerminalImageCapture{}, session.ErrListSnapshotExpired
+	}
+	imageLines := normalizeTerminalANSI(visible.Text, im.OutputModeImage, freshTarget.Columns)
+	safeANSI := panel.JoinANSI(imageLines)
+	capturedAt := time.Now().UTC()
+	image, renderErr := s.renderTerminalImage(ctx, safeANSI, 1, 1, len(imageLines))
+
+	audit, auditErr := client.ReadRecent(ctx, freshTarget.PaneID, maxLines)
+	if auditErr != nil {
+		s.logger.Warn("终端图片审计文本读取失败",
+			"pane_id", freshTarget.PaneID,
+			"source", "recent_unwrapped",
+			"lines_requested", maxLines,
+			"reason", safeOperationError(auditErr),
+		)
+		if renderErr != nil {
+			return directTerminalImageCapture{}, errors.Join(renderErr, auditErr)
+		}
+		return directTerminalImageCapture{}, auditErr
+	}
+	if audit.PaneID != freshTarget.PaneID {
+		return directTerminalImageCapture{}, session.ErrListSnapshotExpired
+	}
+	auditLines := panel.Normalize(audit.Text)
+	if len(auditLines) > maxLines {
+		auditLines = auditLines[len(auditLines)-maxLines:]
+	}
+	s.logger.Info("终端图片审计文本已读取",
+		"pane_id", freshTarget.PaneID,
+		"source", "recent_unwrapped",
+		"lines_requested", maxLines,
+		"line_count", len(auditLines),
+		"text_bytes", len(audit.Text),
+		"truncated", audit.Truncated,
+	)
+
+	content := im.TerminalContent{
+		Mode: im.OutputModeImage, Text: strings.Join(auditLines, "\n"),
+		Page: &im.TerminalPage{Current: 1, Total: 1}, CapturedAt: capturedAt,
+		Image: image,
+	}
+	if renderErr != nil {
+		content.Mode = im.OutputModeText
+		content.Image = nil
+	}
+	return directTerminalImageCapture{content: content, imageLines: imageLines}, renderErr
+}
+
+func (s *Service) renderTerminalImage(
+	ctx context.Context,
+	safeANSI string,
+	pageCurrent, pageTotal, lineCount int,
+) (*im.TerminalImage, error) {
+	s.stateMu.Lock()
+	renderer := s.renderer
+	s.stateMu.Unlock()
+	if renderer == nil {
+		return nil, ErrTerminalImageUnsupported
+	}
+	result, err := renderer.Render(ctx, safeANSI)
+	if err != nil {
+		s.logger.Warn("终端图片生成失败",
+			"output_mode", im.OutputModeImage,
+			"page_current", pageCurrent,
+			"page_total", pageTotal,
+			"line_count", lineCount,
+			"ansi_bytes", len(safeANSI),
+			"reason", safeOperationError(err),
+		)
+		return nil, err
+	}
+	s.logger.Info("终端图片已生成",
+		"output_mode", im.OutputModeImage,
+		"page_current", pageCurrent,
+		"page_total", pageTotal,
+		"line_count", lineCount,
+		"ansi_bytes", len(safeANSI),
+		"image_width", result.Width,
+		"image_height", result.Height,
+		"image_bytes", len(result.PNG),
+	)
+	return &im.TerminalImage{
+		MediaType: "image/png", Data: append([]byte(nil), result.PNG...),
+		Width: result.Width, Height: result.Height, ColorMode: "indexed-256",
+	}, nil
 }
 
 func (s *Service) buildTerminalContent(ctx context.Context, page panel.Page, mode im.OutputMode) (im.TerminalContent, error) {
@@ -1006,22 +1172,13 @@ func (s *Service) buildTerminalContent(ctx context.Context, page panel.Page, mod
 	if mode == im.OutputModeText {
 		return content, nil
 	}
-	s.stateMu.Lock()
-	renderer := s.renderer
-	s.stateMu.Unlock()
-	if renderer == nil {
-		content.Mode = im.OutputModeText
-		return content, ErrTerminalImageUnsupported
-	}
-	result, err := renderer.Render(ctx, panel.JoinANSI(page.Lines))
+	safeANSI := panel.JoinANSI(page.Lines)
+	image, err := s.renderTerminalImage(ctx, safeANSI, page.Current, page.Total, len(page.Lines))
 	if err != nil {
 		content.Mode = im.OutputModeText
 		return content, err
 	}
-	content.Image = &im.TerminalImage{
-		MediaType: "image/png", Data: append([]byte(nil), result.PNG...),
-		Width: result.Width, Height: result.Height, ColorMode: "indexed-256",
-	}
+	content.Image = image
 	return content, nil
 }
 
@@ -1033,6 +1190,44 @@ func normalizedOutputMode(mode im.OutputMode) im.OutputMode {
 		return mode
 	}
 	return ""
+}
+
+func (s *Service) readLatestANSI(ctx context.Context, client HerdrAPI, target string, lines int, mode im.OutputMode) (herdr.ReadResult, error) {
+	mode = normalizedOutputMode(mode)
+	source := "recent"
+	read := client.ReadRecentANSI
+	if mode == im.OutputModeImage {
+		source = "visible"
+		read = client.ReadVisibleANSI
+	}
+	result, err := read(ctx, target, lines)
+	if err != nil {
+		s.logger.Warn("终端 ANSI 快照读取失败",
+			"pane_id", target,
+			"output_mode", mode,
+			"source", source,
+			"lines_requested", lines,
+			"reason", safeOperationError(err),
+		)
+		return herdr.ReadResult{}, err
+	}
+	s.logger.Info("终端 ANSI 快照已读取",
+		"pane_id", target,
+		"returned_pane_id", result.PaneID,
+		"output_mode", mode,
+		"source", source,
+		"lines_requested", lines,
+		"text_bytes", len(result.Text),
+		"truncated", result.Truncated,
+	)
+	return result, nil
+}
+
+func normalizeTerminalANSI(text string, mode im.OutputMode, columns int) []panel.Line {
+	if normalizedOutputMode(mode) == im.OutputModeImage && columns > 0 {
+		return panel.NormalizeANSIWidth(text, columns)
+	}
+	return panel.NormalizeANSI(text)
 }
 
 func (s *Service) reply(ctx context.Context, requestID, content string) {

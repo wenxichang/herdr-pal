@@ -1649,6 +1649,10 @@ func (c *supervisorClient) ReadRecentANSI(context.Context, string, int) (herdr.R
 	return herdr.ReadResult{}, nil
 }
 
+func (c *supervisorClient) ReadVisibleANSI(context.Context, string, int) (herdr.ReadResult, error) {
+	return herdr.ReadResult{}, nil
+}
+
 func (c *supervisorClient) PromptUntilStateChange(context.Context, string, string) (herdr.AgentInfo, error) {
 	return herdr.AgentInfo{}, nil
 }

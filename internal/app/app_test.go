@@ -2723,6 +2723,10 @@ func (f *fakeManagedHerdr) ReadRecentANSI(ctx context.Context, target string, li
 	return f.ReadRecent(ctx, target, lines)
 }
 
+func (f *fakeManagedHerdr) ReadVisibleANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error) {
+	return f.ReadRecent(ctx, target, lines)
+}
+
 func (f *fakeManagedHerdr) PromptUntilStateChange(context.Context, string, string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

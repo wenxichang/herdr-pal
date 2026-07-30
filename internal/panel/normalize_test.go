@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/mattn/go-runewidth"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 )
 
@@ -194,6 +196,37 @@ func TestNormalizeANSICarriageReturnResetsDiscardedStyle(t *testing.T) {
 	want := []panel.Line{{Text: "新内容", ANSI: "\x1b[0m新内容\x1b[0m"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NormalizeANSI() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeANSIWidthRestoresSoftWrappedRows(t *testing.T) {
+	got := panel.NormalizeANSIWidth("\x1b[31mAB中文CD\x1b[0m\n12345\nnext", 6)
+	want := []panel.Line{
+		{Text: "AB中文", ANSI: "\x1b[31mAB中文"},
+		{Text: "CD", ANSI: "CD\x1b[0m"},
+		{Text: "12345", ANSI: "12345"},
+		{Text: "next", ANSI: "next"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeANSIWidth() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeANSIWidthTreatsBoxDrawingAsNarrowRegardlessLocale(t *testing.T) {
+	previousGlobal := runewidth.EastAsianWidth
+	previousCondition := runewidth.DefaultCondition.EastAsianWidth
+	runewidth.EastAsianWidth = true
+	runewidth.DefaultCondition.EastAsianWidth = true
+	t.Cleanup(func() {
+		runewidth.EastAsianWidth = previousGlobal
+		runewidth.DefaultCondition.EastAsianWidth = previousCondition
+	})
+
+	input := strings.Repeat("─", 10)
+	got := panel.NormalizeANSIWidth(input, 10)
+	want := []panel.Line{{Text: strings.Repeat("─", 6), ANSI: input}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeANSIWidth() = %#v, want locale-independent %#v", got, want)
 	}
 }
 
