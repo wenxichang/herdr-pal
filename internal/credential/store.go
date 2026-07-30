@@ -23,7 +23,7 @@ const storeVersion = 2
 var (
 	// ErrInsecurePermissions 表示凭据文件可被当前用户之外的主体读取或写入。
 	ErrInsecurePermissions = errors.New("HPRP 凭据文件权限不安全")
-	// ErrCredentialConflict 表示凭据文件中存在重复 credential ID。
+	// ErrCredentialConflict 表示 credential ID 或用户机器身份发生冲突。
 	ErrCredentialConflict = errors.New("HPRP credential ID 冲突")
 	// ErrCredentialNotFound 表示管理操作指定的 credential ID 不存在。
 	ErrCredentialNotFound = errors.New("HPRP credential 不存在")
@@ -141,6 +141,11 @@ func (store *Store) Issue(principalID, machineID string, allowedSources []string
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	for _, current := range store.records {
+		if current.PrincipalID == principalID && current.MachineID == machineID {
+			return "", Record{}, ErrCredentialConflict
+		}
+	}
 	if store.nextID == 0 {
 		return "", Record{}, ErrCredentialIDExhausted
 	}

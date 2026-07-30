@@ -128,6 +128,21 @@ func TestStoreConcurrentIssueAllocatesUniqueIDs(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsDuplicatePrincipalAndMachineWithoutConsumingID(t *testing.T) {
+	store := loadStoreForTest(t, filepath.Join(t.TempDir(), "credentials.json"))
+	first := issueStoreRecord(t, store, "home")
+	if _, _, err := store.Issue("user", "home", []string{"10.0.0.1"}, nil); !errors.Is(err, ErrCredentialConflict) {
+		t.Fatalf("Store.Issue(duplicate) error = %v, want ErrCredentialConflict", err)
+	}
+	second := issueStoreRecord(t, store, "office")
+	if first.CredentialID != 1 || second.CredentialID != 2 {
+		t.Fatalf("credential ids = %d, %d", first.CredentialID, second.CredentialID)
+	}
+	if records := store.List(); len(records) != 2 {
+		t.Fatalf("records = %#v", records)
+	}
+}
+
 func TestStoreListShowAndStatusCRUDReturnIndependentRecords(t *testing.T) {
 	store := loadStoreForTest(t, filepath.Join(t.TempDir(), "credentials.json"))
 	first := issueStoreRecord(t, store, "first")
