@@ -32,7 +32,10 @@ func TestStoreIssuePersistsDigestSourcesAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret := token[strings.LastIndex(token, "_")+1:]
+	_, secret, err := parseToken(token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(string(data), token) || strings.Contains(string(data), secret) {
 		t.Fatalf("credential file leaked token: %s", data)
 	}
