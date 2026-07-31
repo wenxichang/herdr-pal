@@ -30,9 +30,21 @@ type sessionStatus struct {
 
 // ResolveSocket 依次通过显式路径、Herdr 公共 CLI 和默认 HOME 路径解析本地 Socket。
 func ResolveSocket(ctx context.Context, explicitPath, sessionName string, runner CommandRunner) (string, error) {
+	return ResolveSocketWithEnvironment(ctx, explicitPath, "", sessionName, runner)
+}
+
+// ResolveSocketWithEnvironment 按显式配置、Sidecar 环境、公共 CLI 和默认路径解析 Socket。
+func ResolveSocketWithEnvironment(ctx context.Context, explicitPath, environmentPath, sessionName string, runner CommandRunner) (string, error) {
 	if explicitPath != "" {
 		return explicitPath, nil
 	}
+	if environmentPath != "" {
+		return environmentPath, nil
+	}
+	return resolveSocketWithoutHints(ctx, sessionName, runner)
+}
+
+func resolveSocketWithoutHints(ctx context.Context, sessionName string, runner CommandRunner) (string, error) {
 	var cliErr error
 	if runner == nil {
 		cliErr = errors.New("解析 Herdr Socket 失败：CommandRunner 不能为空")
