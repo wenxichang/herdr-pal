@@ -13,6 +13,7 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/app"
 	"github.com/wenxichang/herdr-pal/internal/config"
+	"github.com/wenxichang/herdr-pal/internal/installer"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
@@ -26,6 +27,13 @@ func main() {
 type appExecutor func(context.Context, app.Options) error
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, execute appExecutor) int {
+	return runWithExecutors(ctx, args, stdin, stdout, stderr, execute, installer.Apply)
+}
+
+func runWithExecutors(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, execute appExecutor, setup setupExecutor) int {
+	if len(args) > 0 && args[0] == "setup" {
+		return runSetup(ctx, args[1:], stdin, stdout, stderr, setup)
+	}
 	flags := flag.NewFlagSet("herdr-pal", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	interactiveMode := flags.Bool("i", false, "进入本地交互模式")

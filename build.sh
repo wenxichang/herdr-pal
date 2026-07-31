@@ -5,6 +5,16 @@ export GOTOOLCHAIN=go1.26.5+auto
 
 cd "$(dirname "$0")"
 
+if [ "${1-}" = "bundle" ]; then
+	shift
+	"$0"
+	exec ./packaging/build-bundle.sh "$@"
+fi
+if [ "$#" -ne 0 ]; then
+	printf '%s\n' "用法: ./build.sh [bundle <打包参数>]" >&2
+	exit 2
+fi
+
 if [ -n "$(gofmt -l .)" ]; then
 	printf '%s\n' "请先运行 gofmt。" >&2
 	exit 1

@@ -12,3 +12,4 @@ coverage.out
 *.tmp
 .tmp/
 tmp/
+docs/superpowers/

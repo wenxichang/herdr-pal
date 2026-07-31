@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/wenxichang/herdr-pal/internal/app"
+	"github.com/wenxichang/herdr-pal/internal/installer"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
@@ -191,5 +192,34 @@ func TestRunReportsDetailedConfigErrors(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunWithExecutorsDispatchesSetupCommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	appCalls := 0
+	setupCalls := 0
+
+	code := runWithExecutors(
+		context.Background(),
+		[]string{"setup", "--url", "wss://relay.example/hprp", "--herdr-bin", "/tmp/herdr"},
+		strings.NewReader(validSetupKey+"\n"),
+		&stdout,
+		&stderr,
+		func(context.Context, app.Options) error {
+			appCalls++
+			return nil
+		},
+		func(context.Context, installer.Request, installer.Options) (installer.Result, error) {
+			setupCalls++
+			return installer.Result{}, nil
+		},
+	)
+
+	if code != 0 {
+		t.Fatalf("runWithExecutors() = %d, stderr = %q", code, stderr.String())
+	}
+	if appCalls != 0 || setupCalls != 1 {
+		t.Fatalf("app calls = %d, setup calls = %d", appCalls, setupCalls)
 	}
 }

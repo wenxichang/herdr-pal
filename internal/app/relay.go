@@ -58,7 +58,17 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if runner == nil {
 		runner = commandRunner{}
 	}
-	socketPath, err := herdr.ResolveSocket(ctx, loaded.Herdr.SocketPath, loaded.Herdr.Session, runner)
+	getenv := options.Getenv
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	socketPath, err := herdr.ResolveSocketWithEnvironment(
+		ctx,
+		loaded.Herdr.SocketPath,
+		strings.TrimSpace(getenv("HERDR_SOCKET_PATH")),
+		loaded.Herdr.Session,
+		runner,
+	)
 	if err != nil {
 		return fmt.Errorf("解析 Herdr Socket: %w", err)
 	}

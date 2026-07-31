@@ -1,0 +1,20 @@
+# Herdr Bundle @BUNDLE_VERSION@
+
+目标平台：`@BUNDLE_TARGET@`
+
+Herdr 源码提交：`@HERDR_COMMIT@`
+
+本目录同时包含 Herdr 和 Herdr Pal。请在当前目录执行：
+
+```sh
+./install.sh
+```
+
+安装器会引导你选择安装目录，并输入 HPRP Server URL 与机器 Key。默认安装目录是
+`~/.local/bin`，已有二进制和配置会先备份。安装完成后，Herdr 会通过 `[[sidecar]]` 在自身
+生命周期内启动和守护 Herdr Pal。
+
+机器 Key 由管理员按机器签发。尚未取得用户 ID 时，请先在企业微信机器人单聊中发送
+`/userid`，再把返回值交给管理员。
+
+安装完成后启动 Herdr，并在企业微信中执行 `/ls` 验证连接。

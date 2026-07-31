@@ -171,19 +171,16 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"OpenCode 默认使用图片模式",
 		"模式只在 Server 本次运行期间保存",
 		"/key down,sp,dn,A,7",
-		"https://herdr.dev/docs/install/",
 		"https://github.com/wenxichang/herdr-pal/releases/latest",
-		"herdr-pal-windows-amd64.exe",
-		`%USERPROFILE%\.config\herdr-pal\config.json`,
-		`"url": "wss://请向管理员获取服务器地址:9443"`,
-		`"key": "管理员签发的 hpk_ 机器 Key"`,
-		"每台机器使用独立 Key",
-		"把返回值交给管理员",
-		"relay.url",
-		"relay.key",
-		"herdr.socket_path",
-		"protocol",
-		"17",
+		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
+		"./install.sh",
+		"默认 `~/.local/bin`",
+		"机器 Key",
+		"把返回的用户 ID 交给管理员",
+		"Sidecar",
+		"live-handoff",
+		"~/.config/herdr-pal/config.json",
+		"~/.config/herdr/config.toml",
 	} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help reply lacks %q:\n%s", want, help)
@@ -192,6 +189,11 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 	for _, forbidden := range []string{"server-config", "HERDR_PAL_WECOM_SECRET", "herdr-pal-server", "Bot ID"} {
 		if strings.Contains(help, forbidden) {
 			t.Fatalf("help reply contains server deployment field %q:\n%s", forbidden, help)
+		}
+	}
+	for _, forbidden := range []string{"herdr-pal-windows-amd64.exe", "创建 config.json", "curl -fsSL https://herdr.dev/install.sh"} {
+		if strings.Contains(help, forbidden) {
+			t.Fatalf("help reply retained old installation field %q:\n%s", forbidden, help)
 		}
 	}
 	for _, forbidden := range []string{`"userid":`, `"machine_id":`} {
