@@ -84,16 +84,7 @@ if [ -z "$relay_url" ]; then
 fi
 
 printf '机器 Key: '
-if [ -t 0 ]; then
-	stty_state=$(stty -g)
-	stty -echo
-	IFS= read -r relay_key || relay_key=''
-	stty "$stty_state"
-	stty_state=''
-	printf '\n'
-else
-	IFS= read -r relay_key || relay_key=''
-fi
+IFS= read -r relay_key || relay_key=''
 if [ -z "$relay_key" ]; then
 	fail "机器 Key 不能为空。"
 fi

@@ -67,6 +67,7 @@ func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
 		"/ls",
 		"/N",
 		"Sidecar",
+		"Key 会在终端回显",
 	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("default help missing %q", want)
@@ -75,6 +76,7 @@ func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
 	for _, old := range []string{
 		"/userid",
 		"/sel",
+		"Key 不会显示在终端",
 		"curl -fsSL https://herdr.dev/install.sh",
 		"创建 config.json",
 		"herdr-pal-windows-amd64.exe",

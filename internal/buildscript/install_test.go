@@ -11,6 +11,20 @@ import (
 
 const bundleInstallTestKey = "hpk_7_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
+func TestBundleInstallScriptLeavesMachineKeyEchoEnabled(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join(repositoryRoot(t), "packaging", "bundle", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	if strings.Contains(script, "stty -echo") {
+		t.Fatal("install.sh still disables terminal echo for machine key")
+	}
+	if !strings.Contains(script, "printf '机器 Key: '\nIFS= read -r relay_key") {
+		t.Fatal("install.sh should read machine key directly after the prompt")
+	}
+}
+
 func TestBundleInstallScriptInstallsConfiguresAndHandsOff(t *testing.T) {
 	root := repositoryRoot(t)
 	bundle := t.TempDir()
