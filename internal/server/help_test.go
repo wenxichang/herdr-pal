@@ -58,3 +58,27 @@ func TestFileHelpProviderRejectsUnavailableContent(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
+	help := DefaultHelpText()
+	for _, want := range []string{
+		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
+		"./install.sh",
+		"/userid",
+		"/ls",
+		"Sidecar",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("default help missing %q", want)
+		}
+	}
+	for _, old := range []string{
+		"curl -fsSL https://herdr.dev/install.sh",
+		"创建 config.json",
+		"herdr-pal-windows-amd64.exe",
+	} {
+		if strings.Contains(help, old) {
+			t.Errorf("default help still contains old installation text %q", old)
+		}
+	}
+}

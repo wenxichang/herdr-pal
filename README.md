@@ -16,7 +16,7 @@ herdr-pal-server
 ```
 
 - `herdr-pal-server` 连接企业微信机器人，一套机器人只运行一个服务端。
-- 每台运行 Herdr 的机器启动一个 `herdr-pal` 客户端。
+- 每台运行 Herdr 的机器通过 Herdr `[[sidecar]]` 启动并守护一个 `herdr-pal` 客户端。
 - 一个用户可以接入多台机器，并在同一个企业微信单聊中切换会话。
 - Pal 与 Server 使用公开的 HPRP/1 协议；每台机器使用一把由服务端签发的独立 Key。
 - `herdr-pal -i` 可以脱离企业微信，在本机终端中直接操作 Herdr Agent。
@@ -75,6 +75,19 @@ herdr status server --json
 GitHub Release 只发布带操作系统和架构后缀的文件。Intel/AMD x64 选择 `amd64`，Apple
 Silicon 或 ARM64 Linux 选择 `arm64`。Windows 当前只发布客户端 AMD64 Beta，不发布
 Windows 服务端。
+
+为终端用户制作包含 Herdr 和 Herdr Pal 的单平台安装包：
+
+```sh
+./build.sh bundle \
+  --target darwin-arm64 \
+  --version "$(git describe --tags --always)" \
+  --herdr-source ~/Code/herdr
+```
+
+`--target` 支持 `darwin-amd64`、`darwin-arm64`、`linux-amd64` 和 `linux-arm64`。跨平台构建
+Herdr 不方便时，也可以把现有 Herdr 构建产物通过 `--herdr-binary` 传入。生成结果为
+`dist/herdr-bundle-<版本>-<目标>.tar.gz` 和同名 `.sha256`。
 
 ## 第一步：申请企业微信智能机器人
 
@@ -305,14 +318,34 @@ Server 时的来源地址，不信任 `X-Forwarded-For` 等代理头。不同用
 
 ## 第四步：启动每台客户端
 
-在每台运行 Herdr 的机器上执行：
+Linux 和 macOS 推荐直接使用同时包含 Herdr、Herdr Pal 和安装器的一体化包。从 Release
+下载与本机匹配的文件：
+
+- Apple Silicon：`herdr-bundle-<版本>-darwin-arm64.tar.gz`
+- Intel Mac：`herdr-bundle-<版本>-darwin-amd64.tar.gz`
+- Linux x64：`herdr-bundle-<版本>-linux-amd64.tar.gz`
+- Linux ARM64：`herdr-bundle-<版本>-linux-arm64.tar.gz`
+
+使用同名 `.sha256` 校验文件后解压，在包目录执行：
 
 ```sh
-mkdir -p ~/.config/herdr-pal
-cp config.example.json ~/.config/herdr-pal/config.json
+./install.sh
 ```
 
-编辑 `~/.config/herdr-pal/config.json`：
+安装器会交互完成以下操作：
+
+- 选择安装目录，默认 `~/.local/bin`，也可以输入其他用户可写目录。
+- 输入服务端 `wss://` URL 和管理员为本机签发的 Key；Key 输入不会回显。
+- 把 `herdr` 和 `herdr-pal` 安装为同目录的真实文件，旧文件先生成带时间戳的备份。
+- 合并并备份 `~/.config/herdr-pal/config.json` 和 `~/.config/herdr/config.toml`。
+- 添加幂等的 `[[sidecar]] command = ["herdr-pal"]`，让 Herdr 在自身生命周期内启动、守护并
+  停止 Pal。
+- 检测到 Herdr 已运行时，询问是否执行 `live-handoff`，默认执行且不会清空现有 pane。
+
+安装完成后不需要手工启动 `herdr-pal`。启动 Herdr，或让安装器完成 `live-handoff`，再回到
+企业微信执行 `/ls`。
+
+高级用户需要手工部署或排错时，Pal 配置仍使用：
 
 ```json
 {
@@ -331,7 +364,7 @@ cp config.example.json ~/.config/herdr-pal/config.json
 }
 ```
 
-配置说明：
+字段说明：
 
 - `url` 必须使用 `wss://`，地址指向 `herdr-pal-server`。
 - `key` 填写管理员为当前机器签发的完整 `hpk_...` Key。用户和机器身份都由该 Key 绑定，
@@ -341,7 +374,7 @@ cp config.example.json ~/.config/herdr-pal/config.json
 - 使用命名 Herdr session 时填写 `session`；只有自动探测失败时才手工填写
   `socket_path`。
 
-启动客户端：
+手工启动客户端：
 
 ```sh
 ./dist/herdr-pal
@@ -556,7 +589,8 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 
 ### Herdr Socket 自动探测失败
 
-客户端先调用 Herdr 公共 CLI。默认 session 查询失败时，还会尝试：
+作为 Herdr Sidecar 运行时，客户端先使用 Herdr 注入的 `HERDR_SOCKET_PATH`。非 Sidecar
+部署会调用 Herdr 公共 CLI；默认 session 查询失败时，还会尝试：
 
 ```text
 $HOME/.config/herdr/herdr.sock

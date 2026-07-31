@@ -248,7 +248,7 @@ git commit -m "feat: 添加安装配置原子写入"
 
 - [ ] **Step 1：添加 TOML 解析依赖**
 
-Run: `go get github.com/BurntSushi/toml@v1.5.0`
+Run: `go get github.com/BurntSushi/toml@v1.6.0`
 
 Expected: `go.mod` 和 `go.sum` 增加直接依赖。
 
