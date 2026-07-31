@@ -149,8 +149,8 @@ cp server-config.example.json ~/.config/herdr-pal-server/server.json
 ```
 
 企业微信 `/help` 的完整内容保存在 `~/.config/herdr-pal-server/help.md`。首次启动会生成默认
-文件；此后每次 `/help` 都重新读取磁盘，不缓存内容。管理员应直接在该文件的 Pal 配置示例
-中填写用户实际可访问的 WSS 地址，保存后无需重启 Server 即可生效。
+文件；此后每次 `/help` 都重新读取磁盘，不缓存内容。默认帮助会引导用户下载 Herdr Bundle、
+输入管理员签发的 WSS 地址和机器 Key；管理员可直接修改该文件，保存后无需重启 Server 即可生效。
 
 `rate_limit` 按企业微信用户限制唯一输入，默认每秒 1 条、滚动 60 秒内 20 条。字段缺省使用
 默认值，显式设置为 `0` 会关闭对应窗口；重复投递的同一企业微信消息不会重复计数。

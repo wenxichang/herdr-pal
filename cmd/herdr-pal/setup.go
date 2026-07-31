@@ -30,7 +30,6 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	}
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			flags.Usage()
 			return 0
 		}
 		fmt.Fprintln(stderr, "安装配置参数错误。")

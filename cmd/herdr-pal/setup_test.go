@@ -111,6 +111,19 @@ func TestRunSetupRejectsInvalidArgumentsAndInput(t *testing.T) {
 	}
 }
 
+func TestRunSetupHelpPrintsUsageOnce(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := runSetup(context.Background(), []string{"--help"}, strings.NewReader(""), &stdout, &stderr, nil)
+
+	if code != 0 {
+		t.Fatalf("runSetup() = %d, want 0", code)
+	}
+	if count := strings.Count(stderr.String(), "用法: herdr-pal setup"); count != 1 {
+		t.Fatalf("usage count = %d, want 1; stderr = %q", count, stderr.String())
+	}
+}
+
 func TestRunSetupRedactsKeyFromExecutorError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
