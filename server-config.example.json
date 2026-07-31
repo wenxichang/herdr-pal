@@ -1,6 +1,7 @@
 {
   "wecom": {
-    "bot_id": ""
+    "bot_id": "",
+    "secret": ""
   },
   "server": {
     "listen": "0.0.0.0:9443",

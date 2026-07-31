@@ -41,10 +41,11 @@ var _ server.WeComImageGateway = (*wecom.Client)(nil)
 // Options 是 herdr-pal-server 的外部启动选项。
 type Options struct {
 	ConfigPath string
-	Getenv     func(string) string
-	Stdout     io.Writer
-	Stderr     io.Writer
-	Verbose    bool
+	// Getenv 只读取 OTLP 标准请求头环境变量；企业微信 Secret 必须在配置文件中提供。
+	Getenv  func(string) string
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Verbose bool
 	// AuthFile 覆盖固定管理员认证文件路径；只供本机自动化测试隔离状态。
 	AuthFile string
 	// WeComEndpoint 覆盖企业微信长连接地址；CLI 和配置文件不暴露该入口。
@@ -52,7 +53,11 @@ type Options struct {
 }
 
 // Run 启动唯一企业微信连接和 Relay TLS 监听，直到 context 取消或关键组件失败。
-func Run(ctx context.Context, options Options) error {
+func Run(ctx context.Context, options Options) (runErr error) {
+	errorRedactor := audit.NewRedactor(nil)
+	defer func() {
+		runErr = redactServerRunError(runErr, errorRedactor)
+	}()
 	if ctx == nil || strings.TrimSpace(options.ConfigPath) == "" {
 		return fmt.Errorf("%w: 缺少启动参数", ErrConfig)
 	}
@@ -64,6 +69,11 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
+	initialSecrets := []string{loaded.WeCom.Secret}
+	for _, value := range loaded.Audit.Headers {
+		initialSecrets = append(initialSecrets, value)
+	}
+	errorRedactor = audit.NewRedactor(initialSecrets)
 	stderr := options.Stderr
 	if stderr == nil {
 		stderr = os.Stderr
@@ -97,6 +107,7 @@ func Run(ctx context.Context, options Options) error {
 	for _, value := range loaded.Audit.Headers {
 		runtimeSecrets = append(runtimeSecrets, value)
 	}
+	errorRedactor = audit.NewRedactor(runtimeSecrets)
 	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, runtimeSecrets...)
 	if err != nil {
 		if bootstrap.Created {
@@ -291,6 +302,30 @@ func Run(ctx context.Context, options Options) error {
 		"audit_stderr", loaded.Audit.Stderr,
 	)
 	return runServerComponents(ctx, stopRequested, components, shutdown, logger)
+}
+
+type redactedServerRunError struct {
+	cause   error
+	message string
+}
+
+func (err redactedServerRunError) Error() string {
+	return err.message
+}
+
+func (err redactedServerRunError) Unwrap() error {
+	return err.cause
+}
+
+func redactServerRunError(err error, redactor *audit.Redactor) error {
+	if err == nil {
+		return nil
+	}
+	message := redactor.Redact(err.Error())
+	if message == err.Error() {
+		return err
+	}
+	return redactedServerRunError{cause: err, message: message}
 }
 
 func buildRelayURLHint(addrHint, listen string) (string, error) {

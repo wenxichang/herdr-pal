@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/serverapp"
@@ -84,10 +85,5 @@ func finishRun(ctx context.Context, err error, resolvedConfigPath string, stderr
 }
 
 func safeServerError(err error) string {
-	message := err.Error()
-	secret := os.Getenv(config.SecretEnvName)
-	if strings.TrimSpace(secret) != "" {
-		message = strings.ReplaceAll(message, secret, "[REDACTED]")
-	}
-	return message
+	return audit.NewRedactor(nil).Redact(err.Error())
 }

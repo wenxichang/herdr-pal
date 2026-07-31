@@ -69,22 +69,20 @@ func TestLoadClientRejectsPlainWSLegacyIdentityAndUnknownNestedField(t *testing.
 	}
 }
 
-func TestLoadServerReadsSecretAndDefaultsCredentialPath(t *testing.T) {
+func TestLoadServerReadsSecretFromFileAndDefaultsCredentialPath(t *testing.T) {
 	path := writeConfig(t, `{
-	  "wecom": {"bot_id": "bot-1"},
+	  "wecom": {"bot_id": "bot-1", "secret": "file-secret-value"},
 	  "server": {"listen": "127.0.0.1:9443", "addr_hint": "10.1.3.4"},
 	  "log": {}
 	}`)
 	loaded, err := LoadServer(path, func(name string) string {
-		if name != SecretEnvName {
-			t.Fatalf("getenv name = %q", name)
-		}
-		return "secret-value"
+		t.Fatalf("LoadServer() unexpectedly read environment variable %q", name)
+		return "environment-secret-must-be-ignored"
 	})
 	if err != nil {
 		t.Fatalf("LoadServer() error = %v", err)
 	}
-	if loaded.WeCom.BotID != "bot-1" || loaded.WeCom.Secret != "secret-value" || loaded.Server.Listen != "127.0.0.1:9443" {
+	if loaded.WeCom.BotID != "bot-1" || loaded.WeCom.Secret != "file-secret-value" || loaded.Server.Listen != "127.0.0.1:9443" {
 		t.Fatalf("LoadServer() = %#v", loaded)
 	}
 	if filepath.Base(loaded.Server.StateDir) != "herdr-pal-server" || loaded.Log.Level != "info" {
@@ -104,9 +102,24 @@ func TestLoadServerReadsSecretAndDefaultsCredentialPath(t *testing.T) {
 	}
 }
 
+func TestLoadServerRequiresSecretInConfigurationFile(t *testing.T) {
+	path := writeConfig(t, `{
+	  "wecom": {"bot_id": "bot-1"},
+	  "server": {"listen": "127.0.0.1:9443"},
+	  "log": {}
+	}`)
+	_, err := LoadServer(path, func(name string) string {
+		t.Fatalf("LoadServer() unexpectedly read environment variable %q", name)
+		return "environment-secret-must-be-ignored"
+	})
+	if err == nil || !strings.Contains(err.Error(), "wecom.secret") || strings.Contains(err.Error(), "environment-secret-must-be-ignored") {
+		t.Fatalf("LoadServer() error = %v", err)
+	}
+}
+
 func TestLoadServerAppliesWebAdminDefaults(t *testing.T) {
 	loaded, err := LoadServer(writeConfig(t, `{
-  "wecom":{"bot_id":"bot"},
+  "wecom":{"bot_id":"bot","secret":"secret"},
   "server":{"listen":"127.0.0.1:9443"},
   "log":{}
 }`), func(string) string { return "secret" })
@@ -126,7 +139,7 @@ func TestLoadServerAppliesWebAdminDefaults(t *testing.T) {
 
 func TestLoadServerAcceptsWebAdminConfiguration(t *testing.T) {
 	loaded, err := LoadServer(writeConfig(t, `{
-  "wecom":{"bot_id":"bot"},
+  "wecom":{"bot_id":"bot","secret":"secret"},
   "server":{"listen":"127.0.0.1:9443"},
   "admin":{"listen":"127.0.0.1:0","loki_url":"https://loki.internal:3100/"},
   "log":{}
@@ -165,7 +178,7 @@ func TestLoadServerRejectsInvalidWebAdminConfiguration(t *testing.T) {
 
 func TestLoadServerAcceptsExplicitRateLimitDisable(t *testing.T) {
 	path := writeConfig(t, `{
-  "wecom": {"bot_id": "bot-1"},
+	  "wecom": {"bot_id": "bot-1", "secret": "secret-value"},
   "server": {"listen": "127.0.0.1:9443"},
   "rate_limit": {"per_second": 0, "per_minute": 0},
   "audit": {"type": "none", "stderr": true},
@@ -207,7 +220,7 @@ func TestLoadServerRejectsInvalidRateLimit(t *testing.T) {
 
 func TestLoadServerAcceptsOTLPAuditAndParsesHeaders(t *testing.T) {
 	path := writeConfig(t, `{
-  "wecom": {"bot_id": "bot-1"},
+	  "wecom": {"bot_id": "bot-1", "secret": "secret-value"},
   "server": {"listen": "127.0.0.1:9443"},
   "audit": {
     "type": "otlp",
@@ -219,11 +232,10 @@ func TestLoadServerAcceptsOTLPAuditAndParsesHeaders(t *testing.T) {
 }`)
 	loaded, err := LoadServer(path, func(name string) string {
 		switch name {
-		case SecretEnvName:
-			return "secret-value"
 		case OTLPLogsHeadersEnvName:
 			return "Authorization=Bearer%20token,x-tenant=team%2Cone"
 		default:
+			t.Fatalf("getenv name = %q", name)
 			return ""
 		}
 	})
@@ -267,14 +279,14 @@ func TestLoadServerRejectsInvalidAudit(t *testing.T) {
 
 func TestLoadServerRejectsMalformedOTLPHeaders(t *testing.T) {
 	path := writeConfig(t, `{
-  "wecom": {"bot_id": "bot-1"},
+	  "wecom": {"bot_id": "bot-1", "secret": "secret-value"},
   "server": {"listen": "127.0.0.1:9443"},
   "audit": {"type": "otlp", "endpoint": "https://collector/v1/logs"},
   "log": {}
 }`)
 	_, err := LoadServer(path, func(name string) string {
-		if name == SecretEnvName {
-			return "secret"
+		if name != OTLPLogsHeadersEnvName {
+			t.Fatalf("getenv name = %q", name)
 		}
 		return "missing-equals"
 	})
@@ -342,23 +354,19 @@ func shortConfigStateDir(t *testing.T) string {
 
 func TestLoadServerRequiresListenSecretAndCertificatePair(t *testing.T) {
 	tests := []struct {
-		name   string
-		raw    string
-		secret string
-		field  string
+		name  string
+		raw   string
+		field string
 	}{
-		{name: "listen", raw: `{"wecom":{"bot_id":"bot"},"server":{},"log":{}}`, secret: "secret", field: "listen"},
-		{name: "secret", raw: `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"log":{}}`, secret: " ", field: SecretEnvName},
-		{name: "certificate pair", raw: `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443","cert_file":"cert.pem"},"log":{}}`, secret: "secret", field: "cert_file"},
+		{name: "listen", raw: `{"wecom":{"bot_id":"bot","secret":"secret"},"server":{},"log":{}}`, field: "listen"},
+		{name: "secret", raw: `{"wecom":{"bot_id":"bot"},"server":{"listen":"127.0.0.1:9443"},"log":{}}`, field: "wecom.secret"},
+		{name: "certificate pair", raw: `{"wecom":{"bot_id":"bot","secret":"secret"},"server":{"listen":"127.0.0.1:9443","cert_file":"cert.pem"},"log":{}}`, field: "cert_file"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := LoadServer(writeConfig(t, test.raw), func(string) string { return test.secret })
+			_, err := LoadServer(writeConfig(t, test.raw), func(string) string { return "" })
 			if err == nil || !strings.Contains(err.Error(), test.field) {
 				t.Fatalf("LoadServer() error = %v, want field %q", err, test.field)
-			}
-			if strings.TrimSpace(test.secret) != "" && strings.Contains(err.Error(), test.secret) {
-				t.Fatalf("LoadServer() leaked secret: %v", err)
 			}
 		})
 	}

@@ -80,7 +80,6 @@ func TestRunServerMapsConfigAndRuntimeErrors(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		err           error
-		secret        string
 		code          int
 		wantParts     []string
 		forbiddenPart string
@@ -94,12 +93,11 @@ func TestRunServerMapsConfigAndRuntimeErrors(t *testing.T) {
 			wantParts: []string{"Herdr Pal Server 启动或运行失败", "监听 Relay 地址: bind: address already in use"},
 		},
 		{
-			name: "secret redaction", err: errors.New("企业微信认证失败: secret-sensitive"), secret: "secret-sensitive", code: 1,
-			wantParts: []string{"企业微信认证失败", "[REDACTED]"}, forbiddenPart: "secret-sensitive",
+			name: "credential redaction", err: errors.New("认证失败: hpk_12_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), code: 1,
+			wantParts: []string{"认证失败", "[REDACTED]"}, forbiddenPart: "hpk_12_",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("HERDR_PAL_WECOM_SECRET", test.secret)
 			var stdout, stderr bytes.Buffer
 			code := run(context.Background(), []string{"-config", "/tmp/server.json"}, &stdout, &stderr, func(context.Context, serverapp.Options) error { return test.err })
 			if code != test.code {

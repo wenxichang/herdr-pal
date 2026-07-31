@@ -25,8 +25,8 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 
 ## 2. 固定产品决策
 
-- 企业微信 Bot ID 和 Secret 只由 Server 持有；Secret 来自
-  `HERDR_PAL_WECOM_SECRET`。
+- 企业微信 Bot ID 和 Secret 只由 Server 持有；Secret 直接保存在权限为 `0600` 的
+  `server-config.json` 的 `wecom.secret` 字段中。
 - 企业微信应用可见范围是用户入口边界；Router 只处理单聊。
 - `/userid` 只用于向管理员提供企业微信 principal ID，不再写入 Pal 配置。
 - 管理员使用 `hp-cli key issue` 为每台机器签发独立 `hpk_...` Key，并必须配置至少一条

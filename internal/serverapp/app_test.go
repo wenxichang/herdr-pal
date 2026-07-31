@@ -14,9 +14,18 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminserver"
+	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/server"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
+
+func TestRedactServerRunErrorPreservesCauseAndRemovesConfiguredSecret(t *testing.T) {
+	original := fmt.Errorf("%w: upstream rejected configured-secret", ErrConfig)
+	redacted := redactServerRunError(original, audit.NewRedactor([]string{"configured-secret"}))
+	if !errors.Is(redacted, ErrConfig) || strings.Contains(redacted.Error(), "configured-secret") || !strings.Contains(redacted.Error(), "[REDACTED]") {
+		t.Fatalf("redactServerRunError() = %v", redacted)
+	}
+}
 
 func TestServerAppRoutesImageGateway(t *testing.T) {
 	client, err := wecom.NewClient(wecom.ClientConfig{
@@ -180,7 +189,7 @@ func TestRunServerFailsWhenAdminSocketCannotStartAndClosesRelay(t *testing.T) {
 	listenAddress := probe.Addr().String()
 	probe.Close()
 	configPath := filepath.Join(t.TempDir(), "server.json")
-	raw := fmt.Sprintf(`{"wecom":{"bot_id":"bot-test"},"server":{"listen":%q,"state_dir":%q},"admin":{"listen":"127.0.0.1:0"},"log":{}}`, listenAddress, stateDir)
+	raw := fmt.Sprintf(`{"wecom":{"bot_id":"bot-test","secret":"wecom-secret"},"server":{"listen":%q,"state_dir":%q},"admin":{"listen":"127.0.0.1:0"},"log":{}}`, listenAddress, stateDir)
 	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +319,7 @@ func reserveServerAppAddress(t *testing.T) string {
 func writeServerAppConfig(t *testing.T, stateDir, relayAddress, webAddress, botID string) string {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "server.json")
-	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q},"server":{"listen":%q,"state_dir":%q},"admin":{"listen":%q},"log":{}}`, botID, relayAddress, stateDir, webAddress)
+	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q,"secret":"wecom-secret"},"server":{"listen":%q,"state_dir":%q},"admin":{"listen":%q},"log":{}}`, botID, relayAddress, stateDir, webAddress)
 	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}

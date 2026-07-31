@@ -40,11 +40,11 @@ func TestWebAdminEndToEnd(t *testing.T) {
 	authFile := filepath.Join(stateDir, "server-auth.json")
 	configPath := filepath.Join(t.TempDir(), "server.json")
 	rawConfig := fmt.Sprintf(`{
-		"wecom":{"bot_id":%q},
+		"wecom":{"bot_id":%q,"secret":%q},
 		"server":{"listen":%q,"addr_hint":"127.0.0.1","state_dir":%q},
 		"admin":{"listen":%q,"loki_url":%q},
 		"log":{"level":"debug"}
-	}`, botID, relayAddress, stateDir, webAddress, lokiServer.URL)
+	}`, botID, secret, relayAddress, stateDir, webAddress, lokiServer.URL)
 	if err := os.WriteFile(configPath, []byte(rawConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestWebAdminEndToEnd(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- serverapp.Run(ctx, serverapp.Options{
-			ConfigPath: configPath, Getenv: func(string) string { return secret },
+			ConfigPath: configPath, Getenv: func(string) string { return "" },
 			Stdout: stdout, Stderr: stderr, AuthFile: authFile, WeComEndpoint: weComServer.Endpoint(),
 		})
 	}()

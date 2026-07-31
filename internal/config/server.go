@@ -44,7 +44,7 @@ type serverConfigFile struct {
 // ServerWeComConfig 是服务端独占的企业微信机器人配置。
 type ServerWeComConfig struct {
 	BotID  string `json:"bot_id"`
-	Secret string `json:"-"`
+	Secret string `json:"secret"`
 }
 
 // ListenerConfig 是 Relay WSS 监听和证书配置。
@@ -102,7 +102,7 @@ type AuditConfig struct {
 	Headers    map[string]string `json:"-"`
 }
 
-// LoadServer 加载服务端配置并从环境读取企业微信 Secret。
+// LoadServer 加载服务端配置；企业微信 Secret 只允许来自配置文件。
 func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 	loaded, err := LoadServerAdmin(path)
 	if err != nil {
@@ -111,7 +111,6 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	loaded.WeCom.Secret = getenv(SecretEnvName)
 	if loaded.Audit.Type == "otlp" {
 		headers, err := parseOTLPHeaders(getenv(OTLPLogsHeadersEnvName))
 		if err != nil {
@@ -123,7 +122,7 @@ func LoadServer(path string, getenv func(string) string) (ServerConfig, error) {
 		return ServerConfig{}, fmt.Errorf("缺少必填字段 bot_id")
 	}
 	if strings.TrimSpace(loaded.WeCom.Secret) == "" {
-		return ServerConfig{}, fmt.Errorf("缺少环境变量 %s", SecretEnvName)
+		return ServerConfig{}, fmt.Errorf("缺少必填字段 wecom.secret")
 	}
 	if strings.TrimSpace(loaded.Server.Listen) == "" {
 		return ServerConfig{}, fmt.Errorf("缺少必填字段 listen")

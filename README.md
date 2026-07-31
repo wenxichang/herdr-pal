@@ -104,7 +104,8 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
 ```json
 {
   "wecom": {
-    "bot_id": "你的 Bot ID"
+    "bot_id": "你的 Bot ID",
+    "secret": "你的机器人 Secret"
   },
   "server": {
     "listen": "0.0.0.0:9443",
@@ -167,10 +168,10 @@ export OTEL_EXPORTER_OTLP_LOGS_HEADERS='Authorization=Bearer%20collector-token,x
 队列满或关闭刷新超时都不会阻断用户操作。`audit.stderr=true` 会额外向 stderr 输出包含完整
 审计正文的 JSON Lines，只应在受控调试环境启用。
 
-设置 Secret 并启动：
+配置文件包含企业微信 Secret，请限制为当前用户可读，然后启动：
 
 ```sh
-export HERDR_PAL_WECOM_SECRET='你的机器人 Secret'
+chmod 600 ~/.config/herdr-pal/server-config.json
 ./dist/herdr-pal-server
 ```
 
@@ -236,8 +237,8 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 ./dist/hp-cli server status
 ```
 
-`hp-cli` 默认读取同一个 `~/.config/herdr-pal/server-config.json` 来定位 Admin Socket，不
-需要企业微信 Secret。服务端使用其他配置文件时，给 `hp-cli` 传入相同的 `-config`。
+`hp-cli` 默认读取同一个 `~/.config/herdr-pal/server-config.json` 来定位 Admin Socket，但不
+使用其中的企业微信 Secret。服务端使用其他配置文件时，给 `hp-cli` 传入相同的 `-config`。
 
 查看管理命令和参数帮助：
 
@@ -509,13 +510,13 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 ### 提示配置错误
 
 - 检查默认配置文件是否存在且 JSON 格式正确。
-- 服务端确认已设置 `HERDR_PAL_WECOM_SECRET`。
+- 服务端确认 `wecom.bot_id` 和 `wecom.secret` 已填写。
 - 客户端确认 `url` 和管理员签发的 `key` 已填写。
 
 服务端会同时打印配置文件路径和具体原因，例如：
 
 ```text
-配置错误（/home/user/.config/herdr-pal/server-config.json）：缺少环境变量 HERDR_PAL_WECOM_SECRET
+配置错误（/home/user/.config/herdr-pal/server-config.json）：缺少必填字段 wecom.secret
 ```
 
 客户端和本机交互模式也会打印对应配置路径及加载或校验原因，例如：
