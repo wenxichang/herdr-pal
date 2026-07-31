@@ -31,7 +31,7 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - 企业微信 Bot ID 和 Secret 只由 Server 持有；Secret 直接保存在权限为 `0600` 的
   `server.json` 的 `wecom.secret` 字段中。
 - 企业微信应用可见范围是用户入口边界；Router 只处理单聊。
-- `/userid` 只用于向管理员提供企业微信 principal ID，不再写入 Pal 配置。
+- 企业微信 principal ID 和机器标识只由管理员在签发机器 Key 时绑定，不写入 Pal 配置。
 - 管理员使用 `hp-cli key issue` 为每台机器签发独立 `hpk_...` Key，并必须配置至少一条
   来源地址规则。
 - Key 在服务端绑定 `(principal_id, machine_id)`；Pal 不能自行声明或覆盖身份。
@@ -60,7 +60,7 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 6. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
 7. `/help` 每次重新读取 `help.md`，管理员修改后无需重启即可生效。
 
-用户在企业微信发送 `/userid` 后，管理员执行：
+管理员从企业微信管理信息或组织内账户系统取得 principal ID 后执行：
 
 ```sh
 hp-cli key issue \
@@ -110,7 +110,7 @@ machine_id + slot_id + session_id
 
 - Server 先校验单聊身份和消息 ID，再完成 `msgid` 幂等去重；唯一输入随后进入按用户滚动
   窗口限速，默认每秒 1 条、60 秒内 20 条，显式配置 0 可关闭对应窗口。
-- `/userid`、`/ls`、独立 `/N`/`/sel N` 和 `/help` 由 Server 处理。
+- `/ls`、独立 `/N` 和 `/help` 由 Server 处理。
 - `/N 内容` 与 `#N 内容` 先由 Server 把全局编号解析为稳定目标；前者仅在成功后切换，
   后者不改变当前选择。
 - 其余内容要求已有稳定选择，Server 发送 `command.execute`。

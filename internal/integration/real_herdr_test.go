@@ -161,9 +161,9 @@ func TestRealHerdr(t *testing.T) {
 		}
 		t.Fatalf("等待真实交互 /ls 就绪失败，目标 pane %s：%v", target.PaneID, err)
 	}
-	selectReply := sendRealInteractiveLine(t, application, fmt.Sprintf("/sel %d", selectionIndex))
+	selectReply := sendRealInteractiveLine(t, application, fmt.Sprintf("/%d", selectionIndex))
 	if !strings.Contains(selectReply, target.PaneID) {
-		t.Fatalf("真实交互 /sel 未选择目标 pane %s", target.PaneID)
+		t.Fatalf("真实交互 /N 未选择目标 pane %s", target.PaneID)
 	}
 	contentReply := sendRealInteractiveLine(t, application, "/con")
 	joined := listReply + selectReply + contentReply

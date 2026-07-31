@@ -25,9 +25,6 @@ import (
 
 // RunCLI 按公开 CLI 模式运行本地交互或 Relay 客户端。
 func RunCLI(ctx context.Context, options Options) error {
-	if options.DiscoverUser {
-		return newConfigError("-discover-user 已移除")
-	}
 	if options.Interactive {
 		return Run(ctx, options)
 	}

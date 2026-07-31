@@ -64,8 +64,8 @@ func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
 	for _, want := range []string{
 		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
 		"./install.sh",
-		"/userid",
 		"/ls",
+		"/N",
 		"Sidecar",
 	} {
 		if !strings.Contains(help, want) {
@@ -73,6 +73,8 @@ func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
 		}
 	}
 	for _, old := range []string{
+		"/userid",
+		"/sel",
 		"curl -fsSL https://herdr.dev/install.sh",
 		"创建 config.json",
 		"herdr-pal-windows-amd64.exe",

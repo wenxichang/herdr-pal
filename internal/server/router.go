@@ -29,7 +29,7 @@ const defaultRelayRequestTimeout = 20 * time.Second
 
 const backgroundNotificationActivityWindow = 2 * time.Minute
 
-const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户 ID，并联系管理员签发机器 Key 后配置 herdr-pal；使用/help获取内置命令帮助"
+const noAvailableSessionsMessage = "当前没有可用会话，请联系管理员获取 Server URL 和机器 Key，并完成 Herdr Pal 接入；使用 /help 获取帮助。"
 
 //go:embed default_help.md
 var serverHelpTextTemplate string
@@ -348,14 +348,12 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	}
 	router.logger.Debug("企业微信交互已接收", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "target_index", action.index, "switch_after", action.switchAfter, "content_bytes", len([]byte(message.Content)))
 	router.activity.Touch(message.UserID, router.now())
-	if action.kind != serverActionUserID && action.kind != serverActionHelp && !router.catalog.HasSessions(message.UserID) {
+	if action.kind != serverActionHelp && !router.catalog.HasSessions(message.UserID) {
 		router.logger.Info("企业微信交互未路由", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "error_type", "no_sessions", "reason", "当前用户没有在线且可用的 Relay 会话")
 		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
 	}
 	switch action.kind {
-	case serverActionUserID:
-		router.reply(ctx, message, message.UserID)
 	case serverActionList:
 		router.handleList(ctx, message)
 	case serverActionSelect:
@@ -407,7 +405,7 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 		content.WriteString(marker)
 		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Display.Workspace, entry.Session.Display.Tab)), safeRouterLabel(panel.AgentStatusLabelValue(hprp.NormalizeStatus(entry.Session.Status))))
 	}
-	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
+	content.WriteString("\n使用 /N 选择目标。")
 	router.logger.Debug("企业微信会话列表已生成", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "session_count", len(entries), "has_selection", selectedErr == nil)
 	router.reply(ctx, message, content.String())
 }
@@ -943,7 +941,6 @@ type serverActionKind uint8
 
 const (
 	serverActionForward serverActionKind = iota
-	serverActionUserID
 	serverActionList
 	serverActionSelect
 	serverActionHelp
@@ -969,11 +966,6 @@ func parseServerAction(content string) (serverAction, error) {
 		return action, err
 	}
 	switch fields[0] {
-	case "/userid":
-		if len(fields) != 1 {
-			return serverAction{}, errors.New("/userid 用法: /userid")
-		}
-		return serverAction{kind: serverActionUserID}, nil
 	case "/ls":
 		if len(fields) != 1 {
 			return serverAction{}, errors.New("/ls 用法: /ls")
@@ -998,15 +990,6 @@ func parseServerAction(content string) (serverAction, error) {
 			return serverAction{}, errors.New("/mode 用法: /mode img 或 /mode txt")
 		}
 		return serverAction{kind: serverActionMode, mode: mode}, nil
-	case "/sel":
-		if len(fields) != 2 {
-			return serverAction{}, errors.New("/sel 用法: /sel N")
-		}
-		index, err := positiveASCIIInt(fields[1])
-		if err != nil {
-			return serverAction{}, errors.New("/sel 用法: /sel N")
-		}
-		return serverAction{kind: serverActionSelect, index: index}, nil
 	}
 	if len(fields) == 1 && strings.HasPrefix(fields[0], "/") {
 		if index, err := positiveASCIIInt(strings.TrimPrefix(fields[0], "/")); err == nil {
@@ -1033,7 +1016,7 @@ func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
 	}
 	nested, err := parseServerAction(remainder)
 	if err != nil || (nested.kind != serverActionForward && nested.kind != serverActionMode) {
-		return serverAction{}, true, errors.New("定向输入不能执行 /userid、/ls、/help、/N 或 /sel N。")
+		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help 或另一个 /N。")
 	}
 	return serverAction{
 		kind:        serverActionDirected,

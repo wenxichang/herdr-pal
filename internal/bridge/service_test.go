@@ -454,7 +454,7 @@ func TestServiceListAndSelectionResetPanel(t *testing.T) {
 	if !strings.Contains(list, "1.") || !strings.Contains(list, "workspace-1") || !strings.Contains(list, "状态：working ⏳") || strings.Contains(list, "当前选择") {
 		t.Fatalf("list reply = %q", list)
 	}
-	service.HandleMessage(context.Background(), incoming("select", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("select", "/1"))
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "[终端输出]") {
 		t.Fatalf("select reply = %q", fakeIMFromService(t, service).lastReply())
 	}
@@ -476,7 +476,7 @@ func TestServiceListRefreshesAgentSessionBeforeSelection(t *testing.T) {
 	fake.promptResult = changedAgent(current, herdr.AgentStatusWorking)
 
 	service.HandleMessage(context.Background(), incoming("session-refresh-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("session-refresh-select", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("session-refresh-select", "/1"))
 	service.HandleMessage(context.Background(), incoming("session-refresh-prompt", "继续处理"))
 
 	if got := fake.snapshotCount(); got != 1 {
@@ -511,7 +511,7 @@ func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T
 		}
 	}
 	fake.setRead(herdr.ReadResult{PaneID: "pane-a", Text: "第一项终端"}, nil)
-	service.HandleMessage(context.Background(), incoming("list-select", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("list-select", "/1"))
 	service.HandleMessage(context.Background(), incoming("list-current", "/ls"))
 	if !strings.Contains(fakeIMFromService(t, service).lastReply(), "1. Claude（当前选择）") {
 		t.Fatalf("current marker missing: %q", fakeIMFromService(t, service).lastReply())
@@ -563,7 +563,7 @@ func TestServicePromptRebindsSessionChangedAfterSubmission(t *testing.T) {
 			t.Fatalf("发送后会话切换回复缺少 %q：%q", want, reply)
 		}
 	}
-	if strings.Contains(reply, "/ls") || strings.Contains(reply, "/sel") {
+	if strings.Contains(reply, "/ls") || strings.Contains(reply, "/N") {
 		t.Fatalf("自动选择新会话后仍要求手工选择：%q", reply)
 	}
 	selected, err := service.registry.ValidateSelected()
@@ -733,7 +733,7 @@ func TestServicePromptStallInvalidatesReplacementObservedAfterEnter(t *testing.T
 	if _, err := service.registry.ValidateSelected(); err == nil {
 		t.Fatal("replacement did not invalidate selection")
 	}
-	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/sel") {
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/N") {
 		t.Fatalf("replacement reply = %q", reply)
 	}
 	audits := fakeAuditFromService(t, service).records()
@@ -1088,7 +1088,7 @@ func TestServiceKeyMismatchClearsSelectionWithoutSending(t *testing.T) {
 	selectTarget(t, service)
 	fake.setAgent(agentInfo("pane-1", "terminal-1", "other"))
 	service.HandleMessage(context.Background(), incoming("key-mismatch", "/key enter"))
-	if len(fake.keys()) != 0 || !strings.Contains(fakeIMFromService(t, service).lastReply(), "/sel") {
+	if len(fake.keys()) != 0 || !strings.Contains(fakeIMFromService(t, service).lastReply(), "/N") {
 		t.Fatalf("mismatch keys=%#v reply=%q", fake.keys(), fakeIMFromService(t, service).lastReply())
 	}
 }
@@ -1119,16 +1119,16 @@ func TestServiceInputMismatchDoesNotInvalidateNewSelection(t *testing.T) {
 			fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 			selectDone := make(chan struct{})
 			go func() {
-				service.HandleMessage(context.Background(), incoming("input-mismatch-select-"+test.name, "/sel 2"))
+				service.HandleMessage(context.Background(), incoming("input-mismatch-select-"+test.name, "/2"))
 				close(selectDone)
 			}()
 			waitForCondition(t, func() bool {
 				service.opMu.Lock()
 				defer service.opMu.Unlock()
 				return service.inputBlocked > 0
-			}, "/sel input barrier")
+			}, "/N input barrier")
 			close(fake.blockGet)
-			awaitSignal(t, selectDone, "/sel B")
+			awaitSignal(t, selectDone, "/N B")
 			awaitSignal(t, requestDone, "mismatched input")
 			selected, err := service.registry.ValidateSelected()
 			if err != nil || selected.PaneID != "pane-2" {
@@ -1180,7 +1180,7 @@ func TestServiceReadMismatchDoesNotInvalidateNewSelectionOrPanel(t *testing.T) {
 			fake.clearReadStarted()
 			service.HandleMessage(context.Background(), incoming("read-mismatch-list-"+test.name, "/ls"))
 			fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: namedLines("B", 100, 200)}, nil)
-			service.HandleMessage(context.Background(), incoming("read-mismatch-select-"+test.name, "/sel 2"))
+			service.HandleMessage(context.Background(), incoming("read-mismatch-select-"+test.name, "/2"))
 			service.HandleMessage(context.Background(), incoming("read-mismatch-new-"+test.name, "/con"))
 			close(oldReadBlock)
 			awaitSignal(t, oldDone, "old mismatched read")
@@ -1242,7 +1242,7 @@ func TestServiceReplaceSnapshotWaitsForInputAndResetsInvalidSelection(t *testing
 
 	service.registry.Replace(testSnapshot(), false)
 	service.HandleMessage(context.Background(), incoming("replace-reconnect-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("replace-reconnect-select", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("replace-reconnect-select", "/1"))
 	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("reconnect", 100, 200)}, nil)
 	service.HandleMessage(context.Background(), incoming("replace-reconnect-content", "/con"))
 	fake.setRead(herdr.ReadResult{PaneID: "pane-1", Text: namedLines("reconnect", 0, 200)}, nil)
@@ -1417,14 +1417,14 @@ func TestServiceSelectResetsExistingPanelCache(t *testing.T) {
 	service.registry.Replace(snapshot, false)
 	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("select-one", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("select-one", "/1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(100, 200)}
 	service.HandleMessage(context.Background(), incoming("select-content", "/con"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(0, 200)}
 	service.HandleMessage(context.Background(), incoming("select-pageup", "/pageup"))
 	service.HandleMessage(context.Background(), incoming("select-list-again", "/ls"))
 	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
-	service.HandleMessage(context.Background(), incoming("select-two", "/sel 2"))
+	service.HandleMessage(context.Background(), incoming("select-two", "/2"))
 	beforeReads := len(fake.reads())
 	service.HandleMessage(context.Background(), incoming("select-pagedown", "/pagedn"))
 	if len(fake.reads()) != beforeReads || !strings.Contains(fakeIMFromService(t, service).lastReply(), "最新") || strings.Contains(fakeIMFromService(t, service).lastReply(), "line-100") {
@@ -1438,7 +1438,7 @@ func TestServiceBlockedReadCannotRestoreOldPanelAfterSelectionChanges(t *testing
 	service.registry.Replace(snapshot, false)
 	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("read-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("read-select-one", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("read-select-one", "/1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: "OLD-TERMINAL-CONTENT"}
 	oldReadBlock := make(chan struct{})
 	fake.blockRead = oldReadBlock
@@ -1449,7 +1449,7 @@ func TestServiceBlockedReadCannotRestoreOldPanelAfterSelectionChanges(t *testing
 	fake.clearReadStarted()
 	service.HandleMessage(context.Background(), incoming("read-list-again", "/ls"))
 	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "NEW-TERMINAL-CONTENT"}, nil)
-	service.HandleMessage(context.Background(), incoming("read-select-two", "/sel 2"))
+	service.HandleMessage(context.Background(), incoming("read-select-two", "/2"))
 	close(oldReadBlock)
 	awaitSignal(t, readDone, "old /con")
 	if reply := fakeIMFromService(t, service).lastReply(); strings.Contains(reply, "OLD-TERMINAL-CONTENT") || !strings.Contains(reply, "/con") {
@@ -1800,7 +1800,7 @@ func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 	service.registry.Replace(snapshot, false)
 	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("select-one", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("select-one", "/1"))
 	fake.blockPrompt = make(chan struct{})
 	fake.promptStarted = make(chan struct{}, 1)
 	promptDone := make(chan struct{})
@@ -1812,13 +1812,13 @@ func TestServiceSelectWaitsForInFlightPrompt(t *testing.T) {
 	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 	selectDone := make(chan struct{})
 	go func() {
-		service.HandleMessage(context.Background(), incoming("select-two", "/sel 2"))
+		service.HandleMessage(context.Background(), incoming("select-two", "/2"))
 		close(selectDone)
 	}()
-	assertNotClosed(t, selectDone, "/sel returned before Prompt")
+	assertNotClosed(t, selectDone, "/N returned before Prompt")
 	close(fake.blockPrompt)
 	awaitSignal(t, promptDone, "prompt")
-	awaitSignal(t, selectDone, "/sel")
+	awaitSignal(t, selectDone, "/N")
 	second := agentInfo("pane-2", "terminal-2", "claude")
 	second.DisplayAgent = stringRef("Claude")
 	fake.setAgent(second)
@@ -1836,7 +1836,7 @@ func TestServiceConcurrentSelectAndPageDownNeverMixTargetAndPanel(t *testing.T) 
 	service.registry.Replace(snapshot, false)
 	fake.setSnapshot(snapshot)
 	service.HandleMessage(context.Background(), incoming("mix-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("mix-select-one", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("mix-select-one", "/1"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(100, 200)}
 	service.HandleMessage(context.Background(), incoming("mix-content", "/con"))
 	fake.read = herdr.ReadResult{PaneID: "pane-1", Text: textLines(0, 200)}
@@ -1856,13 +1856,13 @@ func TestServiceConcurrentSelectAndPageDownNeverMixTargetAndPanel(t *testing.T) 
 	awaitSignal(t, hookEntered, "/pagedn hook")
 	fake.setRead(herdr.ReadResult{PaneID: "pane-2", Text: "SECOND-PANEL"}, nil)
 	go func() {
-		service.HandleMessage(context.Background(), incoming("mix-select-two", "/sel 2"))
+		service.HandleMessage(context.Background(), incoming("mix-select-two", "/2"))
 		close(selectDone)
 	}()
-	assertNotClosed(t, selectDone, "/sel completed before /pagedn released state")
+	assertNotClosed(t, selectDone, "/N completed before /pagedn released state")
 	close(releaseHook)
 	awaitSignal(t, pageDone, "/pagedn")
-	awaitSignal(t, selectDone, "/sel")
+	awaitSignal(t, selectDone, "/N")
 	for _, reply := range im.repliesFrom(beforeReplies) {
 		if strings.Contains(reply, "line-100") && strings.Contains(reply, "Claude（pane-2）") {
 			t.Fatalf("new target title was combined with old panel: %q", reply)
@@ -1942,7 +1942,7 @@ func fakeAuditFromService(t *testing.T, service *Service) *fakeKeyAuditSink {
 func selectTarget(t *testing.T, service *Service) {
 	t.Helper()
 	service.HandleMessage(context.Background(), incoming("select-list", "/ls"))
-	service.HandleMessage(context.Background(), incoming("select-target", "/sel 1"))
+	service.HandleMessage(context.Background(), incoming("select-target", "/1"))
 	if fake, ok := service.client.Load().client.(*fakeHerdr); ok {
 		fake.clearReads()
 	}

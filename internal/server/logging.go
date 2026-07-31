@@ -119,8 +119,6 @@ func safeLogValue(value string) string {
 
 func serverActionName(kind serverActionKind) string {
 	switch kind {
-	case serverActionUserID:
-		return "userid"
 	case serverActionList:
 		return "list"
 	case serverActionSelect:

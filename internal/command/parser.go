@@ -51,7 +51,7 @@ const maxKeySequence = 32
 
 const helpText = `输入帮助：
 /ls                 列出 Agent
-/N 或 /sel N        选择第 N 个 Agent，并显示最新 100 行
+/N                  选择第 N 个 Agent，并显示最新 100 行
 /help               显示本帮助
 /con                显示最新 100 行并重置分页
 /pageup、/pagedn    上翻、下翻缓存
@@ -96,8 +96,6 @@ func Parse(input string) (Action, error) {
 		return parseAlias(fields, command, Action{Kind: KindHelp})
 	case "/enter":
 		return parseAlias(fields, command, Action{Kind: KindKey, Keys: []string{"enter"}})
-	case "/sel":
-		return parseSelect(fields)
 	case "/key":
 		return parseKeys(strings.TrimSpace(strings.TrimPrefix(trimmed, "/key")))
 	case "/slash":
@@ -112,13 +110,6 @@ func parseAlias(fields []string, command string, action Action) (Action, error) 
 		return Action{}, invalidCommand(command + " 用法: " + command)
 	}
 	return action, nil
-}
-
-func parseSelect(fields []string) (Action, error) {
-	if len(fields) != 2 || !isASCIIUnsignedInteger(fieldsAt(fields, 1)) {
-		return Action{}, invalidCommand("/sel 用法: /sel N")
-	}
-	return parseSelectIndex(fields[1], "/sel 用法: /sel N")
 }
 
 func parseSelectIndex(value, usage string) (Action, error) {

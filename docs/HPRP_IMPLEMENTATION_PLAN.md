@@ -301,7 +301,7 @@ Upgrade 前把 Key 解析为 `(principal_id, machine_id)`，Pal 只持有 Bearer
 1. 先修改测试，使服务端注入真实文件凭据 Store，客户端仅持有对应 Key。
 2. `serverapp.Run` 加载凭据 Store 并注入 Hub；Pal 装配层从 Key 解析 credential ID 创建
    PolicyGuard。
-3. Router 保持 `/userid`、`/ls`、`/N`、定向前缀、2 分钟通知降噪和会话替换行为；只替换
+3. Router 保持 `/ls`、`/N`、定向前缀、2 分钟通知降噪和会话替换行为；只替换
    HPRP 传输类型，不改变企业微信文案。
 4. 端到端覆盖同一用户两台机器、不同用户同名机器、重复 Key 连接拒绝、快照确认、选择、
    prompt、后续 output、通知和断线撤下。
@@ -322,7 +322,7 @@ Upgrade 前把 Key 解析为 `(principal_id, machine_id)`，Pal 只持有 Bearer
 1. 删除 `internal/relayproto`，用 `rg relayproto` 确认生产代码和测试均无引用。
 2. 修订 `docs/HPRP_PROTOCOL_DESIGN.md`：补充 `command.output` payload、认证身份用于本地
    审计的说明，并修复重复标题。
-3. 更新示例配置和 README：管理员先用 `/userid` 获取 principal ID，再签发机器 Key；Pal
+3. 更新示例配置和 README：管理员使用可信账户信息中的 principal ID 签发机器 Key；Pal
    只配置 URL、Key、TLS 和 Herdr endpoint。
 4. 更新 `docs/HANDOFF_CONTEXT.md` 和 `docs/BRIDGE_ARCHITECTURE.md`，明确 HPRP/1 与凭据文件。
 5. 运行文档 JSON 示例解析和 `git diff --check`，提交：

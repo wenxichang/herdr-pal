@@ -57,24 +57,6 @@ func Load(path string, getenv func(string) string) (Config, error) {
 	return config, nil
 }
 
-// LoadDiscovery 加载企业微信用户发现模式配置，不要求预先知道 allowed_user_id。
-func LoadDiscovery(path string, getenv func(string) string) (Config, error) {
-	config, err := loadFile(path)
-	if err != nil {
-		return Config{}, err
-	}
-
-	config.WeCom.Secret = getenv(SecretEnvName)
-	if strings.TrimSpace(config.WeCom.BotID) == "" {
-		return Config{}, fmt.Errorf("缺少必填字段 bot_id")
-	}
-	if strings.TrimSpace(config.WeCom.Secret) == "" {
-		return Config{}, fmt.Errorf("缺少必填字段 secret")
-	}
-
-	return config, nil
-}
-
 // LoadInteractive 加载交互模式配置。空 path 使用公共 CLI 自动发现 Herdr。
 // 该函数不读取企业微信 Secret，也不校验企业微信字段。
 func LoadInteractive(path string) (Config, error) {

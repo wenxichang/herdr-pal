@@ -240,15 +240,15 @@ func (r *Registry) ValidateSelected() (Target, error) {
 
 	if r.selectionInvalid {
 		r.selectionInvalid = false
-		return Target{}, fmt.Errorf("%w，请重新执行 /ls 和 /sel", ErrSelectionInvalid)
+		return Target{}, fmt.Errorf("%w，请重新执行 /ls 并使用 /N 选择目标", ErrSelectionInvalid)
 	}
 	if r.selectedKey == "" {
-		return Target{}, fmt.Errorf("%w，请先执行 /ls 和 /sel", ErrNoSelection)
+		return Target{}, fmt.Errorf("%w，请先执行 /ls 并使用 /N 选择目标", ErrNoSelection)
 	}
 	target, found := r.targets[r.selectedPane]
 	if !found || target.OccupantKey != r.selectedKey {
 		r.invalidateSelection()
-		return Target{}, fmt.Errorf("%w，请重新执行 /ls 和 /sel", ErrSelectionInvalid)
+		return Target{}, fmt.Errorf("%w，请重新执行 /ls 并使用 /N 选择目标", ErrSelectionInvalid)
 	}
 	return target, nil
 }

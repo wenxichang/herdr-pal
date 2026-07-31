@@ -18,8 +18,6 @@ func TestParseCommands(t *testing.T) {
 		want  Action
 	}{
 		{name: "list", input: "/ls", want: Action{Kind: KindList}},
-		{name: "select", input: "  /sel   2 \t", want: Action{Kind: KindSelect, Index: 2}},
-		{name: "select with leading zero", input: "/sel 01", want: Action{Kind: KindSelect, Index: 1}},
 		{name: "select shorthand", input: "/2", want: Action{Kind: KindSelect, Index: 2}},
 		{name: "select shorthand with leading zero", input: "/01", want: Action{Kind: KindSelect, Index: 1}},
 		{name: "content", input: "/con", want: Action{Kind: KindContent}},
@@ -70,13 +68,7 @@ func TestParseInvalidCommands(t *testing.T) {
 	}{
 		{name: "empty", input: "", usage: "可用命令"},
 		{name: "whitespace", input: " \t\n ", usage: "可用命令"},
-		{name: "select missing index", input: "/sel", usage: "/sel N"},
-		{name: "select zero", input: "/sel 0", usage: "/sel N"},
-		{name: "select negative", input: "/sel -1", usage: "/sel N"},
-		{name: "select plus sign", input: "/sel +1", usage: "/sel N"},
-		{name: "select full width digit", input: "/sel １", usage: "/sel N"},
-		{name: "select multiple indices", input: "/sel 1 2", usage: "/sel N"},
-		{name: "select overflow", input: "/sel " + overflow, usage: "/sel N"},
+		{name: "removed select alias", input: "/sel 2", usage: "可用命令"},
 		{name: "select shorthand zero", input: "/0", usage: "/N"},
 		{name: "select shorthand negative", input: "/-1", usage: "可用命令"},
 		{name: "select shorthand overflow", input: "/" + overflow, usage: "/N"},
@@ -128,12 +120,12 @@ func TestHelpTextDocumentsSupportedCommands(t *testing.T) {
 	t.Parallel()
 
 	help := HelpText()
-	for _, want := range []string{"/help", "/N", "/sel N", "/key", "dn", "sp", "/enter", "/slash", "等待 200ms"} {
+	for _, want := range []string{"/help", "/N", "/key", "dn", "sp", "/enter", "/slash", "等待 200ms"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("HelpText() = %q, want %q", help, want)
 		}
 	}
-	for _, removed := range []string{"/keyup", "/keydn", "/space", "/esc", "/mode"} {
+	for _, removed := range []string{"/sel", "/keyup", "/keydn", "/space", "/esc", "/mode"} {
 		if strings.Contains(help, removed) {
 			t.Fatalf("HelpText() = %q, must not document removed command %q", help, removed)
 		}

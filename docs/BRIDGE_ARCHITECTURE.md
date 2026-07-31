@@ -58,7 +58,7 @@ credential_id + principal_id + machine_id + secret_digest + allowed_sources
 
 Router 以企业微信用户 ID 为隔离边界：
 
-- 直接处理 `/userid`、`/ls`、独立 `/N`/`/sel N` 和 `/help`。
+- 直接处理 `/ls`、独立 `/N` 和 `/help`。
 - 把 `/N 内容`、`#N 内容` 的全局编号解析成 HPRP 稳定目标。
 - 将其他输入路由到当前选择，并在成功后按命令语义更新选择。
 - 按完整稳定目标维护 `/mode img|txt` 的内存覆盖；OpenCode 默认图片，其他 Agent 默认文本。

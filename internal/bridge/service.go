@@ -410,7 +410,7 @@ func (s *Service) handleList(ctx context.Context, message im.IncomingText) {
 		}
 		fmt.Fprintf(&content, "\n%d. %s%s\n   标题：%s\n   工作区：%s\n   状态：%s\n   面板：%s", index+1, safeLabel(name), marker, safeLabel(target.Title), safeLabel(panel.WorkspaceLabel(target.Workspace, target.Tab)), safeLabel(panel.AgentStatusLabel(target.Status)), safeLabel(target.PaneID))
 	}
-	content.WriteString("\n使用 /N 或 /sel N 选择目标。")
+	content.WriteString("\n使用 /N 选择目标。")
 	s.reply(ctx, message.RequestID, content.String())
 }
 
@@ -668,7 +668,7 @@ func (s *Service) handleKeys(ctx context.Context, message im.IncomingText, keys 
 	}
 	if result.PaneID != target.PaneID {
 		s.invalidateExpected(target)
-		s.reply(ctx, message.RequestID, summary+"\n\n控制台目标已变化，请重新执行 /ls 和 /sel。")
+		s.reply(ctx, message.RequestID, summary+"\n\n控制台目标已变化，请重新执行 /ls 并使用 /N 选择目标。")
 		return
 	}
 	page, applyErr := s.applyRefresh(target, generation, normalizeTerminalANSI(result.Text, message.OutputMode, target.Columns))
@@ -1262,8 +1262,8 @@ func (s *Service) logIMDeliveryFailure(message, requestID string, partIndex, par
 }
 
 const unavailableMessage = "Herdr 暂不可用，操作未执行，请稍后重试。"
-const targetChangedMessage = "目标 Agent 已变化，请重新执行 /ls 和 /sel。"
-const targetChangedAfterPromptMessage = "消息已发送，但 Agent 会话在发送过程中发生变化。为避免后续消息投递到错误会话，请重新执行 /ls 和 /sel。"
+const targetChangedMessage = "目标 Agent 已变化，请重新执行 /ls 并使用 /N 选择目标。"
+const targetChangedAfterPromptMessage = "消息已发送，但 Agent 会话在发送过程中发生变化。为避免后续消息投递到错误会话，请重新执行 /ls 并使用 /N 选择目标。"
 
 func safeCommandError(err error) string {
 	if errors.Is(err, command.ErrInvalidCommand) {

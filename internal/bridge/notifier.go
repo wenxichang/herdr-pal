@@ -610,7 +610,7 @@ func renderNotificationEvent(event im.NotificationEvent, target im.NotificationT
 	title := "Agent 状态发生变化。"
 	switch event.Kind {
 	case im.NotificationKindTargetInvalidated:
-		title = "Agent 目标已失效，请重新执行 /ls 和 /sel。"
+		title = "Agent 目标已失效，请重新执行 /ls 并使用 /N 选择目标。"
 	case im.NotificationKindAgentStatusChanged:
 		switch herdr.AgentStatus(event.Status) {
 		case herdr.AgentStatusWorking:

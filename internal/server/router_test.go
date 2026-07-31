@@ -22,14 +22,12 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
-func TestRouterHandlesUserIDWithoutOnlineClient(t *testing.T) {
-	router, gateway, relay := newRouterHarness(t)
-	router.Handle(context.Background(), routerMessage("request-1", "message-1", "user-token", "/userid"))
-	if got := gateway.LastReply(); got != "user-token" {
-		t.Fatalf("reply = %q", got)
-	}
-	if relay.CallCount() != 0 {
-		t.Fatal("/userid should not reach relay")
+func TestParseServerActionDoesNotReserveRemovedCommands(t *testing.T) {
+	for _, content := range []string{"/userid", "/sel 2"} {
+		action, err := parseServerAction(content)
+		if err != nil || action.kind != serverActionForward {
+			t.Fatalf("parseServerAction(%q) = %#v, %v, want forward", content, action, err)
+		}
 	}
 }
 
@@ -76,8 +74,8 @@ func TestConversationRouterDuplicateMessageDoesNotConsumeQuotaOrRepeatAudit(t *t
 		t.Fatalf("events = %#v, replies = %#v", collector.Events(), gateway.Replies())
 	}
 	now = now.Add(time.Second)
-	router.Handle(context.Background(), routerMessage("request-2", "message-2", "user-a", "/userid"))
-	if len(collector.Events()) != 2 || gateway.LastReply() != "user-a" {
+	router.Handle(context.Background(), routerMessage("request-2", "message-2", "user-a", "/help"))
+	if len(collector.Events()) != 2 || !strings.Contains(gateway.LastReply(), "Herdr Pal 快速上手") {
 		t.Fatalf("events = %#v, reply = %q", collector.Events(), gateway.LastReply())
 	}
 }
@@ -142,7 +140,7 @@ func TestRouterVerboseLogsExplicitWeComReplyFailure(t *testing.T) {
 func TestRouterExplainsHowToConnectWhenNoSessions(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-empty", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{Sequence: 1})
-	want := "当前没有可用会话，使用/userid 获取用户 ID，并联系管理员签发机器 Key 后配置 herdr-pal；使用/help获取内置命令帮助"
+	want := noAvailableSessionsMessage
 	for index, content := range []string{"/ls", "/1", "/con", "继续处理"} {
 		router.Handle(context.Background(), routerMessage(
 			"request-empty-"+strconv.Itoa(index), "message-empty-"+strconv.Itoa(index), "user-a", content,
@@ -162,7 +160,6 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 	help := gateway.LastReply()
 	for _, want := range []string{
 		"### Herdr Pal 快速上手",
-		"/userid",
 		"`/N 内容` 在第 N 个会话执行，成功后切换",
 		"`#N 内容` 执行但不切换",
 		"定向前缀不能用于",
@@ -176,7 +173,6 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"./install.sh",
 		"默认 `~/.local/bin`",
 		"机器 Key",
-		"把返回的用户 ID 交给管理员",
 		"Sidecar",
 		"live-handoff",
 		"~/.config/herdr-pal/config.json",
@@ -186,7 +182,7 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 			t.Fatalf("help reply lacks %q:\n%s", want, help)
 		}
 	}
-	for _, forbidden := range []string{"server-config", "HERDR_PAL_WECOM_SECRET", "herdr-pal-server", "Bot ID"} {
+	for _, forbidden := range []string{"/userid", "/sel", "server-config", "HERDR_PAL_WECOM_SECRET", "herdr-pal-server", "Bot ID"} {
 		if strings.Contains(help, forbidden) {
 			t.Fatalf("help reply contains server deployment field %q:\n%s", forbidden, help)
 		}
@@ -371,7 +367,7 @@ func TestRouterDoesNotStoreSelectionWhenClientRejectsTarget(t *testing.T) {
 	})
 	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
 	relay.selectErr = ErrTargetChanged
-	router.Handle(context.Background(), routerMessage("request-select", "message-select", "user-a", "/sel 1"))
+	router.Handle(context.Background(), routerMessage("request-select", "message-select", "user-a", "/1"))
 	if _, err := router.catalog.Selected("user-a"); !errors.Is(err, ErrNoSelection) {
 		t.Fatalf("Selected() error = %v", err)
 	}
@@ -550,11 +546,9 @@ func TestParseServerActionSupportsModeCommands(t *testing.T) {
 func TestParseServerActionRejectsInvalidDirectedPrefixes(t *testing.T) {
 	for _, content := range []string{
 		"#3",
-		"/3 /userid",
 		"/3 /ls",
 		"/3 /help",
 		"/3 /2",
-		"#3 /sel 2",
 		"#3 #2 /con",
 	} {
 		t.Run(content, func(t *testing.T) {

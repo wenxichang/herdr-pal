@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,87 +91,9 @@ func TestRunReportsLockConflictWithoutResolvingSocket(t *testing.T) {
 	}
 }
 
-func TestRunDiscoveryPrintsFirstSingleUserWithoutStartingHerdr(t *testing.T) {
-	options := testOptions(t)
-	options.DiscoverUser = true
-	var stdout, stderr bytes.Buffer
-	options.Stdout = &stdout
-	options.Stderr = &stderr
-	loaded := testConfig()
-	loaded.WeCom.AllowedUserID = ""
-	options.dependencies.loadDiscoveryConfig = func(path string, getenv func(string) string) (config.Config, error) {
-		if path != options.ConfigPath || getenv(config.SecretEnvName) != "secret-sensitive" {
-			t.Fatalf("发现模式配置参数错误：path=%q", path)
-		}
-		return loaded, nil
-	}
-	options.dependencies.loadConfig = func(string, func(string) string) (config.Config, error) {
-		t.Fatal("发现模式不应调用普通配置加载器")
-		return config.Config{}, nil
-	}
-	options.dependencies.resolveSocket = func(context.Context, string, string, herdr.CommandRunner) (string, error) {
-		t.Fatal("发现模式不应解析 Herdr Socket")
-		return "", nil
-	}
-	im := newFakeWeCom()
-	options.dependencies.assembleDiscovery = func(got config.Config, logger *slog.Logger) (imRuntime, error) {
-		if got.WeCom.BotID != loaded.WeCom.BotID || got.WeCom.Secret != loaded.WeCom.Secret || logger == nil {
-			t.Fatalf("发现模式装配参数错误：%+v", got.WeCom)
-		}
-		return im, nil
-	}
-
-	result := make(chan error, 1)
-	go func() { result <- Run(context.Background(), options) }()
-	waitClosed(t, im.started, "发现模式企业微信连接")
-	im.events <- wecom.IncomingText{UserID: "group-user", ChatType: "group", Content: "/ls"}
-	im.events <- wecom.IncomingText{UserID: "encrypted-user-id", ChatType: "single", Content: "/ls"}
-
-	if err := waitResult(t, result); err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if got := stdout.String(); got != "userid=encrypted-user-id\n" {
-		t.Fatalf("stdout = %q", got)
-	}
-	if strings.Contains(stderr.String(), "encrypted-user-id") || strings.Contains(stderr.String(), "secret-sensitive") {
-		t.Fatalf("发现模式日志泄露敏感值：%q", stderr.String())
-	}
-}
-
-func TestRunDiscoveryWaitsForConnectionShutdownBeforeReleasingLock(t *testing.T) {
-	options := testOptions(t)
-	options.DiscoverUser = true
-	options.dependencies.loadDiscoveryConfig = func(string, func(string) string) (config.Config, error) {
-		loaded := testConfig()
-		loaded.WeCom.AllowedUserID = ""
-		return loaded, nil
-	}
-	release := make(chan struct{})
-	im := newDelayedCancelWeCom(release)
-	options.dependencies.assembleDiscovery = func(config.Config, *slog.Logger) (imRuntime, error) { return im, nil }
-	lock := &fakeLock{}
-	options.dependencies.acquireLock = func(string) (processLock, error) { return lock, nil }
-
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- Run(ctx, options) }()
-	waitClosed(t, im.started, "发现模式企业微信连接")
-	cancel()
-	waitClosed(t, im.canceled, "发现模式取消")
-	select {
-	case err := <-result:
-		t.Fatalf("连接退出前 Run 已返回：%v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	if lock.releases.Load() != 0 {
-		t.Fatal("连接退出前进程锁已释放")
-	}
-	close(release)
-	if err := waitResult(t, result); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want context.Canceled", err)
-	}
-	if lock.releases.Load() != 1 {
-		t.Fatalf("进程锁释放次数 = %d", lock.releases.Load())
+func TestOptionsDoesNotExposeRemovedUserDiscoveryMode(t *testing.T) {
+	if _, exists := reflect.TypeOf(Options{}).FieldByName("DiscoverUser"); exists {
+		t.Fatal("Options still exposes removed DiscoverUser mode")
 	}
 }
 
@@ -836,7 +759,7 @@ func TestAssembleBridgeRuntimeSharesOneHerdrClientAcrossAllBridgeUsers(t *testin
 
 	runtime.service.SetHerdr(managed)
 	runtime.service.ReplaceSnapshot(managed.snapshot, false)
-	for index, content := range []string{"/ls", "/sel 1", "继续处理"} {
+	for index, content := range []string{"/ls", "/1", "继续处理"} {
 		runtime.service.HandleMessage(context.Background(), incomingForUser("bridge-user", "service-"+string(rune('a'+index)), content))
 	}
 	if got := managed.promptCount(); got != 1 {
@@ -947,7 +870,7 @@ func TestAssembleInteractiveUsesLocalGuardAndSharedHerdrClient(t *testing.T) {
 
 	runtime.service.SetHerdr(managed)
 	runtime.service.ReplaceSnapshot(managed.snapshot, false)
-	for index, content := range []string{"/ls", "/sel 1", "继续处理"} {
+	for index, content := range []string{"/ls", "/1", "继续处理"} {
 		runtime.service.HandleMessage(context.Background(), incomingForUser(interactive.UserID, fmt.Sprintf("interactive-%d", index), content))
 	}
 	runtime.service.HandleMessage(context.Background(), incomingForUser("unknown-local-user", "interactive-unknown", "不得转发"))
@@ -1036,7 +959,7 @@ func TestAssembleBridgeRuntimeInjectsSafeStructuredKeyAuditLogger(t *testing.T) 
 	}
 	runtime.service.SetHerdr(managed)
 	runtime.service.ReplaceSnapshot(managed.snapshot, false)
-	for index, content := range []string{"/ls", "/sel 1", "/enter"} {
+	for index, content := range []string{"/ls", "/1", "/enter"} {
 		runtime.service.HandleMessage(context.Background(), incoming(fmt.Sprintf("audit-%d", index), content))
 	}
 
@@ -1078,29 +1001,6 @@ func TestAssembleRuntimeUsesOfficialWeComEndpointByDefault(t *testing.T) {
 
 	if _, err := assembleRuntime(testConfig(), "/tmp/shared.sock", logger, dependencies); err != nil {
 		t.Fatalf("assembleRuntime() error = %v", err)
-	}
-}
-
-func TestAssembleDiscoveryRuntimeCreatesReceiveOnlyWeComClient(t *testing.T) {
-	dependencies := defaultAssemblyDependencies()
-	dependencies.newHerdr = func(string) bridge.ManagedHerdr {
-		t.Fatal("用户发现模式不应创建 Herdr Client")
-		return nil
-	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dependencies.newWeCom = func(clientConfig wecom.ClientConfig) (imRuntime, error) {
-		if clientConfig.Endpoint != wecom.DefaultEndpoint || clientConfig.BotID != "bot-sensitive" ||
-			clientConfig.Secret != "secret-sensitive" || clientConfig.AllowedUserID != "" || clientConfig.Logger != logger {
-			t.Fatalf("发现模式企业微信配置错误：%+v", clientConfig)
-		}
-		return newFakeWeCom(), nil
-	}
-	loaded := testConfig()
-	loaded.WeCom.AllowedUserID = ""
-
-	im, err := assembleDiscoveryRuntime(loaded, logger, dependencies)
-	if err != nil || im == nil {
-		t.Fatalf("assembleDiscoveryRuntime() = %v, %v", im, err)
 	}
 }
 

@@ -494,7 +494,7 @@ go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 
 测试先执行公共 CLI `herdr status server --json`。只有运行中服务精确返回 protocol 17
 才继续调用真实 `ping`、`session.snapshot`、`agent.get` 和 `agent.read`，并覆盖
-`herdr-pal -i` 的 `/ls`、`/sel`、`/con` 只读路径；企业微信侧不参与，也不需要 Secret。
+`herdr-pal -i` 的 `/ls`、`/N`、`/con` 只读路径；企业微信侧不参与，也不需要 Secret。
 
 实时 prompt 另有三重显式门禁：
 

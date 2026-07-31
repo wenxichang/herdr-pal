@@ -41,10 +41,10 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 		t.Fatalf("/ls 回复未包含 pane-1：%q", listReply)
 	}
 
-	selectReply := sendInteractiveLine(t, application, "/sel 1")
+	selectReply := sendInteractiveLine(t, application, "/1")
 	assertReplyBlock(t, selectReply)
 	if !strings.Contains(selectReply, "[终端输出]") || !strings.Contains(selectReply, "页码:[1/1]") {
-		t.Fatalf("/sel 1 回复 = %q, want terminal content", selectReply)
+		t.Fatalf("/1 回复 = %q, want terminal content", selectReply)
 	}
 
 	herdrServer.SetOutput(numberedLines(250))

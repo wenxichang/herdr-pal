@@ -223,7 +223,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.wecom.WaitRequestCount(t, "aibot_send_msg", 1)
 		reply := harness.send(t, "message-after-replace", testUserID, "single", "不得发送")
 
-		if !strings.Contains(reply.Content, "/ls") || !strings.Contains(reply.Content, "/sel") {
+		if !strings.Contains(reply.Content, "/ls") || !strings.Contains(reply.Content, "/N") {
 			t.Fatalf("occupant 替换后的回复不可操作：%q", reply.Content)
 		}
 		if calls := harness.herdr.Calls("agent.prompt"); len(calls) != 0 {
@@ -262,12 +262,12 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.herdr.WaitCallCount(t, "session.snapshot", beforeProbe+1)
 		assertStableCount(t, func() int { return len(harness.wecom.Requests("aibot_send_msg")) }, sentBeforeReconnect)
 
-		reselect := harness.send(t, "message-reconnected-select", testUserID, "single", "/sel 1")
+		reselect := harness.send(t, "message-reconnected-select", testUserID, "single", "/1")
 		if !strings.Contains(reselect.Content, "先执行 /ls") {
 			t.Fatalf("Herdr 重连后旧列表编号仍可用：%q", reselect.Content)
 		}
 		withoutSelection := harness.send(t, "message-reconnected-prompt", testUserID, "single", "重连后仍不得沿用选择")
-		if !strings.Contains(withoutSelection.Content, "/ls") || !strings.Contains(withoutSelection.Content, "/sel") {
+		if !strings.Contains(withoutSelection.Content, "/ls") || !strings.Contains(withoutSelection.Content, "/N") {
 			t.Fatalf("Herdr 重连后的普通文本回复 = %q", withoutSelection.Content)
 		}
 		if calls := harness.herdr.Calls("agent.prompt"); len(calls) != 0 {
@@ -382,7 +382,7 @@ func (h *bridgeHarness) send(t *testing.T, messageID, userID, chatType, content 
 func (h *bridgeHarness) selectFirst(t *testing.T) {
 	t.Helper()
 	h.send(t, "message-list-"+fmt.Sprint(time.Now().UnixNano()), testUserID, "single", "/ls")
-	h.send(t, "message-select-"+fmt.Sprint(time.Now().UnixNano()), testUserID, "single", "/sel 1")
+	h.send(t, "message-select-"+fmt.Sprint(time.Now().UnixNano()), testUserID, "single", "/1")
 }
 
 func assertCallParams(t *testing.T, call testkit.HerdrCall, want map[string]any) {

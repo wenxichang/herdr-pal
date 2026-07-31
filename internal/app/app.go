@@ -64,8 +64,6 @@ var (
 type Options struct {
 	// Interactive 选择使用本机标准输入输出的交互模式。
 	Interactive bool
-	// DiscoverUser 选择只连接企业微信并发现首个单聊消息发送者。
-	DiscoverUser bool
 	// ConfigPath 是非密钥 JSON 配置文件路径。
 	ConfigPath string
 	// Stdin 是交互模式输入；nil 时使用 os.Stdin。
@@ -158,7 +156,6 @@ type applicationRuntime struct {
 
 type appDependencies struct {
 	loadConfig            func(string, func(string) string) (config.Config, error)
-	loadDiscoveryConfig   func(string, func(string) string) (config.Config, error)
 	loadInteractiveConfig func(string) (config.Config, error)
 	userCacheDir          func() (string, error)
 	mkdirAll              func(string, os.FileMode) error
@@ -166,7 +163,6 @@ type appDependencies struct {
 	resolveSocket         func(context.Context, string, string, herdr.CommandRunner) (string, error)
 	prepareStableDialPath func(string) (*dialPathLease, error)
 	assemble              func(config.Config, string, *slog.Logger) (*applicationRuntime, error)
-	assembleDiscovery     func(config.Config, *slog.Logger) (imRuntime, error)
 	assembleInteractive   func(config.Config, string, io.Reader, io.Writer, *slog.Logger) (*applicationRuntime, error)
 	shutdownTimeout       time.Duration
 }
@@ -196,150 +192,10 @@ func (commandRunner) Output(ctx context.Context, name string, args ...string) ([
 
 // Run 按选项选择运行模式，直到 context 取消或运行循环失败。
 func Run(ctx context.Context, options Options) error {
-	if options.Interactive && options.DiscoverUser {
-		return fmt.Errorf("%w: 运行模式冲突", ErrConfig)
-	}
 	if options.Interactive {
 		return runInteractive(ctx, options)
 	}
-	if options.DiscoverUser {
-		return runWeComDiscovery(ctx, options)
-	}
 	return runWeCom(ctx, options)
-}
-
-func runWeComDiscovery(ctx context.Context, options Options) (runErr error) {
-	if ctx == nil {
-		return fmt.Errorf("%w: context 不能为空", ErrConfig)
-	}
-	if strings.TrimSpace(options.ConfigPath) == "" {
-		return fmt.Errorf("%w: 缺少 -config", ErrConfig)
-	}
-	dependencies := options.dependencies
-	if dependencies == nil {
-		dependencies = defaultAppDependencies()
-	}
-	getenv := options.Getenv
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-	stdout := options.Stdout
-	if stdout == nil {
-		stdout = os.Stdout
-	}
-	stderr := options.Stderr
-	if stderr == nil {
-		stderr = os.Stderr
-	}
-
-	loaded, err := dependencies.loadDiscoveryConfig(options.ConfigPath, getenv)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
-	}
-	loaded.WeCom.Endpoint = strings.TrimSpace(options.WeComEndpoint)
-	logger, err := newLogger(stderr, loaded.Log.Level)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
-	}
-
-	cacheDir, err := dependencies.userCacheDir()
-	if err != nil {
-		return fmt.Errorf("获取缓存目录: %w", err)
-	}
-	lockDir := filepath.Join(cacheDir, "herdr-pal")
-	if err := dependencies.mkdirAll(lockDir, 0o700); err != nil {
-		return fmt.Errorf("创建锁目录: %w", err)
-	}
-	lockPath := filepath.Join(lockDir, shortHash(loaded.WeCom.BotID)+".lock")
-	lock, err := dependencies.acquireLock(lockPath)
-	if err != nil {
-		return fmt.Errorf("获取进程锁: %w", err)
-	}
-	var timedOutComponentDone <-chan struct{}
-	defer func() {
-		finishProcessLock(lock, &runErr, timedOutComponentDone)
-	}()
-
-	im, err := dependencies.assembleDiscovery(loaded, logger)
-	if err != nil {
-		return fmt.Errorf("组装用户发现模式: %w", err)
-	}
-	if im == nil {
-		return errors.New("组装用户发现模式: 企业微信客户端无效")
-	}
-
-	componentContext, cancelComponent := context.WithCancel(ctx)
-	componentDone := make(chan struct{})
-	componentResult := make(chan error, 1)
-	go func() {
-		defer close(componentDone)
-		componentResult <- im.Run(componentContext)
-	}()
-	logger.Info("企业微信用户发现模式启动", "bot_hash", shortHash(loaded.WeCom.BotID))
-
-	for {
-		select {
-		case <-ctx.Done():
-			cancelComponent()
-			shutdownTimeout := dependencies.shutdownTimeout
-			if shutdownTimeout <= 0 {
-				shutdownTimeout = defaultShutdownTimeout
-			}
-			timer := time.NewTimer(shutdownTimeout)
-			defer timer.Stop()
-			select {
-			case err := <-componentResult:
-				if err != nil && !errors.Is(err, ctx.Err()) {
-					return fmt.Errorf("停止企业微信用户发现连接: %w", err)
-				}
-				return ctx.Err()
-			case <-timer.C:
-				timedOutComponentDone = componentDone
-				return errors.Join(ctx.Err(), ErrShutdownTimeout)
-			}
-		case err := <-componentResult:
-			cancelComponent()
-			if err == nil {
-				return ErrLoopStopped
-			}
-			return fmt.Errorf("企业微信用户发现连接运行失败: %w", err)
-		case message, ok := <-im.Events():
-			if !ok {
-				cancelComponent()
-				return ErrLoopStopped
-			}
-			if message.ChatType != "single" {
-				logger.Warn("企业微信用户发现忽略非单聊消息", "chat_type", message.ChatType, "user_hash", shortHash(message.UserID))
-				continue
-			}
-			if strings.TrimSpace(message.UserID) == "" {
-				logger.Warn("企业微信用户发现收到空用户标识")
-				continue
-			}
-			if _, err := fmt.Fprintf(stdout, "userid=%s\n", message.UserID); err != nil {
-				cancelComponent()
-				return fmt.Errorf("输出企业微信用户标识: %w", err)
-			}
-			logger.Info("企业微信用户发现完成", "user_hash", shortHash(message.UserID))
-			cancelComponent()
-			shutdownTimeout := dependencies.shutdownTimeout
-			if shutdownTimeout <= 0 {
-				shutdownTimeout = defaultShutdownTimeout
-			}
-			timer := time.NewTimer(shutdownTimeout)
-			defer timer.Stop()
-			select {
-			case err := <-componentResult:
-				if err != nil && !errors.Is(err, context.Canceled) {
-					return fmt.Errorf("停止企业微信用户发现连接: %w", err)
-				}
-				return nil
-			case <-timer.C:
-				timedOutComponentDone = componentDone
-				return ErrShutdownTimeout
-			}
-		}
-	}
 }
 
 func runWeCom(ctx context.Context, options Options) (runErr error) {
@@ -641,7 +497,6 @@ func finishProcessLock(lock processLock, runErr *error, timedOutComponentsDone <
 func defaultAppDependencies() *appDependencies {
 	return &appDependencies{
 		loadConfig:            config.Load,
-		loadDiscoveryConfig:   config.LoadDiscovery,
 		loadInteractiveConfig: config.LoadInteractive,
 		userCacheDir:          os.UserCacheDir,
 		mkdirAll:              os.MkdirAll,
@@ -650,9 +505,6 @@ func defaultAppDependencies() *appDependencies {
 		prepareStableDialPath: prepareStableDialPath,
 		assemble: func(loaded config.Config, socketPath string, logger *slog.Logger) (*applicationRuntime, error) {
 			return assembleRuntime(loaded, socketPath, logger, defaultAssemblyDependencies())
-		},
-		assembleDiscovery: func(loaded config.Config, logger *slog.Logger) (imRuntime, error) {
-			return assembleDiscoveryRuntime(loaded, logger, defaultAssemblyDependencies())
 		},
 		assembleInteractive: func(loaded config.Config, socketPath string, input io.Reader, output io.Writer, logger *slog.Logger) (*applicationRuntime, error) {
 			return assembleInteractiveRuntime(loaded, socketPath, input, output, logger, defaultAssemblyDependencies())
@@ -677,26 +529,6 @@ func defaultAssemblyDependencies() assemblyDependencies {
 			return interactive.NewAdapter(input, output)
 		},
 	}
-}
-
-func assembleDiscoveryRuntime(loaded config.Config, logger *slog.Logger, dependencies assemblyDependencies) (imRuntime, error) {
-	if logger == nil {
-		return nil, errors.New("结构化日志器无效")
-	}
-	endpoint := loaded.WeCom.Endpoint
-	if endpoint == "" {
-		endpoint = wecom.DefaultEndpoint
-	}
-	im, err := dependencies.newWeCom(wecom.ClientConfig{
-		Endpoint: endpoint,
-		BotID:    loaded.WeCom.BotID,
-		Secret:   loaded.WeCom.Secret,
-		Logger:   logger,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("创建企业微信客户端: %w", err)
-	}
-	return im, nil
 }
 
 func assembleRuntime(loaded config.Config, socketPath string, logger *slog.Logger, dependencies assemblyDependencies) (*applicationRuntime, error) {
