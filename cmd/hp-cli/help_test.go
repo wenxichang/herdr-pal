@@ -184,7 +184,7 @@ func TestLegacyGlobalOptions(t *testing.T) {
 	stdout.Reset()
 	code := run(context.Background(), []string{"server", "status", "--json"}, &stdout, io.Discard,
 		func(_ context.Context, configPath string, _ Invocation) (any, error) {
-			if configPath != filepath.Join(home, ".config", "herdr-pal", "server-config.json") {
+			if configPath != filepath.Join(home, ".config", "herdr-pal-server", "server.json") {
 				t.Fatalf("default config path = %q", configPath)
 			}
 			return adminproto.ServerStatusResult{}, nil

@@ -87,7 +87,7 @@ Windows 服务端。
 4. 设置机器人名称、头像和可见范围。需要使用 Herdr Pal 的成员必须处于可见范围内。
 5. 保存机器人，并记录 `Bot ID` 和 `Secret`。
 
-`Secret` 只通过环境变量交给服务端，不要写入配置文件或提交到 Git。企业微信界面发生变化
+`Secret` 直接写入权限为 `0600` 的服务端配置文件，不要提交到 Git。企业微信界面发生变化
 时，可参考[企业微信智能机器人官方文档](https://developer.work.weixin.qq.com/document/path/101463)。
 
 ## 第二步：启动服务端
@@ -95,11 +95,12 @@ Windows 服务端。
 创建默认配置目录并复制示例：
 
 ```sh
-mkdir -p ~/.config/herdr-pal
-cp server-config.example.json ~/.config/herdr-pal/server-config.json
+mkdir -p ~/.config/herdr-pal-server
+chmod 700 ~/.config/herdr-pal-server
+cp server-config.example.json ~/.config/herdr-pal-server/server.json
 ```
 
-编辑 `~/.config/herdr-pal/server-config.json`：
+编辑 `~/.config/herdr-pal-server/server.json`：
 
 ```json
 {
@@ -109,7 +110,6 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
   },
   "server": {
     "listen": "0.0.0.0:9443",
-    "addr_hint": "10.1.3.4",
     "cert_file": "",
     "key_file": "",
     "state_dir": "",
@@ -135,9 +135,9 @@ cp server-config.example.json ~/.config/herdr-pal/server-config.json
 }
 ```
 
-`addr_hint` 填写客户端机器能够访问的服务端主机名或 IP，不要包含 `wss://`、端口或路径。
-服务端会自动使用 `listen` 中的端口，在企业微信 `/help` 的客户端配置示例中生成
-`wss://10.1.3.4:9443`。留空时 `/help` 继续显示需要向管理员获取地址的占位提示。
+企业微信 `/help` 的完整内容保存在 `~/.config/herdr-pal-server/help.md`。首次启动会生成默认
+文件；此后每次 `/help` 都重新读取磁盘，不缓存内容。管理员应直接在该文件的 Pal 配置示例
+中填写用户实际可访问的 WSS 地址，保存后无需重启 Server 即可生效。
 
 `rate_limit` 按企业微信用户限制唯一输入，默认每秒 1 条、滚动 60 秒内 20 条。字段缺省使用
 默认值，显式设置为 `0` 会关闭对应窗口；重复投递的同一企业微信消息不会重复计数。
@@ -171,12 +171,13 @@ export OTEL_EXPORTER_OTLP_LOGS_HEADERS='Authorization=Bearer%20collector-token,x
 配置文件包含企业微信 Secret，请限制为当前用户可读，然后启动：
 
 ```sh
-chmod 600 ~/.config/herdr-pal/server-config.json
+chmod 600 ~/.config/herdr-pal-server/server.json
 ./dist/herdr-pal-server
 ```
 
-首次启动时，Server 会在标准输出中创建并显示一次默认管理员 `admin` 的随机初始密码和
-自动化 Token。请立即保存；后续启动不会再次显示。浏览器访问：
+首次启动时，Server 会在标准输出中显示一次默认管理员 `admin` 的随机初始密码和自动化
+Token，并同步写入权限为 `0600` 的 `~/.config/herdr-pal-server/bootstrap.txt`。请立即登录
+修改密码并妥善保存 Token；认证文件已存在时不会重新生成或覆盖引导文件。浏览器访问：
 
 ```text
 https://服务端地址:4001/admin/
@@ -187,11 +188,12 @@ https://服务端地址:4001/admin/
 
 - 签发、启用、禁用和删除机器 Key，维护来源地址规则。
 - 查看 HPRP 在线连接与各用户、各机器上的 Agent 会话。
-- 创建其他管理员，重置密码并轮换或禁用自动化 Token。
+- 修改自己的密码；创建其他管理员、重置他人密码并轮换或禁用自动化 Token。
 - 切换详细日志、查看运行状态和优雅停止 Server。
 - 配置 `admin.loki_url` 后按用户、机器、日期范围和关键字查询审计日志。
+- 在“系统”页面查看外部 IT 系统签发和删除机器 Key 的接入指南。
 
-管理员认证文件固定为 `~/.config/herdr-pal/server-auth.json`，只保存 Argon2id 密码摘要和
+管理员认证文件固定为 `~/.config/herdr-pal-server/auth.json`，只保存 Argon2id 密码摘要和
 自动化 Token 摘要，Unix 权限必须保持 `0600`。文件损坏、版本无效或权限过宽时 Server 会
 拒绝启动并明确报告路径；不要手工编辑其内容。忘记密码时应使用另一个管理员重置，或在
 明确接受重建全部管理员身份的情况下先备份再移走该文件并重启。
@@ -215,7 +217,7 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 未指定 `-config` 时，服务端默认读取：
 
 ```text
-~/.config/herdr-pal/server-config.json
+~/.config/herdr-pal-server/server.json
 ```
 
 需要使用其他文件时：
@@ -237,7 +239,7 @@ credential ID，以及用户/message/session 的摘要，不记录 prompt、终�
 ./dist/hp-cli server status
 ```
 
-`hp-cli` 默认读取同一个 `~/.config/herdr-pal/server-config.json` 来定位 Admin Socket，但不
+`hp-cli` 默认读取同一个 `~/.config/herdr-pal-server/server.json` 来定位 Admin Socket，但不
 使用其中的企业微信 Secret。服务端使用其他配置文件时，给 `hp-cli` 传入相同的 `-config`。
 
 查看管理命令和参数帮助：
@@ -516,7 +518,7 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 服务端会同时打印配置文件路径和具体原因，例如：
 
 ```text
-配置错误（/home/user/.config/herdr-pal/server-config.json）：缺少必填字段 wecom.secret
+配置错误（/home/user/.config/herdr-pal-server/server.json）：缺少必填字段 wecom.secret
 ```
 
 客户端和本机交互模式也会打印对应配置路径及加载或校验原因，例如：

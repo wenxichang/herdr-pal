@@ -35,6 +35,7 @@ type Event struct {
 	Action            string            `json:"action,omitempty"`
 	Outcome           string            `json:"outcome"`
 	MachineID         string            `json:"machine_id,omitempty"`
+	Agent             string            `json:"agent,omitempty"`
 	PaneID            string            `json:"pane_id,omitempty"`
 	SessionIDHash     string            `json:"session_id_hash,omitempty"`
 	Presentation      string            `json:"presentation,omitempty"`

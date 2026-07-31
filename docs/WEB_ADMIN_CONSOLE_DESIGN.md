@@ -81,14 +81,14 @@ Server 配置增加：
 - `admin.listen` 缺省或留空时使用 `0.0.0.0:4001`。
 - `admin.loki_url` 是独立配置，不从 `audit.endpoint` 推导。
 - 管理台复用 HPRP Server 的 TLS 证书和私钥，仅提供 HTTPS。
-- 管理员文件固定为当前运行用户的 `~/.config/herdr-pal/server-auth.json`。
+- 管理员文件固定为当前运行用户的 `~/.config/herdr-pal-server/auth.json`。
 - 管理端口监听失败、TLS 材料无效或管理员文件损坏时，整个 Server 启动失败。
 - Loki 不可用不阻断 Server 启动，只使审计查询返回明确错误。
 
 启动顺序为：
 
 1. 加载 Server 配置和 TLS 材料。
-2. 加载并校验 `server-auth.json`。
+2. 加载并校验 `auth.json`。
 3. 必要时创建初始 `admin`。
 4. 初始化共享 `AdminService`、HPAP Server 和 Web 管理台。
 5. 所有必需监听成功后进入运行状态。
@@ -99,7 +99,7 @@ Server 配置增加：
 
 ## 5. 管理员存储
 
-`server-auth.json` 使用版本化结构：
+`auth.json` 使用版本化结构：
 
 ```json
 {

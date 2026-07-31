@@ -102,7 +102,7 @@ curl -fsS http://127.0.0.1:3000/api/health
 
 ## 4. 配置 herdr-pal-server
 
-修改默认配置 `~/.config/herdr-pal/server-config.json`，增加或替换以下部分：
+修改默认配置 `~/.config/herdr-pal-server/server.json`，增加或替换以下部分：
 
 ```json
 "admin": {

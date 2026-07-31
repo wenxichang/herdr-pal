@@ -60,7 +60,7 @@ CSRF、管理员和 Loki 查询能力。
 <state_dir>/admin.sock
 ```
 
-`hp-cli` 默认读取 `~/.config/herdr-pal/server-config.json`，使用与 Server 相同的配置加载
+`hp-cli` 默认读取 `~/.config/herdr-pal-server/server.json`，使用与 Server 相同的配置加载
 逻辑推导 `state_dir` 和 Socket 路径。保留 `-config` 用于 Server 使用非默认配置路径的
 部署，但不设计自动发现多个实例。
 

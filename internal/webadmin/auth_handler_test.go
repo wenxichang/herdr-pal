@@ -54,18 +54,20 @@ func TestAuthLoginSessionPasswordAndLogoutFlow(t *testing.T) {
 	}
 	passwordCookie := findSessionCookie(t, passwordResponse)
 	passwordData := decodeWebEnvelope(t, passwordResponse)["data"].(map[string]any)
-	if passwordData["must_change_password"] != false || passwordData["csrf_token"] == "" {
+	if passwordData["password_changed"] != true || passwordCookie.MaxAge >= 0 {
 		t.Fatalf("password data = %#v", passwordData)
 	}
 
-	logoutRequest := newTLSRequest(http.MethodPost, "/admin/api/v1/auth/logout", strings.NewReader(`{}`))
-	logoutRequest.Header.Set("Origin", "https://admin.example.test:4001")
-	logoutRequest.Header.Set("X-CSRF-Token", passwordData["csrf_token"].(string))
-	logoutRequest.AddCookie(passwordCookie)
-	logoutResponse := httptest.NewRecorder()
-	web.Handler().ServeHTTP(logoutResponse, logoutRequest)
-	if logoutResponse.Code != http.StatusOK || findSessionCookie(t, logoutResponse).MaxAge >= 0 {
-		t.Fatalf("logout status=%d cookie=%#v body=%s", logoutResponse.Code, findSessionCookie(t, logoutResponse), logoutResponse.Body.String())
+	revokedRequest := newTLSRequest(http.MethodGet, "/admin/api/v1/auth/session", nil)
+	revokedRequest.AddCookie(rotatedCookie)
+	revokedResponse := httptest.NewRecorder()
+	web.Handler().ServeHTTP(revokedResponse, revokedRequest)
+	if revokedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked session status=%d body=%s", revokedResponse.Code, revokedResponse.Body.String())
+	}
+	relogin := loginWebAdmin(t, web, "admin", "replacement password")
+	if relogin.Code != http.StatusOK || decodeWebEnvelope(t, relogin)["data"].(map[string]any)["must_change_password"] != false {
+		t.Fatalf("relogin status=%d body=%s", relogin.Code, relogin.Body.String())
 	}
 }
 

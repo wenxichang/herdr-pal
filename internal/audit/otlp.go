@@ -212,6 +212,7 @@ func eventLogRecord(event Event) *logsv1.LogRecord {
 		stringKeyValue("herdr_pal.audit.action", event.Action),
 		stringKeyValue("herdr_pal.audit.outcome", event.Outcome),
 		stringKeyValue("herdr_pal.audit.machine_id", event.MachineID),
+		stringKeyValue("herdr_pal.audit.agent", event.Agent),
 		stringKeyValue("herdr_pal.audit.pane_id", event.PaneID),
 		stringKeyValue("herdr_pal.audit.session_id_hash", event.SessionIDHash),
 		stringKeyValue("herdr_pal.audit.presentation", event.Presentation),

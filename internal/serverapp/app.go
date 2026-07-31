@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +47,9 @@ type Options struct {
 	Verbose bool
 	// AuthFile 覆盖固定管理员认证文件路径；只供本机自动化测试隔离状态。
 	AuthFile string
+	// BootstrapFile 和 HelpFile 只供本机自动化测试隔离运行文件。
+	BootstrapFile string
+	HelpFile      string
 	// WeComEndpoint 覆盖企业微信长连接地址；CLI 和配置文件不暴露该入口。
 	WeComEndpoint string
 }
@@ -95,13 +97,16 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		return err
 	}
 	defer lock.Release()
-	authFile := loaded.Admin.AuthFile
-	if strings.TrimSpace(options.AuthFile) != "" {
-		authFile = filepath.Clean(strings.TrimSpace(options.AuthFile))
+	runtimeFiles := resolveRuntimeFiles(loaded.Files, options)
+	if err := ensureDefaultHelpFile(runtimeFiles.HelpFile); err != nil {
+		return fmt.Errorf("准备企业微信帮助文件 %q: %w", runtimeFiles.HelpFile, err)
 	}
-	authStore, bootstrap, err := adminauth.Load(authFile, adminauth.Options{})
+	authStore, bootstrap, err := adminauth.Load(runtimeFiles.AuthFile, adminauth.Options{})
 	if err != nil {
-		return fmt.Errorf("加载管理员认证文件 %q: %w", authFile, err)
+		return fmt.Errorf("加载管理员认证文件 %q: %w", runtimeFiles.AuthFile, err)
+	}
+	if err := publishAdminBootstrap(stdout, runtimeFiles.BootstrapFile, bootstrap); err != nil {
+		return err
 	}
 	runtimeSecrets := []string{loaded.WeCom.Secret, bootstrap.InitialPassword, bootstrap.AutomationToken}
 	for _, value := range loaded.Audit.Headers {
@@ -110,17 +115,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	errorRedactor = audit.NewRedactor(runtimeSecrets)
 	runtimeLogger, err := newLogger(stderr, loaded.Log.Level, options.Verbose, runtimeSecrets...)
 	if err != nil {
-		if bootstrap.Created {
-			_ = printAdminBootstrap(stdout, bootstrap)
-		}
 		return fmt.Errorf("%w: %v", ErrConfig, err)
 	}
 	logger := runtimeLogger.Logger
-	if bootstrap.Created {
-		if err := printAdminBootstrap(stdout, bootstrap); err != nil {
-			return fmt.Errorf("输出初始管理员凭据: %w", err)
-		}
-	}
 	businessAuditor, auditRedactor, err := newBusinessAuditor(loaded.Audit, stderr, logger, loaded.WeCom.Secret, version.Version)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConfig, err)
@@ -146,6 +143,10 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("创建企业微信客户端: %w", err)
 	}
+	helpProvider, err := server.NewFileHelpProvider(runtimeFiles.HelpFile)
+	if err != nil {
+		return fmt.Errorf("创建企业微信帮助读取器: %w", err)
+	}
 	credentialStore, err := credential.LoadStore(loaded.Server.CredentialsFile)
 	if err != nil {
 		return fmt.Errorf("加载 HPRP 凭据存储: %w", err)
@@ -159,15 +160,11 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return err
 	}
-	relayURL, err := buildRelayURLHint(loaded.Server.AddrHint, loaded.Server.Listen)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConfig, err)
-	}
 	router, err := server.NewConversationRouterWithConfig(
 		server.ConversationRouterConfig{
-			RelayURL:    relayURL,
-			RateLimiter: server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
-			Auditor:     businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
+			HelpProvider: helpProvider,
+			RateLimiter:  server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
+			Auditor:      businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
 		},
 		catalog, server.NewUserExecutor(64), weComClient, hub, deduper, logger,
 	)
@@ -328,47 +325,6 @@ func redactServerRunError(err error, redactor *audit.Redactor) error {
 	return redactedServerRunError{cause: err, message: message}
 }
 
-func buildRelayURLHint(addrHint, listen string) (string, error) {
-	_, port, err := net.SplitHostPort(strings.TrimSpace(listen))
-	if err != nil {
-		return "", fmt.Errorf("listen 无法提取端口")
-	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", fmt.Errorf("listen 端口无效")
-	}
-
-	addrHint = strings.TrimSpace(addrHint)
-	if addrHint == "" {
-		return fmt.Sprintf("wss://管理员提供的地址:%d", portNumber), nil
-	}
-	if ip := net.ParseIP(strings.Trim(addrHint, "[]")); ip != nil {
-		return "wss://" + net.JoinHostPort(ip.String(), port), nil
-	}
-	if !validAddressHint(addrHint) {
-		return "", fmt.Errorf("addr_hint 必须是主机名或 IP，不能包含协议、端口或路径")
-	}
-	return "wss://" + net.JoinHostPort(addrHint, port), nil
-}
-
-func validAddressHint(value string) bool {
-	if len(value) == 0 || len(value) > 253 {
-		return false
-	}
-	for _, label := range strings.Split(value, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, character := range label {
-			if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' {
-				continue
-			}
-			return false
-		}
-	}
-	return true
-}
-
 type weComRuntime interface {
 	Run(context.Context) error
 	Events() <-chan im.IncomingText
@@ -488,10 +444,7 @@ func printAdminBootstrap(writer io.Writer, bootstrap adminauth.Bootstrap) error 
 	if writer == nil || !bootstrap.Created {
 		return nil
 	}
-	_, err := fmt.Fprintf(writer,
-		"已创建 Herdr Pal Server 初始管理员，请立即登录并修改密码。\n管理员：%s\n初始密码：%s\n自动化 Token：%s\n",
-		bootstrap.Username, bootstrap.InitialPassword, bootstrap.AutomationToken,
-	)
+	_, err := io.WriteString(writer, formatAdminBootstrap(bootstrap))
 	return err
 }
 

@@ -20,6 +20,7 @@ type Entry struct {
 	EventName     string    `json:"event_name"`
 	PrincipalID   string    `json:"userid"`
 	MachineID     string    `json:"machine_id,omitempty"`
+	Agent         string    `json:"agent,omitempty"`
 	PaneID        string    `json:"pane_id,omitempty"`
 	SessionIDHash string    `json:"session_id_hash,omitempty"`
 	Action        string    `json:"action,omitempty"`

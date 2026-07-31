@@ -41,7 +41,7 @@ func TestWebAdminEndToEnd(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "server.json")
 	rawConfig := fmt.Sprintf(`{
 		"wecom":{"bot_id":%q,"secret":%q},
-		"server":{"listen":%q,"addr_hint":"127.0.0.1","state_dir":%q},
+		"server":{"listen":%q,"state_dir":%q},
 		"admin":{"listen":%q,"loki_url":%q},
 		"log":{"level":"debug"}
 	}`, botID, secret, relayAddress, stateDir, webAddress, lokiServer.URL)
@@ -112,13 +112,19 @@ func TestWebAdminEndToEnd(t *testing.T) {
 		t.Fatalf("login = %#v", login)
 	}
 	const replacementPassword = "replacement password 2026"
-	passwordChanged := webAdminJSON[webAuthResult](t, httpClient, http.MethodPost, baseURL+"/admin/api/v1/auth/password", baseURL, login.CSRFToken, "", map[string]any{
+	passwordChanged := webAdminJSON[webPasswordChangedResult](t, httpClient, http.MethodPost, baseURL+"/admin/api/v1/auth/password", baseURL, login.CSRFToken, "", map[string]any{
 		"current_password": bootstrap.password, "new_password": replacementPassword,
 	})
-	if passwordChanged.MustChangePassword || passwordChanged.CSRFToken == "" {
+	if !passwordChanged.PasswordChanged {
 		t.Fatalf("password result = %#v", passwordChanged)
 	}
-	csrf := passwordChanged.CSRFToken
+	login = webAdminJSON[webAuthResult](t, httpClient, http.MethodPost, baseURL+"/admin/api/v1/auth/login", baseURL, "", "", map[string]any{
+		"username": bootstrap.username, "password": replacementPassword,
+	})
+	if login.MustChangePassword || login.CSRFToken == "" {
+		t.Fatalf("relogin = %#v", login)
+	}
+	csrf := login.CSRFToken
 
 	issued := webAdminJSON[adminservice.CredentialIssueResult](t, httpClient, http.MethodPost, baseURL+"/admin/api/v1/credentials", baseURL, csrf, "", map[string]any{
 		"principal_id": "web-user", "machine_id": "web-home", "sources": []string{"127.0.0.1"},
@@ -212,6 +218,10 @@ type webAuthResult struct {
 	Username           string `json:"username"`
 	MustChangePassword bool   `json:"must_change_password"`
 	CSRFToken          string `json:"csrf_token"`
+}
+
+type webPasswordChangedResult struct {
+	PasswordChanged bool `json:"password_changed"`
 }
 
 type webCreatedAdmin struct {

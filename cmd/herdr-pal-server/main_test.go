@@ -34,7 +34,7 @@ func TestRunServerParsesConfigAndVersion(t *testing.T) {
 		gotDefault = options
 		return nil
 	})
-	wantDefault := filepath.Join(home, ".config", "herdr-pal", "server-config.json")
+	wantDefault := filepath.Join(home, ".config", "herdr-pal-server", "server.json")
 	if code != 0 || gotDefault.ConfigPath != wantDefault {
 		t.Fatalf("default run() = %d, config path %q, want %q", code, gotDefault.ConfigPath, wantDefault)
 	}

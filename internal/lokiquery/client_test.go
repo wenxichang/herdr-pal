@@ -64,7 +64,7 @@ func TestClientQueryBuildsRangeRequestAndParsesStreams(t *testing.T) {
 			"data":{"resultType":"streams","result":[
 				{"stream":{"herdr_pal_audit_event_name":"user.input","herdr_pal_audit_principal_id":"fallback-user","herdr_pal_audit_machine_id":"home"},"values":[
 					["`+strconv.FormatInt(oldest.UnixNano(), 10)+`","old body"],
-					["`+strconv.FormatInt(newest.UnixNano(), 10)+`","new body",{"event_name":"terminal.output","herdr_pal_audit_principal_id":"user-a","herdr_pal_audit_machine_id":"office","herdr_pal_audit_pane_id":"w1:p2","herdr_pal_audit_session_id_hash":"session-hash","herdr_pal_audit_action":"read","herdr_pal_audit_outcome":"accepted"}]
+					["`+strconv.FormatInt(newest.UnixNano(), 10)+`","new body",{"event_name":"terminal.output","herdr_pal_audit_principal_id":"user-a","herdr_pal_audit_machine_id":"office","herdr_pal_audit_agent":"claude","herdr_pal_audit_pane_id":"w1:p2","herdr_pal_audit_session_id_hash":"session-hash","herdr_pal_audit_action":"read","herdr_pal_audit_outcome":"accepted"}]
 				]}
 			]}
 		}`)
@@ -89,10 +89,10 @@ func TestClientQueryBuildsRangeRequestAndParsesStreams(t *testing.T) {
 	if len(page.Items) != 2 || page.Items[0].Timestamp != newest || page.Items[1].Timestamp != oldest {
 		t.Fatalf("items = %#v", page.Items)
 	}
-	if page.Items[0].EventName != "terminal.output" || page.Items[0].PrincipalID != "user-a" || page.Items[0].MachineID != "office" || page.Items[0].PaneID != "w1:p2" || page.Items[0].Body != "new body" {
+	if page.Items[0].EventName != "terminal.output" || page.Items[0].PrincipalID != "user-a" || page.Items[0].MachineID != "office" || page.Items[0].Agent != "claude" || page.Items[0].PaneID != "w1:p2" || page.Items[0].Body != "new body" {
 		t.Fatalf("structured item = %#v", page.Items[0])
 	}
-	if page.Items[1].PrincipalID != "fallback-user" || page.Items[1].MachineID != "home" || page.Items[1].Body != "old body" {
+	if page.Items[1].PrincipalID != "fallback-user" || page.Items[1].MachineID != "home" || page.Items[1].Agent != "" || page.Items[1].Body != "old body" {
 		t.Fatalf("fallback item = %#v", page.Items[1])
 	}
 	if page.NextCursor == "" {

@@ -145,7 +145,7 @@ func TestRunUsesDefaultConfigVersionJSONAndExitCodes(t *testing.T) {
 		gotPath, gotInvocation = configPath, invocation
 		return adminproto.KeyListResult{}, nil
 	})
-	wantPath := filepath.Join(home, ".config", "herdr-pal", "server-config.json")
+	wantPath := filepath.Join(home, ".config", "herdr-pal-server", "server.json")
 	var jsonResult adminproto.KeyListResult
 	jsonErr := json.Unmarshal(stdout.Bytes(), &jsonResult)
 	if code != 0 || gotPath != wantPath || gotInvocation.Method != adminproto.MethodKeyList || jsonErr != nil {

@@ -13,7 +13,10 @@ Herdr Pal 是 Herdr 与企业微信之间的独立 sidecar bridge：
 
 网络模式默认配置：
 
-- Server：`~/.config/herdr-pal/server-config.json`
+- Server：`~/.config/herdr-pal-server/server.json`
+- 管理员认证：`~/.config/herdr-pal-server/auth.json`
+- 首次引导：`~/.config/herdr-pal-server/bootstrap.txt`
+- 企业微信帮助：`~/.config/herdr-pal-server/help.md`
 - Pal：`~/.config/herdr-pal/config.json`
 - 凭据存储：默认 `<state_dir>/credentials.json`
 - Admin Socket：默认 `<state_dir>/admin.sock`
@@ -26,7 +29,7 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 ## 2. 固定产品决策
 
 - 企业微信 Bot ID 和 Secret 只由 Server 持有；Secret 直接保存在权限为 `0600` 的
-  `server-config.json` 的 `wecom.secret` 字段中。
+  `server.json` 的 `wecom.secret` 字段中。
 - 企业微信应用可见范围是用户入口边界；Router 只处理单聊。
 - `/userid` 只用于向管理员提供企业微信 principal ID，不再写入 Pal 配置。
 - 管理员使用 `hp-cli key issue` 为每台机器签发独立 `hpk_...` Key，并必须配置至少一条
@@ -49,13 +52,13 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 
 ### 3.1 Server
 
-1. `config.LoadServer` 读取 Bot ID、监听地址、`addr_hint`、TLS 和凭据文件路径。
+1. `config.LoadServer` 读取 Bot ID、监听地址、TLS 和凭据文件路径，并派生固定运行文件路径。
 2. `EnsureTLS` 加载外部证书；未配置时在状态目录生成并复用自签名证书。
 3. `credential.LoadStore` 加载仅保存摘要的 HPRP 机器凭据。
 4. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
 5. 在 `<state_dir>/admin.sock` 启动 HPAP 管理面；失败时整个 Server 启动失败。
 6. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
-7. `/help` 使用 `addr_hint + listen 端口` 生成 Pal 的 WSS 配置示例。
+7. `/help` 每次重新读取 `help.md`，管理员修改后无需重启即可生效。
 
 用户在企业微信发送 `/userid` 后，管理员执行：
 

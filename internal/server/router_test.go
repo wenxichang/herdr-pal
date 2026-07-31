@@ -175,7 +175,7 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"https://github.com/wenxichang/herdr-pal/releases/latest",
 		"herdr-pal-windows-amd64.exe",
 		`%USERPROFILE%\.config\herdr-pal\config.json`,
-		`"url": "wss://管理员提供的地址:9443"`,
+		`"url": "wss://请向管理员获取服务器地址:9443"`,
 		`"key": "管理员签发的 hpk_ 机器 Key"`,
 		"每台机器使用独立 Key",
 		"把返回值交给管理员",
@@ -207,15 +207,26 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 	}
 }
 
-func TestRouterHelpUsesConfiguredRelayURL(t *testing.T) {
-	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RelayURL: "wss://10.1.3.4:9443"})
-	router.Handle(context.Background(), routerMessage("request-help-url", "message-help-url", "user-a", "/help"))
-	help := gateway.LastReply()
-	if !strings.Contains(help, `"url": "wss://10.1.3.4:9443"`) {
-		t.Fatalf("help reply lacks configured relay URL:\n%s", help)
+func TestRouterHelpReadsProviderForEveryRequest(t *testing.T) {
+	provider := &routerHelpProvider{text: "第一版帮助"}
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{HelpProvider: provider})
+	router.Handle(context.Background(), routerMessage("request-help-1", "message-help-1", "user-a", "/help"))
+	if got := gateway.LastReply(); got != "第一版帮助" {
+		t.Fatalf("first help = %q", got)
 	}
-	if strings.Contains(help, "管理员提供的地址") {
-		t.Fatalf("help reply retained address placeholder:\n%s", help)
+	provider.text = "第二版帮助"
+	router.Handle(context.Background(), routerMessage("request-help-2", "message-help-2", "user-a", "/help"))
+	if got := gateway.LastReply(); got != "第二版帮助" {
+		t.Fatalf("second help = %q", got)
+	}
+}
+
+func TestRouterHelpReportsProviderFailure(t *testing.T) {
+	provider := &routerHelpProvider{err: errors.New("permission denied")}
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{HelpProvider: provider})
+	router.Handle(context.Background(), routerMessage("request-help-error", "message-help-error", "user-a", "/help"))
+	if got := gateway.LastReply(); !strings.Contains(got, "帮助内容暂时不可用") {
+		t.Fatalf("help error reply = %q", got)
 	}
 }
 
@@ -984,8 +995,29 @@ func TestConversationRouterTerminalAuditRecordsTextReply(t *testing.T) {
 	if event.Action != "command_result" || event.Outcome != "delivered" || event.Presentation != "txt" || event.Delivery != "reply" || event.Body != "终端原始文本" {
 		t.Fatalf("event = %#v", event)
 	}
-	if event.MachineID != "home-mac" || event.PaneID != "w1:p1" || event.SessionIDHash == "" || event.MessageIDHash == "" || event.RequestIDHash == "" {
+	if event.MachineID != "home-mac" || event.Agent != "codex" || event.PaneID != "w1:p1" || event.SessionIDHash == "" || event.MessageIDHash == "" || event.RequestIDHash == "" {
 		t.Fatalf("target event = %#v", event)
+	}
+}
+
+func TestConversationRouterUserInputAuditRecordsSelectedAgent(t *testing.T) {
+	collector := &routerAuditCollector{}
+	router, _, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{Auditor: collector})
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "w1:p1", "occ-1", "任务")},
+	})
+	entry := router.catalog.CreateNumberedSnapshot("user-a")[0]
+	if err := router.catalog.SetSelection("user-a", entry.Ref); err != nil {
+		t.Fatal(err)
+	}
+	router.Handle(context.Background(), routerMessage("request-input", "message-input", "user-a", "继续实现"))
+	events := collector.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %#v", events)
+	}
+	event := events[0]
+	if event.EventName != audit.EventNameUserInput || event.Agent != "codex" || event.MachineID != "home-mac" || event.PaneID != "w1:p1" || event.SessionIDHash == "" {
+		t.Fatalf("user input event = %#v", event)
 	}
 }
 
@@ -1634,5 +1666,14 @@ func (relay *routerRelay) FetchCalls() []routerFetchCall {
 type testDiscardWriter struct{}
 
 func (testDiscardWriter) Write(data []byte) (int, error) { return len(data), nil }
+
+type routerHelpProvider struct {
+	text string
+	err  error
+}
+
+func (provider *routerHelpProvider) Read() (string, error) {
+	return provider.text, provider.err
+}
 
 type lockedLogBuffer = lockedHPRPLogBuffer

@@ -157,18 +157,9 @@ func (server *Server) changePassword(writer http.ResponseWriter, request *http.R
 		}
 		return
 	}
-	credentials, err := server.sessions.Rotate(identity.SessionID)
-	if err != nil {
-		server.sessions.RevokeUser(identity.Username)
-		clearSessionCookie(writer)
-		_ = writeAPIError(writer, request, http.StatusInternalServerError, "internal", "更新管理员会话失败，请重新登录")
-		return
-	}
-	server.sessions.RevokeUserExcept(identity.Username, credentials.ID)
-	setSessionCookie(writer, credentials.ID)
-	_ = writeAPIData(writer, request, http.StatusOK, authResponse{
-		Username: identity.Username, MustChangePassword: false, CSRFToken: credentials.CSRFToken,
-	})
+	server.sessions.RevokeUser(identity.Username)
+	clearSessionCookie(writer)
+	_ = writeAPIData(writer, request, http.StatusOK, map[string]bool{"password_changed": true})
 }
 
 func setSessionCookie(writer http.ResponseWriter, value string) {

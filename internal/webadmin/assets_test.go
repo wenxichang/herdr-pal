@@ -58,8 +58,39 @@ func TestPagesForceInitialAdminToPasswordChangeView(t *testing.T) {
 	response := httptest.NewRecorder()
 	web.Handler().ServeHTTP(response, request)
 	body := response.Body.String()
-	if response.Code != http.StatusOK || !strings.Contains(body, `id="password-change-form"`) || strings.Contains(body, `id="credentials-page"`) || strings.Contains(body, `class="nav-link`) {
+	if response.Code != http.StatusOK || !strings.Contains(body, `id="password-change-form"`) || !strings.Contains(body, `name="confirm_password"`) || strings.Contains(body, `id="credentials-page"`) || strings.Contains(body, `class="nav-link`) {
 		t.Fatalf("must-change page status=%d body=%s", response.Code, body)
+	}
+}
+
+func TestAdministratorsPageSupportsOwnPasswordChange(t *testing.T) {
+	web, cookie, _, _ := authenticatedManagementServer(t, webTestDependencies{})
+	request := newTLSRequest(http.MethodGet, "/admin/administrators", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	web.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	for _, want := range []string{`id="self-password-form"`, `name="current_password"`, `name="new_password"`, `name="confirm_password"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("administrators page lacks %q: %s", want, body)
+		}
+	}
+}
+
+func TestSystemPageDocumentsExternalCredentialAutomation(t *testing.T) {
+	web, cookie, _, _ := authenticatedManagementServer(t, webTestDependencies{})
+	request := newTLSRequest(http.MethodGet, "/admin/system", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	web.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	for _, want := range []string{
+		`id="automation-guide"`, `id="automation-base-url"`, `id="automation-issue-example"`, `id="automation-delete-example"`,
+		"Bearer Token", "/admin/api/v1/automation/credentials", "机器 Key 只显示一次", "来源地址",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("system page lacks %q: %s", want, body)
+		}
 	}
 }
 
@@ -91,6 +122,15 @@ func TestAssetsHaveContentTypesCachePolicyAndNoPersistentAuditStorage(t *testing
 			}
 			if !strings.Contains(body, "pageState.username") || !strings.Contains(body, `window.location.assign("/admin/login")`) {
 				t.Fatalf("app.js does not preserve self-reset one-time password flow")
+			}
+			if !strings.Contains(body, `#self-password-form`) || !strings.Contains(body, `username !== pageState.username`) || !strings.Contains(body, "confirm_password") {
+				t.Fatalf("app.js does not implement self password change and self reset hiding")
+			}
+			if !strings.Contains(body, `item.agent || "-"`) || strings.Contains(body, `item.pane_id || "-"`) {
+				t.Fatalf("app.js audit Agent column does not use the real agent field")
+			}
+			if !strings.Contains(body, "window.location.origin") || !strings.Contains(body, "automation-issue-example") || !strings.Contains(body, "automation-delete-example") {
+				t.Fatalf("app.js does not generate automation examples from the current HTTPS origin")
 			}
 		}
 	}

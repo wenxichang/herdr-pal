@@ -226,7 +226,7 @@ protocol.error
 
 ## 7. 安全边界
 
-- Bot Secret 只在 Server 环境变量中；机器 Key 只在对应 Pal 配置中。
+- Bot Secret 只在权限为 `0600` 的 Server 配置文件中；机器 Key 只在对应 Pal 配置中。
 - Server 只能向 Key 所属用户与机器路由命令；Pal 仍执行本地 `PolicyGuard`。
 - 普通运行日志不记录完整 Key、Secret、Cookie、prompt 或终端快照；显式启用的业务审计流
   会包含脱敏后的完整用户输入和终端文本，必须单独控制访问权限。

@@ -5,7 +5,6 @@
   },
   "server": {
     "listen": "0.0.0.0:9443",
-    "addr_hint": "",
     "cert_file": "",
     "key_file": "",
     "state_dir": "",

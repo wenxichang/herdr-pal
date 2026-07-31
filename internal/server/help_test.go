@@ -1,0 +1,60 @@
+package server
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestFileHelpProviderReadsLatestContentEveryTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "help.md")
+	if err := os.WriteFile(path, []byte("第一版帮助"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := NewFileHelpProvider(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := provider.Read()
+	if err != nil || first != "第一版帮助" {
+		t.Fatalf("first Read() = %q, %v", first, err)
+	}
+	if err := os.WriteFile(path, []byte("第二版帮助\n立即生效"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := provider.Read()
+	if err != nil || second != "第二版帮助\n立即生效" {
+		t.Fatalf("second Read() = %q, %v", second, err)
+	}
+}
+
+func TestFileHelpProviderRejectsUnavailableContent(t *testing.T) {
+	directory := t.TempDir()
+	tests := []struct {
+		name string
+		path string
+		data []byte
+	}{
+		{name: "missing", path: filepath.Join(directory, "missing.md")},
+		{name: "empty", path: filepath.Join(directory, "empty.md"), data: []byte(" \n\t")},
+		{name: "oversized", path: filepath.Join(directory, "large.md"), data: []byte(strings.Repeat("x", MaxHelpFileBytes+1))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.data != nil {
+				if err := os.WriteFile(test.path, test.data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			provider, err := NewFileHelpProvider(test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := provider.Read(); !errors.Is(err, ErrHelpUnavailable) {
+				t.Fatalf("Read() error = %v", err)
+			}
+		})
+	}
+}

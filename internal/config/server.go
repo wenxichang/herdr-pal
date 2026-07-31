@@ -24,12 +24,13 @@ const OTLPLogsHeadersEnvName = "OTEL_EXPORTER_OTLP_LOGS_HEADERS"
 
 // ServerConfig 是 herdr-pal-server 的完整配置。
 type ServerConfig struct {
-	WeCom     ServerWeComConfig `json:"wecom"`
-	Server    ListenerConfig    `json:"server"`
-	Admin     AdminConfig       `json:"admin"`
-	RateLimit RateLimitConfig   `json:"rate_limit"`
-	Audit     AuditConfig       `json:"audit"`
-	Log       LogConfig         `json:"log"`
+	WeCom     ServerWeComConfig  `json:"wecom"`
+	Server    ListenerConfig     `json:"server"`
+	Admin     AdminConfig        `json:"admin"`
+	RateLimit RateLimitConfig    `json:"rate_limit"`
+	Audit     AuditConfig        `json:"audit"`
+	Log       LogConfig          `json:"log"`
+	Files     ServerRuntimeFiles `json:"-"`
 }
 
 type serverConfigFile struct {
@@ -50,7 +51,6 @@ type ServerWeComConfig struct {
 // ListenerConfig 是 Relay WSS 监听和证书配置。
 type ListenerConfig struct {
 	Listen          string `json:"listen"`
-	AddrHint        string `json:"addr_hint"`
 	CertFile        string `json:"cert_file"`
 	KeyFile         string `json:"key_file"`
 	StateDir        string `json:"state_dir"`
@@ -60,9 +60,15 @@ type ListenerConfig struct {
 
 // AdminConfig 定义内嵌 HTTPS 管理台的监听地址和 Loki 查询地址。
 type AdminConfig struct {
-	Listen   string `json:"listen"`
-	LokiURL  string `json:"loki_url"`
-	AuthFile string `json:"-"`
+	Listen  string `json:"listen"`
+	LokiURL string `json:"loki_url"`
+}
+
+// ServerRuntimeFiles 定义服务端固定使用的认证、引导和实时帮助文件。
+type ServerRuntimeFiles struct {
+	AuthFile      string
+	BootstrapFile string
+	HelpFile      string
 }
 
 // RateLimitConfig 定义单个企业微信用户的滚动窗口输入限额。
@@ -163,7 +169,15 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 		loaded.Admin.Listen = defaultWebAdminListen
 	}
 	loaded.Admin.LokiURL = strings.TrimSpace(loaded.Admin.LokiURL)
-	loaded.Admin.AuthFile, err = DefaultServerAuthPath()
+	loaded.Files.AuthFile, err = DefaultServerAuthPath()
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	loaded.Files.BootstrapFile, err = DefaultServerBootstrapPath()
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	loaded.Files.HelpFile, err = DefaultServerHelpPath()
 	if err != nil {
 		return ServerConfig{}, err
 	}

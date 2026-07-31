@@ -90,9 +90,10 @@ function bindPasswordChange() {
     clearFormError();
     const data = new FormData(form);
     try {
+      if (data.get("new_password") !== data.get("confirm_password")) throw new Error("两次输入的新密码不一致");
       await api("/admin/api/v1/auth/password", { method: "POST", body: { current_password: data.get("current_password"), new_password: data.get("new_password") } });
       form.reset();
-      window.location.assign("/admin");
+      window.location.assign("/admin/login");
     } catch (error) {
       showFormError(error.message);
     }
@@ -291,7 +292,7 @@ function auditRow(item) {
     value?.replaceChildren(document.createTextNode(item.body || ""));
     document.querySelector("#audit-detail")?.showModal();
   });
-  return row(formatTime(item.timestamp), item.event_name, item.userid, item.machine_id || "-", item.pane_id || "-", item.outcome || "-", preview);
+  return row(formatTime(item.timestamp), item.event_name, item.userid, item.machine_id || "-", item.agent || "-", item.outcome || "-", preview);
 }
 
 function clearAuditDetail() {
@@ -299,6 +300,7 @@ function clearAuditDetail() {
 }
 
 async function setupAdministrators() {
+  document.querySelector("#self-password-form")?.addEventListener("submit", changeOwnPassword);
   document.querySelector("#administrator-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -313,6 +315,21 @@ async function setupAdministrators() {
   await loadAdministrators();
 }
 
+async function changeOwnPassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  await runVisible(async () => {
+    if (data.get("new_password") !== data.get("confirm_password")) throw new Error("两次输入的新密码不一致");
+    await api("/admin/api/v1/auth/password", {
+      method: "POST",
+      body: { current_password: data.get("current_password"), new_password: data.get("new_password") },
+    });
+    form.reset();
+    window.location.assign("/admin/login");
+  });
+}
+
 async function loadAdministrators() {
   await runVisible(async () => {
     const result = await api("/admin/api/v1/administrators");
@@ -323,17 +340,16 @@ async function loadAdministrators() {
 function administratorRow(item) {
   const username = item.username;
   const enabled = item.automation_token?.enabled;
-  const actions = actionCell(
-    actionButton("重置密码", async () => {
+  const actions = actionCell();
+  if (username !== pageState.username) {
+    actions.append(actionButton("重置密码", async () => {
       if (!window.confirm(`确认重置管理员 ${username} 的密码？`)) return;
       const result = await api(`/admin/api/v1/administrators/${encodeURIComponent(username)}/reset-password`, { method: "POST", body: { confirm: true } });
-      if (username === pageState.username) {
-        showSecret(`管理员 ${username} 的新初始密码`, result.initial_password, () => window.location.assign("/admin/login"));
-        return;
-      }
       showSecret(`管理员 ${username} 的新初始密码`, result.initial_password);
       await loadAdministrators();
-    }),
+    }));
+  }
+  actions.append(
     actionButton("轮换 Token", async () => {
       if (!window.confirm(`确认轮换管理员 ${username} 的自动化 Token？旧 Token 将立即失效。`)) return;
       const result = await api(`/admin/api/v1/administrators/${encodeURIComponent(username)}/token/rotate`, { method: "POST", body: { confirm: true } });
@@ -356,7 +372,28 @@ function administratorRow(item) {
 async function setupSystem() {
   document.querySelector("#debug-toggle")?.addEventListener("click", () => void toggleDebug());
   document.querySelector("#stop-server")?.addEventListener("click", () => void stopServer());
+  renderAutomationGuide();
   await loadSystem();
+}
+
+function renderAutomationGuide() {
+  const baseURL = window.location.origin;
+  const base = document.querySelector("#automation-base-url");
+  if (base) base.textContent = baseURL;
+  const issue = document.querySelector("#automation-issue-example");
+  if (issue) issue.textContent = `export HERDR_PAL_ADMIN_TOKEN='hpa_...'
+
+curl --fail-with-body -X POST '${baseURL}/admin/api/v1/automation/credentials' \\
+  -H "Authorization: Bearer $HERDR_PAL_ADMIN_TOKEN" \\
+  -H 'Content-Type: application/json' \\
+  --data '{
+    "principal_id": "企业微信用户 ID",
+    "machine_id": "当前运行 Herdr 的机器标识",
+    "sources": ["192.168.1.20", "192.168.2.0/24", "10.0.0.10-10.0.0.20"]
+  }'`;
+  const remove = document.querySelector("#automation-delete-example");
+  if (remove) remove.textContent = `curl --fail-with-body -X DELETE '${baseURL}/admin/api/v1/automation/credentials/凭据ID' \\
+  -H "Authorization: Bearer $HERDR_PAL_ADMIN_TOKEN"`;
 }
 
 async function loadSystem() {

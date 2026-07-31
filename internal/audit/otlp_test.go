@@ -58,7 +58,8 @@ func TestOTLPExporterSendsProtobufLogsWithHeaders(t *testing.T) {
 		SchemaVersion: 1, EventID: "event-1", EventName: EventNameUserInput,
 		Timestamp: time.Unix(100, 2), ObservedTimestamp: time.Unix(101, 3),
 		PrincipalID: "user-1", BotIDHash: "bot-hash", Action: "prompt", Outcome: "accepted",
-		Body: "full input", ContentBytes: 10, Attributes: map[string]string{"limit.window": "second"},
+		Agent: "codex",
+		Body:  "full input", ContentBytes: 10, Attributes: map[string]string{"limit.window": "second"},
 	}
 	if err := exporter.Export(context.Background(), []Event{event}); err != nil {
 		t.Fatalf("Export() error = %v", err)
@@ -80,7 +81,7 @@ func TestOTLPExporterSendsProtobufLogsWithHeaders(t *testing.T) {
 		t.Fatalf("record = %#v", record)
 	}
 	attributes := keyValues(record.Attributes)
-	if attributes["herdr_pal.audit.event_id"] != "event-1" || attributes["herdr_pal.audit.principal_id"] != "user-1" || attributes["herdr_pal.audit.limit.window"] != "second" {
+	if attributes["herdr_pal.audit.event_id"] != "event-1" || attributes["herdr_pal.audit.principal_id"] != "user-1" || attributes["herdr_pal.audit.agent"] != "codex" || attributes["herdr_pal.audit.limit.window"] != "second" {
 		t.Fatalf("attributes = %#v", attributes)
 	}
 }

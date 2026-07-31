@@ -30,10 +30,6 @@ const backgroundNotificationActivityWindow = 2 * time.Minute
 
 const noAvailableSessionsMessage = "当前没有可用会话，使用/userid 获取用户 ID，并联系管理员签发机器 Key 后配置 herdr-pal；使用/help获取内置命令帮助"
 
-const defaultHelpRelayURL = "wss://管理员提供的地址:9443"
-
-const helpRelayURLToken = "{{RELAY_URL}}"
-
 const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"已经完成配置时：`/ls` 查看会话 → `/1` 选择会话 → 直接发送任务。\n\n" +
 	"【基本控制】\n" +
@@ -87,7 +83,7 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"配置示例：\n\n" +
 	"{\n" +
 	"  \"relay\": {\n" +
-	"    \"url\": \"" + helpRelayURLToken + "\",\n" +
+	"    \"url\": \"wss://请向管理员获取服务器地址:9443\",\n" +
 	"    \"key\": \"管理员签发的 hpk_ 机器 Key\",\n" +
 	"    \"skip_verify\": true\n" +
 	"  },\n" +
@@ -113,12 +109,9 @@ const serverHelpTextTemplate = "### Herdr Pal 快速上手\n\n" +
 	"`.\\herdr-pal-windows-amd64.exe`\n\n" +
 	"启动成功后回到企微，发送 `/ls`，再用 `/N` 选择会话。"
 
-func buildServerHelpText(relayURL string) string {
-	relayURL = strings.TrimSpace(relayURL)
-	if relayURL == "" {
-		relayURL = defaultHelpRelayURL
-	}
-	return strings.Replace(serverHelpTextTemplate, helpRelayURLToken, relayURL, 1)
+// DefaultHelpText 返回首次创建 help.md 时使用的客户端快速上手内容。
+func DefaultHelpText() string {
+	return serverHelpTextTemplate
 }
 
 // WeComGateway 是 Router 回复企业微信消息所需的动态用户发送能力。
@@ -236,7 +229,7 @@ type ConversationRouter struct {
 	relay          RelayRequester
 	deduper        *policy.Deduper
 	logger         *slog.Logger
-	helpText       string
+	helpProvider   HelpProvider
 	requestTimeout time.Duration
 	activity       *userActivityTracker
 	now            func() time.Time
@@ -248,8 +241,8 @@ type ConversationRouter struct {
 
 // ConversationRouterConfig 是服务端会话路由器的展示配置。
 type ConversationRouterConfig struct {
-	// RelayURL 是在 /help 客户端配置示例中展示的 WSS 地址。
-	RelayURL string
+	// HelpProvider 每次 /help 请求都读取最新内容；nil 仅用于测试和内嵌默认值。
+	HelpProvider HelpProvider
 	// RateLimiter 在消息去重后限制单个用户的唯一输入频率；nil 表示禁用。
 	RateLimiter *UserRateLimiter
 	// Auditor 接收用户输入和终端文本审计事件；nil 表示不输出。
@@ -279,9 +272,12 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 	if config.AuditRedactor == nil {
 		config.AuditRedactor = audit.NewRedactor(nil)
 	}
+	if config.HelpProvider == nil {
+		config.HelpProvider = staticHelpProvider{content: DefaultHelpText()}
+	}
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
-		deduper: deduper, logger: logger, helpText: buildServerHelpText(config.RelayURL), requestTimeout: defaultRelayRequestTimeout,
+		deduper: deduper, logger: logger, helpProvider: config.HelpProvider, requestTimeout: defaultRelayRequestTimeout,
 		activity: newUserActivityTracker(), now: time.Now, rateLimiter: config.RateLimiter,
 		auditor: config.Auditor, auditRedactor: config.AuditRedactor, botIDHash: config.BotIDHash,
 	}, nil
@@ -362,16 +358,49 @@ func (router *ConversationRouter) emitUserInputAudit(message im.IncomingText, de
 		attributes["limit.per_minute"] = strconv.Itoa(perMinute)
 	}
 	now := router.now()
-	event, err := audit.PrepareEvent(audit.Event{
+	source, hasSource := router.userInputAuditSource(message.UserID, message.Content)
+	eventInput := audit.Event{
 		EventName: audit.EventNameUserInput, Timestamp: now, PrincipalID: message.UserID,
 		BotIDHash: router.botIDHash, MessageID: message.MessageID, RequestID: message.RequestID,
 		Action: actionName, Outcome: outcome, Body: router.auditRedactor.Redact(message.Content), Attributes: attributes,
-	}, now, nil)
+	}
+	if hasSource {
+		eventInput.MachineID = source.Ref.MachineID
+		eventInput.Agent = auditAgent(source)
+		eventInput.PaneID = source.Ref.SlotID
+		eventInput.SessionID = source.Ref.SessionID
+	}
+	event, err := audit.PrepareEvent(eventInput, now, nil)
 	if err != nil {
 		router.logger.Warn("用户输入审计事件构造失败", "error_type", "event_id_generation")
 		return
 	}
 	router.auditor.Emit(event)
+}
+
+func (router *ConversationRouter) userInputAuditSource(userID, content string) (CatalogEntry, bool) {
+	action, err := parseServerAction(content)
+	if err != nil {
+		return CatalogEntry{}, false
+	}
+	switch action.kind {
+	case serverActionSelect, serverActionDirected:
+		entry, err := router.catalog.ResolveNumbered(userID, action.index)
+		return entry, err == nil
+	case serverActionForward, serverActionMode:
+		entry, err := router.catalog.Selected(userID)
+		return entry, err == nil
+	default:
+		return CatalogEntry{}, false
+	}
+}
+
+func auditAgent(source CatalogEntry) string {
+	agent := strings.TrimSpace(source.Session.Display.Agent)
+	if agent == "" {
+		agent = strings.TrimSpace(source.Session.Display.DisplayAgent)
+	}
+	return strings.ToLower(agent)
 }
 
 func maxInt64(left, right int64) int64 {
@@ -407,7 +436,13 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	case serverActionSelect:
 		router.handleSelect(ctx, message, action.index)
 	case serverActionHelp:
-		router.reply(ctx, message, router.helpText)
+		helpText, err := router.helpProvider.Read()
+		if err != nil {
+			router.logger.Warn("企业微信帮助内容读取失败", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "error_type", "help_unavailable", "reason", safeServerErrorReason(err))
+			router.reply(ctx, message, "帮助内容暂时不可用，请联系管理员检查服务端 help.md。")
+			return
+		}
+		router.reply(ctx, message, helpText)
 	case serverActionMode:
 		router.handleMode(ctx, message, action.mode)
 	case serverActionDirected:
@@ -825,7 +860,7 @@ func (router *ConversationRouter) emitTerminalAudit(userID, messageID, requestID
 	event, err := audit.PrepareEvent(audit.Event{
 		EventName: audit.EventNameTerminalOutput, Timestamp: timestamp, PrincipalID: userID,
 		BotIDHash: router.botIDHash, MessageID: messageID, RequestID: requestID,
-		Action: action, Outcome: outcome, MachineID: source.Ref.MachineID, PaneID: source.Ref.SlotID,
+		Action: action, Outcome: outcome, MachineID: source.Ref.MachineID, Agent: auditAgent(source), PaneID: source.Ref.SlotID,
 		SessionID: source.Ref.SessionID, Presentation: string(presentation), Delivery: delivery,
 		Body: router.auditRedactor.Redact(content.Text), Attributes: attributes,
 	}, observedAt, nil)

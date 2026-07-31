@@ -362,7 +362,7 @@ func newHPAPHarness(t *testing.T) *hpapHarness {
 	secret := fmt.Sprintf("secret-hpap-%d", time.Now().UnixNano())
 	weComServer := testkit.NewWeComServer(t, botID, secret)
 	configPath := filepath.Join(t.TempDir(), "server.json")
-	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q,"secret":%q},"server":{"listen":%q,"addr_hint":"127.0.0.1","state_dir":%q},"admin":{"listen":"127.0.0.1:0"},"log":{"level":"debug"}}`, botID, secret, listenAddress, stateDir)
+	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q,"secret":%q},"server":{"listen":%q,"state_dir":%q},"admin":{"listen":"127.0.0.1:0"},"log":{"level":"debug"}}`, botID, secret, listenAddress, stateDir)
 	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}

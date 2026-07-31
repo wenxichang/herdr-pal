@@ -72,7 +72,7 @@ func TestLoadClientRejectsPlainWSLegacyIdentityAndUnknownNestedField(t *testing.
 func TestLoadServerReadsSecretFromFileAndDefaultsCredentialPath(t *testing.T) {
 	path := writeConfig(t, `{
 	  "wecom": {"bot_id": "bot-1", "secret": "file-secret-value"},
-	  "server": {"listen": "127.0.0.1:9443", "addr_hint": "10.1.3.4"},
+	  "server": {"listen": "127.0.0.1:9443"},
 	  "log": {}
 	}`)
 	loaded, err := LoadServer(path, func(name string) string {
@@ -117,6 +117,17 @@ func TestLoadServerRequiresSecretInConfigurationFile(t *testing.T) {
 	}
 }
 
+func TestLoadServerRejectsRemovedAddrHint(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom":{"bot_id":"bot","secret":"secret"},
+  "server":{"listen":"127.0.0.1:9443","addr_hint":"10.1.3.4"},
+  "log":{}
+}`)
+	if _, err := LoadServer(path, func(string) string { return "" }); err == nil || !strings.Contains(err.Error(), "addr_hint") {
+		t.Fatalf("LoadServer() error = %v, want removed addr_hint rejection", err)
+	}
+}
+
 func TestLoadServerAppliesWebAdminDefaults(t *testing.T) {
 	loaded, err := LoadServer(writeConfig(t, `{
   "wecom":{"bot_id":"bot","secret":"secret"},
@@ -132,8 +143,14 @@ func TestLoadServerAppliesWebAdminDefaults(t *testing.T) {
 	if loaded.Admin.LokiURL != "" {
 		t.Fatalf("admin loki URL = %q", loaded.Admin.LokiURL)
 	}
-	if !strings.HasSuffix(loaded.Admin.AuthFile, filepath.Join(".config", "herdr-pal", "server-auth.json")) {
-		t.Fatalf("auth file = %q", loaded.Admin.AuthFile)
+	if !strings.HasSuffix(loaded.Files.AuthFile, filepath.Join(".config", "herdr-pal-server", "auth.json")) {
+		t.Fatalf("auth file = %q", loaded.Files.AuthFile)
+	}
+	if !strings.HasSuffix(loaded.Files.BootstrapFile, filepath.Join(".config", "herdr-pal-server", "bootstrap.txt")) {
+		t.Fatalf("bootstrap file = %q", loaded.Files.BootstrapFile)
+	}
+	if !strings.HasSuffix(loaded.Files.HelpFile, filepath.Join(".config", "herdr-pal-server", "help.md")) {
+		t.Fatalf("help file = %q", loaded.Files.HelpFile)
 	}
 }
 

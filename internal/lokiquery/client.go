@@ -282,6 +282,7 @@ func parseValue(value []json.RawMessage, labels map[string]string) (Entry, error
 		EventName:     field("event_name", "herdr_pal_audit_event_name"),
 		PrincipalID:   field("herdr_pal_audit_principal_id"),
 		MachineID:     field("herdr_pal_audit_machine_id"),
+		Agent:         field("herdr_pal_audit_agent"),
 		PaneID:        field("herdr_pal_audit_pane_id"),
 		SessionIDHash: field("herdr_pal_audit_session_id_hash"),
 		Action:        field("herdr_pal_audit_action"),

@@ -1,4 +1,18 @@
 {{define "system-content"}}<section id="system-page" class="page-section">
   <section class="panel"><div class="panel-heading"><h2>运行信息</h2><button class="secondary" data-action="refresh-system">刷新</button></div><dl id="system-details" class="details-grid"></dl></section>
+  <section id="automation-guide" class="panel guide-panel">
+    <div class="panel-heading"><div><h2>外部签发自动化接入</h2><p class="muted">供 IT 系统通过 HTTPS 自动签发或删除机器凭据。</p></div></div>
+    <p>基础地址：<code id="automation-base-url">当前管理台 HTTPS 地址</code></p>
+    <ol>
+      <li>在“管理员”页面轮换并安全保存当前管理员的自动化 Bearer Token；页面和示例不会展示真实 Token。</li>
+      <li>签发时必须提供企业微信用户 ID、当前运行 Herdr 的机器标识，以及至少一条来源地址规则。来源地址支持单 IP、CIDR 和闭区间。</li>
+      <li>签发成功返回的机器 Key 只显示一次，调用方必须立即安全保存。重复签发会返回失败。</li>
+      <li>删除凭据会同时禁用该 Key，并断开使用它的在线 HPRP 连接。</li>
+    </ol>
+    <p><strong>接口：</strong><code>POST /admin/api/v1/automation/credentials</code>；<code>DELETE /admin/api/v1/automation/credentials/{credential_id}</code></p>
+    <h3>签发机器 Key</h3><pre id="automation-issue-example" class="code-block"></pre>
+    <h3>删除机器凭据</h3><pre id="automation-delete-example" class="code-block"></pre>
+    <p class="muted">自动化接口仅允许签发和删除，按 Token 限制为每秒 5 次、每分钟 100 次。请不要把 Token 写入代码仓库或普通日志。</p>
+  </section>
   <section class="panel danger-zone"><h2>运行控制</h2><p class="muted">调试日志会增加输出量；停止服务会断开企业微信、HPRP 和管理连接。</p><div class="button-row"><button id="debug-toggle" class="secondary">切换调试日志</button><button id="stop-server" class="danger">停止 Server</button></div></section>
 </section>{{end}}
