@@ -1,11 +1,13 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,12 +20,13 @@ import (
 )
 
 const (
-	testBotID  = "bot-integration"
 	testSecret = "secret-integration"
 	testUserID = "user-integration"
 )
 
-func TestBridgeEndToEnd(t *testing.T) {
+var testBotID = fmt.Sprintf("bot-integration-%d", os.Getpid())
+
+func TestLegacyDirectBridgeEndToEnd(t *testing.T) {
 	t.Run("启动后完成协议门禁快照与两侧订阅", func(t *testing.T) {
 		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
 		defer harness.stop(t)
@@ -303,6 +306,32 @@ func TestBridgeEndToEnd(t *testing.T) {
 		harness.send(t, "message-after-wecom-reconnect", testUserID, "single", "重连后新消息")
 		harness.herdr.WaitCallCount(t, "agent.prompt", 2)
 	})
+}
+
+func TestLegacyDirectBridgeEndToEndRunsInParallelProcesses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	commands := make([]*exec.Cmd, 2)
+	outputs := make([]bytes.Buffer, len(commands))
+	for index := range commands {
+		commands[index] = exec.CommandContext(ctx, "go", "test", "-count=1", "-run", "^TestLegacyDirectBridgeEndToEnd$", ".")
+		commands[index].Stdout = &outputs[index]
+		commands[index].Stderr = &outputs[index]
+		if err := commands[index].Start(); err != nil {
+			t.Fatalf("启动并行端到端测试 %d：%v", index+1, err)
+		}
+	}
+
+	var failures []string
+	for index := range commands {
+		if err := commands[index].Wait(); err != nil {
+			failures = append(failures, fmt.Sprintf("并行端到端测试 %d 失败：%v\n%s", index+1, err, outputs[index].String()))
+		}
+	}
+	if len(failures) != 0 {
+		t.Fatal(strings.Join(failures, "\n"))
+	}
 }
 
 func TestApplicationHarnessCleanupReleasesProcessLock(t *testing.T) {

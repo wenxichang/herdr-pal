@@ -72,9 +72,10 @@ herdr status server --json
 - `dist/herdr-pal`
 - `dist/hp-cli`
 
-GitHub Release 只发布带操作系统和架构后缀的文件。Intel/AMD x64 选择 `amd64`，Apple
-Silicon 或 ARM64 Linux 选择 `arm64`。Windows 当前只发布客户端 AMD64 Beta，不发布
-Windows 服务端。
+公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Bundle。Intel/AMD x64 选择
+`amd64`，Apple Silicon 或 ARM64 Linux 选择 `arm64`。`./build.sh` 仍会生成 Pal、Server、
+`hp-cli` 的分平台二进制；Windows AMD64 客户端 Beta 需要从源码构建，不发布 Windows
+服务端。
 
 为终端用户制作包含 Herdr 和 Herdr Pal 的单平台安装包：
 
@@ -330,7 +331,8 @@ Linux 和 macOS 推荐直接使用同时包含 Herdr、Herdr Pal 和安装器的
 安装器会交互完成以下操作：
 
 - 选择安装目录，默认 `~/.local/bin`，也可以输入其他用户可写目录。
-- 输入服务端 `wss://` URL 和管理员为本机签发的 Key；Key 输入不会回显。
+- 输入服务端 `wss://` URL 和管理员为本机签发的 Key；Key 会在终端回显，请确认粘贴完整并
+  避免旁人看到。
 - 把 `herdr` 和 `herdr-pal` 安装为同目录的真实文件，旧文件先生成带时间戳的备份。
 - 合并并备份 `~/.config/herdr-pal/config.json` 和 `~/.config/herdr/config.toml`。
 - 添加幂等的 `[[sidecar]] command = ["herdr-pal"]`，让 Herdr 在自身生命周期内启动、守护并
