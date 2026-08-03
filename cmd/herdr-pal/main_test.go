@@ -10,6 +10,7 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/app"
 	"github.com/wenxichang/herdr-pal/internal/installer"
+	"github.com/wenxichang/herdr-pal/internal/lifecycle"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
@@ -221,5 +222,105 @@ func TestRunWithExecutorsDispatchesSetupCommand(t *testing.T) {
 	}
 	if appCalls != 0 || setupCalls != 1 {
 		t.Fatalf("app calls = %d, setup calls = %d", appCalls, setupCalls)
+	}
+}
+
+func TestRunWithCommandExecutorsDispatchesLifecycleCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaultConfig := filepath.Join(home, ".config", "herdr-pal", "config.json")
+	tests := []struct {
+		name        string
+		args        []string
+		wantCode    int
+		wantCommand string
+		wantConfig  string
+		wantSocket  string
+	}{
+		{name: "start default config", args: []string{"start"}, wantCommand: "start", wantConfig: defaultConfig},
+		{name: "start explicit config", args: []string{"start", "-config", "/tmp/pal.json"}, wantCommand: "start", wantConfig: "/tmp/pal.json"},
+		{name: "supervisor", args: []string{"__supervise", "-config", "/tmp/pal.json", "-socket", "/tmp/herdr.sock"}, wantCommand: "supervise", wantConfig: "/tmp/pal.json", wantSocket: "/tmp/herdr.sock"},
+		{name: "worker", args: []string{"__worker", "-config", "/tmp/pal.json"}, wantCommand: "worker", wantConfig: "/tmp/pal.json"},
+		{name: "supervisor missing socket", args: []string{"__supervise", "-config", "/tmp/pal.json"}, wantCode: 2},
+		{name: "worker extra arg", args: []string{"__worker", "extra"}, wantCode: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			called := ""
+			var got lifecycleCommandOptions
+			executors := commandExecutors{
+				app: func(context.Context, app.Options) error { t.Fatal("app executor called"); return nil },
+				setup: func(context.Context, installer.Request, installer.Options) (installer.Result, error) {
+					t.Fatal("setup executor called")
+					return installer.Result{}, nil
+				},
+				start: func(_ context.Context, options lifecycleCommandOptions) error {
+					called, got = "start", options
+					return nil
+				},
+				supervise: func(_ context.Context, options lifecycleCommandOptions) error {
+					called, got = "supervise", options
+					return nil
+				},
+				worker: func(_ context.Context, options lifecycleCommandOptions) error {
+					called, got = "worker", options
+					return nil
+				},
+			}
+			code := runWithCommandExecutors(context.Background(), test.args, strings.NewReader(""), &stdout, &stderr, executors)
+			if code != test.wantCode {
+				t.Fatalf("runWithCommandExecutors() = %d, stderr=%q", code, stderr.String())
+			}
+			if called != test.wantCommand || got.ConfigPath != test.wantConfig || got.SocketPath != test.wantSocket {
+				t.Fatalf("called/options = %q/%#v", called, got)
+			}
+		})
+	}
+}
+
+func TestLifecycleInternalCommandsStayOutOfPublicUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runWithCommandExecutors(context.Background(), []string{"--unknown"}, strings.NewReader(""), &stdout, &stderr, commandExecutors{
+		app: func(context.Context, app.Options) error { return lifecycle.ErrUnsupported },
+	})
+	if code != 2 {
+		t.Fatalf("code = %d", code)
+	}
+	if strings.Contains(stderr.String(), "__supervise") || strings.Contains(stderr.String(), "__worker") {
+		t.Fatalf("public usage exposes internal commands: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "herdr-pal start") {
+		t.Fatalf("public usage lacks start command: %q", stderr.String())
+	}
+}
+
+func TestPublicHelpPrintsUsageOnce(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "application", args: []string{"--help"}},
+		{name: "start", args: []string{"start", "--help"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runWithCommandExecutors(context.Background(), test.args, strings.NewReader(""), &stdout, &stderr, commandExecutors{
+				app: func(context.Context, app.Options) error {
+					t.Fatal("application executor called")
+					return nil
+				},
+				start: func(context.Context, lifecycleCommandOptions) error {
+					t.Fatal("lifecycle executor called")
+					return nil
+				},
+			})
+			if code != 0 {
+				t.Fatalf("code = %d, stderr=%q", code, stderr.String())
+			}
+			if count := strings.Count(stderr.String(), "用法:"); count != 1 {
+				t.Fatalf("usage count = %d, stderr=%q", count, stderr.String())
+			}
+		})
 	}
 }

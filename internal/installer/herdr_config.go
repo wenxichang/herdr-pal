@@ -1,7 +1,6 @@
 package installer
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 
@@ -31,7 +30,7 @@ func mergeHerdrConfig(existing []byte) ([]byte, error) {
 		return nil, fmt.Errorf("Herdr 配置中的受管 Sidecar 标记无效")
 	}
 
-	var merged []byte
+	merged := append([]byte(nil), existing...)
 	if beginCount == 1 {
 		beginIndex := strings.Index(text, managedSidecarBegin)
 		endIndex := strings.Index(text, managedSidecarEnd)
@@ -44,27 +43,7 @@ func mergeHerdrConfig(existing []byte) ([]byte, error) {
 		} else if strings.HasPrefix(text[endCut:], "\n") {
 			endCut++
 		}
-		merged = []byte(text[:beginIndex] + managedSidecarBlock + text[endCut:])
-	} else {
-		document, err := decodeHerdrDocument(existing)
-		if err != nil {
-			return nil, err
-		}
-		for _, sidecar := range document.Sidecars {
-			if len(sidecar.Command) == 1 && sidecar.Command[0] == "herdr-pal" {
-				return append([]byte(nil), existing...), nil
-			}
-		}
-		var output bytes.Buffer
-		output.Write(existing)
-		if len(existing) > 0 && existing[len(existing)-1] != '\n' {
-			output.WriteByte('\n')
-		}
-		if output.Len() > 0 {
-			output.WriteByte('\n')
-		}
-		output.WriteString(managedSidecarBlock)
-		merged = output.Bytes()
+		merged = []byte(text[:beginIndex] + text[endCut:])
 	}
 	if _, err := decodeHerdrDocument(merged); err != nil {
 		return nil, err

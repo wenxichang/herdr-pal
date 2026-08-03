@@ -33,7 +33,7 @@ func ResolveSocket(ctx context.Context, explicitPath, sessionName string, runner
 	return ResolveSocketWithEnvironment(ctx, explicitPath, "", sessionName, runner)
 }
 
-// ResolveSocketWithEnvironment 按显式配置、Sidecar 环境、公共 CLI 和默认路径解析 Socket。
+// ResolveSocketWithEnvironment 按显式配置、Herdr 注入环境、公共 CLI 和默认路径解析 Socket。
 func ResolveSocketWithEnvironment(ctx context.Context, explicitPath, environmentPath, sessionName string, runner CommandRunner) (string, error) {
 	if explicitPath != "" {
 		return explicitPath, nil

@@ -2,7 +2,7 @@
 
 ## 1. 架构目标
 
-Herdr Pal 由中央 Server 与每机 Pal sidecar 组成。Server 集中持有企业微信机器人连接；Pal
+Herdr Pal 由中央 Server 与每机独立 Pal bridge 组成。Server 集中持有企业微信机器人连接；Pal
 只访问本机 Herdr 公共 Socket，并通过 HPRP/1 WSS 上报会话与执行用户功能。
 
 ```text
@@ -14,7 +14,7 @@ HTTPS 管理台 ─────────▶ ├── WebAdmin ────�
                                   │ HPRP/1 WSS
                      ┌────────────┴────────────┐
                      ▼                         ▼
-             herdr-pal: office-pc      herdr-pal: home-mac
+             Pal Supervisor            Pal Supervisor
              RelayClient               RelayClient
              Service / Notifier        Service / Notifier
              EventSupervisor           EventSupervisor
@@ -25,7 +25,8 @@ HTTPS 管理台 ─────────▶ ├── WebAdmin ────�
 
 固定边界：
 
-- 不修改 Herdr，不使用 MCP、plugin startup hook、私有 TUI socket 或内部 Rust 模块。
+- 不修改 Herdr，不使用 MCP、私有 TUI socket 或内部 Rust 模块。Plugin startup hook 只触发
+  快速 Launcher，不承载常驻 IM 连接，也不作为 Herdr 与 Pal 的协议层。
 - 不把 Herdr Socket、任意 Herdr RPC、本地路径或凭据暴露到远程网络。
 - 只允许 WSS；终端内容是近期快照，不是结构化 LLM 消息或完整对话。
 - 不自动批准权限请求。
@@ -138,7 +139,18 @@ Target
 
 ## 4. Pal 模块
 
-### 4.1 RelayClient
+### 4.1 Launcher、Supervisor 与 Worker
+
+一体化安装包注册用户级 Herdr Startup 插件。插件在公共 Socket 就绪后调用
+`herdr-pal start`；Launcher 使用由规范化 Socket endpoint 派生的单实例锁和本地只读状态
+端点，保证重复 startup 与 live-handoff 不会创建重复实例。它启动脱离插件调用栈的
+Supervisor 后立即返回。
+
+Supervisor 只通过公共 `ping` 和首次 `session.snapshot` 判断 Herdr 生命周期。短暂断连进入
+5 秒宽限期，恢复后沿用原 Worker；持续不可连接则停止 Worker 并退出。Herdr 存活时，Worker
+异常退出会按有上限的退避重启。该机制不安装 systemd 或 launchd 服务。
+
+### 4.2 RelayClient
 
 职责：
 
@@ -152,7 +164,7 @@ Target
   预算，不能通过驱逐窗口内 Key 释放空间。
 - 上报带稳定目标的 `notification.event`；断线时不缓存任何输入、输出或通知。
 
-### 4.2 HerdrClient、SessionRegistry 与 EventSupervisor
+### 4.3 HerdrClient、SessionRegistry 与 EventSupervisor
 
 `HerdrClient` 只使用公共 NDJSON API。普通文本使用 `agent.prompt`，UI 控制使用
 `agent.send_keys`。每次操作都以 pane ID 调用，并复核 occupant。
@@ -169,7 +181,7 @@ Herdr 不可用时向 HPRP 暴露空会话。
 5. pane/occupant 变化后重建订阅。
 6. 每 10 秒重读权威 snapshot。
 
-### 4.3 Service、PolicyGuard 与 Notifier
+### 4.4 Service、PolicyGuard 与 Notifier
 
 Service 解析 `/con`、分页、`/key`、`/enter`、`/slash` 和普通 prompt。普通文本只允许
 实时 `idle` 或 `done`；prompt stalled 时最多补发一次经过目标复核的 Enter。图片模式先

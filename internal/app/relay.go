@@ -32,7 +32,16 @@ func RunCLI(ctx context.Context, options Options) error {
 }
 
 // RunRelay 连接本机 Herdr 与中央 Relay Server，直到 context 取消或关键组件失败。
-func RunRelay(ctx context.Context, options Options) (runErr error) {
+func RunRelay(ctx context.Context, options Options) error {
+	return runRelay(ctx, options, true)
+}
+
+// RunManagedRelay 运行由外层 Pal Supervisor 持有实例锁的业务 Worker。
+func RunManagedRelay(ctx context.Context, options Options) error {
+	return runRelay(ctx, options, false)
+}
+
+func runRelay(ctx context.Context, options Options, acquireOwnerLock bool) (runErr error) {
 	if ctx == nil {
 		return newConfigError("context 不能为空")
 	}
@@ -51,44 +60,23 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return newConfigError(err.Error())
 	}
-	runner := options.Runner
-	if runner == nil {
-		runner = commandRunner{}
-	}
-	getenv := options.Getenv
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-	socketPath, err := herdr.ResolveSocketWithEnvironment(
-		ctx,
-		loaded.Herdr.SocketPath,
-		strings.TrimSpace(getenv("HERDR_SOCKET_PATH")),
-		loaded.Herdr.Session,
-		runner,
-	)
+	identity, err := resolveRelayIdentityFromConfig(ctx, loaded, options)
 	if err != nil {
-		return fmt.Errorf("解析 Herdr Socket: %w", err)
-	}
-	canonicalEndpoint, err := canonicalSocketPath(socketPath)
-	if err != nil {
-		return fmt.Errorf("规范化 Herdr Socket: %w", err)
-	}
-	socketHash := shortHash(canonicalEndpoint)
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return fmt.Errorf("获取缓存目录: %w", err)
-	}
-	lockDir := filepath.Join(cacheDir, "herdr-pal")
-	if err := os.MkdirAll(lockDir, 0o700); err != nil {
-		return fmt.Errorf("创建锁目录: %w", err)
-	}
-	lock, err := processlock.Acquire(filepath.Join(lockDir, socketHash+".lock"))
-	if err != nil {
-		return fmt.Errorf("获取进程锁: %w", err)
+		return err
 	}
 	var timedOutComponentsDone <-chan struct{}
-	defer func() { finishProcessLock(lock, &runErr, timedOutComponentsDone) }()
-	stableDialPath, err := prepareStableDialPath(canonicalEndpoint)
+	var lock processLock
+	if acquireOwnerLock {
+		if err := os.MkdirAll(filepath.Dir(identity.LockPath), 0o700); err != nil {
+			return fmt.Errorf("创建锁目录: %w", err)
+		}
+		lock, err = processlock.Acquire(identity.LockPath)
+		if err != nil {
+			return fmt.Errorf("获取进程锁: %w", err)
+		}
+		defer func() { finishProcessLock(lock, &runErr, timedOutComponentsDone) }()
+	}
+	stableDialPath, err := prepareStableDialPath(identity.CanonicalEndpoint)
 	if err != nil {
 		return fmt.Errorf("准备 Herdr Socket 连接路径: %w", err)
 	}
@@ -147,7 +135,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		"relay_endpoint", relayLogEndpoint(loaded.Relay.URL),
 		"skip_verify", loaded.Relay.SkipVerify,
 		"herdr_session", herdrSession,
-		"socket_hash", socketHash,
+		"socket_hash", identity.SocketHash,
 	)
 	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, supervisor.Run, defaultShutdownTimeout)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {

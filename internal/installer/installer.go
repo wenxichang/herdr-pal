@@ -23,6 +23,9 @@ type Request struct {
 	ClientConfigPath string
 	HerdrConfigPath  string
 	HerdrBinaryPath  string
+	PalBinaryPath    string
+	PluginDirectory  string
+	PluginVersion    string
 	RelayURL         string
 	RelayKey         string
 }
@@ -31,12 +34,18 @@ type Request struct {
 type Result struct {
 	ClientBackupPath string
 	HerdrBackupPath  string
+	PluginBackupPath string
+	PluginDirectory  string
 }
+
+// LinkPluginFunc 使用 Herdr 公开 CLI 把本地 startup 插件注册到当前用户。
+type LinkPluginFunc func(context.Context, string, string, string) error
 
 // Options 提供安装配置过程中的可测试时钟和 Herdr 校验入口。
 type Options struct {
 	Now              func() time.Time
 	CheckHerdrConfig func(context.Context, string, string, []byte) error
+	LinkPlugin       LinkPluginFunc
 }
 
 // Apply 在全部候选配置通过校验后，以可恢复顺序更新 Herdr 和 Herdr Pal 配置。
@@ -47,11 +56,21 @@ func Apply(ctx context.Context, request Request, options Options) (Result, error
 	request.ClientConfigPath = strings.TrimSpace(request.ClientConfigPath)
 	request.HerdrConfigPath = strings.TrimSpace(request.HerdrConfigPath)
 	request.HerdrBinaryPath = strings.TrimSpace(request.HerdrBinaryPath)
-	if request.ClientConfigPath == "" || request.HerdrConfigPath == "" || request.HerdrBinaryPath == "" {
+	request.PalBinaryPath = strings.TrimSpace(request.PalBinaryPath)
+	request.PluginDirectory = strings.TrimSpace(request.PluginDirectory)
+	request.PluginVersion = strings.TrimSpace(request.PluginVersion)
+	if request.PluginDirectory == "" && request.ClientConfigPath != "" {
+		request.PluginDirectory = DefaultPluginDirectory(request.ClientConfigPath)
+	}
+	if request.ClientConfigPath == "" || request.HerdrConfigPath == "" || request.HerdrBinaryPath == "" || request.PalBinaryPath == "" || request.PluginDirectory == "" {
 		return Result{}, fmt.Errorf("安装配置路径不能为空")
 	}
 	if filepath.Clean(request.ClientConfigPath) == filepath.Clean(request.HerdrConfigPath) {
 		return Result{}, fmt.Errorf("Herdr 与 Herdr Pal 配置路径不能相同")
+	}
+	artifacts, err := buildPluginArtifacts(request.PalBinaryPath, request.ClientConfigPath, request.PluginVersion)
+	if err != nil {
+		return Result{}, err
 	}
 
 	clientExisting, err := readOptionalRegularFile(request.ClientConfigPath)
@@ -91,14 +110,37 @@ func Apply(ctx context.Context, request Request, options Options) (Result, error
 		return Result{}, err
 	}
 	result.ClientBackupPath, err = writePrivateFile(request.ClientConfigPath, clientCandidate, now)
-	if err == nil {
-		return result, nil
+	if err != nil {
+		restoreErr := restoreBackup(request.HerdrConfigPath, result.HerdrBackupPath)
+		if restoreErr != nil {
+			return Result{}, errors.Join(err, restoreErr)
+		}
+		return Result{}, err
 	}
-	restoreErr := restoreBackup(request.HerdrConfigPath, result.HerdrBackupPath)
-	if restoreErr != nil {
-		return Result{}, errors.Join(err, restoreErr)
+	result.PluginDirectory = request.PluginDirectory
+	result.PluginBackupPath, err = writePluginDirectory(request.PluginDirectory, artifacts, now)
+	if err != nil {
+		return Result{}, errors.Join(err, rollbackInstalledConfigs(request, result))
 	}
-	return Result{}, err
+	linkPlugin := options.LinkPlugin
+	if linkPlugin == nil {
+		linkPlugin = runHerdrPluginLink
+	}
+	if err := linkPlugin(ctx, request.HerdrBinaryPath, request.HerdrConfigPath, request.PluginDirectory); err != nil {
+		rollbackErr := errors.Join(
+			restorePluginDirectory(request.PluginDirectory, result.PluginBackupPath),
+			rollbackInstalledConfigs(request, result),
+		)
+		return Result{}, errors.Join(err, rollbackErr)
+	}
+	return result, nil
+}
+
+func rollbackInstalledConfigs(request Request, result Result) error {
+	return errors.Join(
+		restoreBackup(request.ClientConfigPath, result.ClientBackupPath),
+		restoreBackup(request.HerdrConfigPath, result.HerdrBackupPath),
+	)
 }
 
 func readOptionalRegularFile(path string) ([]byte, error) {

@@ -129,7 +129,7 @@ Feature 的合同只描述用户意图和可观察结果。Pal 是领域适配�
 调用展开为任意数量的 Herdr snapshot、read、prompt、wait、keys 或其他公共 API 调用。
 底层调用顺序、Herdr protocol 版本、重试和兼容分支都不得成为 HPRP 对端依赖。
 
-参考实现中的 Pal 是独立 sidecar，只通过 Herdr 公共本地 Socket API、CLI 和公开 Schema
+参考实现中的 Pal 是独立 bridge，只通过 Herdr 公共本地 Socket API、CLI 和公开 Schema
 完成编排。Feature Package 不得要求访问 Herdr 私有 TUI socket、内部状态或未公开模块。
 
 Pal 只有在当前 Herdr 环境中能够完整实现某个 Feature 合同时，才能声明支持该 Feature。

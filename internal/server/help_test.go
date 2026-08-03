@@ -59,14 +59,17 @@ func TestFileHelpProviderRejectsUnavailableContent(t *testing.T) {
 	}
 }
 
-func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
+func TestDefaultHelpUsesStartupPluginBundleInstallation(t *testing.T) {
 	help := DefaultHelpText()
 	for _, want := range []string{
 		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
 		"./install.sh",
 		"/ls",
 		"/N",
-		"Sidecar",
+		"Startup 插件",
+		"herdr-pal start",
+		"~/Library/Logs/herdr-pal/herdr-pal.log",
+		"~/.local/state/herdr-pal/herdr-pal.log",
 		"Key 会在终端回显",
 	} {
 		if !strings.Contains(help, want) {

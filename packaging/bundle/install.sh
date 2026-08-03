@@ -169,7 +169,7 @@ esac
 
 server_status=$(HERDR_CONFIG_PATH=$herdr_config "$herdr_target" status server --json 2>/dev/null || true)
 if printf '%s\n' "$server_status" | grep -Eq '"running"[[:space:]]*:[[:space:]]*true'; then
-	printf '\n检测到 Herdr 正在运行，立即执行 live-handoff 加载新版本和 Sidecar？[Y/n]: '
+	printf '\n检测到 Herdr 正在运行，立即执行 live-handoff 加载新版本和 Startup 插件？[Y/n]: '
 	IFS= read -r handoff_choice || handoff_choice=''
 	case "$handoff_choice" in
 		'' | y | Y | yes | YES)
@@ -177,7 +177,7 @@ if printf '%s\n' "$server_status" | grep -Eq '"running"[[:space:]]*:[[:space:]]*
 				printf '%s\n' "live-handoff 未成功，现有 Herdr 保持运行；请稍后手工重启 Herdr。" >&2
 			fi
 			;;
-		*) printf '%s\n' "已跳过 live-handoff，请手工重启 Herdr 以启动 Sidecar。" ;;
+		*) printf '%s\n' "已跳过 live-handoff，请手工重启 Herdr 以加载 Startup 插件。" ;;
 	esac
 fi
 

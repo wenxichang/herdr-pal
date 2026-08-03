@@ -34,11 +34,18 @@ func TestREADMEReflectsCurrentInstallerAndReleasePolicy(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"Key 会在终端回显",
+		"Startup 插件",
+		"herdr-pal start",
+		"~/Library/Logs/herdr-pal/herdr-pal.log",
+		"~/.local/state/herdr-pal/herdr-pal.log",
 		"公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Bundle",
 		"Windows AMD64 客户端 Beta 需要从源码构建",
 	} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("README 缺少当前发布说明 %q", expected)
 		}
+	}
+	if strings.Contains(content, "通过 `[[sidecar]]`") {
+		t.Fatal("README 仍把 Sidecar 描述为当前安装机制")
 	}
 }

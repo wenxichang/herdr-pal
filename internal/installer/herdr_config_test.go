@@ -5,71 +5,42 @@ import (
 	"testing"
 )
 
-func TestMergeHerdrConfigAppendsManagedSidecarOnce(t *testing.T) {
-	first, err := mergeHerdrConfig([]byte("[ui]\nmouse_capture = true\n"))
+func TestMergeHerdrConfigRemovesManagedSidecar(t *testing.T) {
+	existing := []byte("[ui]\nmouse_capture = true\n\n" + managedSidecarBegin + "\n[[sidecar]]\ncommand = [\"herdr-pal\"]\n" + managedSidecarEnd + "\n\n[advanced]\nscrollback_limit_bytes = 1234\n")
+
+	merged, err := mergeHerdrConfig(existing)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := mergeHerdrConfig(first)
+	text := string(merged)
+	for _, forbidden := range []string{managedSidecarBegin, managedSidecarEnd, `command = ["herdr-pal"]`} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("managed sidecar remains as %q:\n%s", forbidden, text)
+		}
+	}
+	for _, want := range []string{"mouse_capture = true", "scrollback_limit_bytes = 1234"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("merged config missing %q:\n%s", want, text)
+		}
+	}
+	second, err := mergeHerdrConfig(merged)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(first) != string(second) {
-		t.Fatalf("merge is not idempotent:\nfirst:\n%s\nsecond:\n%s", first, second)
-	}
-	if strings.Count(string(second), "[[sidecar]]") != 1 {
-		t.Fatalf("sidecar count is not one:\n%s", second)
-	}
-	if !strings.Contains(string(second), managedSidecarBlock) {
-		t.Fatalf("managed block missing:\n%s", second)
+	if string(second) != string(merged) {
+		t.Fatalf("migration is not idempotent:\nfirst:\n%s\nsecond:\n%s", merged, second)
 	}
 }
 
-func TestMergeHerdrConfigKeepsExistingUnmanagedPalSidecar(t *testing.T) {
-	existing := []byte("[[sidecar]]\ncommand = [\n  \"herdr-pal\",\n]\n")
+func TestMergeHerdrConfigKeepsUnmanagedSidecars(t *testing.T) {
+	existing := []byte("onboarding = false\n\n[[sidecar]]\ncommand = [\"herdr-pal\"]\n\n[[sidecar]]\ncommand = [\"metrics-agent\", \"--serve\"]\n")
 
 	merged, err := mergeHerdrConfig(existing)
-
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(merged) != string(existing) {
-		t.Fatalf("existing sidecar changed:\n%s", merged)
-	}
-}
-
-func TestMergeHerdrConfigPreservesOtherSidecarsAndSettings(t *testing.T) {
-	existing := []byte("onboarding = false\n\n[[sidecar]]\ncommand = [\"metrics-agent\", \"--serve\"]\n")
-
-	merged, err := mergeHerdrConfig(existing)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(merged)
-	for _, want := range []string{"onboarding = false", `command = ["metrics-agent", "--serve"]`, managedSidecarBlock} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("merged config missing %q:\n%s", want, text)
-		}
-	}
-}
-
-func TestMergeHerdrConfigReplacesManagedBlock(t *testing.T) {
-	existing := []byte("[ui]\nmouse_capture = true\n\n" + managedSidecarBegin + "\n[[sidecar]]\ncommand = [\"old-pal\"]\n" + managedSidecarEnd + "\n\n[advanced]\nscrollback_limit_bytes = 1234\n")
-
-	merged, err := mergeHerdrConfig(existing)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(merged)
-	if strings.Contains(text, "old-pal") || strings.Count(text, managedSidecarBegin) != 1 || strings.Count(text, managedSidecarEnd) != 1 {
-		t.Fatalf("managed block was not replaced:\n%s", text)
-	}
-	for _, want := range []string{"mouse_capture = true", "scrollback_limit_bytes = 1234", `command = ["herdr-pal"]`} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("merged config missing %q:\n%s", want, text)
-		}
+		t.Fatalf("unmanaged sidecars changed:\n%s", merged)
 	}
 }
 

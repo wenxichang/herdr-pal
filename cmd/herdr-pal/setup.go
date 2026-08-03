@@ -7,10 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/config"
 	"github.com/wenxichang/herdr-pal/internal/installer"
+	"github.com/wenxichang/herdr-pal/internal/version"
 )
 
 const setupInputLimit = 4096
@@ -67,10 +69,19 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 			return 2
 		}
 	}
+	palBinaryPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(stderr, "确定 Herdr Pal 可执行文件路径失败：%s\n", err)
+		return 1
+	}
+	pluginDirectory := installer.DefaultPluginDirectory(*clientConfigPath)
 	result, err := execute(ctx, installer.Request{
 		ClientConfigPath: *clientConfigPath,
 		HerdrConfigPath:  *herdrConfigPath,
 		HerdrBinaryPath:  *herdrBinaryPath,
+		PalBinaryPath:    palBinaryPath,
+		PluginDirectory:  pluginDirectory,
+		PluginVersion:    version.Version,
 		RelayURL:         strings.TrimSpace(*relayURL),
 		RelayKey:         key,
 	}, installer.Options{})
@@ -81,11 +92,15 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	fmt.Fprintln(stdout, "安装配置已更新：")
 	fmt.Fprintf(stdout, "Herdr Pal: %s\n", *clientConfigPath)
 	fmt.Fprintf(stdout, "Herdr: %s\n", *herdrConfigPath)
+	fmt.Fprintf(stdout, "Startup 插件: %s\n", result.PluginDirectory)
 	if result.ClientBackupPath != "" {
 		fmt.Fprintf(stdout, "Herdr Pal 备份: %s\n", result.ClientBackupPath)
 	}
 	if result.HerdrBackupPath != "" {
 		fmt.Fprintf(stdout, "Herdr 备份: %s\n", result.HerdrBackupPath)
+	}
+	if result.PluginBackupPath != "" {
+		fmt.Fprintf(stdout, "Startup 插件备份: %s\n", result.PluginBackupPath)
 	}
 	return 0
 }

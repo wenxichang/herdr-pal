@@ -2,10 +2,11 @@
 
 ## 1. 当前状态
 
-Herdr Pal 是 Herdr 与企业微信之间的独立 sidecar bridge：
+Herdr Pal 是 Herdr 与企业微信之间的独立 bridge：
 
 - `herdr-pal-server` 独占企业微信智能机器人长连接，并监听 HPRP/1 WSS。
-- 每台运行 Herdr 的机器启动一个 `herdr-pal`，只访问本机 Herdr 公共 Socket。
+- 每台运行 Herdr 的机器启动一个 `herdr-pal`，只访问本机 Herdr 公共 Socket；一体化安装包
+  使用 Herdr Startup 插件触发快速 Launcher，由 Pal Supervisor 自己守护业务 Worker。
 - Server 通过每机独立 Bearer Key 认证 Pal；Key 在服务端绑定企业微信用户 ID 和机器标识。
 - `hp-cli` 通过本机 HPAP/1 Unix Socket 动态管理正在运行的 Server，不直接修改凭据文件。
 - Pal 上报本机完整 Agent 会话快照，Server 为同一用户聚合多台机器并负责企业微信路由。
@@ -81,13 +82,17 @@ hp-cli key issue \
 
 1. `config.LoadClient` 严格校验 `wss://` 和 `relay.key`，并从 Key 派生安全日志使用的
    `credential_id`。
-2. 解析本机 Herdr Socket，并按 Socket endpoint 获取单实例进程锁。
-3. 启动 `EventSupervisor`，以 Herdr 权威 `session.snapshot` 接管本机会话。
+2. Startup 插件调用 `herdr-pal start`；Launcher 按规范化 Socket endpoint 保证幂等并启动
+   脱离插件调用栈的 Supervisor。直接运行旧入口时仍按同一 endpoint 获取单实例进程锁。
+3. Supervisor 通过 Herdr 公共 API 确认就绪后启动业务 Worker；Worker 启动
+   `EventSupervisor`，以 Herdr 权威 `session.snapshot` 接管本机会话。
 4. 使用 `Authorization: Bearer ...` 和子协议 `herdr-pal-relay.v1` 建立 WSS。
 5. 完成 `hello.client/hello.server`，从服务端确认 Key 所绑定的 `machine_id`。
 6. 上报并等待确认首个完整 `session.snapshot`，之后连接才进入 READY。
 7. Registry 变化后最多约 250ms 上报快照；同时按校准周期强制上报完整快照。
 8. 断线时不缓存 prompt、按键或通知，指数退避并从 hello、完整快照重新开始。
+9. Supervisor 定时探测 Herdr 公共 `ping`；短暂不可连接进入宽限期，持续 5 秒不可连接后
+   停止 Worker 并退出。Worker 自身异常退出时在 Herdr 存活期间退避重启。
 
 ## 4. HPRP/1 数据流
 

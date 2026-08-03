@@ -1,7 +1,6 @@
 # Herdr 插件自动启动与生命周期管理
 
-> 本文保留对 Herdr 插件能力的审核结论。基于当前 `v0.5.1` 代码的详细进程模型、状态机、
-> 安装迁移和测试设计见
+> 本文记录 Herdr 插件能力的审核结论和当前实现。详细进程模型、状态机、安装迁移和测试设计见
 > [Pal 自动启动与自守护设计](plans/2026-08-03-pal-autostart-supervisor-design.md)。
 
 ## 背景
@@ -9,8 +8,8 @@
 Herdr Pal 需要在 Herdr Server 启动后自动运行，并在 Herdr Server 真正退出后自动
 结束。该能力不得依赖 `launchd`、`systemd` 等系统服务，也不修改 Herdr 源码。
 
-本文记录对 Herdr 0.7.5 插件能力的审核结论，以及 Herdr Pal 后续实现自动启动和
-自守护时需要遵守的生命周期规则。
+本文记录对 Herdr 0.7.5 插件能力的审核结论，以及 Herdr Pal 自动启动和自守护实现遵守的
+生命周期规则。
 
 ## 结论
 
@@ -77,14 +76,11 @@ command = ["./start-herdr-pal"]
 单条订阅连接断开不能直接证明 Herdr Server 已退出。状态订阅可能因为 pane 或 Agent
 变化而重建，连接也可能因临时错误结束。
 
-应将权威生命周期订阅断开作为探测触发信号，并以公共 Socket 持续不可连接作为最终
-退出判据：
+当前 Supervisor 每 2 秒主动探测公共 `ping`，断连后每 500 毫秒重试，并以公共 Socket
+持续不可连接作为最终退出判据：
 
 ```text
-权威订阅断开
-    │
-    ▼
-立即探测同一 HERDR_SOCKET_PATH
+定时探测同一 HERDR_SOCKET_PATH
     │
     ├─ 5 秒内恢复：继续运行
     │
@@ -92,8 +88,8 @@ command = ["./start-herdr-pal"]
                               停止 Worker 并退出 Supervisor
 ```
 
-探测应至少完成公共协议兼容性检查或权威 snapshot 请求，不能只判断 Socket 文件是否
-存在。Server 崩溃后可能残留 Socket 文件，但连接会失败。
+首次就绪必须完成公共协议兼容性检查和权威 snapshot；后续存活探测使用 `ping`，不能只判断
+Socket 文件是否存在。Server 崩溃后可能残留 Socket 文件，但连接会失败。
 
 这里的退出对象是 Herdr Server，而不是某个 TUI 客户端：
 
@@ -151,6 +147,8 @@ Herdr Pal 当前已经按照规范化后的 Herdr Socket 身份获取进程锁�
 - 插件启动时可以使用 Herdr 注入的 `HERDR_SOCKET_PATH`，但用户配置中的显式 Socket
   选择仍具有稳定、可审计的优先级。
 - 启动失败、Worker 重启、Herdr 断线探测和最终退出都必须有明确日志。
+- macOS 日志位于 `~/Library/Logs/herdr-pal/herdr-pal.log`；Linux 默认位于
+  `~/.local/state/herdr-pal/herdr-pal.log`，设置 `XDG_STATE_HOME` 时随其变化。
 
 ## 不采用的方案
 

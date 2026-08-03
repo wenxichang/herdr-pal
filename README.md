@@ -16,7 +16,7 @@ herdr-pal-server
 ```
 
 - `herdr-pal-server` 连接企业微信机器人，一套机器人只运行一个服务端。
-- 每台运行 Herdr 的机器通过 Herdr `[[sidecar]]` 启动并守护一个 `herdr-pal` 客户端。
+- 每台运行 Herdr 的机器通过 Startup 插件调用 `herdr-pal start`，由 Pal 自己守护客户端业务进程。
 - 一个用户可以接入多台机器，并在同一个企业微信单聊中切换会话。
 - Pal 与 Server 使用公开的 HPRP/1 协议；每台机器使用一把由服务端签发的独立 Key。
 - `herdr-pal -i` 可以脱离企业微信，在本机终端中直接操作 Herdr Agent。
@@ -335,8 +335,8 @@ Linux 和 macOS 推荐直接使用同时包含 Herdr、Herdr Pal 和安装器的
   避免旁人看到。
 - 把 `herdr` 和 `herdr-pal` 安装为同目录的真实文件，旧文件先生成带时间戳的备份。
 - 合并并备份 `~/.config/herdr-pal/config.json` 和 `~/.config/herdr/config.toml`。
-- 添加幂等的 `[[sidecar]] command = ["herdr-pal"]`，让 Herdr 在自身生命周期内启动、守护并
-  停止 Pal。
+- 安装并注册 Herdr Startup 插件；插件只调用快速返回的 `herdr-pal start`，由 Pal Supervisor
+  守护业务进程，并在 Herdr 公共服务持续停止后退出。
 - 检测到 Herdr 已运行时，询问是否执行 `live-handoff`，默认执行且不会清空现有 pane。
 
 安装完成后不需要手工启动 `herdr-pal`。启动 Herdr，或让安装器完成 `live-handoff`，再回到
@@ -514,12 +514,17 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 
 ## 日志与常见问题
 
-服务端和客户端默认把日志写到 stderr，不会自动创建 `herdr-pal.log`。需要保存日志时：
+服务端和手工运行的客户端默认把日志写到 stderr。需要保存日志时：
 
 ```sh
 ./dist/herdr-pal-server --verbose 2>&1 | tee herdr-pal-server.log
 ./dist/herdr-pal 2>&1 | tee herdr-pal.log
 ```
+
+通过 Startup 插件运行时，`herdr-pal start` 会自动把 Launcher、Supervisor 和 Worker 日志
+写入用户目录：macOS 为 `~/Library/Logs/herdr-pal/herdr-pal.log`，Linux 默认为
+`~/.local/state/herdr-pal/herdr-pal.log`（设置 `XDG_STATE_HOME` 时随其变化）。同一命令可
+手工执行用于幂等补启动；它不会创建第二个健康实例。
 
 服务端默认记录启动、连接和异常等运行信息；`--verbose` 额外记录客户端快照上报、心跳、
 企业微信入站交互和出站发送结果。每条错误日志都包含 `error_type` 和 `reason`，企业微信
@@ -585,8 +590,8 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 
 ### Herdr Socket 自动探测失败
 
-作为 Herdr Sidecar 运行时，客户端先使用 Herdr 注入的 `HERDR_SOCKET_PATH`。非 Sidecar
-部署会调用 Herdr 公共 CLI；默认 session 查询失败时，还会尝试：
+由 Herdr Startup 插件启动时，客户端先使用 Herdr 注入的 `HERDR_SOCKET_PATH`。手工部署会
+调用 Herdr 公共 CLI；默认 session 查询失败时，还会尝试：
 
 ```text
 $HOME/.config/herdr/herdr.sock

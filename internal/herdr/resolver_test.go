@@ -98,18 +98,18 @@ func TestResolveSocketReturnsExplicitPathWithoutRunningCLI(t *testing.T) {
 	}
 }
 
-func TestResolveSocketWithEnvironmentUsesSidecarPathBeforeCLI(t *testing.T) {
+func TestResolveSocketWithEnvironmentUsesInjectedPathBeforeCLI(t *testing.T) {
 	runner := &fakeCommandRunner{}
 
 	path, err := ResolveSocketWithEnvironment(
-		context.Background(), "", "/tmp/sidecar.sock", "named", runner,
+		context.Background(), "", "/tmp/injected.sock", "named", runner,
 	)
 
 	if err != nil {
 		t.Fatalf("ResolveSocketWithEnvironment() error = %v", err)
 	}
-	if path != "/tmp/sidecar.sock" {
-		t.Fatalf("path = %q, want /tmp/sidecar.sock", path)
+	if path != "/tmp/injected.sock" {
+		t.Fatalf("path = %q, want /tmp/injected.sock", path)
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("CLI calls = %d, want 0", len(runner.calls))
@@ -120,7 +120,7 @@ func TestResolveSocketWithEnvironmentKeepsExplicitPathFirst(t *testing.T) {
 	runner := &fakeCommandRunner{}
 
 	path, err := ResolveSocketWithEnvironment(
-		context.Background(), "/tmp/config.sock", "/tmp/sidecar.sock", "", runner,
+		context.Background(), "/tmp/config.sock", "/tmp/injected.sock", "", runner,
 	)
 
 	if err != nil {

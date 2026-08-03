@@ -44,6 +44,9 @@ func TestRunSetupPassesValidatedRequest(t *testing.T) {
 	if got.ClientConfigPath != clientPath || got.HerdrConfigPath != herdrPath || got.HerdrBinaryPath != herdrBinary || got.RelayURL != "wss://relay.example/hprp" || got.RelayKey != validSetupKey {
 		t.Fatalf("request = %+v", got)
 	}
+	if got.PalBinaryPath == "" || !filepath.IsAbs(got.PalBinaryPath) || got.PluginDirectory != filepath.Join(filepath.Dir(clientPath), "plugin") || got.PluginVersion == "" {
+		t.Fatalf("plugin request fields = %+v", got)
+	}
 	for _, want := range []string{clientPath, herdrPath, "备份"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("stdout = %q, want %q", stdout.String(), want)
@@ -78,6 +81,9 @@ func TestRunSetupUsesDefaultConfigPaths(t *testing.T) {
 	}
 	if got.HerdrConfigPath != filepath.Join(xdg, "herdr", "config.toml") {
 		t.Fatalf("herdr path = %q", got.HerdrConfigPath)
+	}
+	if got.PluginDirectory != filepath.Join(filepath.Dir(got.ClientConfigPath), "plugin") {
+		t.Fatalf("plugin directory = %q", got.PluginDirectory)
 	}
 }
 

@@ -59,6 +59,9 @@ func TestBundleInstallScriptInstallsConfiguresAndHandsOff(t *testing.T) {
 	if strings.Contains(string(output), bundleInstallTestKey) {
 		t.Fatalf("installer output exposes key:\n%s", output)
 	}
+	if strings.Contains(string(output), "Sidecar") || !strings.Contains(string(output), "Startup 插件") {
+		t.Fatalf("installer output should describe the startup plugin:\n%s", output)
+	}
 	for _, name := range []string{"herdr", "herdr-pal"} {
 		path := filepath.Join(target, name)
 		info, err := os.Lstat(path)
@@ -224,7 +227,7 @@ IFS= read -r received_key
 [ "${SETUP_FAIL:-0}" != "1" ]
 mkdir -p "$(dirname "$client_config")" "$(dirname "$herdr_config")"
 printf '%s\n' '{}' > "$client_config"
-printf '%s\n' '[[sidecar]]' 'command = ["herdr-pal"]' > "$herdr_config"
+printf '%s\n' '# startup plugin is linked by herdr-pal setup' > "$herdr_config"
 `)
 }
 
