@@ -30,7 +30,7 @@ OpenCode 默认使用图片模式，其他 Agent 默认使用文本模式；模�
 1. 从管理员处获取本机专用的 Server URL 和机器 Key。
 2. 从以下地址下载最新版本：
    https://github.com/wenxichang/herdr-pal/releases/latest
-3. 选择与本机匹配的 `herdr-bundle-<版本>-<系统>-<架构>.tar.gz`：
+3. 选择与本机匹配的 `herdr-pal-bundle-<版本>-<系统>-<架构>.tar.gz`：
    - Apple Silicon：`darwin-arm64`
    - Intel Mac：`darwin-amd64`
    - Linux x64：`linux-amd64`
@@ -40,13 +40,14 @@ OpenCode 默认使用图片模式，其他 Agent 默认使用文本模式；模�
    `./install.sh`
 
 5. 按提示选择安装目录，默认 `~/.local/bin`；然后输入 Server URL 和机器 Key。Key 会在终端回显，请确认粘贴完整并注意避免旁人看到。
-6. 安装器会备份旧文件、注册 Herdr Startup 插件，并在 Herdr 正在运行时询问是否立即 `live-handoff`。
-7. 启动或切换 Herdr 后回到企业微信，发送 `/ls` 验证接入。
+6. 安装包只携带 Herdr Pal。安装器会复用兼容 Herdr；缺少 Herdr 时自动下载兼容版本；检测到不兼容 Herdr 时先询问，再把兼容版本安装到所选目录，不覆盖 Homebrew、mise 等外部安装。
+7. 安装器会备份旧文件、注册 Herdr Startup 插件，并在 Herdr 正在运行时询问是否立即 `live-handoff`。
+8. 启动或切换 Herdr 后回到企业微信，发送 `/ls` 验证接入。
 
 正常安装不需要手工编辑配置。高级用户可以检查：
 
 - Herdr Pal：`~/.config/herdr-pal/config.json`
 - Herdr：`~/.config/herdr/config.toml`
 
-Herdr 与 `herdr-pal` 会安装在同一目录。Herdr 启动后，Startup 插件会调用 `herdr-pal start`；Pal 会自动守护业务进程，并在 Herdr 停止后退出。
+Herdr 启动后，Startup 插件会调用 `herdr-pal start`；Pal 会自动守护业务进程，并在 Herdr 停止后退出。
 排错日志：macOS 为 `~/Library/Logs/herdr-pal/herdr-pal.log`；Linux 默认为 `~/.local/state/herdr-pal/herdr-pal.log`。

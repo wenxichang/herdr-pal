@@ -169,7 +169,7 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"模式只在 Server 本次运行期间保存",
 		"/key down,sp,dn,A,7",
 		"https://github.com/wenxichang/herdr-pal/releases/latest",
-		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
+		"herdr-pal-bundle-<版本>-<系统>-<架构>.tar.gz",
 		"./install.sh",
 		"默认 `~/.local/bin`",
 		"机器 Key",
@@ -178,6 +178,9 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"live-handoff",
 		"~/.config/herdr-pal/config.json",
 		"~/.config/herdr/config.toml",
+		"安装包只携带 Herdr Pal",
+		"缺少 Herdr 时自动下载兼容版本",
+		"检测到不兼容 Herdr 时先询问",
 	} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help reply lacks %q:\n%s", want, help)
@@ -188,7 +191,7 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 			t.Fatalf("help reply contains server deployment field %q:\n%s", forbidden, help)
 		}
 	}
-	for _, forbidden := range []string{"herdr-pal-windows-amd64.exe", "创建 config.json", "curl -fsSL https://herdr.dev/install.sh"} {
+	for _, forbidden := range []string{"herdr-pal-windows-amd64.exe", "创建 config.json", "curl -fsSL https://herdr.dev/install.sh", "herdr-bundle-<版本>-<系统>-<架构>.tar.gz", "Herdr 与 `herdr-pal` 会安装在同一目录"} {
 		if strings.Contains(help, forbidden) {
 			t.Fatalf("help reply retained old installation field %q:\n%s", forbidden, help)
 		}

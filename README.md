@@ -72,23 +72,22 @@ herdr status server --json
 - `dist/herdr-pal`
 - `dist/hp-cli`
 
-公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Bundle。Intel/AMD x64 选择
+公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Pal Bundle。Intel/AMD x64 选择
 `amd64`，Apple Silicon 或 ARM64 Linux 选择 `arm64`。`./build.sh` 仍会生成 Pal、Server、
 `hp-cli` 的分平台二进制；Windows AMD64 客户端 Beta 需要从源码构建，不发布 Windows
 服务端。
 
-为终端用户制作包含 Herdr 和 Herdr Pal 的单平台安装包：
+为终端用户制作只携带 Herdr Pal 的单平台安装包：
 
 ```sh
 ./build.sh bundle \
   --target darwin-arm64 \
-  --version "$(git describe --tags --always)" \
-  --herdr-source ~/Code/herdr
+  --version "$(git describe --tags --always)"
 ```
 
-`--target` 支持 `darwin-amd64`、`darwin-arm64`、`linux-amd64` 和 `linux-arm64`。跨平台构建
-Herdr 不方便时，也可以把现有 Herdr 构建产物通过 `--herdr-binary` 传入。生成结果为
-`dist/herdr-bundle-<版本>-<目标>.tar.gz` 和同名 `.sha256`。
+`--target` 支持 `darwin-amd64`、`darwin-arm64`、`linux-amd64` 和 `linux-arm64`。安装器内置
+已验证的 Herdr 兼容名单和官方资产摘要，不需要在打包机上构建 Herdr。生成结果为
+`dist/herdr-pal-bundle-<版本>-<目标>.tar.gz` 和同名 `.sha256`。
 
 ## 第一步：申请企业微信智能机器人
 
@@ -150,7 +149,7 @@ cp server-config.example.json ~/.config/herdr-pal-server/server.json
 ```
 
 企业微信 `/help` 的完整内容保存在 `~/.config/herdr-pal-server/help.md`。首次启动会生成默认
-文件；此后每次 `/help` 都重新读取磁盘，不缓存内容。默认帮助会引导用户下载 Herdr Bundle、
+文件；此后每次 `/help` 都重新读取磁盘，不缓存内容。默认帮助会引导用户下载 Herdr Pal Bundle、
 输入管理员签发的 WSS 地址和机器 Key；管理员可直接修改该文件，保存后无需重启 Server 即可生效。
 
 `rate_limit` 按企业微信用户限制唯一输入，默认每秒 1 条、滚动 60 秒内 20 条。字段缺省使用
@@ -314,13 +313,13 @@ Server 时的来源地址，不信任 `X-Forwarded-For` 等代理头。不同用
 
 ## 第四步：启动每台客户端
 
-Linux 和 macOS 推荐直接使用同时包含 Herdr、Herdr Pal 和安装器的一体化包。从 Release
+Linux 和 macOS 推荐直接使用只包含 Herdr Pal 和安装器的 Bundle。从 Release
 下载与本机匹配的文件：
 
-- Apple Silicon：`herdr-bundle-<版本>-darwin-arm64.tar.gz`
-- Intel Mac：`herdr-bundle-<版本>-darwin-amd64.tar.gz`
-- Linux x64：`herdr-bundle-<版本>-linux-amd64.tar.gz`
-- Linux ARM64：`herdr-bundle-<版本>-linux-arm64.tar.gz`
+- Apple Silicon：`herdr-pal-bundle-<版本>-darwin-arm64.tar.gz`
+- Intel Mac：`herdr-pal-bundle-<版本>-darwin-amd64.tar.gz`
+- Linux x64：`herdr-pal-bundle-<版本>-linux-amd64.tar.gz`
+- Linux ARM64：`herdr-pal-bundle-<版本>-linux-arm64.tar.gz`
 
 使用同名 `.sha256` 校验文件后解压，在包目录执行：
 
@@ -333,7 +332,11 @@ Linux 和 macOS 推荐直接使用同时包含 Herdr、Herdr Pal 和安装器的
 - 选择安装目录，默认 `~/.local/bin`，也可以输入其他用户可写目录。
 - 输入服务端 `wss://` URL 和管理员为本机签发的 Key；Key 会在终端回显，请确认粘贴完整并
   避免旁人看到。
-- 把 `herdr` 和 `herdr-pal` 安装为同目录的真实文件，旧文件先生成带时间戳的备份。
+- 检查所选目录和 `PATH` 中的 Herdr；兼容名单中的版本直接复用。
+- 缺少 Herdr 时，从官方 Release 下载经过固定 SHA-256 校验的兼容版本。
+- 检测到不兼容 Herdr 时先询问；确认后把兼容版本安装到所选目录，不覆盖 Homebrew、mise、
+  Nix 或其他外部安装。
+- 安装 `herdr-pal`，目标已有文件时先生成带时间戳的备份。
 - 合并并备份 `~/.config/herdr-pal/config.json` 和 `~/.config/herdr/config.toml`。
 - 安装并注册 Herdr Startup 插件；插件只调用快速返回的 `herdr-pal start`，由 Pal Supervisor
   守护业务进程，并在 Herdr 公共服务持续停止后退出。

@@ -62,7 +62,7 @@ func TestFileHelpProviderRejectsUnavailableContent(t *testing.T) {
 func TestDefaultHelpUsesStartupPluginBundleInstallation(t *testing.T) {
 	help := DefaultHelpText()
 	for _, want := range []string{
-		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
+		"herdr-pal-bundle-<版本>-<系统>-<架构>.tar.gz",
 		"./install.sh",
 		"/ls",
 		"/N",
@@ -71,6 +71,9 @@ func TestDefaultHelpUsesStartupPluginBundleInstallation(t *testing.T) {
 		"~/Library/Logs/herdr-pal/herdr-pal.log",
 		"~/.local/state/herdr-pal/herdr-pal.log",
 		"Key 会在终端回显",
+		"安装包只携带 Herdr Pal",
+		"缺少 Herdr 时自动下载兼容版本",
+		"检测到不兼容 Herdr 时先询问",
 	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("default help missing %q", want)
@@ -83,6 +86,8 @@ func TestDefaultHelpUsesStartupPluginBundleInstallation(t *testing.T) {
 		"curl -fsSL https://herdr.dev/install.sh",
 		"创建 config.json",
 		"herdr-pal-windows-amd64.exe",
+		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
+		"Herdr 与 `herdr-pal` 会安装在同一目录",
 	} {
 		if strings.Contains(help, old) {
 			t.Errorf("default help still contains old installation text %q", old)

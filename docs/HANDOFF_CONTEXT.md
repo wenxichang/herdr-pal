@@ -5,8 +5,9 @@
 Herdr Pal 是 Herdr 与企业微信之间的独立 bridge：
 
 - `herdr-pal-server` 独占企业微信智能机器人长连接，并监听 HPRP/1 WSS。
-- 每台运行 Herdr 的机器启动一个 `herdr-pal`，只访问本机 Herdr 公共 Socket；一体化安装包
-  使用 Herdr Startup 插件触发快速 Launcher，由 Pal Supervisor 自己守护业务 Worker。
+- 每台运行 Herdr 的机器启动一个 `herdr-pal`，只访问本机 Herdr 公共 Socket；Pal Bundle
+  会复用或下载兼容名单中的 Herdr，并使用 Startup 插件触发快速 Launcher，由 Pal
+  Supervisor 自己守护业务 Worker。
 - Server 通过每机独立 Bearer Key 认证 Pal；Key 在服务端绑定企业微信用户 ID 和机器标识。
 - `hp-cli` 通过本机 HPAP/1 Unix Socket 动态管理正在运行的 Server，不直接修改凭据文件。
 - Pal 上报本机完整 Agent 会话快照，Server 为同一用户聚合多台机器并负责企业微信路由。

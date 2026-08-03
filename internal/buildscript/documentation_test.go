@@ -38,7 +38,9 @@ func TestREADMEReflectsCurrentInstallerAndReleasePolicy(t *testing.T) {
 		"herdr-pal start",
 		"~/Library/Logs/herdr-pal/herdr-pal.log",
 		"~/.local/state/herdr-pal/herdr-pal.log",
-		"公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Bundle",
+		"公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Pal Bundle",
+		"缺少 Herdr 时，从官方 Release 下载经过固定 SHA-256 校验的兼容版本",
+		"不覆盖 Homebrew、mise",
 		"Windows AMD64 客户端 Beta 需要从源码构建",
 	} {
 		if !strings.Contains(content, expected) {

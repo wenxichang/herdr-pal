@@ -141,7 +141,7 @@ Target
 
 ### 4.1 Launcher、Supervisor 与 Worker
 
-一体化安装包注册用户级 Herdr Startup 插件。插件在公共 Socket 就绪后调用
+Herdr Pal 安装器注册用户级 Herdr Startup 插件。插件在公共 Socket 就绪后调用
 `herdr-pal start`；Launcher 使用由规范化 Socket endpoint 派生的单实例锁和本地只读状态
 端点，保证重复 startup 与 live-handoff 不会创建重复实例。它启动脱离插件调用栈的
 Supervisor 后立即返回。

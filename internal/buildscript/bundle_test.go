@@ -14,11 +14,13 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 	targets := []struct {
 		name       string
 		fileOutput string
+		herdrAsset string
+		herdrSHA   string
 	}{
-		{name: "linux-amd64", fileOutput: "ELF 64-bit LSB executable, x86-64, statically linked"},
-		{name: "linux-arm64", fileOutput: "ELF 64-bit LSB executable, ARM aarch64, statically linked"},
-		{name: "darwin-amd64", fileOutput: "Mach-O 64-bit executable x86_64"},
-		{name: "darwin-arm64", fileOutput: "Mach-O 64-bit executable arm64"},
+		{name: "linux-amd64", fileOutput: "ELF 64-bit LSB executable, x86-64, statically linked", herdrAsset: "herdr-linux-x86_64", herdrSHA: "3dc83288073e4c2d3c679a30e7be97bcca9141c6fd17dbbb9219142e95c59253"},
+		{name: "linux-arm64", fileOutput: "ELF 64-bit LSB executable, ARM aarch64, statically linked", herdrAsset: "herdr-linux-aarch64", herdrSHA: "32e763a1499a6b694b1d708e4f062b743be1da9f34fcfa4d212d6db6fe09a8b9"},
+		{name: "darwin-amd64", fileOutput: "Mach-O 64-bit executable x86_64", herdrAsset: "herdr-macos-x86_64", herdrSHA: "3fe50c4a63dc8102306b1322178628ddb3655cd3ae56d784f094153408d69e62"},
+		{name: "darwin-arm64", fileOutput: "Mach-O 64-bit executable arm64", herdrAsset: "herdr-macos-aarch64", herdrSHA: "37350546b0012555943b92eaf962665de4e264395baeb44227b8015e8ff5b0d6"},
 	}
 	for _, target := range targets {
 		t.Run(target.name, func(t *testing.T) {
@@ -28,25 +30,22 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 			writeExecutable(t, filepath.Join(fakeBin, "file"), "#!/bin/sh\nprintf '%s\\n' \"$BUNDLE_TEST_FILE_OUTPUT\"\n")
-			herdrBinary := filepath.Join(root, "prebuilt-herdr")
-			writeExecutable(t, herdrBinary, "#!/bin/sh\nexit 0\n")
 			writeExecutable(t, filepath.Join(root, "dist", "herdr-pal-"+target.name), "#!/bin/sh\nexit 0\n")
 
 			command := exec.Command("/bin/sh", filepath.Join(root, "packaging", "build-bundle.sh"),
 				"--target", target.name,
 				"--version", "v0.5.0",
-				"--herdr-binary", herdrBinary,
-				"--herdr-commit", "abc123",
 			)
 			command.Env = append(os.Environ(),
 				"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"BUNDLE_TEST_FILE_OUTPUT="+target.fileOutput,
+				"HERDR_SOURCE_DIR="+filepath.Join(root, "missing-herdr-source"),
 			)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("build-bundle.sh error = %v\n%s", err, output)
 			}
 
-			archiveName := "herdr-bundle-v0.5.0-" + target.name + ".tar.gz"
+			archiveName := "herdr-pal-bundle-v0.5.0-" + target.name + ".tar.gz"
 			archivePath := filepath.Join(root, "dist", archiveName)
 			checksumPath := archivePath + ".sha256"
 			assertPathExists(t, archivePath)
@@ -56,9 +55,8 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatalf("tar list error = %v\n%s", err, listOutput)
 			}
-			rootName := "herdr-bundle-v0.5.0-" + target.name
+			rootName := "herdr-pal-bundle-v0.5.0-" + target.name
 			for _, want := range []string{
-				rootName + "/herdr",
 				rootName + "/herdr-pal",
 				rootName + "/install.sh",
 				rootName + "/README.md",
@@ -66,6 +64,9 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 				if !strings.Contains(string(listOutput), want) {
 					t.Errorf("archive missing %q:\n%s", want, listOutput)
 				}
+			}
+			if strings.Contains(string(listOutput), rootName+"/herdr\n") {
+				t.Fatalf("archive should not contain Herdr:\n%s", listOutput)
 			}
 			verifyBundleChecksum(t, archivePath, checksumPath)
 			extractDirectory := filepath.Join(root, "extract")
@@ -76,7 +77,7 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 			if output, err := extractCommand.CombinedOutput(); err != nil {
 				t.Fatalf("tar extract error = %v\n%s", err, output)
 			}
-			for _, name := range []string{"herdr", "herdr-pal", "install.sh"} {
+			for _, name := range []string{"herdr-pal", "install.sh"} {
 				info, err := os.Stat(filepath.Join(extractDirectory, rootName, name))
 				if err != nil {
 					t.Fatal(err)
@@ -89,10 +90,22 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, want := range []string{"v0.5.0", target.name, "abc123", "./install.sh"} {
+			for _, want := range []string{"v0.5.0", target.name, "只携带 Herdr Pal", "0.7.5", "./install.sh"} {
 				if !strings.Contains(string(readme), want) {
 					t.Errorf("README missing %q:\n%s", want, readme)
 				}
+			}
+			installScript, err := os.ReadFile(filepath.Join(extractDirectory, rootName, "install.sh"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"HERDR_VERSION='0.7.5'", "HERDR_PROTOCOL='17'", target.herdrAsset, target.herdrSHA} {
+				if !strings.Contains(string(installScript), want) {
+					t.Errorf("install.sh missing %q", want)
+				}
+			}
+			if strings.Contains(string(installScript), "@HERDR_") || strings.Contains(string(installScript), "@BUNDLE_") {
+				t.Errorf("install.sh contains unreplaced placeholders")
 			}
 		})
 	}
@@ -100,11 +113,14 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 
 func TestBuildBundleRejectsInvalidArguments(t *testing.T) {
 	root := prepareBundleTestRoot(t)
+	writeExecutable(t, filepath.Join(root, "dist", "herdr-pal-darwin-arm64"), "#!/bin/sh\nexit 0\n")
 	tests := [][]string{
-		{"--target", "windows-amd64", "--version", "v0.5.0", "--herdr-binary", "/tmp/herdr"},
-		{"--target", "darwin-arm64", "--version", "v0.5.0-dirty", "--herdr-binary", "/tmp/herdr"},
-		{"--target", "darwin-arm64", "--version", "bad/version", "--herdr-binary", "/tmp/herdr"},
-		{"--target", "darwin-arm64", "--version", "v0.5.0", "--herdr-binary", "/missing/herdr"},
+		{"--target", "windows-amd64", "--version", "v0.5.0"},
+		{"--target", "darwin-arm64", "--version", "v0.5.0-dirty"},
+		{"--target", "darwin-arm64", "--version", "bad/version"},
+		{"--target", "darwin-arm64", "--version", "v0.5.0", "--herdr-source", "/tmp/herdr"},
+		{"--target", "darwin-arm64", "--version", "v0.5.0", "--herdr-binary", "/tmp/herdr"},
+		{"--target", "darwin-arm64", "--version", "v0.5.0", "--herdr-commit", "abc123"},
 	}
 	for _, args := range tests {
 		command := exec.Command("/bin/sh", append([]string{filepath.Join(root, "packaging", "build-bundle.sh")}, args...)...)
@@ -112,51 +128,6 @@ func TestBuildBundleRejectsInvalidArguments(t *testing.T) {
 			t.Fatalf("build-bundle.sh should fail for %v:\n%s", args, output)
 		}
 	}
-}
-
-func TestBuildBundleBuildsCleanHerdrSource(t *testing.T) {
-	root := prepareBundleTestRoot(t)
-	fakeBin := filepath.Join(root, "fake-bin")
-	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeExecutable(t, filepath.Join(fakeBin, "file"), "#!/bin/sh\nprintf '%s\\n' 'Mach-O 64-bit executable arm64'\n")
-	writeExecutable(t, filepath.Join(fakeBin, "cargo"), `#!/bin/sh
-set -eu
-target=''
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--target" ]; then
-    shift
-    target=$1
-  fi
-  shift
-done
-mkdir -p "target/$target/release"
-printf '%s\n' '#!/bin/sh' 'exit 0' > "target/$target/release/herdr"
-chmod 0755 "target/$target/release/herdr"
-`)
-	writeExecutable(t, filepath.Join(root, "dist", "herdr-pal-darwin-arm64"), "#!/bin/sh\nexit 0\n")
-	herdrSource := filepath.Join(root, "herdr-source")
-	if err := os.MkdirAll(herdrSource, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(herdrSource, "Cargo.toml"), []byte("[package]\nname='herdr'\nversion='0.1.0'\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, herdrSource, "init")
-	runGit(t, herdrSource, "add", "Cargo.toml")
-	runGit(t, herdrSource, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init")
-
-	command := exec.Command("/bin/sh", filepath.Join(root, "packaging", "build-bundle.sh"),
-		"--target", "darwin-arm64",
-		"--version", "v0.5.0",
-		"--herdr-source", herdrSource,
-	)
-	command.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build-bundle.sh error = %v\n%s", err, output)
-	}
-	assertPathExists(t, filepath.Join(root, "dist", "herdr-bundle-v0.5.0-darwin-arm64.tar.gz"))
 }
 
 func TestBuildScriptBundleEntryBuildsPalThenDelegates(t *testing.T) {
@@ -195,7 +166,7 @@ fi
 exit 0
 `)
 	argsLog := filepath.Join(root, "bundle-args.log")
-	command := exec.Command(buildPath, "bundle", "--target", "darwin-arm64", "--version", "v0.5.0", "--herdr-binary", "/tmp/herdr")
+	command := exec.Command(buildPath, "bundle", "--target", "darwin-arm64", "--version", "v0.5.0")
 	command.Env = append(os.Environ(),
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"BUNDLE_ARGS_LOG="+argsLog,
@@ -210,7 +181,7 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(argsData) != "--target darwin-arm64 --version v0.5.0 --herdr-binary /tmp/herdr\n" {
+	if string(argsData) != "--target darwin-arm64 --version v0.5.0\n" {
 		t.Fatalf("bundle args = %q", argsData)
 	}
 	assertPathExists(t, filepath.Join(root, "dist", "herdr-pal-darwin-arm64"))
@@ -262,14 +233,5 @@ func verifyBundleChecksum(t *testing.T, archivePath, checksumPath string) {
 	fields := strings.Fields(string(checksumData))
 	if len(fields) != 2 || fields[0] != hex.EncodeToString(digest[:]) || fields[1] != filepath.Base(archivePath) {
 		t.Fatalf("invalid checksum: %q", checksumData)
-	}
-}
-
-func runGit(t *testing.T, directory string, args ...string) {
-	t.Helper()
-	command := exec.Command("git", args...)
-	command.Dir = directory
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("git %v error = %v\n%s", args, err, output)
 	}
 }
