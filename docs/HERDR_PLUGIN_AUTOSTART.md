@@ -1,5 +1,9 @@
 # Herdr 插件自动启动与生命周期管理
 
+> 本文保留对 Herdr 插件能力的审核结论。基于当前 `v0.5.1` 代码的详细进程模型、状态机、
+> 安装迁移和测试设计见
+> [Pal 自动启动与自守护设计](plans/2026-08-03-pal-autostart-supervisor-design.md)。
+
 ## 背景
 
 Herdr Pal 需要在 Herdr Server 启动后自动运行，并在 Herdr Server 真正退出后自动
