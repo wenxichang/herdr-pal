@@ -524,7 +524,7 @@ func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, tex
 		if err != nil {
 			release()
 			if errors.Is(err, herdr.ErrAgentStateChangeTimeout) {
-				s.reply(ctx, message.RequestID, "发送未生效，请检查 Agent 界面。")
+				s.reply(ctx, message.RequestID, "消息已送入终端，但未检测到 Agent 状态变化，请检查 Agent 界面。")
 			} else {
 				s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
 			}
@@ -539,7 +539,7 @@ func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, tex
 	}
 	release()
 	if !promptStateChanged(current, changed) {
-		s.reply(ctx, message.RequestID, "发送未生效，请检查 Agent 界面。")
+		s.reply(ctx, message.RequestID, "消息已送入终端，但未检测到 Agent 状态变化，请检查 Agent 界面。")
 		return
 	}
 	s.replyPromptSuccess(ctx, message.RequestID, changed.AgentStatus)

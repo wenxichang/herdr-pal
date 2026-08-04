@@ -680,7 +680,24 @@ func TestServicePromptStallTimesOutAfterOneEnter(t *testing.T) {
 	if len(fake.keys()) != 1 || len(fake.waits()) != 1 {
 		t.Fatalf("recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
 	}
-	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "未生效") || strings.Contains(reply, "已发送") {
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "消息已送入终端，但未检测到 Agent 状态变化，请检查 Agent 界面。") || strings.Contains(reply, "发送未生效") {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestServicePromptStallReportsUndetectedStateAfterUnchangedWait(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	current := fake.currentAgent()
+	fake.promptErr = &herdr.APIError{Code: "agent_prompt_stalled", Message: "no state change"}
+	fake.waitResult = current
+
+	service.HandleMessage(context.Background(), incoming("prompt-stall-unchanged", "prompt"))
+
+	if len(fake.keys()) != 1 || len(fake.waits()) != 1 {
+		t.Fatalf("recovery calls: keys=%#v waits=%#v", fake.keys(), fake.waits())
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "消息已送入终端，但未检测到 Agent 状态变化，请检查 Agent 界面。") || strings.Contains(reply, "发送未生效") {
 		t.Fatalf("reply = %q", reply)
 	}
 }
