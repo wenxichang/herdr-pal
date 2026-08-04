@@ -53,6 +53,37 @@ func TestMergeClientConfigCreatesSafeDefaults(t *testing.T) {
 	}
 }
 
+func TestMergeClientConfigRemovesLegacyIdentityFields(t *testing.T) {
+	existing := []byte(`{
+  "relay":{
+    "url":"wss://old.example/hprp",
+    "key":"hpk_1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "userid":"legacy-user",
+    "machine_id":"legacy-machine",
+    "skip_verify":false
+  },
+  "herdr":{"session":"work"},
+  "log":{"level":"debug"}
+}`)
+
+	merged, err := mergeClientConfig(existing, "wss://new.example/hprp", validMachineKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(merged, &root); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"userid", "machine_id"} {
+		if _, ok := root["relay"][field]; ok {
+			t.Fatalf("legacy relay field %q was retained: %s", field, merged)
+		}
+	}
+	if string(root["relay"]["skip_verify"]) != "false" {
+		t.Fatalf("skip_verify changed: %s", merged)
+	}
+}
+
 func TestMergeClientConfigRejectsInvalidInput(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -41,6 +41,8 @@ func mergeClientConfig(existing []byte, relayURL, relayKey string) ([]byte, erro
 			return nil, fmt.Errorf("客户端配置 relay 必须是对象")
 		}
 	}
+	delete(relay, "userid")
+	delete(relay, "machine_id")
 	encodedURL, _ := json.Marshal(endpoint.String())
 	encodedKey, _ := json.Marshal(relayKey)
 	relay["url"] = encodedURL
