@@ -492,16 +492,39 @@ func TestRouterTerminalDecorationRejectsSourceRemovedAfterResolution(t *testing.
 func TestRouterDoesNotStoreSelectionWhenClientRejectsTarget(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
-		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "occ-1", "title")},
+		Sequence: 1, Sessions: []hprp.Session{
+			relaySession(1, "pane-1", "occ-1", "first"),
+			relaySession(2, "pane-2", "occ-2", "second"),
+		},
 	})
 	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
 	relay.selectErr = ErrTargetChanged
 	router.Handle(context.Background(), routerMessage("request-select", "message-select", "user-a", "/1"))
-	if _, err := router.catalog.Selected("user-a"); !errors.Is(err, ErrNoSelection) {
-		t.Fatalf("Selected() error = %v", err)
+	router.catalog.mu.RLock()
+	selected := router.catalog.routing["user-a"].selected
+	router.catalog.mu.RUnlock()
+	if selected != nil {
+		t.Fatalf("selection stored after client rejection: %#v", selected)
 	}
 	if !strings.Contains(gateway.LastReply(), "目标已变化") {
 		t.Fatalf("reply = %q", gateway.LastReply())
+	}
+}
+
+func TestRouterAutomaticallyForwardsToOnlySessionWithoutSelection(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{relaySession(1, "pane-1", "occ-1", "only")},
+	})
+
+	router.Handle(context.Background(), routerMessage("request-auto", "message-auto", "user-a", "继续处理任务"))
+
+	calls := relay.Calls()
+	if len(calls) != 1 || calls[0].kind != "execute" || calls[0].target != (hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}) || calls[0].message.Content != "继续处理任务" {
+		t.Fatalf("relay calls = %#v", calls)
+	}
+	if reply := gateway.LastReply(); strings.Contains(reply, "尚未选择") {
+		t.Fatalf("reply = %q", reply)
 	}
 }
 

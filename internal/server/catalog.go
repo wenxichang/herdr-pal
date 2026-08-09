@@ -367,7 +367,7 @@ func (catalog *SessionCatalog) RebindSelection(ctx context.Context, userID strin
 	}
 }
 
-// Selected 返回仍存在且 occupant 未变化的当前选择。
+// Selected 返回仍存在且 occupant 未变化的当前选择；没有选择且仅有一个会话时自动选中它。
 func (catalog *SessionCatalog) Selected(userID string) (CatalogEntry, error) {
 	if catalog == nil {
 		return CatalogEntry{}, ErrNoSelection
@@ -375,19 +375,30 @@ func (catalog *SessionCatalog) Selected(userID string) (CatalogEntry, error) {
 	catalog.mu.Lock()
 	defer catalog.mu.Unlock()
 	routing := catalog.routing[userID]
-	if routing.selected == nil {
-		return CatalogEntry{}, ErrNoSelection
-	}
-	entry, ok := catalog.findEntryLocked(userID, *routing.selected)
-	if !ok {
+	selectionInvalidated := false
+	if routing.selected != nil {
+		if entry, ok := catalog.findEntryLocked(userID, *routing.selected); ok {
+			return entry, nil
+		}
 		invalidated := *routing.selected
 		routing.selected = nil
 		routing.invalidated = &invalidated
+		selectionInvalidated = true
+	}
+	entries := catalog.entriesLocked(userID)
+	if len(entries) == 1 {
+		selected := entries[0].Ref
+		routing.selected = &selected
+		routing.invalidated = nil
 		catalog.routing[userID] = routing
 		catalog.signalUpdateLocked()
-		return CatalogEntry{}, ErrNoSelection
+		return entries[0], nil
 	}
-	return entry, nil
+	if selectionInvalidated {
+		catalog.routing[userID] = routing
+		catalog.signalUpdateLocked()
+	}
+	return CatalogEntry{}, ErrNoSelection
 }
 
 // ResolveTarget 从最新目录复核任意稳定目标，不修改用户编号或选择。

@@ -158,6 +158,40 @@ func TestCatalogCreatesStableCrossMachineNumbering(t *testing.T) {
 	}
 }
 
+func TestCatalogSelectedAutomaticallyUsesOnlySession(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-1", "only")},
+	})
+
+	selected, err := catalog.Selected("user-a")
+	if err != nil || selected.Ref != (hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}) {
+		t.Fatalf("Selected() = %#v, %v", selected, err)
+	}
+
+	attachSnapshot(t, catalog, "conn-2", ClientKey{UserID: "user-a", MachineID: "office-pc"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-2", "occ-2", "second")},
+	})
+	selected, err = catalog.Selected("user-a")
+	if err != nil || selected.Ref.MachineID != "home-mac" {
+		t.Fatalf("persisted Selected() = %#v, %v", selected, err)
+	}
+}
+
+func TestCatalogSelectedStillRequiresExplicitChoiceForMultipleSessions(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-1", "first"),
+			hprpSession(2, "pane-2", "occ-2", "second"),
+		},
+	})
+
+	if _, err := catalog.Selected("user-a"); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("Selected() error = %v", err)
+	}
+}
+
 func TestCatalogDetachInvalidatesNumberingAndSelection(t *testing.T) {
 	catalog := NewSessionCatalog()
 	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
@@ -181,7 +215,7 @@ func TestCatalogDetachInvalidatesNumberingAndSelection(t *testing.T) {
 	}
 }
 
-func TestCatalogInvalidatesSelectionWhenOccupantChanges(t *testing.T) {
+func TestCatalogSelectedAutomaticallyUsesOnlyReplacementAfterOccupantChanges(t *testing.T) {
 	catalog := NewSessionCatalog()
 	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
 		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-1", "title")},
@@ -195,8 +229,9 @@ func TestCatalogInvalidatesSelectionWhenOccupantChanges(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := catalog.Selected("user-a"); !errors.Is(err, ErrNoSelection) {
-		t.Fatalf("Selected() error = %v", err)
+	selected, err := catalog.Selected("user-a")
+	if err != nil || selected.Ref != (hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-2"}) {
+		t.Fatalf("Selected() = %#v, %v", selected, err)
 	}
 	if _, err := catalog.ResolveNumbered("user-a", 1); !errors.Is(err, ErrTargetChanged) {
 		t.Fatalf("ResolveNumbered(stale occupant) error = %v", err)
