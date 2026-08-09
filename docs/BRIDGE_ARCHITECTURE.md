@@ -10,6 +10,7 @@ Herdr Pal 由中央 Server 与每机 Pal sidecar 组成。Server 集中持有企
                        ├── WeComClient / ConversationRouter / UserExecutor
 hp-cli ── HPAP/1 ────▶ ├── AdminServer ─┐
 HTTPS 管理台 ─────────▶ ├── WebAdmin ────┴── AdminService / CredentialStore
+企业微信 /reg ─────────▶ ├── MachineRegistrationService / RegistrationStore
                        └── ClientHub / SessionCatalog
                                   │ HPRP/1 WSS
                      ┌────────────┴────────────┐
@@ -39,7 +40,7 @@ credential_id + principal_id + machine_id + secret_digest + allowed_sources
 ```
 
 - `principal_id` 是企业微信回调中的用户 ID。
-- `machine_id` 是管理员签发 Key 时确定的逻辑机器标识。
+- `machine_id` 是用户通过 `/reg` 提交或管理员人工签发时确定的逻辑机器标识。
 - Pal 配置只包含 `relay.url` 和 `relay.key`，不声明用户或机器身份。
 - WebSocket Upgrade 使用 `Authorization: Bearer ...` 和
   `Sec-WebSocket-Protocol: herdr-pal-relay.v1`。
@@ -58,7 +59,7 @@ credential_id + principal_id + machine_id + secret_digest + allowed_sources
 
 Router 以企业微信用户 ID 为隔离边界：
 
-- 直接处理 `/ls`、独立 `/N` 和 `/help`。
+- 直接处理 `/ls`、独立 `/N`、`/help`，并在没有在线会话时处理 `/reg`。
 - 把 `/N 内容`、`#N 内容` 的全局编号解析成 HPRP 稳定目标。
 - 将其他输入路由到当前选择，并在成功后按命令语义更新选择。
 - 按完整稳定目标维护 `/mode img|txt` 的内存覆盖；OpenCode 默认图片，其他 Agent 默认文本。
@@ -88,9 +89,24 @@ hp-cli key issue --principal-id USERID --machine-id MACHINE --source 192.168.1.2
 凭据存储默认位于 `state_dir/credentials.json`，文件权限受限。验证使用常量时间摘要比较，并
 同时核验 TLS 连接的真实来源地址。`hp-cli` 只连接 `<state_dir>/admin.sock`，不直接修改文件。
 
-### 3.4 管理面
+### 3.4 MachineRegistrationService
 
-`AdminService` 集中实现 Key CRUD、来源策略、连接与会话查询、动态 debug 和优雅停止的
+机器自主注册不改变 HPRP/1 或 HPAP/1。Router 从企业微信可信单聊身份取得 `principal_id`：
+
+- 用户没有任何凭据且没有 pending 时，首台机器直接签发并通过当前企微响应交付一次性 Key。
+- 用户已有任意凭据或 pending 时，只在 `<state_dir>/registrations.json` 保存待审批申请。
+- Web 管理员批准后签发并主动发送 Key；交付失败删除新凭据并保留申请，便于重试。
+- 驳回先删除申请再尽力通知用户；通知失败不恢复已经生效的决定。
+- 同一用户的 `/reg`、Web 审批和人工 Key 变更使用固定条带锁串行化，不能绕过 pending。
+
+注册文件不保存已批准或已驳回历史。完整生命周期写入
+`herdr_pal.machine_registration` OTLP/Loki 业务审计；明文 Key 不进入浏览器响应、普通日志或
+审计正文。
+
+### 3.5 管理面
+
+`AdminService` 集中实现 Key CRUD、机器注册审批、来源策略、连接与会话查询、动态 debug
+和优雅停止的
 业务规则。两个传输入口复用该服务：
 
 - `AdminServer` 通过 HPAP/1 Unix Socket 向 Server 主机上的同一系统用户提供完整管理能力。
@@ -101,7 +117,7 @@ Web 管理台不通过 Unix Socket 自调用 HPAP，HPAP/1 协议保持不变。
 输入；只有审计查询会读取 Loki 中已经保存的用户输入和终端文本。Windows 当前不构建
 Server 或 `hp-cli`。
 
-### 3.5 ClientHub
+### 3.6 ClientHub
 
 ClientHub 实现 HPRP/1 Server 状态机：
 
@@ -122,7 +138,7 @@ TLS/Upgrade 认证
 - 验证 `command.output` 与 `notification.event` 的机器身份、稳定目标、序号和幂等键。
 - 连接结束时立即撤下机器及其全部会话。
 
-### 3.5 SessionCatalog
+### 3.7 SessionCatalog
 
 目录保存每条连接最近确认的完整会话快照。稳定目标为：
 

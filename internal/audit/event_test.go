@@ -46,6 +46,23 @@ func TestPrepareEventPreservesExistingEventIDAcrossOutputs(t *testing.T) {
 	}
 }
 
+func TestPrepareEventAcceptsMachineRegistration(t *testing.T) {
+	event, err := PrepareEvent(Event{
+		EventName:   EventNameMachineRegistration,
+		PrincipalID: "user-a",
+		MachineID:   "office-laptop",
+		Action:      "request",
+		Outcome:     "pending",
+		Body:        "机器注册申请 office-laptop",
+	}, time.Unix(30, 0), bytes.NewReader(bytes.Repeat([]byte{0xcd}, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.EventName != EventNameMachineRegistration || event.SchemaVersion != 1 || event.EventID == "" {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
 func TestPrepareEventRejectsInvalidNameAndRandomSource(t *testing.T) {
 	if _, err := PrepareEvent(Event{EventName: "unknown"}, time.Now(), bytes.NewReader(make([]byte, 16))); err == nil {
 		t.Fatal("PrepareEvent() accepted unknown event name")

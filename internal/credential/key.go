@@ -61,7 +61,7 @@ type Identity struct {
 // Issue 使用已分配的 credential ID 生成至少包含 256 位随机 Secret 的机器 Key 和摘要记录。
 func Issue(credentialID uint64, principalID, machineID string, allowedSources []SourceRule, expiresAt *time.Time, now time.Time, random io.Reader) (string, Record, error) {
 	now = now.UTC()
-	if credentialID == 0 || !validPrincipalID(principalID) || hprp.ValidateMachineID(machineID) != nil || random == nil || now.IsZero() {
+	if credentialID == 0 || ValidatePrincipalID(principalID) != nil || hprp.ValidateMachineID(machineID) != nil || random == nil || now.IsZero() {
 		return "", Record{}, ErrInvalidRecord
 	}
 	if err := validateSourceRules(allowedSources); err != nil {
@@ -93,6 +93,14 @@ func Issue(credentialID uint64, principalID, machineID string, allowedSources []
 		UpdatedAt:      now,
 	}
 	return "hpk_" + strconv.FormatUint(credentialID, 10) + "_" + secret, record, nil
+}
+
+// ValidatePrincipalID 校验企业微信 principal ID 是否可安全持久化和用于身份绑定。
+func ValidatePrincipalID(value string) error {
+	if !validPrincipalID(value) {
+		return ErrInvalidRecord
+	}
+	return nil
 }
 
 // BearerCredentialID 解析 Key 中不敏感的十进制 credential ID，供本地审计和服务端索引使用。

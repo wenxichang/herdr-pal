@@ -15,6 +15,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
@@ -29,7 +30,7 @@ const defaultRelayRequestTimeout = 20 * time.Second
 
 const backgroundNotificationActivityWindow = 2 * time.Minute
 
-const noAvailableSessionsMessage = "当前没有可用会话，请联系管理员获取 Server URL 和机器 Key，并完成 Herdr Pal 接入；使用 /help 获取帮助。"
+const noAvailableSessionsMessage = "当前没有可用会话，可使用 /reg <机器标识> <来源地址> 注册机器；使用 /help 获取安装帮助。"
 
 //go:embed default_help.md
 var serverHelpTextTemplate string
@@ -56,6 +57,11 @@ type RelayRequester interface {
 	Execute(ctx context.Context, userID string, target hprp.Target, message im.IncomingText) (RelayExecution, error)
 	SupportsCapability(userID string, target hprp.Target, capability string) bool
 	FetchTerminalSnapshot(ctx context.Context, userID string, target hprp.Target, mode hprp.OutputMode, maxLines int) (hprp.TerminalSnapshotResult, error)
+}
+
+// RegistrationRequester 处理已认证企微用户的机器自主注册。
+type RegistrationRequester interface {
+	Register(context.Context, machinereg.RegisterInput, machinereg.KeyDeliveryFunc) (machinereg.RegisterResult, error)
 }
 
 // RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
@@ -162,6 +168,7 @@ type ConversationRouter struct {
 	auditor        audit.Auditor
 	auditRedactor  *audit.Redactor
 	botIDHash      string
+	registrations  RegistrationRequester
 }
 
 // ConversationRouterConfig 是服务端会话路由器的展示配置。
@@ -176,6 +183,8 @@ type ConversationRouterConfig struct {
 	AuditRedactor *audit.Redactor
 	// BotIDHash 用于跨事件关联机器人，但不暴露 Bot ID 原文。
 	BotIDHash string
+	// RegistrationRequester 处理 /reg；nil 时仅返回注册服务不可用。
+	RegistrationRequester RegistrationRequester
 }
 
 // NewConversationRouter 创建多用户会话路由器。
@@ -200,11 +209,15 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 	if config.HelpProvider == nil {
 		config.HelpProvider = staticHelpProvider{content: DefaultHelpText()}
 	}
+	if config.RegistrationRequester == nil {
+		config.RegistrationRequester = unavailableRegistrationRequester{}
+	}
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
 		deduper: deduper, logger: logger, helpProvider: config.HelpProvider, requestTimeout: defaultRelayRequestTimeout,
 		activity: newUserActivityTracker(), now: time.Now, rateLimiter: config.RateLimiter,
 		auditor: config.Auditor, auditRedactor: config.AuditRedactor, botIDHash: config.BotIDHash,
+		registrations: config.RegistrationRequester,
 	}, nil
 }
 
@@ -339,6 +352,10 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	action, err := parseServerAction(message.Content)
 	if err != nil {
 		router.logger.Warn("企业微信交互解析失败", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "content_bytes", len([]byte(message.Content)), "error_type", "invalid_action", "reason", safeServerErrorReason(err))
+		if isRegistrationCommand(message.Content) {
+			router.reply(ctx, message, err.Error())
+			return
+		}
 		if !router.catalog.HasSessions(message.UserID) {
 			router.reply(ctx, message, noAvailableSessionsMessage)
 			return
@@ -348,7 +365,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	}
 	router.logger.Debug("企业微信交互已接收", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "target_index", action.index, "switch_after", action.switchAfter, "content_bytes", len([]byte(message.Content)))
 	router.activity.Touch(message.UserID, router.now())
-	if action.kind != serverActionHelp && !router.catalog.HasSessions(message.UserID) {
+	if action.kind != serverActionHelp && action.kind != serverActionRegister && !router.catalog.HasSessions(message.UserID) {
 		router.logger.Info("企业微信交互未路由", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "error_type", "no_sessions", "reason", "当前用户没有在线且可用的 Relay 会话")
 		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
@@ -366,6 +383,8 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 			return
 		}
 		router.reply(ctx, message, helpText)
+	case serverActionRegister:
+		router.handleRegistration(ctx, message, action)
 	case serverActionMode:
 		router.handleMode(ctx, message, action.mode)
 	case serverActionDirected:
@@ -376,6 +395,57 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		}
 	default:
 		router.handleExecute(ctx, message)
+	}
+}
+
+func (router *ConversationRouter) handleRegistration(ctx context.Context, message im.IncomingText, action serverAction) {
+	result, err := router.registrations.Register(ctx, machinereg.RegisterInput{
+		PrincipalID: message.UserID,
+		MachineID:   action.machineID,
+		Sources:     append([]string(nil), action.sources...),
+	}, func(deliveryContext context.Context, delivery machinereg.KeyDelivery) error {
+		content := fmt.Sprintf("机器注册成功：%s\n机器 Key（仅显示一次）：\n`%s`\n请妥善保存，并使用 /help 查看 Herdr 与 Herdr Pal 的安装步骤。",
+			safeRouterLabel(delivery.MachineID), delivery.Token)
+		return router.gateway.RespondMarkdown(deliveryContext, message.RequestID, content)
+	})
+	if err != nil {
+		router.logger.Warn("企业微信机器注册失败",
+			"user_hash", routerHash(message.UserID),
+			"message_hash", routerHash(message.MessageID),
+			"machine_id", safeLogValue(action.machineID),
+			"error_type", registrationErrorType(err),
+		)
+		if errors.Is(err, machinereg.ErrDeliveryFailed) || errors.Is(err, machinereg.ErrRollbackFailed) {
+			// Key 交付回调已经尝试占用当前响应，不能再次回复同一企业微信请求。
+			return
+		}
+		switch {
+		case errors.Is(err, machinereg.ErrMachineExists):
+			router.reply(ctx, message, "该机器已经注册，不能重复签发 Key。")
+		case errors.Is(err, machinereg.ErrInvalidRequest):
+			router.reply(ctx, message, "/reg 用法: /reg <机器标识> <来源地址1,来源地址2>")
+		default:
+			router.reply(ctx, message, "机器注册失败，请稍后重试或联系管理员。")
+		}
+		return
+	}
+	switch result.Disposition {
+	case machinereg.DispositionAutoIssued:
+		return
+	case machinereg.DispositionPending:
+		if result.Request == nil {
+			router.reply(ctx, message, "机器注册状态异常，请联系管理员。")
+			return
+		}
+		router.reply(ctx, message, fmt.Sprintf("机器注册申请已提交，等待管理员审批。\n申请编号：%s\n审批通过后会通过企业微信发送机器 Key。", safeRouterLabel(result.Request.RegistrationID)))
+	case machinereg.DispositionAlreadyPending:
+		if result.Request == nil {
+			router.reply(ctx, message, "机器注册状态异常，请联系管理员。")
+			return
+		}
+		router.reply(ctx, message, fmt.Sprintf("该机器已有待审批申请。\n申请编号：%s\n请等待管理员处理。", safeRouterLabel(result.Request.RegistrationID)))
+	default:
+		router.reply(ctx, message, "机器注册状态异常，请联系管理员。")
 	}
 }
 
@@ -946,6 +1016,7 @@ const (
 	serverActionHelp
 	serverActionMode
 	serverActionDirected
+	serverActionRegister
 )
 
 type serverAction struct {
@@ -953,6 +1024,8 @@ type serverAction struct {
 	index       int
 	content     string
 	mode        hprp.OutputMode
+	machineID   string
+	sources     []string
 	switchAfter bool
 }
 
@@ -990,6 +1063,17 @@ func parseServerAction(content string) (serverAction, error) {
 			return serverAction{}, errors.New("/mode 用法: /mode img 或 /mode txt")
 		}
 		return serverAction{kind: serverActionMode, mode: mode}, nil
+	case "/reg":
+		if len(fields) != 3 {
+			return serverAction{}, errors.New("/reg 用法: /reg <机器标识> <来源地址1,来源地址2>")
+		}
+		sources := strings.Split(fields[2], ",")
+		for _, source := range sources {
+			if source == "" {
+				return serverAction{}, errors.New("/reg 用法: /reg <机器标识> <来源地址1,来源地址2>")
+			}
+		}
+		return serverAction{kind: serverActionRegister, machineID: fields[1], sources: sources}, nil
 	}
 	if len(fields) == 1 && strings.HasPrefix(fields[0], "/") {
 		if index, err := positiveASCIIInt(strings.TrimPrefix(fields[0], "/")); err == nil {
@@ -1016,7 +1100,7 @@ func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
 	}
 	nested, err := parseServerAction(remainder)
 	if err != nil || (nested.kind != serverActionForward && nested.kind != serverActionMode) {
-		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help 或另一个 /N。")
+		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help、/reg 或另一个 /N。")
 	}
 	return serverAction{
 		kind:        serverActionDirected,
@@ -1025,6 +1109,42 @@ func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
 		mode:        nested.mode,
 		switchAfter: prefix[0] == '/',
 	}, true, nil
+}
+
+func isRegistrationCommand(content string) bool {
+	fields := strings.Fields(strings.TrimSpace(content))
+	if len(fields) == 0 {
+		return false
+	}
+	if fields[0] == "/reg" {
+		return true
+	}
+	if len(fields) < 2 || fields[1] != "/reg" || len(fields[0]) < 2 || fields[0][0] != '/' && fields[0][0] != '#' {
+		return false
+	}
+	_, err := positiveASCIIInt(fields[0][1:])
+	return err == nil
+}
+
+func registrationErrorType(err error) string {
+	switch {
+	case errors.Is(err, machinereg.ErrMachineExists):
+		return "machine_exists"
+	case errors.Is(err, machinereg.ErrDeliveryFailed):
+		return "delivery_failed"
+	case errors.Is(err, machinereg.ErrRollbackFailed):
+		return "rollback_failed"
+	case errors.Is(err, machinereg.ErrInvalidRequest):
+		return "invalid_request"
+	default:
+		return "internal"
+	}
+}
+
+type unavailableRegistrationRequester struct{}
+
+func (unavailableRegistrationRequester) Register(context.Context, machinereg.RegisterInput, machinereg.KeyDeliveryFunc) (machinereg.RegisterResult, error) {
+	return machinereg.RegisterResult{}, machinereg.ErrInvalidRequest
 }
 
 func positiveASCIIInt(value string) (int, error) {

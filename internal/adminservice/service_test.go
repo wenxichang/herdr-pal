@@ -1,14 +1,96 @@
 package adminservice
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/server"
 )
+
+func TestServiceListsPendingRegistrationsAsSafeViews(t *testing.T) {
+	requestedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	manager := &fakeRegistrationManager{pending: []machinereg.Request{{
+		RegistrationID: "reg_one", PrincipalID: "user-a", MachineID: "office",
+		AllowedSources: []credential.SourceRule{"127.0.0.1"}, RequestedAt: requestedAt,
+	}}}
+	service := newTestServiceWithRegistrations(t, manager)
+	registrations := service.ListRegistrations()
+	if len(registrations) != 1 || registrations[0].RegistrationID != "reg_one" || registrations[0].RequestedAt.Location() != time.UTC ||
+		!reflect.DeepEqual(registrations[0].AllowedSources, []string{"127.0.0.1"}) {
+		t.Fatalf("registrations=%#v", registrations)
+	}
+	registrations[0].AllowedSources[0] = "10.0.0.1"
+	if manager.pending[0].AllowedSources[0] != "127.0.0.1" {
+		t.Fatal("registration view aliases manager sources")
+	}
+}
+
+func TestServiceApprovesRegistrationWithoutReturningToken(t *testing.T) {
+	manager := &fakeRegistrationManager{approval: machinereg.ApprovalResult{
+		Request:      machinereg.Request{RegistrationID: "reg_one", PrincipalID: "user-a", MachineID: "office"},
+		CredentialID: 7,
+	}}
+	service := newTestServiceWithRegistrations(t, manager)
+	result, err := service.ApproveRegistration(context.Background(), "reg_one", "admin")
+	if err != nil || result.CredentialID != 7 || !result.Approved || strings.Contains(fmt.Sprintf("%#v", result), "hpk_") {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if manager.approveDelivery == nil || manager.approveAdmin != "admin" {
+		t.Fatalf("manager=%#v", manager)
+	}
+}
+
+func TestServiceRejectsRegistrationEvenWhenNotificationFails(t *testing.T) {
+	manager := &fakeRegistrationManager{rejection: machinereg.RejectionResult{
+		Request:          machinereg.Request{RegistrationID: "reg_one", PrincipalID: "user-a", MachineID: "office"},
+		NotificationSent: false,
+	}}
+	service := newTestServiceWithRegistrations(t, manager)
+	result, err := service.RejectRegistration(context.Background(), "reg_one", "admin", "来源不符合要求")
+	if err != nil || !result.Rejected || result.NotificationSent || result.RegistrationID != "reg_one" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if manager.rejectDelivery == nil || manager.rejectReason != "来源不符合要求" {
+		t.Fatalf("manager=%#v", manager)
+	}
+}
+
+func TestServiceMapsRegistrationErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want ErrorCode
+	}{
+		{name: "not found", err: machinereg.ErrRequestNotFound, want: CodeRegistrationNotFound},
+		{name: "conflict", err: machinereg.ErrMachineExists, want: CodeRegistrationConflict},
+		{name: "delivery", err: machinereg.ErrDeliveryFailed, want: CodeRegistrationDeliveryFailed},
+		{name: "rollback", err: &machinereg.OperationError{Kind: machinereg.ErrRollbackFailed, CredentialID: 9}, want: CodeRegistrationRollbackFailed},
+		{name: "cleanup", err: &machinereg.OperationError{Kind: machinereg.ErrCleanupFailed, CredentialID: 10}, want: CodeRegistrationCleanupFailed},
+		{name: "invalid reason", err: machinereg.ErrInvalidRequest, want: CodeInvalidArgument},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &fakeRegistrationManager{approveErr: test.err, rejectErr: test.err}
+			service := newTestServiceWithRegistrations(t, manager)
+			_, approveErr := service.ApproveRegistration(context.Background(), "reg_one", "admin")
+			if ErrorCodeOf(approveErr) != test.want || strings.Contains(approveErr.Error(), "disk/path") || strings.Contains(approveErr.Error(), "hpk_") {
+				t.Fatalf("approve error=%v code=%s", approveErr, ErrorCodeOf(approveErr))
+			}
+			_, rejectErr := service.RejectRegistration(context.Background(), "reg_one", "admin", "reason")
+			if ErrorCodeOf(rejectErr) != test.want {
+				t.Fatalf("reject error=%v code=%s", rejectErr, ErrorCodeOf(rejectErr))
+			}
+		})
+	}
+}
 
 func TestServiceDisablesCredentialBeforeDisconnect(t *testing.T) {
 	store, record := seededServiceStore(t, "home", "127.0.0.1")
@@ -115,11 +197,14 @@ func TestServiceListSourcesValidatesCredentialID(t *testing.T) {
 func TestServiceObservedAtUsesInjectedClockAndUTC(t *testing.T) {
 	want := time.Date(2026, 7, 30, 8, 30, 0, 0, time.FixedZone("CST", 8*60*60))
 	service, err := New(Config{
-		Credentials: emptyCredentialManager{},
-		Connections: &fakeConnections{},
-		Sessions:    fakeSessions{},
-		Runtime:     &fakeRuntime{},
-		Now:         func() time.Time { return want },
+		Credentials:       emptyCredentialManager{},
+		Connections:       &fakeConnections{},
+		Sessions:          fakeSessions{},
+		Runtime:           &fakeRuntime{},
+		Registrations:     emptyRegistrationManager{},
+		KeyDelivery:       func(context.Context, machinereg.KeyDelivery) error { return nil },
+		RejectionDelivery: func(context.Context, machinereg.RejectionDelivery) error { return nil },
+		Now:               func() time.Time { return want },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -165,11 +250,32 @@ func TestServicePrepareStopRollbackAllowsRetry(t *testing.T) {
 func newTestService(t *testing.T, credentials CredentialManager, connections ConnectionManager, runtime RuntimeController) *Service {
 	t.Helper()
 	service, err := New(Config{
-		Credentials: credentials,
-		Connections: connections,
-		Sessions:    fakeSessions{},
-		Runtime:     runtime,
-		Now:         func() time.Time { return time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC) },
+		Credentials:       credentials,
+		Connections:       connections,
+		Sessions:          fakeSessions{},
+		Runtime:           runtime,
+		Registrations:     emptyRegistrationManager{},
+		KeyDelivery:       func(context.Context, machinereg.KeyDelivery) error { return nil },
+		RejectionDelivery: func(context.Context, machinereg.RejectionDelivery) error { return nil },
+		Now:               func() time.Time { return time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
+}
+
+func newTestServiceWithRegistrations(t *testing.T, registrations RegistrationManager) *Service {
+	t.Helper()
+	service, err := New(Config{
+		Credentials:       emptyCredentialManager{},
+		Connections:       &fakeConnections{},
+		Sessions:          fakeSessions{},
+		Runtime:           &fakeRuntime{},
+		Registrations:     registrations,
+		KeyDelivery:       func(context.Context, machinereg.KeyDelivery) error { return nil },
+		RejectionDelivery: func(context.Context, machinereg.RejectionDelivery) error { return nil },
+		Now:               func() time.Time { return time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -274,4 +380,42 @@ func (emptyCredentialManager) RemoveSources(uint64, []string) (credential.Record
 }
 func (emptyCredentialManager) SetSources(uint64, []string) (credential.Record, error) {
 	return credential.Record{}, credential.ErrCredentialNotFound
+}
+
+type emptyRegistrationManager struct{}
+
+func (emptyRegistrationManager) ListPending() []machinereg.Request { return nil }
+func (emptyRegistrationManager) Approve(context.Context, string, string, machinereg.KeyDeliveryFunc) (machinereg.ApprovalResult, error) {
+	return machinereg.ApprovalResult{}, machinereg.ErrRequestNotFound
+}
+func (emptyRegistrationManager) Reject(context.Context, string, string, string, machinereg.RejectionDeliveryFunc) (machinereg.RejectionResult, error) {
+	return machinereg.RejectionResult{}, machinereg.ErrRequestNotFound
+}
+
+type fakeRegistrationManager struct {
+	pending         []machinereg.Request
+	approval        machinereg.ApprovalResult
+	approveErr      error
+	approveAdmin    string
+	approveDelivery machinereg.KeyDeliveryFunc
+	rejection       machinereg.RejectionResult
+	rejectErr       error
+	rejectReason    string
+	rejectDelivery  machinereg.RejectionDeliveryFunc
+}
+
+func (manager *fakeRegistrationManager) ListPending() []machinereg.Request {
+	return append([]machinereg.Request(nil), manager.pending...)
+}
+
+func (manager *fakeRegistrationManager) Approve(_ context.Context, _ string, admin string, deliver machinereg.KeyDeliveryFunc) (machinereg.ApprovalResult, error) {
+	manager.approveAdmin = admin
+	manager.approveDelivery = deliver
+	return manager.approval, manager.approveErr
+}
+
+func (manager *fakeRegistrationManager) Reject(_ context.Context, _ string, _ string, reason string, deliver machinereg.RejectionDeliveryFunc) (machinereg.RejectionResult, error) {
+	manager.rejectReason = reason
+	manager.rejectDelivery = deliver
+	return manager.rejection, manager.rejectErr
 }

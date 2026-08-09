@@ -201,6 +201,38 @@ func TestRunReportsCorruptAuthFilePathWithoutLeakingContent(t *testing.T) {
 	}
 }
 
+func TestRunRejectsInvalidRegistrationStoreWithoutLeakingContent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		mode os.FileMode
+	}{
+		{name: "corrupt", body: `{"version":1,"registrations":[{"secret":"sensitive-registration-content"}]}`, mode: 0o600},
+		{name: "insecure permissions", body: `{"version":1,"registrations":[]}`, mode: 0o644},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := secureServerAppTempDir(t)
+			registrationPath := filepath.Join(stateDir, "registrations.json")
+			if err := os.WriteFile(registrationPath, []byte(test.body), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(registrationPath, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			configPath := writeServerAppConfig(t, stateDir, reserveServerAppAddress(t), "127.0.0.1:0", "bot-registration-invalid")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := Run(ctx, Options{
+				ConfigPath: configPath, Getenv: func(string) string { return "" },
+				Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, AuthFile: filepath.Join(t.TempDir(), "server-auth.json"),
+			})
+			if err == nil || !strings.Contains(err.Error(), "机器注册") || strings.Contains(err.Error(), "sensitive-registration-content") {
+				t.Fatalf("Run() error=%v", err)
+			}
+		})
+	}
+}
+
 func TestRunPrintsBootstrapOnceAndReleasesRelayAndAdminOnWebListenFailure(t *testing.T) {
 	stateDir := secureServerAppTempDir(t)
 	relayAddress := reserveServerAppAddress(t)

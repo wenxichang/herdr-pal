@@ -21,14 +21,19 @@ const (
 )
 
 var statusByCode = map[adminservice.ErrorCode]int{
-	adminservice.CodeInvalidArgument:    http.StatusBadRequest,
-	adminservice.CodeCredentialNotFound: http.StatusNotFound,
-	adminservice.CodeCredentialConflict: http.StatusConflict,
-	adminservice.CodeSourceRequired:     http.StatusBadRequest,
-	adminservice.CodeSourceInvalid:      http.StatusBadRequest,
-	adminservice.CodeConnectionNotFound: http.StatusNotFound,
-	adminservice.CodeServerBusy:         http.StatusConflict,
-	adminservice.CodeInternal:           http.StatusInternalServerError,
+	adminservice.CodeInvalidArgument:            http.StatusBadRequest,
+	adminservice.CodeCredentialNotFound:         http.StatusNotFound,
+	adminservice.CodeCredentialConflict:         http.StatusConflict,
+	adminservice.CodeSourceRequired:             http.StatusBadRequest,
+	adminservice.CodeSourceInvalid:              http.StatusBadRequest,
+	adminservice.CodeConnectionNotFound:         http.StatusNotFound,
+	adminservice.CodeRegistrationNotFound:       http.StatusNotFound,
+	adminservice.CodeRegistrationConflict:       http.StatusConflict,
+	adminservice.CodeRegistrationDeliveryFailed: http.StatusBadGateway,
+	adminservice.CodeRegistrationRollbackFailed: http.StatusInternalServerError,
+	adminservice.CodeRegistrationCleanupFailed:  http.StatusInternalServerError,
+	adminservice.CodeServerBusy:                 http.StatusConflict,
+	adminservice.CodeInternal:                   http.StatusInternalServerError,
 }
 
 type credentialIssueRequest struct {

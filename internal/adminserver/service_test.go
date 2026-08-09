@@ -1,12 +1,14 @@
 package adminserver
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminservice"
 	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/server"
 )
 
@@ -25,16 +27,29 @@ func newAdminServiceForTest(t *testing.T, credentials CredentialManager, connect
 		runtime = &emptyAdminRuntimeInspector{}
 	}
 	service, err := adminservice.New(adminservice.Config{
-		Credentials: credentials,
-		Connections: connections,
-		Sessions:    sessions,
-		Runtime:     runtime,
-		Now:         now,
+		Credentials:       credentials,
+		Connections:       connections,
+		Sessions:          sessions,
+		Runtime:           runtime,
+		Registrations:     emptyAdminRegistrationManager{},
+		KeyDelivery:       func(context.Context, machinereg.KeyDelivery) error { return nil },
+		RejectionDelivery: func(context.Context, machinereg.RejectionDelivery) error { return nil },
+		Now:               now,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return service
+}
+
+type emptyAdminRegistrationManager struct{}
+
+func (emptyAdminRegistrationManager) ListPending() []machinereg.Request { return nil }
+func (emptyAdminRegistrationManager) Approve(context.Context, string, string, machinereg.KeyDeliveryFunc) (machinereg.ApprovalResult, error) {
+	return machinereg.ApprovalResult{}, machinereg.ErrRequestNotFound
+}
+func (emptyAdminRegistrationManager) Reject(context.Context, string, string, string, machinereg.RejectionDeliveryFunc) (machinereg.RejectionResult, error) {
+	return machinereg.RejectionResult{}, machinereg.ErrRequestNotFound
 }
 
 type emptyAdminCredentialManager struct{}

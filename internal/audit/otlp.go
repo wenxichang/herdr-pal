@@ -198,7 +198,7 @@ func (exporter *OTLPExporter) request(events []Event) *collectorlogsv1.ExportLog
 func eventLogRecord(event Event) *logsv1.LogRecord {
 	severity := logsv1.SeverityNumber_SEVERITY_NUMBER_INFO
 	severityText := "INFO"
-	if event.Outcome == "rate_limited" || event.Outcome == "delivery_failed" {
+	if event.Outcome == "rate_limited" || event.Outcome == "delivery_failed" || event.Outcome == "rollback_failed" {
 		severity = logsv1.SeverityNumber_SEVERITY_NUMBER_WARN
 		severityText = "WARN"
 	}

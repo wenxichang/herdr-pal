@@ -4,6 +4,7 @@ const pageState = {
   csrf: "",
   username: "",
   credentialsCursor: "",
+  registrationsCursor: "",
   connectionsCursor: "",
   sessionsCursor: "",
   auditCursor: "",
@@ -38,6 +39,7 @@ async function startPage() {
   const loaders = {
     overview: loadOverview,
     credentials: setupCredentials,
+    registrations: setupRegistrations,
     connections: setupConnections,
     sessions: setupSessions,
     audit: setupAudit,
@@ -116,6 +118,7 @@ function bindRefreshButtons() {
     const actions = {
       "refresh-overview": loadOverview,
       "refresh-credentials": () => loadCredentials(true),
+      "refresh-registrations": () => loadRegistrations(true),
       "refresh-connections": () => loadConnections(true),
       "refresh-sessions": () => loadSessions(true),
       "refresh-administrators": loadAdministrators,
@@ -200,6 +203,45 @@ function credentialRow(item) {
     }, "danger"),
   );
   return row(item.credential_id, item.principal_id, item.machine_id, statusBadge(item.status), (item.allowed_sources || []).join(", "), actions);
+}
+
+async function setupRegistrations() {
+  document.querySelector("#registrations-next")?.addEventListener("click", () => void loadRegistrations(false));
+  await loadRegistrations(true);
+}
+
+async function loadRegistrations(reset) {
+  if (reset) pageState.registrationsCursor = "";
+  await runVisible(async () => {
+    const suffix = pageState.registrationsCursor ? `?limit=100&page_token=${encodeURIComponent(pageState.registrationsCursor)}` : "?limit=100";
+    const page = await api(`/admin/api/v1/registrations${suffix}`);
+    document.querySelector("#registrations-body")?.replaceChildren(...page.items.map(registrationRow));
+    pageState.registrationsCursor = page.next_page_token || "";
+    toggleNext("#registrations-next", pageState.registrationsCursor);
+  });
+}
+
+function registrationRow(item) {
+  const actions = actionCell(
+    actionButton("批准", () => approveRegistration(item), "primary"),
+    actionButton("拒绝", () => rejectRegistration(item), "danger"),
+  );
+  return row(item.registration_id, item.principal_id, item.machine_id, (item.allowed_sources || []).join(", "), formatTime(item.requested_at), actions);
+}
+
+async function approveRegistration(item) {
+  if (!window.confirm(`确认批准 ${item.principal_id}/${item.machine_id}？`)) return;
+  const result = await api(`/admin/api/v1/registrations/${encodeURIComponent(item.registration_id)}/approve`, { method: "POST", body: {} });
+  notify(`已批准，凭据 ID：${result.credential_id}`);
+  await loadRegistrations(true);
+}
+
+async function rejectRegistration(item) {
+  const reason = window.prompt(`拒绝 ${item.principal_id}/${item.machine_id}，可填写原因`, "");
+  if (reason === null) return;
+  const result = await api(`/admin/api/v1/registrations/${encodeURIComponent(item.registration_id)}/reject`, { method: "POST", body: { reason } });
+  notify(result.notification_sent ? "已拒绝并通知用户" : "已拒绝，但通知发送失败", !result.notification_sent);
+  await loadRegistrations(true);
 }
 
 async function setupConnections() {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -16,11 +17,139 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
+
+func TestParseServerActionRegistration(t *testing.T) {
+	tests := []struct {
+		input   string
+		machine string
+		sources []string
+		wantErr bool
+	}{
+		{input: "/reg office 192.168.0.1", machine: "office", sources: []string{"192.168.0.1"}},
+		{input: "/reg office 192.168.0.1,10.0.0.0/24", machine: "office", sources: []string{"192.168.0.1", "10.0.0.0/24"}},
+		{input: "/reg", wantErr: true},
+		{input: "/reg office", wantErr: true},
+		{input: "/reg office 192.168.0.1 extra", wantErr: true},
+		{input: "/reg office 192.168.0.1,", wantErr: true},
+	}
+	for _, test := range tests {
+		action, err := parseServerAction(test.input)
+		if test.wantErr {
+			if err == nil {
+				t.Fatalf("%q accepted", test.input)
+			}
+			continue
+		}
+		if err != nil || action.kind != serverActionRegister || action.machineID != test.machine || !reflect.DeepEqual(action.sources, test.sources) {
+			t.Fatalf("%q action=%#v err=%v", test.input, action, err)
+		}
+	}
+}
+
+func TestRouterHandlesRegistrationWithoutSessions(t *testing.T) {
+	tests := []struct {
+		name      string
+		result    machinereg.RegisterResult
+		err       error
+		token     string
+		want      string
+		forbidden string
+	}{
+		{
+			name: "auto issued", token: "hpk_1_abcdefghijklmnopqrstuvwxyz0123456789ABCDE",
+			result: machinereg.RegisterResult{Disposition: machinereg.DispositionAutoIssued, CredentialID: 1},
+			want:   "/help", forbidden: "等待管理员审批",
+		},
+		{
+			name:   "pending",
+			result: machinereg.RegisterResult{Disposition: machinereg.DispositionPending, Request: &machinereg.Request{RegistrationID: "reg_pending", MachineID: "office"}},
+			want:   "等待管理员审批",
+		},
+		{
+			name:   "already pending",
+			result: machinereg.RegisterResult{Disposition: machinereg.DispositionAlreadyPending, Request: &machinereg.Request{RegistrationID: "reg_pending", MachineID: "office"}},
+			want:   "已有待审批申请",
+		},
+		{name: "existing machine", err: machinereg.ErrMachineExists, want: "该机器已经注册"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registration := &routerRegistrationRequester{result: test.result, err: test.err, token: test.token}
+			router, gateway, relay := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationRequester: registration})
+			router.Handle(context.Background(), routerMessage("request-reg-"+strconv.Itoa(index), "message-reg-"+strconv.Itoa(index), "user-a", "/reg office 192.168.0.1"))
+			reply := gateway.LastReply()
+			if !strings.Contains(reply, test.want) || test.forbidden != "" && strings.Contains(reply, test.forbidden) {
+				t.Fatalf("reply=%q", reply)
+			}
+			if test.token != "" && !strings.Contains(reply, test.token) {
+				t.Fatalf("reply does not contain delivered key: %q", reply)
+			}
+			if registration.calls != 1 || registration.lastInput.PrincipalID != "user-a" || registration.lastInput.MachineID != "office" || !reflect.DeepEqual(registration.lastInput.Sources, []string{"192.168.0.1"}) {
+				t.Fatalf("registration=%#v", registration)
+			}
+			if relay.CallCount() != 0 {
+				t.Fatalf("relay calls=%d", relay.CallCount())
+			}
+		})
+	}
+}
+
+func TestRouterRegistrationErrorsRemainSpecificWithoutSessions(t *testing.T) {
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationRequester: &routerRegistrationRequester{}})
+	router.Handle(context.Background(), routerMessage("request-invalid-reg", "message-invalid-reg", "user-a", "/reg office 192.168.0.1 extra"))
+	if reply := gateway.LastReply(); !strings.Contains(reply, "/reg 用法") || reply == noAvailableSessionsMessage {
+		t.Fatalf("invalid registration reply=%q", reply)
+	}
+	router.Handle(context.Background(), routerMessage("request-no-session", "message-no-session", "user-a", "继续"))
+	if reply := gateway.LastReply(); reply != noAvailableSessionsMessage {
+		t.Fatalf("normal no-session reply=%q", reply)
+	}
+	for index, content := range []string{"/1 /reg office 127.0.0.1", "#1 /reg office 127.0.0.1"} {
+		router.Handle(context.Background(), routerMessage("request-directed-reg-"+strconv.Itoa(index), "message-directed-reg-"+strconv.Itoa(index), "user-a", content))
+		if reply := gateway.LastReply(); !strings.Contains(reply, "定向输入不能执行") {
+			t.Fatalf("directed registration reply=%q", reply)
+		}
+	}
+}
+
+func TestRouterRegistrationDeliveryFailureDoesNotReplyTwiceOrLogKey(t *testing.T) {
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "hpk_9_abcdefghijklmnopqrstuvwxyz0123456789ABCDE"
+	registration := &routerRegistrationRequester{
+		result: machinereg.RegisterResult{Disposition: machinereg.DispositionAutoIssued, CredentialID: 9},
+		token:  token,
+	}
+	gateway := &registrationFailingGateway{err: errors.New("response unavailable")}
+	relay := &routerRelay{capabilities: make(map[string]bool)}
+	var logs bytes.Buffer
+	router, err := NewConversationRouterWithConfig(
+		ConversationRouterConfig{RegistrationRequester: registration},
+		NewSessionCatalog(), NewUserExecutor(64), gateway, relay, deduper,
+		slog.New(slog.NewTextHandler(&logs, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.Handle(context.Background(), routerMessage("request-reg-failed", "message-reg-failed", "user-a", "/reg office 192.168.0.1"))
+	if gateway.CallCount() != 1 {
+		t.Fatalf("response calls=%d", gateway.CallCount())
+	}
+	if relay.CallCount() != 0 {
+		t.Fatalf("relay calls=%d", relay.CallCount())
+	}
+	if strings.Contains(logs.String(), token) {
+		t.Fatalf("logs leaked machine key: %s", logs.String())
+	}
+}
 
 func TestParseServerActionDoesNotReserveRemovedCommands(t *testing.T) {
 	for _, content := range []string{"/userid", "/sel 2"} {
@@ -1430,6 +1559,31 @@ type routerGateway struct {
 	images  [][]byte
 }
 
+type routerRegistrationRequester struct {
+	result    machinereg.RegisterResult
+	err       error
+	token     string
+	calls     int
+	lastInput machinereg.RegisterInput
+}
+
+func (requester *routerRegistrationRequester) Register(ctx context.Context, input machinereg.RegisterInput, deliver machinereg.KeyDeliveryFunc) (machinereg.RegisterResult, error) {
+	requester.calls++
+	requester.lastInput = input
+	if requester.err != nil {
+		return machinereg.RegisterResult{}, requester.err
+	}
+	if requester.result.Disposition == machinereg.DispositionAutoIssued {
+		if err := deliver(ctx, machinereg.KeyDelivery{
+			PrincipalID: input.PrincipalID, MachineID: input.MachineID,
+			CredentialID: requester.result.CredentialID, Token: requester.token,
+		}); err != nil {
+			return machinereg.RegisterResult{}, machinereg.ErrDeliveryFailed
+		}
+	}
+	return requester.result, nil
+}
+
 type routerAuditCollector struct {
 	mu     sync.Mutex
 	events []audit.Event
@@ -1451,6 +1605,33 @@ func (collector *routerAuditCollector) Events() []audit.Event {
 
 type failingRouterGateway struct {
 	err error
+}
+
+type registrationFailingGateway struct {
+	mu    sync.Mutex
+	err   error
+	calls int
+}
+
+func (gateway *registrationFailingGateway) RespondMarkdown(context.Context, string, string) error {
+	gateway.mu.Lock()
+	gateway.calls++
+	gateway.mu.Unlock()
+	return gateway.err
+}
+
+func (gateway *registrationFailingGateway) SendMarkdownTo(context.Context, string, string) error {
+	return gateway.err
+}
+
+func (gateway *registrationFailingGateway) SendImageTo(context.Context, string, []byte) error {
+	return gateway.err
+}
+
+func (gateway *registrationFailingGateway) CallCount() int {
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	return gateway.calls
 }
 
 type failingImageHeaderGateway struct {

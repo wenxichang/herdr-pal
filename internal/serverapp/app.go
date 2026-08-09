@@ -25,6 +25,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/lokiquery"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/server"
@@ -151,6 +152,22 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("加载 HPRP 凭据存储: %w", err)
 	}
+	registrationStore, err := machinereg.LoadStore(filepath.Join(loaded.Server.StateDir, "registrations.json"), machinereg.StoreOptions{})
+	if err != nil {
+		return fmt.Errorf("加载机器注册申请存储: %w", err)
+	}
+	registrationService, err := machinereg.New(machinereg.Config{
+		Credentials: credentialStore,
+		Requests:    registrationStore,
+		Auditor:     businessAuditor,
+		Redactor:    auditRedactor,
+		Logger:      logger,
+		BotIDHash:   shortHash(loaded.WeCom.BotID),
+		Now:         time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("创建机器注册服务: %w", err)
+	}
 	catalog := server.NewSessionCatalog()
 	hub, err := server.NewClientHub(catalog, credentialStore, server.HubConfig{}, logger)
 	if err != nil {
@@ -165,6 +182,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			HelpProvider: helpProvider,
 			RateLimiter:  server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
 			Auditor:      businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
+			RegistrationRequester: registrationService,
 		},
 		catalog, server.NewUserExecutor(64), weComClient, hub, deduper, logger,
 	)
@@ -205,11 +223,14 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		return fmt.Errorf("创建服务运行状态: %w", err)
 	}
 	adminService, err := adminservice.New(adminservice.Config{
-		Credentials: credentialStore,
-		Connections: hub,
-		Sessions:    catalog,
-		Runtime:     runtimeInspector,
-		Now:         time.Now,
+		Credentials:       registrationService,
+		Connections:       hub,
+		Sessions:          catalog,
+		Runtime:           runtimeInspector,
+		Registrations:     registrationService,
+		KeyDelivery:       registrationKeyDelivery(weComClient),
+		RejectionDelivery: registrationRejectionDelivery(weComClient),
+		Now:               time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("创建共享管理服务: %w", err)
@@ -299,6 +320,33 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		"audit_stderr", loaded.Audit.Stderr,
 	)
 	return runServerComponents(ctx, stopRequested, components, shutdown, logger)
+}
+
+type registrationMessageSender interface {
+	SendMarkdownTo(context.Context, string, string) error
+}
+
+func registrationKeyDelivery(sender registrationMessageSender) machinereg.KeyDeliveryFunc {
+	return func(ctx context.Context, delivery machinereg.KeyDelivery) error {
+		content := fmt.Sprintf("机器注册申请已批准：%s\n机器 Key（仅显示一次）：\n`%s`\n请妥善保存，并发送 /help 查看安装步骤。",
+			safeRegistrationMessageLabel(delivery.MachineID), delivery.Token)
+		return sender.SendMarkdownTo(ctx, delivery.PrincipalID, content)
+	}
+}
+
+func registrationRejectionDelivery(sender registrationMessageSender) machinereg.RejectionDeliveryFunc {
+	return func(ctx context.Context, delivery machinereg.RejectionDelivery) error {
+		content := fmt.Sprintf("机器注册申请已驳回：%s\n申请编号：%s",
+			safeRegistrationMessageLabel(delivery.MachineID), safeRegistrationMessageLabel(delivery.RegistrationID))
+		if delivery.Reason != "" {
+			content += "\n原因：" + safeRegistrationMessageLabel(delivery.Reason)
+		}
+		return sender.SendMarkdownTo(ctx, delivery.PrincipalID, content)
+	}
+}
+
+func safeRegistrationMessageLabel(value string) string {
+	return strings.NewReplacer("\r", " ", "\n", " ", "\x00", "", "```", "``\u200b`").Replace(strings.ToValidUTF8(value, "�"))
 }
 
 type redactedServerRunError struct {

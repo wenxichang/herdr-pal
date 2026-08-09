@@ -13,6 +13,7 @@ import (
 
 	collectorlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
+	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -83,6 +84,13 @@ func TestOTLPExporterSendsProtobufLogsWithHeaders(t *testing.T) {
 	attributes := keyValues(record.Attributes)
 	if attributes["herdr_pal.audit.event_id"] != "event-1" || attributes["herdr_pal.audit.principal_id"] != "user-1" || attributes["herdr_pal.audit.agent"] != "codex" || attributes["herdr_pal.audit.limit.window"] != "second" {
 		t.Fatalf("attributes = %#v", attributes)
+	}
+}
+
+func TestMachineRegistrationRollbackFailureUsesWarningSeverity(t *testing.T) {
+	record := eventLogRecord(Event{EventName: EventNameMachineRegistration, Outcome: "rollback_failed"})
+	if record.SeverityNumber != logsv1.SeverityNumber_SEVERITY_NUMBER_WARN {
+		t.Fatalf("severity = %v", record.SeverityNumber)
 	}
 }
 

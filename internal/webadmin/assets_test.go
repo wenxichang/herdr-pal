@@ -28,9 +28,9 @@ func TestPagesRedirectUnauthenticatedUsersAndRenderLogin(t *testing.T) {
 	}
 }
 
-func TestPagesRenderSevenNavigationEntriesForAuthenticatedAdmin(t *testing.T) {
+func TestPagesRenderEightNavigationEntriesForAuthenticatedAdmin(t *testing.T) {
 	web, cookie, _, _ := authenticatedManagementServer(t, webTestDependencies{})
-	pages := []string{"/admin", "/admin/", "/admin/credentials", "/admin/connections", "/admin/sessions", "/admin/audit", "/admin/administrators", "/admin/system"}
+	pages := []string{"/admin", "/admin/", "/admin/credentials", "/admin/registrations", "/admin/connections", "/admin/sessions", "/admin/audit", "/admin/administrators", "/admin/system"}
 	for _, target := range pages {
 		request := newTLSRequest(http.MethodGet, target, nil)
 		request.AddCookie(cookie)
@@ -40,12 +40,44 @@ func TestPagesRenderSevenNavigationEntriesForAuthenticatedAdmin(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("%s status=%d body=%s", target, response.Code, body)
 		}
-		if strings.Count(body, `class="nav-link`) != 7 || !strings.Contains(body, `data-page=`) || !strings.Contains(body, `id="logout-button"`) {
+		if strings.Count(body, `class="nav-link`) != 8 || !strings.Contains(body, `data-page=`) || !strings.Contains(body, `id="logout-button"`) {
 			t.Fatalf("%s navigation/body invalid: %s", target, body)
 		}
 		if strings.Contains(body, "<script>") || strings.Contains(body, "localStorage") || strings.Contains(body, "sessionStorage") || strings.Contains(body, "indexedDB") {
 			t.Fatalf("%s contains forbidden browser state or inline script", target)
 		}
+	}
+}
+
+func TestRegistrationPageAndAssetsExposeApprovalWithoutSecretModal(t *testing.T) {
+	web, cookie, _, _ := authenticatedManagementServer(t, webTestDependencies{})
+	request := newTLSRequest(http.MethodGet, "/admin/registrations", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	web.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	for _, want := range []string{`id="registrations-page"`, `id="registrations-body"`, `id="registrations-next"`, "待审批机器"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("registration page lacks %q: %s", want, body)
+		}
+	}
+
+	assetRequest := newTLSRequest(http.MethodGet, "/admin/static/app.js", nil)
+	assetResponse := httptest.NewRecorder()
+	web.Handler().ServeHTTP(assetResponse, assetRequest)
+	javascript := assetResponse.Body.String()
+	for _, want := range []string{"setupRegistrations", "/admin/api/v1/registrations/", "/approve", "/reject", "notification_sent"} {
+		if !strings.Contains(javascript, want) {
+			t.Fatalf("app.js lacks %q", want)
+		}
+	}
+	approveStart := strings.Index(javascript, "async function approveRegistration")
+	approveEnd := -1
+	if approveStart >= 0 {
+		approveEnd = strings.Index(javascript[approveStart:], "async function rejectRegistration")
+	}
+	if approveStart < 0 || approveEnd < 0 || strings.Contains(javascript[approveStart:approveStart+approveEnd], "showSecret") {
+		t.Fatal("approval UI must not reveal a machine key")
 	}
 }
 

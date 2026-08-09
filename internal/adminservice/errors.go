@@ -10,14 +10,19 @@ import (
 type ErrorCode string
 
 const (
-	CodeInvalidArgument    ErrorCode = "invalid_argument"
-	CodeCredentialNotFound ErrorCode = "credential_not_found"
-	CodeCredentialConflict ErrorCode = "credential_conflict"
-	CodeSourceRequired     ErrorCode = "source_required"
-	CodeSourceInvalid      ErrorCode = "source_invalid"
-	CodeConnectionNotFound ErrorCode = "connection_not_found"
-	CodeServerBusy         ErrorCode = "server_busy"
-	CodeInternal           ErrorCode = "internal"
+	CodeInvalidArgument            ErrorCode = "invalid_argument"
+	CodeCredentialNotFound         ErrorCode = "credential_not_found"
+	CodeCredentialConflict         ErrorCode = "credential_conflict"
+	CodeSourceRequired             ErrorCode = "source_required"
+	CodeSourceInvalid              ErrorCode = "source_invalid"
+	CodeConnectionNotFound         ErrorCode = "connection_not_found"
+	CodeRegistrationNotFound       ErrorCode = "registration_not_found"
+	CodeRegistrationConflict       ErrorCode = "registration_conflict"
+	CodeRegistrationDeliveryFailed ErrorCode = "registration_delivery_failed"
+	CodeRegistrationRollbackFailed ErrorCode = "registration_rollback_failed"
+	CodeRegistrationCleanupFailed  ErrorCode = "registration_cleanup_failed"
+	CodeServerBusy                 ErrorCode = "server_busy"
+	CodeInternal                   ErrorCode = "internal"
 )
 
 // Error 是不向调用方泄露持久化路径或底层错误正文的管理领域错误。

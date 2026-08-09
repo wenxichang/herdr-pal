@@ -1,6 +1,7 @@
 package webadmin
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/adminauth"
 	"github.com/wenxichang/herdr-pal/internal/adminservice"
 	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/server"
 )
 
@@ -109,11 +111,14 @@ func newTestWebServer(t *testing.T) (*Server, adminauth.Bootstrap, *strings.Buil
 }
 
 type webTestDependencies struct {
-	Connections adminservice.ConnectionManager
-	Sessions    adminservice.SessionInspector
-	Runtime     adminservice.RuntimeController
-	Audit       AuditQuerier
-	Now         func() time.Time
+	Connections       adminservice.ConnectionManager
+	Sessions          adminservice.SessionInspector
+	Runtime           adminservice.RuntimeController
+	Registrations     adminservice.RegistrationManager
+	KeyDelivery       machinereg.KeyDeliveryFunc
+	RejectionDelivery machinereg.RejectionDeliveryFunc
+	Audit             AuditQuerier
+	Now               func() time.Time
 }
 
 func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependencies) (*Server, adminauth.Bootstrap, *strings.Builder) {
@@ -136,12 +141,24 @@ func newTestWebServerWithDependencies(t *testing.T, dependencies webTestDependen
 	if dependencies.Runtime == nil {
 		dependencies.Runtime = &emptyWebRuntime{}
 	}
+	if dependencies.Registrations == nil {
+		dependencies.Registrations = emptyWebRegistrationManager{}
+	}
+	if dependencies.KeyDelivery == nil {
+		dependencies.KeyDelivery = func(context.Context, machinereg.KeyDelivery) error { return nil }
+	}
+	if dependencies.RejectionDelivery == nil {
+		dependencies.RejectionDelivery = func(context.Context, machinereg.RejectionDelivery) error { return nil }
+	}
 	adminService, err := adminservice.New(adminservice.Config{
-		Credentials: credentialStore,
-		Connections: dependencies.Connections,
-		Sessions:    dependencies.Sessions,
-		Runtime:     dependencies.Runtime,
-		Now:         now,
+		Credentials:       credentialStore,
+		Connections:       dependencies.Connections,
+		Sessions:          dependencies.Sessions,
+		Runtime:           dependencies.Runtime,
+		Registrations:     dependencies.Registrations,
+		KeyDelivery:       dependencies.KeyDelivery,
+		RejectionDelivery: dependencies.RejectionDelivery,
+		Now:               now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -215,3 +232,13 @@ func (*emptyWebRuntime) Status() adminservice.ServerStatus { return adminservice
 func (*emptyWebRuntime) EnableDebug()                      {}
 func (*emptyWebRuntime) DisableDebug()                     {}
 func (*emptyWebRuntime) RequestStop() bool                 { return true }
+
+type emptyWebRegistrationManager struct{}
+
+func (emptyWebRegistrationManager) ListPending() []machinereg.Request { return nil }
+func (emptyWebRegistrationManager) Approve(context.Context, string, string, machinereg.KeyDeliveryFunc) (machinereg.ApprovalResult, error) {
+	return machinereg.ApprovalResult{}, machinereg.ErrRequestNotFound
+}
+func (emptyWebRegistrationManager) Reject(context.Context, string, string, string, machinereg.RejectionDeliveryFunc) (machinereg.RejectionResult, error) {
+	return machinereg.RejectionResult{}, machinereg.ErrRequestNotFound
+}

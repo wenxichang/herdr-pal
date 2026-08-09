@@ -19,6 +19,7 @@ Herdr Pal 是 Herdr 与企业微信之间的独立 sidecar bridge：
 - 企业微信帮助：`~/.config/herdr-pal-server/help.md`
 - Pal：`~/.config/herdr-pal/config.json`
 - 凭据存储：默认 `<state_dir>/credentials.json`
+- 待审批机器注册：固定 `<state_dir>/registrations.json`，只保存尚未处理的申请
 - Admin Socket：默认 `<state_dir>/admin.sock`
 
 `build.sh` 使用 `CGO_ENABLED=0` 生成 Darwin/Linux AMD64、ARM64 客户端和服务端，以及
@@ -31,7 +32,10 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - 企业微信 Bot ID 和 Secret 只由 Server 持有；Secret 直接保存在权限为 `0600` 的
   `server.json` 的 `wecom.secret` 字段中。
 - 企业微信应用可见范围是用户入口边界；Router 只处理单聊。
-- 企业微信 principal ID 和机器标识只由管理员在签发机器 Key 时绑定，不写入 Pal 配置。
+- 企业微信 principal ID 来自已认证单聊；机器标识可由用户通过 `/reg` 提交，也可由管理员
+  人工签发，二者都只绑定到机器 Key，不写入 Pal 配置。
+- 用户完全没有凭据和 pending 时，`/reg` 首台机器直接签发；已有任意凭据或 pending 时进入
+  Web-only 审批。审批 Key 交付失败会回滚凭据并保留申请。
 - 管理员使用 `hp-cli key issue` 为每台机器签发独立 `hpk_...` Key，并必须配置至少一条
   来源地址规则。
 - Key 在服务端绑定 `(principal_id, machine_id)`；Pal 不能自行声明或覆盖身份。
@@ -54,11 +58,17 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 
 1. `config.LoadServer` 读取 Bot ID、监听地址、TLS 和凭据文件路径，并派生固定运行文件路径。
 2. `EnsureTLS` 加载外部证书；未配置时在状态目录生成并复用自签名证书。
-3. `credential.LoadStore` 加载仅保存摘要的 HPRP 机器凭据。
-4. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
-5. 在 `<state_dir>/admin.sock` 启动 HPAP 管理面；失败时整个 Server 启动失败。
-6. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
-7. `/help` 每次重新读取 `help.md`，管理员修改后无需重启即可生效。
+3. `credential.LoadStore` 加载仅保存摘要的 HPRP 机器凭据，`machinereg.LoadStore` 加载只含
+   pending 的机器注册申请。
+4. 创建共享 `machinereg.Service`，串行化 `/reg`、Web 审批和人工凭据变更。
+5. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
+6. 在 `<state_dir>/admin.sock` 启动 HPAP 管理面；失败时整个 Server 启动失败。
+7. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
+8. `/help` 每次重新读取 `help.md`，管理员修改后无需重启即可生效。
+
+终端用户优先发送 `/reg <machine_id> <source1,source2>`。首台 Key 在当前响应中只显示一次；
+后续申请进入 Web 管理台，批准后通过主动企微消息交付。`registrations.json` 不保存审批历史，
+申请、自动签发、批准、驳回和回滚写入 `herdr_pal.machine_registration` OTLP/Loki 审计事件。
 
 管理员从企业微信管理信息或组织内账户系统取得 principal ID 后执行：
 
@@ -110,7 +120,7 @@ machine_id + slot_id + session_id
 
 - Server 先校验单聊身份和消息 ID，再完成 `msgid` 幂等去重；唯一输入随后进入按用户滚动
   窗口限速，默认每秒 1 条、60 秒内 20 条，显式配置 0 可关闭对应窗口。
-- `/ls`、独立 `/N` 和 `/help` 由 Server 处理。
+- `/ls`、独立 `/N`、`/help` 和 `/reg` 由 Server 处理。
 - `/N 内容` 与 `#N 内容` 先由 Server 把全局编号解析为稳定目标；前者仅在成功后切换，
   后者不改变当前选择。
 - 其余内容要求已有稳定选择，Server 发送 `command.execute`。
@@ -172,6 +182,7 @@ Bot Secret、OTLP Header、`hpk_...` 和常见认证 Header 在审计入队前�
 
 - `internal/hprp`：HPRP/1 信封、公开消息、校验、协商和错误码。
 - `internal/credential`：机器 Key 生成、摘要存储和 HTTP Bearer 验证。
+- `internal/machinereg`：待审批申请存储、首台签发、审批交付回滚和机器注册审计。
 - `internal/adminproto`、`internal/adminclient`、`internal/adminserver`：HPAP/1、本地客户端、
   Unix Socket 安全边界、管理方法和审计。
 - `internal/server`：在线目录、HPRP Hub、用户执行器和企业微信路由。

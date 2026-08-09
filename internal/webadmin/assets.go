@@ -30,6 +30,7 @@ var adminPages = []struct {
 }{
 	{Path: "/admin", Page: "overview", Title: "概览"},
 	{Path: "/admin/credentials", Page: "credentials", Title: "机器凭据"},
+	{Path: "/admin/registrations", Page: "registrations", Title: "机器注册审批"},
 	{Path: "/admin/connections", Page: "connections", Title: "在线连接"},
 	{Path: "/admin/sessions", Page: "sessions", Title: "Agent 会话"},
 	{Path: "/admin/audit", Page: "audit", Title: "审计日志"},

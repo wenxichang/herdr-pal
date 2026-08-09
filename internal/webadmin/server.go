@@ -103,6 +103,7 @@ func New(config Config) (*Server, error) {
 	mux := http.NewServeMux()
 	server.registerAuthRoutes(mux)
 	server.registerManagementRoutes(mux)
+	server.registerRegistrationRoutes(mux)
 	server.registerAdminRoutes(mux)
 	server.registerAutomationRoutes(mux)
 	server.registerAuditRoutes(mux)

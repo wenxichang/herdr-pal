@@ -17,6 +17,8 @@ const (
 	EventNameUserInput = "herdr_pal.user_input"
 	// EventNameTerminalOutput 表示一次企业微信终端内容投递结果。
 	EventNameTerminalOutput = "herdr_pal.terminal_output"
+	// EventNameMachineRegistration 表示机器自主注册和管理员审批生命周期。
+	EventNameMachineRegistration = "herdr_pal.machine_registration"
 )
 
 var ErrInvalidEvent = errors.New("审计事件无效")
@@ -57,7 +59,7 @@ type Auditor interface {
 
 // PrepareEvent 补齐事件版本、时间、随机 ID 和敏感标识摘要。
 func PrepareEvent(event Event, observedAt time.Time, random io.Reader) (Event, error) {
-	if event.EventName != EventNameUserInput && event.EventName != EventNameTerminalOutput {
+	if !validEventName(event.EventName) {
 		return Event{}, ErrInvalidEvent
 	}
 	if observedAt.IsZero() {
@@ -86,6 +88,15 @@ func PrepareEvent(event Event, observedAt time.Time, random io.Reader) (Event, e
 	event.SessionID = ""
 	event.ContentBytes = len([]byte(event.Body))
 	return event, nil
+}
+
+func validEventName(value string) bool {
+	switch value {
+	case EventNameUserInput, EventNameTerminalOutput, EventNameMachineRegistration:
+		return true
+	default:
+		return false
+	}
 }
 
 // HashIdentifier 返回适合审计关联但不暴露原值的短摘要。

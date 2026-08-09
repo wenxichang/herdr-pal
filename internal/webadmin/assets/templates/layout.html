@@ -29,6 +29,7 @@
       <nav aria-label="管理导航">
         <a class="nav-link {{if active .Page "overview"}}active{{end}}" href="/admin">概览</a>
         <a class="nav-link {{if active .Page "credentials"}}active{{end}}" href="/admin/credentials">机器凭据</a>
+        <a class="nav-link {{if active .Page "registrations"}}active{{end}}" href="/admin/registrations">注册审批</a>
         <a class="nav-link {{if active .Page "connections"}}active{{end}}" href="/admin/connections">在线连接</a>
         <a class="nav-link {{if active .Page "sessions"}}active{{end}}" href="/admin/sessions">Agent 会话</a>
         <a class="nav-link {{if active .Page "audit"}}active{{end}}" href="/admin/audit">审计日志</a>
@@ -44,6 +45,7 @@
       <main class="content">
         {{if active .Page "overview"}}{{template "overview-content" .}}{{end}}
         {{if active .Page "credentials"}}{{template "credentials-content" .}}{{end}}
+        {{if active .Page "registrations"}}{{template "registrations-content" .}}{{end}}
         {{if active .Page "connections"}}{{template "connections-content" .}}{{end}}
         {{if active .Page "sessions"}}{{template "sessions-content" .}}{{end}}
         {{if active .Page "audit"}}{{template "audit-content" .}}{{end}}

@@ -2,6 +2,29 @@ package adminservice
 
 import "time"
 
+// Registration 是待审批机器注册申请的安全视图。
+type Registration struct {
+	RegistrationID string    `json:"registration_id"`
+	PrincipalID    string    `json:"principal_id"`
+	MachineID      string    `json:"machine_id"`
+	AllowedSources []string  `json:"allowed_sources"`
+	RequestedAt    time.Time `json:"requested_at"`
+}
+
+// RegistrationApprovalResult 返回审批结果，不包含一次性机器 Key。
+type RegistrationApprovalResult struct {
+	RegistrationID string `json:"registration_id"`
+	CredentialID   uint64 `json:"credential_id"`
+	Approved       bool   `json:"approved"`
+}
+
+// RegistrationRejectionResult 返回驳回决定和通知投递状态。
+type RegistrationRejectionResult struct {
+	RegistrationID   string `json:"registration_id"`
+	Rejected         bool   `json:"rejected"`
+	NotificationSent bool   `json:"notification_sent"`
+}
+
 // Credential 是不包含 Secret 摘要和明文 Key 的机器凭据视图。
 type Credential struct {
 	CredentialID   uint64     `json:"credential_id"`

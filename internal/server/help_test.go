@@ -86,3 +86,12 @@ func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultHelpIncludesMachineRegistration(t *testing.T) {
+	content := DefaultHelpText()
+	for _, fragment := range []string{"/reg", "机器标识", "来源地址", "首台", "等待管理员审批", "/help"} {
+		if !strings.Contains(content, fragment) {
+			t.Fatalf("default help missing %q", fragment)
+		}
+	}
+}

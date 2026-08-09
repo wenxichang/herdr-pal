@@ -129,6 +129,8 @@ func serverActionName(kind serverActionKind) string {
 		return "mode"
 	case serverActionDirected:
 		return "directed_execute"
+	case serverActionRegister:
+		return "register"
 	default:
 		return "execute"
 	}

@@ -9,6 +9,19 @@ import (
 	"time"
 )
 
+func TestValidatePrincipalID(t *testing.T) {
+	for _, value := range []string{"user-a", "企业微信用户"} {
+		if err := ValidatePrincipalID(value); err != nil {
+			t.Fatalf("ValidatePrincipalID(%q) = %v", value, err)
+		}
+	}
+	for _, value := range []string{"", " user-a", "user\n"} {
+		if err := ValidatePrincipalID(value); !errors.Is(err, ErrInvalidRecord) {
+			t.Fatalf("ValidatePrincipalID(%q) = %v", value, err)
+		}
+	}
+}
+
 func TestIssueCreatesEnabledMachineKeyWithNumericIDAndSources(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	expiresAt := now.Add(24 * time.Hour)

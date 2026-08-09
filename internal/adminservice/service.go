@@ -1,6 +1,7 @@
 package adminservice
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 	"github.com/wenxichang/herdr-pal/internal/server"
 )
 
@@ -24,6 +26,13 @@ type CredentialManager interface {
 	AddSources(credentialID uint64, values []string) (credential.Record, error)
 	RemoveSources(credentialID uint64, values []string) (credential.Record, error)
 	SetSources(credentialID uint64, values []string) (credential.Record, error)
+}
+
+// RegistrationManager 提供待审批注册申请的查询、批准和驳回能力。
+type RegistrationManager interface {
+	ListPending() []machinereg.Request
+	Approve(context.Context, string, string, machinereg.KeyDeliveryFunc) (machinereg.ApprovalResult, error)
+	Reject(context.Context, string, string, string, machinereg.RejectionDeliveryFunc) (machinereg.RejectionResult, error)
 }
 
 // ConnectionManager 提供 HPRP 连接查询和撤下能力。
@@ -50,37 +59,98 @@ type RuntimeController interface {
 
 // Config 指定共享管理服务的运行依赖。
 type Config struct {
-	Credentials CredentialManager
-	Connections ConnectionManager
-	Sessions    SessionInspector
-	Runtime     RuntimeController
-	Now         func() time.Time
+	Credentials       CredentialManager
+	Connections       ConnectionManager
+	Sessions          SessionInspector
+	Runtime           RuntimeController
+	Registrations     RegistrationManager
+	KeyDelivery       machinereg.KeyDeliveryFunc
+	RejectionDelivery machinereg.RejectionDeliveryFunc
+	Now               func() time.Time
 }
 
 // Service 实施 HPAP 与 Web 入口共用的管理规则。
 type Service struct {
-	credentials CredentialManager
-	connections ConnectionManager
-	sessions    SessionInspector
-	runtime     RuntimeController
-	now         func() time.Time
-	stopping    atomic.Bool
+	credentials       CredentialManager
+	connections       ConnectionManager
+	sessions          SessionInspector
+	runtime           RuntimeController
+	registrations     RegistrationManager
+	keyDelivery       machinereg.KeyDeliveryFunc
+	rejectionDelivery machinereg.RejectionDeliveryFunc
+	now               func() time.Time
+	stopping          atomic.Bool
 }
 
 // New 创建共享管理服务。
 func New(config Config) (*Service, error) {
-	if config.Credentials == nil || config.Connections == nil || config.Sessions == nil || config.Runtime == nil {
+	if config.Credentials == nil || config.Connections == nil || config.Sessions == nil || config.Runtime == nil ||
+		config.Registrations == nil || config.KeyDelivery == nil || config.RejectionDelivery == nil {
 		return nil, newError(CodeInternal, "管理服务依赖无效", nil)
 	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
 	return &Service{
-		credentials: config.Credentials,
-		connections: config.Connections,
-		sessions:    config.Sessions,
-		runtime:     config.Runtime,
-		now:         config.Now,
+		credentials:       config.Credentials,
+		connections:       config.Connections,
+		sessions:          config.Sessions,
+		runtime:           config.Runtime,
+		registrations:     config.Registrations,
+		keyDelivery:       config.KeyDelivery,
+		rejectionDelivery: config.RejectionDelivery,
+		now:               config.Now,
+	}, nil
+}
+
+// ListRegistrations 返回稳定排序的待审批机器注册申请。
+func (service *Service) ListRegistrations() []Registration {
+	if service == nil {
+		return nil
+	}
+	requests := service.registrations.ListPending()
+	result := make([]Registration, 0, len(requests))
+	for _, request := range requests {
+		result = append(result, registrationView(request))
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].RequestedAt.Equal(result[right].RequestedAt) {
+			return result[left].RegistrationID < result[right].RegistrationID
+		}
+		return result[left].RequestedAt.Before(result[right].RequestedAt)
+	})
+	return result
+}
+
+// ApproveRegistration 批准待审批申请并仅返回不敏感的 credential ID。
+func (service *Service) ApproveRegistration(ctx context.Context, registrationID, adminUsername string) (RegistrationApprovalResult, error) {
+	if service == nil || strings.TrimSpace(registrationID) == "" || strings.TrimSpace(adminUsername) == "" {
+		return RegistrationApprovalResult{}, newError(CodeInvalidArgument, "注册申请或管理员身份无效", nil)
+	}
+	result, err := service.registrations.Approve(ctx, registrationID, adminUsername, service.keyDelivery)
+	if err != nil {
+		return RegistrationApprovalResult{}, mapRegistrationError(err)
+	}
+	return RegistrationApprovalResult{
+		RegistrationID: result.Request.RegistrationID,
+		CredentialID:   result.CredentialID,
+		Approved:       true,
+	}, nil
+}
+
+// RejectRegistration 驳回并删除待审批申请；通知失败不改变已生效决定。
+func (service *Service) RejectRegistration(ctx context.Context, registrationID, adminUsername, reason string) (RegistrationRejectionResult, error) {
+	if service == nil || strings.TrimSpace(registrationID) == "" || strings.TrimSpace(adminUsername) == "" {
+		return RegistrationRejectionResult{}, newError(CodeInvalidArgument, "注册申请或管理员身份无效", nil)
+	}
+	result, err := service.registrations.Reject(ctx, registrationID, adminUsername, reason, service.rejectionDelivery)
+	if err != nil {
+		return RegistrationRejectionResult{}, mapRegistrationError(err)
+	}
+	return RegistrationRejectionResult{
+		RegistrationID:   result.Request.RegistrationID,
+		Rejected:         true,
+		NotificationSent: result.NotificationSent,
 	}, nil
 }
 
@@ -337,6 +407,44 @@ func mapCredentialError(err error) error {
 		return newError(CodeServerBusy, "Key ID 已耗尽", err)
 	default:
 		return newError(CodeInternal, "机器凭据操作失败", err)
+	}
+}
+
+func mapRegistrationError(err error) error {
+	credentialID, hasCredentialID := machinereg.CredentialIDFromError(err)
+	switch {
+	case errors.Is(err, machinereg.ErrRequestNotFound):
+		return newError(CodeRegistrationNotFound, "机器注册申请不存在", err)
+	case errors.Is(err, machinereg.ErrMachineExists), errors.Is(err, credential.ErrCredentialConflict):
+		return newError(CodeRegistrationConflict, "该用户和机器已存在凭据", err)
+	case errors.Is(err, machinereg.ErrDeliveryFailed):
+		return newError(CodeRegistrationDeliveryFailed, "机器 Key 交付失败，申请仍等待审批", err)
+	case errors.Is(err, machinereg.ErrRollbackFailed):
+		message := "机器 Key 交付失败且凭据回滚失败"
+		if hasCredentialID {
+			message = fmt.Sprintf("%s（credential_id=%d）", message, credentialID)
+		}
+		return newError(CodeRegistrationRollbackFailed, message, err)
+	case errors.Is(err, machinereg.ErrCleanupFailed):
+		message := "机器 Key 已交付但待审批申请清理失败"
+		if hasCredentialID {
+			message = fmt.Sprintf("%s（credential_id=%d）", message, credentialID)
+		}
+		return newError(CodeRegistrationCleanupFailed, message, err)
+	case errors.Is(err, machinereg.ErrInvalidRequest):
+		return newError(CodeInvalidArgument, "机器注册审批参数无效", err)
+	default:
+		return newError(CodeInternal, "机器注册审批失败", err)
+	}
+}
+
+func registrationView(request machinereg.Request) Registration {
+	return Registration{
+		RegistrationID: request.RegistrationID,
+		PrincipalID:    request.PrincipalID,
+		MachineID:      request.MachineID,
+		AllowedSources: sourceStrings(request.AllowedSources),
+		RequestedAt:    request.RequestedAt.UTC(),
 	}
 }
 
