@@ -3,7 +3,7 @@
 ## 目标
 
 为与 Herdr 原生 Windows Beta 配套运行的 `herdr-pal` 客户端增加 Windows AMD64 支持，
-保持单文件分发、Relay 协议和 Herdr protocol 17 业务逻辑不变。
+保持单文件分发、Relay 协议和 Herdr protocol 17/19 业务逻辑不变。
 
 首期支持范围：
 
@@ -17,7 +17,7 @@
 ## 平台传输
 
 Herdr 在 Unix 使用 Unix Domain Socket，在 Windows 使用 Named Pipe，但两者承载相同的
-NDJSON protocol 17。`HerdrClient` 保留统一的请求、响应和订阅逻辑，只把本地连接建立过程
+NDJSON protocol 17/19。`HerdrClient` 保留统一的请求、响应和订阅逻辑，只把本地连接建立过程
 抽象为平台拨号器。
 
 - Unix：使用 `net.Dialer` 连接 `unix` 地址。

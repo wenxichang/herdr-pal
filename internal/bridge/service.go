@@ -383,7 +383,7 @@ func (s *Service) handleList(ctx context.Context, message im.IncomingText) {
 	if availability == operationReady {
 		snapshot, err := client.Snapshot(ctx)
 		release()
-		if err != nil || snapshot.Protocol != herdr.RequiredProtocol {
+		if err != nil || !herdr.IsSupportedProtocol(snapshot.Protocol) {
 			s.reply(ctx, message.RequestID, unavailableMessage)
 			return
 		}
@@ -1050,6 +1050,10 @@ func (s *Service) captureDirectTerminalImage(
 	snapshot, err := client.Snapshot(ctx)
 	if err != nil {
 		s.logger.Warn("终端图片几何快照读取失败", "pane_id", expected.PaneID, "reason", safeOperationError(err))
+		return directTerminalImageCapture{}, err
+	}
+	if err := herdr.ValidateProtocol(snapshot.Version, snapshot.Protocol); err != nil {
+		s.logger.Warn("终端图片几何快照协议不兼容", "pane_id", expected.PaneID, "reason", safeOperationError(err))
 		return directTerminalImageCapture{}, err
 	}
 	freshRegistry := &session.Registry{}

@@ -810,9 +810,9 @@ func TestSupervisorCurrentStreamEndDegradesAndReconnectsFromFreshBaseline(t *tes
 
 func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 	first := newSupervisorClient()
-	first.checkErr = fmt.Errorf("%w: version 0.6.0, expected 17, got 14", herdr.ErrProtocolMismatch)
+	first.checkErr = fmt.Errorf("%w: version 0.6.0, supported 17 or 19, got 14", herdr.ErrProtocolMismatch)
 	second := newSupervisorClient()
-	second.checkErr = fmt.Errorf("%w: version 0.8.0, expected 17, got 18", herdr.ErrProtocolMismatch)
+	second.checkErr = fmt.Errorf("%w: version 0.8.0-preview, supported 17 or 19, got 18", herdr.ErrProtocolMismatch)
 	lifecycle := newSupervisorStream()
 	status := newSupervisorStream()
 	compatible := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
@@ -831,7 +831,7 @@ func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 		"Herdr 连接周期失败",
 		"stage=check_compatible",
 		"error_type=protocol_mismatch",
-		"reason=\"Herdr 协议版本不匹配: version 0.6.0, expected 17, got 14\"",
+		"reason=\"Herdr 协议版本不匹配: version 0.6.0, supported 17 or 19, got 14\"",
 		"retry_delay=30s",
 	} {
 		if output := logs.String(); !strings.Contains(output, want) {
@@ -868,6 +868,21 @@ func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 		if output := logs.String(); !strings.Contains(output, want) {
 			t.Fatalf("logs = %q, want %q", output, want)
 		}
+	}
+}
+
+func TestSupervisorAcceptsAuditedProtocol19Snapshot(t *testing.T) {
+	want := supervisorSnapshotWithProtocol(herdr.Protocol19, supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))
+	client := newSupervisorClient(want)
+	client.log = &supervisorCallLog{}
+	supervisor := &Supervisor{}
+
+	got, err := supervisor.snapshot(context.Background(), client)
+	if err != nil {
+		t.Fatalf("snapshot() 返回错误：%v", err)
+	}
+	if got.Protocol != herdr.Protocol19 || len(got.Panes) != 1 || got.Panes[0].PaneID != "pane-1" {
+		t.Fatalf("snapshot() = %#v", got)
 	}
 }
 
@@ -1431,7 +1446,7 @@ func serviceAvailable(service *Service) bool {
 }
 
 func supervisorSnapshot(panes ...herdr.Pane) herdr.Snapshot {
-	return supervisorSnapshotWithProtocol(herdr.RequiredProtocol, panes...)
+	return supervisorSnapshotWithProtocol(herdr.Protocol17, panes...)
 }
 
 func supervisorSnapshotWithProtocol(protocol uint32, panes ...herdr.Pane) herdr.Snapshot {

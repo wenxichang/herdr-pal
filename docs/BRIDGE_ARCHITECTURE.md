@@ -178,7 +178,7 @@ Herdr 不可用时向 HPRP 暴露空会话。
 
 `EventSupervisor` 每个健康周期执行：
 
-1. `ping` 并要求 protocol 精确为 17。
+1. `ping` 并要求 protocol 位于已审计允许列表 17、19。
 2. 读取 discovery snapshot。
 3. 建立 pane lifecycle 和 `pane.agent_status_changed` 订阅。
 4. 再读权威 snapshot 消除订阅窗口。

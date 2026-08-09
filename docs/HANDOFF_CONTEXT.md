@@ -43,7 +43,7 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - 不同用户可以使用相同机器标识。连接断开后立即移除该机器和全部会话。
 - Pal 与 Server 使用公开 HPRP/1；不兼容的主版本通过 WebSocket 子协议隔离。
 - 网络只允许 WSS。`skip_verify` 默认开启仅用于受信任内网的自签名证书部署。
-- Herdr 只接受精确 protocol 17，只使用公共 Local Socket API、CLI 和公开 Schema。
+- Herdr 只接受已审计的 protocol 17、19，只使用公共 Local Socket API、CLI 和公开 Schema。
 - 不持久化选择、在线目录、分页、通知或在途命令，不提供离线任务和通知回放。
 - 终端显示模式按用户和完整稳定目标保存在 Server 内存中；OpenCode 默认图片，其他 Agent
   默认文本，Server 重启后恢复默认。
@@ -163,7 +163,7 @@ Bot Secret、OTLP Header、`hpk_...` 和常见认证 Header 在审计入队前�
 
 每个健康周期：
 
-1. `ping`，要求 protocol 精确等于 17。
+1. `ping`，要求 protocol 位于已审计允许列表 17、19。
 2. discovery `session.snapshot`。
 3. 建立 pane lifecycle 订阅。
 4. 为当前 Agent pane 建立 `pane.agent_status_changed` 订阅。

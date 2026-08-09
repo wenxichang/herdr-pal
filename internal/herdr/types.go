@@ -6,9 +6,6 @@ import (
 	"strings"
 )
 
-// RequiredProtocol 是 Herdr Pal 支持的 Herdr Socket API 协议版本，必须与审计的 Schema 精确匹配。
-const RequiredProtocol uint32 = 17
-
 // AgentStatus 表示 Herdr 识别到的 Agent 生命周期状态。
 type AgentStatus string
 

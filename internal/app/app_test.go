@@ -2585,7 +2585,7 @@ func newFakeManagedHerdr() *fakeManagedHerdr {
 	agent := "codex"
 	title := "Agent"
 	return &fakeManagedHerdr{snapshot: herdr.Snapshot{
-		Version: "test", Protocol: herdr.RequiredProtocol,
+		Version: "test", Protocol: herdr.Protocol17,
 		Panes: []herdr.Pane{{
 			PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1",
 			Agent: &agent, Title: &title, AgentStatus: herdr.AgentStatusIdle,

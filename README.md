@@ -593,7 +593,7 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 ### `/ls` 没有会话
 
 - 确认目标机器上的 Herdr 正在运行。
-- 检查 `herdr status server --json` 是否显示 protocol 17。
+- 检查 `herdr status server --json` 是否显示已支持的 protocol 17 或 19。
 - 查看客户端日志是否已经连接 Relay，并成功上报会话。
 - 确认管理员签发 Key 时绑定的 principal ID 与企业微信回调中的用户身份完全一致。
 - 确认客户端使用的是为当前机器签发的完整 Key，且服务端凭据文件没有被覆盖。

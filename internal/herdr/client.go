@@ -119,10 +119,7 @@ func (c *Client) CheckCompatible(ctx context.Context) error {
 	if result.Protocol == nil {
 		return protocolError("pong 响应缺少 protocol")
 	}
-	if *result.Protocol != RequiredProtocol {
-		return fmt.Errorf("%w: version %s, expected %d, got %d", ErrProtocolMismatch, *result.Version, RequiredProtocol, *result.Protocol)
-	}
-	return nil
+	return ValidateProtocol(*result.Version, *result.Protocol)
 }
 
 // Snapshot 读取当前 Herdr 会话的最小快照。

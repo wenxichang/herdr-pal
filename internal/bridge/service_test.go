@@ -106,6 +106,26 @@ func TestServiceImageConRendersFreshVisibleSnapshotAndReadsAuditTextSeparately(t
 	}
 }
 
+func TestServiceDirectImageRejectsUnauditedSnapshotProtocol(t *testing.T) {
+	service, fake := newTestService(t)
+	if err := service.SetTerminalRenderer(&fakeTerminalRenderer{result: terminalimage.Result{PNG: []byte("png"), Width: 80, Height: 34}}); err != nil {
+		t.Fatal(err)
+	}
+	target := service.CurrentTargets()[0]
+	snapshot := testSnapshot()
+	snapshot.Version = "0.8.0-preview"
+	snapshot.Protocol = 18
+	fake.setSnapshot(snapshot)
+
+	_, err := service.captureDirectTerminalImage(context.Background(), fake, target, panel.PageSize)
+	if !errors.Is(err, herdr.ErrProtocolMismatch) {
+		t.Fatalf("captureDirectTerminalImage() error = %v，期望协议不匹配", err)
+	}
+	if got := fake.readSourceCalls(); len(got) != 0 {
+		t.Fatalf("未审计协议仍读取终端：%#v", got)
+	}
+}
+
 func TestServiceImageConReadsAuditOnlyAfterDirectRender(t *testing.T) {
 	service, fake := newTestService(t)
 	recorder := &terminalRecorder{}
@@ -464,6 +484,21 @@ func TestServiceListAndSelectionResetPanel(t *testing.T) {
 	}
 }
 
+func TestServiceListAcceptsAuditedProtocol19Snapshot(t *testing.T) {
+	service, fake := newTestService(t)
+	snapshot := testSnapshot()
+	snapshot.Protocol = herdr.Protocol19
+	snapshot.Workspaces[0].Label = "protocol-19-workspace"
+	fake.setSnapshot(snapshot)
+
+	service.HandleMessage(context.Background(), incoming("list-protocol-19", "/ls"))
+
+	reply := fakeIMFromService(t, service).lastReply()
+	if !strings.Contains(reply, "protocol-19-workspace") || strings.Contains(reply, unavailableMessage) {
+		t.Fatalf("list reply = %q", reply)
+	}
+}
+
 func TestServiceListRefreshesAgentSessionBeforeSelection(t *testing.T) {
 	service, fake := newTestService(t)
 	service.registry.Replace(testSnapshotWithSession("session-old"), false)
@@ -493,7 +528,7 @@ func TestServiceListRefreshesAgentSessionBeforeSelection(t *testing.T) {
 func TestServiceListIncludesStableHierarchyTitleAndCurrentSelection(t *testing.T) {
 	service, fake := newTestService(t)
 	snapshot := herdr.Snapshot{
-		Protocol:   herdr.RequiredProtocol,
+		Protocol:   herdr.Protocol17,
 		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-2", Number: 2, Label: "工作区二"}, {WorkspaceID: "workspace-1", Number: 1, Label: "工作区一"}},
 		Tabs:       []herdr.Tab{{TabID: "tab-2", WorkspaceID: "workspace-2", Number: 2, Label: "标签二"}, {TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "标签一"}},
 		Panes: []herdr.Pane{
@@ -1971,7 +2006,7 @@ func incoming(messageID, content string) wecom.IncomingText {
 
 func testSnapshot() herdr.Snapshot {
 	return herdr.Snapshot{
-		Protocol:   herdr.RequiredProtocol,
+		Protocol:   herdr.Protocol17,
 		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-1", Number: 1, Label: "workspace-1"}},
 		Tabs:       []herdr.Tab{{TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "tab-1"}},
 		Panes:      []herdr.Pane{{PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1", Agent: stringRef("codex"), DisplayAgent: stringRef("Codex"), AgentStatus: herdr.AgentStatusWorking}},

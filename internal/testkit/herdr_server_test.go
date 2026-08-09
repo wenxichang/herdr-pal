@@ -272,7 +272,7 @@ func TestHerdrServerEmitsDecodablePaneStatusEvent(t *testing.T) {
 func testkitSnapshot() herdr.Snapshot {
 	agent := "codex"
 	return herdr.Snapshot{
-		Version: "test", Protocol: herdr.RequiredProtocol,
+		Version: "test", Protocol: herdr.Protocol17,
 		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-1", Number: 1, Label: "workspace"}},
 		Tabs:       []herdr.Tab{{TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "tab"}},
 		Panes: []herdr.Pane{{

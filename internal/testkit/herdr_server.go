@@ -28,7 +28,7 @@ type HerdrCall struct {
 	Params json.RawMessage
 }
 
-// HerdrServer 是只实现 protocol 17 必要公开方法的 Unix NDJSON fake。
+// HerdrServer 是只实现已审计协议必要公开方法的 Unix NDJSON fake。
 type HerdrServer struct {
 	listener net.Listener
 	path     string
@@ -59,11 +59,11 @@ type herdrRequest struct {
 	Params json.RawMessage `json:"params"`
 }
 
-// NewHerdrServer 启动一个测试生命周期内可用的 protocol 17 Unix Socket fake。
+// NewHerdrServer 启动一个测试生命周期内可用的已审计协议 Unix Socket fake。
 func NewHerdrServer(t testing.TB, snapshot herdr.Snapshot) *HerdrServer {
 	t.Helper()
-	if snapshot.Protocol != herdr.RequiredProtocol {
-		t.Fatalf("fake Herdr snapshot protocol = %d, want %d", snapshot.Protocol, herdr.RequiredProtocol)
+	if !herdr.IsSupportedProtocol(snapshot.Protocol) {
+		t.Fatalf("fake Herdr snapshot protocol = %d，未通过兼容门禁", snapshot.Protocol)
 	}
 	directory := t.TempDir()
 	path := filepath.Join(directory, "herdr.sock")
@@ -114,8 +114,8 @@ func (s *HerdrServer) SocketPath() string { return s.path }
 
 // SetSnapshot 原子替换后续 session.snapshot 与 agent.get 使用的状态。
 func (s *HerdrServer) SetSnapshot(snapshot herdr.Snapshot) {
-	if snapshot.Protocol != herdr.RequiredProtocol {
-		panic("fake Herdr 仅支持 protocol 17")
+	if !herdr.IsSupportedProtocol(snapshot.Protocol) {
+		panic("fake Herdr 仅支持已审计协议")
 	}
 	s.mu.Lock()
 	s.snapshot = cloneSnapshot(snapshot)

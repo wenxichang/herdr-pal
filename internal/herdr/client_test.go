@@ -265,11 +265,22 @@ func (d *pipeDialer) ClientConnections() []net.Conn {
 	return append([]net.Conn(nil), d.connections...)
 }
 
-func TestClientCheckCompatibleSendsPingAndAcceptsRequiredProtocol(t *testing.T) {
-	client := newBusinessTestClient(t, `{"type":"pong","version":"0.17.0","protocol":17,"unknown":true}`, businessRequestCheck("ping", map[string]any{}))
+func TestClientCheckCompatibleSendsPingAndAcceptsAuditedProtocols(t *testing.T) {
+	for _, test := range []struct {
+		version  string
+		protocol uint32
+	}{
+		{version: "0.7.5", protocol: Protocol17},
+		{version: "0.8.0", protocol: Protocol19},
+	} {
+		t.Run(test.version, func(t *testing.T) {
+			result := fmt.Sprintf(`{"type":"pong","version":%q,"protocol":%d,"unknown":true}`, test.version, test.protocol)
+			client := newBusinessTestClient(t, result, businessRequestCheck("ping", map[string]any{}))
 
-	if err := client.CheckCompatible(context.Background()); err != nil {
-		t.Fatalf("CheckCompatible() 返回错误：%v", err)
+			if err := client.CheckCompatible(context.Background()); err != nil {
+				t.Fatalf("CheckCompatible() 返回错误：%v", err)
+			}
+		})
 	}
 }
 
@@ -280,8 +291,9 @@ func TestClientCheckCompatibleRejectsInvalidPong(t *testing.T) {
 		match  error
 		parts  []string
 	}{
-		{name: "协议过低", result: `{"type":"pong","version":"0.14.0","protocol":14}`, match: ErrProtocolMismatch, parts: []string{"expected 17", "got 14"}},
-		{name: "协议过高", result: `{"type":"pong","version":"0.18.0","protocol":18}`, match: ErrProtocolMismatch, parts: []string{"expected 17", "got 18"}},
+		{name: "协议过低", result: `{"type":"pong","version":"0.14.0","protocol":14}`, match: ErrProtocolMismatch, parts: []string{"supported 17 or 19", "got 14"}},
+		{name: "未审计中间协议", result: `{"type":"pong","version":"0.8.0-preview","protocol":18}`, match: ErrProtocolMismatch, parts: []string{"supported 17 or 19", "got 18"}},
+		{name: "未知更高协议", result: `{"type":"pong","version":"0.9.0","protocol":20}`, match: ErrProtocolMismatch, parts: []string{"supported 17 or 19", "got 20"}},
 		{name: "缺少 type", result: `{"version":"0.17.0","protocol":17}`, match: ErrProtocol},
 		{name: "type 不匹配", result: `{"type":"ok","version":"0.17.0","protocol":17}`, match: ErrProtocol},
 		{name: "缺少 protocol", result: `{"type":"pong","version":"0.17.0"}`, match: ErrProtocol},

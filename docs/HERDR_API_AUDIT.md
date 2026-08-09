@@ -5,13 +5,16 @@
 本文记录 Herdr Pal 创建前对 Herdr 本地 API 的源码审计结果。
 
 - Herdr 源码目录：`/Users/wxc/Code/herdr`
-- 基线提交：`2a20e90 fix: preserve physical escape on windows`
+- 初始基线提交：`2a20e90 fix: preserve physical escape on windows`
+- 兼容版本：Herdr `v0.7.5`/protocol 17、Herdr `v0.8.0`/protocol 19
 - 审计日期：`2026-07-23`
 - Herdr Pal 实现复核：`2026-07-24`
+- Herdr 0.8.0 兼容复核：`2026-08-09`
 - 本文中的源码路径均相对于 Herdr 仓库根目录。
 
-结论只覆盖该基线源码。运行时应通过 `herdr api schema --json` 检查已安装二进制
-实际支持的协议。
+结论只覆盖上述已审计版本。protocol 19 的升级来自 Herdr 原生客户端键盘事件 wire format，
+Pal 使用的公共 NDJSON API 保持 Schema version 1；运行时仍必须通过协议允许列表拒绝未经
+审计的中间版本和未来版本。
 
 ## 2. 协议和传输
 
@@ -219,7 +222,8 @@ Herdr 提供本地 Socket API：
 
 ### 6.1 Agent target 语义
 
-最新源码与真实 Herdr 0.7.5/protocol 17 联调确认，Agent API 的 `target` 支持：
+真实 Herdr 0.7.5/protocol 17 联调及 Herdr 0.8.0/protocol 19 源码、Schema 对比确认，
+Agent API 的 `target` 支持：
 
 - 当前 session 中的公共 pane ID。
 - 能唯一匹配一个 Agent pane 的 Agent name。
@@ -256,7 +260,7 @@ pane ID 和 Agent name；允许 terminal ID 的 `resolve_terminal_target` 是另
 - 解析并验证目标 Agent。
 - 检查该 Agent 是否仍控制 pane 的前台进程。
 - 根据实时 bracketed-paste 模式编码文本。
-- 自动追加 Enter。
+- 自动追加 Enter；Herdr 0.8.0 会在文本后延迟约 300ms 发送 Enter。
 - 可选地在同一请求中等待 `idle`、`done`、`blocked` 等状态。
 
 实现位于 `src/app/api/agents.rs:58` 和 `src/app/api_helpers.rs:25`。
@@ -278,7 +282,7 @@ pane ID 和 Agent name；允许 terminal ID 的 `resolve_terminal_target` 是另
 ```
 
 Herdr Pal 不显式传 `timeout_ms`，使用 Herdr prompt effect 固定的约 5 秒窗口。成功响应
-必须是包含完整 `AgentInfo` 的 `agent_prompted`，其中 protocol 17 的
+必须是包含完整 `AgentInfo` 的 `agent_prompted`，其中 protocol 17 和 19 的
 `state_change_seq` 用于确认请求提交后确实发生了 Agent 生命周期变化；无变化时 Herdr
 返回 `agent_prompt_stalled`。
 
@@ -462,8 +466,8 @@ IM 显式控制按钮
 
 ## 9. Herdr Pal 当前实现与验证
 
-Herdr Pal 客户端固定 `RequiredProtocol = 17`，每次启动和重连都先调用 `ping` 做精确
-协议门禁。只有门禁通过后才会读取 discovery snapshot、建立 lifecycle/status 订阅并
+Herdr Pal 客户端只允许已审计的 protocol 17 和 19，每次启动和重连都先调用 `ping` 做
+允许列表门禁；protocol 18 和未知版本继续拒绝。只有门禁通过后才会读取 discovery snapshot、建立 lifecycle/status 订阅并
 读取订阅后的权威 snapshot；pane/occupant 集合不稳定时继续重建状态订阅和 snapshot，
 直到订阅计划与快照一致。
 
@@ -475,7 +479,7 @@ Herdr Pal 客户端固定 `RequiredProtocol = 17`，每次启动和重连都先�
 4. 外部没有 cursor，重复 lifecycle、重复状态展示和重复企业微信回调分别由 snapshot
    收敛、状态迁移去重和 `msgid` 幂等处理。
 
-测试目录中的 fake Herdr Server 只实现本文列出的公开 NDJSON protocol 17 子集：
+测试目录中的 fake Herdr Server 只实现本文列出的公开 NDJSON protocol 17/19 子集：
 `ping`、`session.snapshot`、`agent.get`、`agent.read`、`agent.prompt`、
 `agent.send_keys`、`events.subscribe`、事件注入和订阅断线。它不导入、复制或模拟 Herdr
 私有 `AppState`、PTY 或 Rust 模块。
@@ -492,7 +496,7 @@ HERDR_PAL_INTEGRATION=1 \
 go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 ```
 
-测试先执行公共 CLI `herdr status server --json`。只有运行中服务精确返回 protocol 17
+测试先执行公共 CLI `herdr status server --json`。只有运行中服务返回已审计的 protocol 17 或 19
 才继续调用真实 `ping`、`session.snapshot`、`agent.get` 和 `agent.read`，并覆盖
 `herdr-pal -i` 的 `/ls`、`/N`、`/con` 只读路径；企业微信侧不参与，也不需要 Secret。
 
@@ -514,6 +518,7 @@ go test ./internal/integration -run '^TestRealHerdrLivePrompt$' -count=1 -v
 联调。它位于 `/Users/wxc/Code/herdr/target/debug/herdr`，使用
 `~/.config/herdr-dev`；Homebrew Herdr 0.7.1 位于 `/opt/homebrew/bin/herdr`，使用
 `~/.config/herdr`。两套 CLI 的配置目录和 Socket 不同，真实测试必须通过 `PATH` 明确
-选择 debug 二进制。所有测试和运行时仍保持 protocol 精确等于 17 的门禁，不接受“17
-或更高”；输出侧也仍按本文既有结论处理：`revision` 固定为 0，且没有公共
+选择 debug 二进制。2026-08-09 对 Herdr 0.8.0/protocol 19 完成源码与生成 Schema 对比；
+Pal 使用的请求、响应和事件结构没有破坏性变化，但尚未记录真实 0.8.0 输入联调结果。
+运行时只接受显式允许的 17 和 19，并非“17 或更高”；输出侧仍按本文既有结论处理：`revision` 固定为 0，且没有公共
 `pane.output_changed` 输出流。

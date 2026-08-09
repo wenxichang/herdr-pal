@@ -3,7 +3,6 @@ package bridge
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -546,8 +545,8 @@ func (s *Supervisor) snapshot(ctx context.Context, client ManagedHerdr) (herdr.S
 	if err != nil {
 		return herdr.Snapshot{}, err
 	}
-	if snapshot.Protocol != herdr.RequiredProtocol {
-		return herdr.Snapshot{}, fmt.Errorf("%w: version %s, expected %d, got %d", herdr.ErrProtocolMismatch, snapshot.Version, herdr.RequiredProtocol, snapshot.Protocol)
+	if err := herdr.ValidateProtocol(snapshot.Version, snapshot.Protocol); err != nil {
+		return herdr.Snapshot{}, err
 	}
 	return snapshot, nil
 }

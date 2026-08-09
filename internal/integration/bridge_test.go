@@ -544,7 +544,7 @@ func integrationSnapshot(sessionID string, status herdr.AgentStatus) herdr.Snaps
 	title := "实现 Herdr Pal"
 	session := &herdr.AgentSession{Source: "codex", Agent: agent, Kind: "id", Value: sessionID}
 	return herdr.Snapshot{
-		Version: "0.8.0-test", Protocol: herdr.RequiredProtocol,
+		Version: "0.8.0-test", Protocol: herdr.Protocol17,
 		Workspaces: []herdr.Workspace{{WorkspaceID: "workspace-1", Number: 1, Label: "项目"}},
 		Tabs:       []herdr.Tab{{TabID: "tab-1", WorkspaceID: "workspace-1", Number: 1, Label: "开发"}},
 		Panes: []herdr.Pane{{

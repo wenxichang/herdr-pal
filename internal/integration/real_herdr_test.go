@@ -39,14 +39,17 @@ type realHerdrStatus struct {
 
 func TestEvaluateRealHerdrStatus(t *testing.T) {
 	tests := []struct {
-		name      string
-		output    string
-		wantReady bool
-		wantErr   bool
+		name       string
+		output     string
+		wantReady  bool
+		wantErr    bool
+		wantSocket string
 	}{
-		{name: "完整兼容状态通过", output: `{"running":true,"protocol":17,"socket":" /tmp/herdr.sock "}`, wantReady: true},
+		{name: "完整兼容状态通过", output: `{"running":true,"protocol":17,"socket":" /tmp/herdr.sock "}`, wantReady: true, wantSocket: "/tmp/herdr.sock"},
+		{name: "Herdr 0.8 兼容状态通过", output: `{"running":true,"protocol":19,"socket":" /tmp/herdr-08.sock "}`, wantReady: true, wantSocket: "/tmp/herdr-08.sock"},
 		{name: "服务未运行不要求后续字段", output: `{"running":false}`},
 		{name: "协议不兼容不要求 socket", output: `{"running":true,"protocol":14}`},
+		{name: "未审计中间协议不要求 socket", output: `{"running":true,"protocol":18}`},
 		{name: "成功命令返回非法 JSON", output: `{`, wantErr: true},
 		{name: "缺少 running", output: `{"protocol":17,"socket":"/tmp/herdr.sock"}`, wantErr: true},
 		{name: "缺少 protocol", output: `{"running":true,"socket":"/tmp/herdr.sock"}`, wantErr: true},
@@ -62,8 +65,8 @@ func TestEvaluateRealHerdrStatus(t *testing.T) {
 			if ready != test.wantReady {
 				t.Fatalf("evaluateRealHerdrStatus() ready = %t, want %t", ready, test.wantReady)
 			}
-			if test.wantReady && status.Socket != "/tmp/herdr.sock" {
-				t.Fatalf("evaluateRealHerdrStatus() socket = %q, want trimmed path", status.Socket)
+			if test.wantReady && status.Socket != test.wantSocket {
+				t.Fatalf("evaluateRealHerdrStatus() socket = %q, want %q", status.Socket, test.wantSocket)
 			}
 		})
 	}
@@ -241,7 +244,7 @@ func requireRealHerdr(t *testing.T) realHerdrFixture {
 		t.Fatalf("Herdr 公共 CLI 状态响应无效：%v", err)
 	}
 	if !ready {
-		t.Skipf("已安装 Herdr 尚未满足真实联调门禁：running=%t protocol=%d，需要 protocol=%d", status.Running, status.Protocol, herdr.RequiredProtocol)
+		t.Skipf("已安装 Herdr 尚未满足真实联调门禁：running=%t protocol=%d，需要已审计协议 17 或 19", status.Running, status.Protocol)
 	}
 
 	client := herdr.NewClient(status.Socket, nil, 5*time.Second)
@@ -252,8 +255,8 @@ func requireRealHerdr(t *testing.T) realHerdrFixture {
 	if err != nil {
 		t.Fatalf("真实 Herdr Snapshot() error = %v", err)
 	}
-	if snapshot.Protocol != herdr.RequiredProtocol {
-		t.Fatalf("真实 Herdr snapshot protocol = %d, want %d", snapshot.Protocol, herdr.RequiredProtocol)
+	if !herdr.IsSupportedProtocol(snapshot.Protocol) {
+		t.Fatalf("真实 Herdr snapshot protocol = %d，未通过兼容门禁", snapshot.Protocol)
 	}
 	return realHerdrFixture{ctx: ctx, socketPath: status.Socket, client: client, snapshot: snapshot}
 }
@@ -278,7 +281,7 @@ func evaluateRealHerdrStatus(output []byte) (realHerdrStatus, bool, error) {
 		return realHerdrStatus{}, false, errors.New("运行中的服务缺少 protocol 必填字段")
 	}
 	status.Protocol = *wire.Protocol
-	if status.Protocol != herdr.RequiredProtocol {
+	if !herdr.IsSupportedProtocol(status.Protocol) {
 		return status, false, nil
 	}
 	if wire.Socket == nil {
