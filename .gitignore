@@ -12,4 +12,5 @@ coverage.out
 *.tmp
 .tmp/
 tmp/
+.worktrees/
 docs/superpowers/
