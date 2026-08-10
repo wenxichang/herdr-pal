@@ -128,6 +128,102 @@ func TestMachineRegistrationEndToEndRejectsPendingRequest(t *testing.T) {
 	}
 }
 
+func TestMachineRegistrationWeComApprovalAndRejectionFlow(t *testing.T) {
+	harness := newHPAPHarnessWithRegistrationAdmins(t, []string{"registration-admin-a", "registration-admin-b"})
+	defer harness.stop(t)
+	const principalID = "registration-wecom-user"
+	if logs := harness.logs.String(); !strings.Contains(logs, "registration_admin_count=2") {
+		t.Fatalf("startup logs = %q, want registration admin count", logs)
+	}
+
+	firstReply := harness.sendText(t, "registration-wecom-first", principalID, "/reg office 127.0.0.1")
+	registrationKeyFromContent(t, firstReply)
+
+	pendingReply := harness.sendText(t, "registration-wecom-second", principalID, "/reg mobile 127.0.0.2")
+	if !strings.Contains(pendingReply, "等待管理员审批") {
+		t.Fatalf("pending reply = %q", pendingReply)
+	}
+	pushes := harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
+	if push := pushes[len(pushes)-1]; push.ChatID != "registration-admin-a" || !strings.Contains(push.Content, "mobile") || !strings.Contains(push.Content, "/ls-reg") {
+		t.Fatalf("first admin notification = %#v", push)
+	}
+
+	listReply := harness.sendText(t, "registration-wecom-list-a", "registration-admin-a", "/ls-reg")
+	for _, want := range []string{"1. 用户：" + principalID, "机器：mobile", "来源：127.0.0.2"} {
+		if !strings.Contains(listReply, want) {
+			t.Fatalf("list reply = %q, want %q", listReply, want)
+		}
+	}
+	approveReply := harness.sendText(t, "registration-wecom-approve", "registration-admin-a", "/apr 1")
+	if !strings.Contains(approveReply, "已批准") || !strings.Contains(approveReply, registrationSnapshotReminderForTest) {
+		t.Fatalf("approve reply = %q", approveReply)
+	}
+	pushes = harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+	if push := pushes[len(pushes)-1]; push.ChatID != principalID || !strings.Contains(push.Content, "机器 Key") {
+		t.Fatalf("approval key push = %#v", push)
+	}
+	staleReply := harness.sendText(t, "registration-wecom-approve-stale", "registration-admin-a", "/apr 1")
+	if !strings.Contains(staleReply, "先执行 /ls-reg") || !strings.Contains(staleReply, registrationSnapshotReminderForTest) {
+		t.Fatalf("stale approve reply = %q", staleReply)
+	}
+
+	thirdReply := harness.sendText(t, "registration-wecom-third", principalID, "/reg laptop 127.0.0.3")
+	if !strings.Contains(thirdReply, "等待管理员审批") {
+		t.Fatalf("third registration reply = %q", thirdReply)
+	}
+	pushes = harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 3)
+	if push := pushes[len(pushes)-1]; push.ChatID != "registration-admin-b" || !strings.Contains(push.Content, "laptop") {
+		t.Fatalf("second admin notification = %#v", push)
+	}
+	if reply := harness.sendText(t, "registration-wecom-list-b", "registration-admin-b", "/ls-reg"); !strings.Contains(reply, "机器：laptop") {
+		t.Fatalf("second list reply = %q", reply)
+	}
+	rejectReply := harness.sendText(t, "registration-wecom-reject", "registration-admin-b", "/rej 1")
+	if !strings.Contains(rejectReply, "已驳回") || !strings.Contains(rejectReply, registrationSnapshotReminderForTest) {
+		t.Fatalf("reject reply = %q", rejectReply)
+	}
+	pushes = harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 4)
+	if push := pushes[len(pushes)-1]; push.ChatID != principalID || !strings.Contains(push.Content, "已驳回") || !strings.Contains(push.Content, "laptop") {
+		t.Fatalf("rejection push = %#v", push)
+	}
+}
+
+func TestMachineRegistrationWeComApprovalRejectsSnapshotChangedByWeb(t *testing.T) {
+	harness := newHPAPHarnessWithRegistrationAdmins(t, []string{"registration-admin"})
+	defer harness.stop(t)
+	const principalID = "registration-race-user"
+
+	registrationKeyFromContent(t, harness.sendText(t, "registration-race-first", principalID, "/reg office 127.0.0.1"))
+	if reply := harness.sendText(t, "registration-race-second", principalID, "/reg mobile 127.0.0.2"); !strings.Contains(reply, "等待管理员审批") {
+		t.Fatalf("pending reply = %q", reply)
+	}
+	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
+	if reply := harness.sendText(t, "registration-race-list", "registration-admin", "/ls-reg"); !strings.Contains(reply, "机器：mobile") {
+		t.Fatalf("list reply = %q", reply)
+	}
+
+	admin := newIntegrationWebAdmin(t, harness)
+	pending := admin.listRegistrations(t)
+	if len(pending) != 1 {
+		t.Fatalf("pending = %#v", pending)
+	}
+	approved := admin.approve(t, pending[0].RegistrationID, http.StatusOK)
+	if !approved.Approved {
+		t.Fatalf("approved = %#v", approved)
+	}
+	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+
+	reply := harness.sendText(t, "registration-race-stale-approve", "registration-admin", "/apr 1")
+	if !strings.Contains(reply, "列表已变化") || !strings.Contains(reply, registrationSnapshotReminderForTest) {
+		t.Fatalf("stale approval reply = %q", reply)
+	}
+	if pending = admin.listRegistrations(t); len(pending) != 0 {
+		t.Fatalf("pending after stale approval = %#v", pending)
+	}
+}
+
+const registrationSnapshotReminderForTest = "列表快照已失效，请重新执行 /ls-reg 核实当前条目顺序。"
+
 var integrationRegistrationKeyPattern = regexp.MustCompile(`\bhpk_[0-9]+_[A-Za-z0-9_-]{20,}\b`)
 
 func registrationKeyFromContent(t *testing.T, content string) string {

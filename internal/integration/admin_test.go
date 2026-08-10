@@ -348,6 +348,10 @@ type hpapHarness struct {
 }
 
 func newHPAPHarness(t *testing.T) *hpapHarness {
+	return newHPAPHarnessWithRegistrationAdmins(t, nil)
+}
+
+func newHPAPHarnessWithRegistrationAdmins(t *testing.T, registrationAdminIDs []string) *hpapHarness {
 	t.Helper()
 	stateDir, err := os.MkdirTemp("/tmp", "hp-hpap-")
 	if err != nil {
@@ -362,8 +366,20 @@ func newHPAPHarness(t *testing.T) *hpapHarness {
 	secret := fmt.Sprintf("secret-hpap-%d", time.Now().UnixNano())
 	weComServer := testkit.NewWeComServer(t, botID, secret)
 	configPath := filepath.Join(t.TempDir(), "server.json")
-	raw := fmt.Sprintf(`{"wecom":{"bot_id":%q,"secret":%q},"server":{"listen":%q,"state_dir":%q},"admin":{"listen":"127.0.0.1:0"},"rate_limit":{"per_second":0,"per_minute":0},"log":{"level":"debug"}}`, botID, secret, listenAddress, stateDir)
-	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+	configData, err := json.Marshal(map[string]any{
+		"wecom": map[string]any{
+			"bot_id": botID, "secret": secret,
+			"registration_admin_ids": append([]string(nil), registrationAdminIDs...),
+		},
+		"server":     map[string]any{"listen": listenAddress, "state_dir": stateDir},
+		"admin":      map[string]any{"listen": "127.0.0.1:0"},
+		"rate_limit": map[string]any{"per_second": 0, "per_minute": 0},
+		"log":        map[string]any{"level": "debug"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	logs := &lockedHPAPBuffer{}

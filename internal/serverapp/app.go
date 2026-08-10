@@ -168,6 +168,19 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("创建机器注册服务: %w", err)
 	}
+	keyDelivery := registrationKeyDelivery(weComClient)
+	rejectionDelivery := registrationRejectionDelivery(weComClient)
+	registrationApproval, err := server.NewRegistrationApprovalCoordinator(server.RegistrationApprovalCoordinatorConfig{
+		AdminIDs:          loaded.WeCom.RegistrationAdminIDs,
+		Registrations:     registrationService,
+		Gateway:           weComClient,
+		KeyDelivery:       keyDelivery,
+		RejectionDelivery: rejectionDelivery,
+		Logger:            logger,
+	})
+	if err != nil {
+		return fmt.Errorf("创建企业微信注册审批协调器: %w", err)
+	}
 	catalog := server.NewSessionCatalog()
 	hub, err := server.NewClientHub(catalog, credentialStore, server.HubConfig{}, logger)
 	if err != nil {
@@ -183,6 +196,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			RateLimiter:  server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
 			Auditor:      businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
 			RegistrationRequester: registrationService,
+			RegistrationApproval:  registrationApproval,
 		},
 		catalog, server.NewUserExecutor(64), weComClient, hub, deduper, logger,
 	)
@@ -228,8 +242,8 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		Sessions:          catalog,
 		Runtime:           runtimeInspector,
 		Registrations:     registrationService,
-		KeyDelivery:       registrationKeyDelivery(weComClient),
-		RejectionDelivery: registrationRejectionDelivery(weComClient),
+		KeyDelivery:       keyDelivery,
+		RejectionDelivery: rejectionDelivery,
 		Now:               time.Now,
 	})
 	if err != nil {
@@ -316,6 +330,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		"verbose", options.Verbose,
 		"rate_limit_per_second", loaded.RateLimit.PerSecond,
 		"rate_limit_per_minute", loaded.RateLimit.PerMinute,
+		"registration_admin_count", len(loaded.WeCom.RegistrationAdminIDs),
 		"audit_type", loaded.Audit.Type,
 		"audit_stderr", loaded.Audit.Stderr,
 	)
