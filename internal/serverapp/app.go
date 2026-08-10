@@ -412,7 +412,7 @@ func runWeComEventLoop(ctx context.Context, weCom weComRuntime, router *server.C
 			if !ok {
 				return errors.New("企业微信事件流已关闭")
 			}
-			router.Handle(ctx, message)
+			router.Dispatch(ctx, message)
 		}
 	}
 }

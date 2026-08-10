@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wenxichang/herdr-pal/internal/audit"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
 const serverLogReasonLimit = 240
+
+var serverErrorRedactor = audit.NewRedactor(nil)
 
 func serverErrorLogArgs(err error) []any {
 	args := []any{"error_type", serverErrorType(err), "reason", safeServerErrorReason(err)}
@@ -79,6 +82,7 @@ func safeServerErrorReason(err error) string {
 		return "无错误"
 	}
 	reason := strings.NewReplacer("\r", " ", "\n", " ", "\x00", "").Replace(strings.ToValidUTF8(err.Error(), "�"))
+	reason = serverErrorRedactor.Redact(reason)
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "错误未提供原因"

@@ -5,19 +5,278 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/adminserver"
 	"github.com/wenxichang/herdr-pal/internal/audit"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
+	"github.com/wenxichang/herdr-pal/internal/im"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
+	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/server"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
+
+func TestRunWeComEventLoopDoesNotBlockOtherUsers(t *testing.T) {
+	weCom := &eventLoopWeCom{events: make(chan im.IncomingText, 2)}
+	approval := newBlockingRegistrationApproval("admin-a")
+	gateway := newEventLoopGateway()
+	router := newEventLoopRouter(t, gateway, approval)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runWeComEventLoop(ctx, weCom, router) }()
+	t.Cleanup(func() {
+		approval.releaseOnce()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("runWeComEventLoop did not stop")
+		}
+	})
+
+	weCom.events <- eventLoopMessage("request-admin", "message-admin", "admin-a", "/apr 1")
+	approval.waitStarted(t)
+	weCom.events <- eventLoopMessage("request-user", "message-user", "user-b", "/help")
+
+	if !gateway.waitForRequest("request-user", 300*time.Millisecond) {
+		t.Fatal("other user was blocked by slow approval")
+	}
+}
+
+func TestRunWeComEventLoopKeepsSameUserSerialized(t *testing.T) {
+	weCom := &eventLoopWeCom{events: make(chan im.IncomingText, 2)}
+	approval := newBlockingRegistrationApproval("admin-a")
+	gateway := newEventLoopGateway()
+	router := newEventLoopRouter(t, gateway, approval)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runWeComEventLoop(ctx, weCom, router) }()
+	t.Cleanup(func() {
+		approval.releaseOnce()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("runWeComEventLoop did not stop")
+		}
+	})
+
+	weCom.events <- eventLoopMessage("request-first", "message-first", "admin-a", "/apr 1")
+	approval.waitStarted(t)
+	weCom.events <- eventLoopMessage("request-second", "message-second", "admin-a", "/help")
+	if gateway.waitForRequest("request-second", 100*time.Millisecond) {
+		t.Fatal("same user message bypassed serialized executor")
+	}
+	approval.releaseOnce()
+	if !gateway.waitForRequest("request-second", time.Second) {
+		t.Fatal("same user queued message was not processed after release")
+	}
+}
+
+func TestRunWeComEventLoopQueueFullDoesNotBlockOtherUsers(t *testing.T) {
+	weCom := &eventLoopWeCom{events: make(chan im.IncomingText, 3)}
+	approval := newBlockingRegistrationApproval("admin-a")
+	gateway := newEventLoopGateway()
+	releaseBlockedResponse := gateway.blockResponse("request-overflow")
+	router := newEventLoopRouterWithCapacity(t, gateway, approval, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runWeComEventLoop(ctx, weCom, router) }()
+	t.Cleanup(func() {
+		approval.releaseOnce()
+		releaseBlockedResponse()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("runWeComEventLoop did not stop")
+		}
+	})
+
+	weCom.events <- eventLoopMessage("request-first", "message-first", "admin-a", "/apr 1")
+	approval.waitStarted(t)
+	weCom.events <- eventLoopMessage("request-overflow", "message-overflow", "admin-a", "/help")
+	weCom.events <- eventLoopMessage("request-user", "message-user", "user-b", "/help")
+	if !gateway.waitForRequest("request-user", 300*time.Millisecond) {
+		t.Fatal("queue-full handling blocked another user")
+	}
+}
+
+type eventLoopWeCom struct {
+	events chan im.IncomingText
+}
+
+func (*eventLoopWeCom) Run(context.Context) error { return nil }
+
+func (runtime *eventLoopWeCom) Events() <-chan im.IncomingText { return runtime.events }
+
+type eventLoopGateway struct {
+	mu               sync.Mutex
+	requests         map[string]chan struct{}
+	blockedRequestID string
+	blockedResponse  chan struct{}
+	blockedOnce      sync.Once
+}
+
+func newEventLoopGateway() *eventLoopGateway {
+	return &eventLoopGateway{requests: make(map[string]chan struct{})}
+}
+
+func (gateway *eventLoopGateway) RespondMarkdown(_ context.Context, requestID, _ string) error {
+	gateway.mu.Lock()
+	blocked := requestID == gateway.blockedRequestID
+	blockedResponse := gateway.blockedResponse
+	gateway.mu.Unlock()
+	if blocked && blockedResponse != nil {
+		<-blockedResponse
+	}
+	gateway.mu.Lock()
+	channel := gateway.requests[requestID]
+	if channel == nil {
+		channel = make(chan struct{})
+		gateway.requests[requestID] = channel
+	}
+	select {
+	case <-channel:
+	default:
+		close(channel)
+	}
+	gateway.mu.Unlock()
+	return nil
+}
+
+func (gateway *eventLoopGateway) blockResponse(requestID string) func() {
+	gateway.mu.Lock()
+	gateway.blockedRequestID = requestID
+	gateway.blockedResponse = make(chan struct{})
+	channel := gateway.blockedResponse
+	gateway.mu.Unlock()
+	return func() {
+		gateway.blockedOnce.Do(func() { close(channel) })
+	}
+}
+
+func (*eventLoopGateway) SendMarkdownTo(context.Context, string, string) error { return nil }
+
+func (gateway *eventLoopGateway) waitForRequest(requestID string, timeout time.Duration) bool {
+	gateway.mu.Lock()
+	channel := gateway.requests[requestID]
+	if channel == nil {
+		channel = make(chan struct{})
+		gateway.requests[requestID] = channel
+	}
+	gateway.mu.Unlock()
+	select {
+	case <-channel:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+type blockingRegistrationApproval struct {
+	adminID string
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingRegistrationApproval(adminID string) *blockingRegistrationApproval {
+	return &blockingRegistrationApproval{adminID: adminID, started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (approval *blockingRegistrationApproval) IsAdmin(userID string) bool {
+	return userID == approval.adminID
+}
+
+func (*blockingRegistrationApproval) NotifyPending(context.Context, machinereg.Request) error {
+	return nil
+}
+
+func (*blockingRegistrationApproval) PrepareList(string) (server.RegistrationApprovalList, error) {
+	return server.RegistrationApprovalList{}, nil
+}
+
+func (*blockingRegistrationApproval) CommitList(string, server.RegistrationApprovalList) error {
+	return nil
+}
+
+func (approval *blockingRegistrationApproval) Approve(context.Context, string, []int) (string, error) {
+	select {
+	case <-approval.started:
+	default:
+		close(approval.started)
+	}
+	<-approval.release
+	return "批准完成", nil
+}
+
+func (*blockingRegistrationApproval) Reject(context.Context, string, []int) (string, error) {
+	return "驳回完成", nil
+}
+
+func (*blockingRegistrationApproval) Invalidate(string) error { return nil }
+
+func (approval *blockingRegistrationApproval) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-approval.started:
+	case <-time.After(time.Second):
+		t.Fatal("approval did not start")
+	}
+}
+
+func (approval *blockingRegistrationApproval) releaseOnce() {
+	approval.once.Do(func() { close(approval.release) })
+}
+
+type eventLoopRelay struct{}
+
+func (eventLoopRelay) Select(context.Context, string, hprp.Target) error { return nil }
+
+func (eventLoopRelay) Execute(context.Context, string, hprp.Target, im.IncomingText) (server.RelayExecution, error) {
+	return server.RelayExecution{}, nil
+}
+
+func (eventLoopRelay) SupportsCapability(string, hprp.Target, string) bool { return false }
+
+func (eventLoopRelay) FetchTerminalSnapshot(context.Context, string, hprp.Target, hprp.OutputMode, int) (hprp.TerminalSnapshotResult, error) {
+	return hprp.TerminalSnapshotResult{}, nil
+}
+
+func newEventLoopRouter(t *testing.T, gateway server.WeComGateway, approval server.RegistrationApprovalHandler) *server.ConversationRouter {
+	return newEventLoopRouterWithCapacity(t, gateway, approval, 64)
+}
+
+func newEventLoopRouterWithCapacity(t *testing.T, gateway server.WeComGateway, approval server.RegistrationApprovalHandler, capacity int) *server.ConversationRouter {
+	t.Helper()
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := server.NewConversationRouterWithConfig(
+		server.ConversationRouterConfig{RegistrationApproval: approval},
+		server.NewSessionCatalog(), server.NewUserExecutor(capacity), gateway, eventLoopRelay{}, deduper,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return router
+}
+
+func eventLoopMessage(requestID, messageID, userID, content string) im.IncomingText {
+	return im.IncomingText{RequestID: requestID, MessageID: messageID, UserID: userID, ChatType: "single", Content: content}
+}
 
 func TestRedactServerRunErrorPreservesCauseAndRemovesConfiguredSecret(t *testing.T) {
 	original := fmt.Errorf("%w: upstream rejected configured-secret", ErrConfig)

@@ -188,6 +188,51 @@ func TestLoadServerRejectsInvalidRegistrationAdminIDs(t *testing.T) {
 	}
 }
 
+func TestLoadServerRejectsNonArrayRegistrationAdminIDs(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "string", value: `"admin-a"`},
+		{name: "object", value: `{"id":"admin-a"}`},
+		{name: "number", value: `1`},
+		{name: "null", value: `null`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeConfig(t, `{
+  "wecom": {
+    "bot_id": "bot",
+    "secret": "secret",
+    "registration_admin_ids": `+test.value+`
+  },
+  "server": {"listen": "127.0.0.1:9443"},
+  "log": {}
+}`)
+			_, err := LoadServer(path, func(string) string { return "" })
+			if err == nil || !strings.Contains(err.Error(), "registration_admin_ids") {
+				t.Fatalf("LoadServer(%s) error = %v, want registration_admin_ids", test.value, err)
+			}
+		})
+	}
+}
+
+func TestLoadServerRejectsUnknownWeComFieldWithRegistrationAdmins(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom": {
+    "bot_id": "bot",
+    "secret": "secret",
+    "registration_admin_ids": ["admin-a"],
+    "unknown": true
+  },
+  "server": {"listen": "127.0.0.1:9443"},
+  "log": {}
+}`)
+	if _, err := LoadServer(path, func(string) string { return "" }); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("LoadServer() error = %v, want unknown field rejection", err)
+	}
+}
+
 func TestLoadServerRejectsRemovedAddrHint(t *testing.T) {
 	path := writeConfig(t, `{
   "wecom":{"bot_id":"bot","secret":"secret"},

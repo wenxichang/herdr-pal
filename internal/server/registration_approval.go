@@ -27,7 +27,10 @@ var (
 	ErrRegistrationApprovalInvalidIndexes = errors.New("注册审批编号无效")
 )
 
-const registrationApprovalSnapshotReminder = "列表快照已失效，请重新执行 /ls-reg 核实当前条目顺序。"
+const (
+	registrationApprovalSnapshotReminder = "列表快照已失效，请重新执行 /ls-reg 核实当前条目顺序。"
+	maxRegistrationApprovalBatch         = 10
+)
 
 // RegistrationApprovalManager 提供注册审批协调器需要的稳定申请列表和单项决策能力。
 type RegistrationApprovalManager interface {
@@ -40,7 +43,8 @@ type RegistrationApprovalManager interface {
 type RegistrationApprovalHandler interface {
 	IsAdmin(string) bool
 	NotifyPending(context.Context, machinereg.Request) error
-	List(string) (string, error)
+	PrepareList(string) (RegistrationApprovalList, error)
+	CommitList(string, RegistrationApprovalList) error
 	Approve(context.Context, string, []int) (string, error)
 	Reject(context.Context, string, []int) (string, error)
 	Invalidate(string) error
@@ -75,6 +79,13 @@ type registrationApprovalSelection struct {
 	index          int
 	registrationID string
 	machineID      string
+}
+
+// RegistrationApprovalList 是尚未提交给管理员的待审批列表候选快照。
+type RegistrationApprovalList struct {
+	adminID         string
+	content         string
+	registrationIDs []string
 }
 
 // NewRegistrationApprovalCoordinator 创建企业微信注册审批协调器。
@@ -150,20 +161,30 @@ func (coordinator *RegistrationApprovalCoordinator) NotifyPending(ctx context.Co
 	return nil
 }
 
-// List 返回当前待审批列表，并替换该管理员最近一次临时编号快照。
-func (coordinator *RegistrationApprovalCoordinator) List(adminID string) (string, error) {
+// PrepareList 生成待审批列表，但不会在管理员完整收到内容前启用编号快照。
+func (coordinator *RegistrationApprovalCoordinator) PrepareList(adminID string) (RegistrationApprovalList, error) {
 	if !coordinator.IsAdmin(adminID) {
-		return "", ErrRegistrationApprovalUnauthorized
+		return RegistrationApprovalList{}, ErrRegistrationApprovalUnauthorized
 	}
 	requests := coordinator.registrations.ListPending()
 	registrationIDs := make([]string, len(requests))
 	for index, request := range requests {
 		registrationIDs[index] = request.RegistrationID
 	}
+	return RegistrationApprovalList{
+		adminID: adminID, content: formatPendingRegistrationApprovals(requests), registrationIDs: registrationIDs,
+	}, nil
+}
+
+// CommitList 在列表完整送达后启用该管理员的临时编号快照。
+func (coordinator *RegistrationApprovalCoordinator) CommitList(adminID string, list RegistrationApprovalList) error {
+	if !coordinator.IsAdmin(adminID) || list.adminID != adminID {
+		return ErrRegistrationApprovalUnauthorized
+	}
 	coordinator.mu.Lock()
-	coordinator.snapshots[adminID] = registrationIDs
+	coordinator.snapshots[adminID] = append([]string(nil), list.registrationIDs...)
 	coordinator.mu.Unlock()
-	return formatPendingRegistrationApprovals(requests), nil
+	return nil
 }
 
 // Invalidate 清除管理员最近一次待审批列表快照。
@@ -267,7 +288,7 @@ func (coordinator *RegistrationApprovalCoordinator) logDecisionFailure(action, a
 }
 
 func validRegistrationApprovalIndexes(indexes []int) bool {
-	if len(indexes) == 0 {
+	if len(indexes) == 0 || len(indexes) > maxRegistrationApprovalBatch {
 		return false
 	}
 	seen := make(map[int]struct{}, len(indexes))

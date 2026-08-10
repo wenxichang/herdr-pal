@@ -15,6 +15,7 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/adminproto"
 	"github.com/wenxichang/herdr-pal/internal/adminservice"
+	"github.com/wenxichang/herdr-pal/internal/machinereg"
 )
 
 func TestMachineRegistrationEndToEndAutoIssueApproveAndRollback(t *testing.T) {
@@ -188,6 +189,105 @@ func TestMachineRegistrationWeComApprovalAndRejectionFlow(t *testing.T) {
 	}
 }
 
+func TestMachineRegistrationWeComApprovalDeliveryFailureKeepsPending(t *testing.T) {
+	harness := newHPAPHarnessWithRegistrationAdmins(t, []string{"registration-admin"})
+	defer harness.stop(t)
+	const principalID = "registration-delivery-failure-user"
+
+	registrationKeyFromContent(t, harness.sendText(t, "registration-delivery-first", principalID, "/reg office 127.0.0.1"))
+	if reply := harness.sendText(t, "registration-delivery-second", principalID, "/reg mobile 127.0.0.2"); !strings.Contains(reply, "等待管理员审批") {
+		t.Fatalf("pending reply = %q", reply)
+	}
+	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
+	if reply := harness.sendText(t, "registration-delivery-list", "registration-admin", "/ls-reg"); !strings.Contains(reply, "机器：mobile") {
+		t.Fatalf("list reply = %q", reply)
+	}
+
+	harness.wecom.SetResponseError("aibot_send_msg", 93000)
+	t.Cleanup(func() { harness.wecom.SetResponseError("aibot_send_msg", 0) })
+	reply := harness.sendText(t, "registration-delivery-approve", "registration-admin", "/apr 1")
+	if !strings.Contains(reply, "Key 交付失败，申请仍保留") || !strings.Contains(reply, registrationSnapshotReminderForTest) {
+		t.Fatalf("approve reply = %q", reply)
+	}
+	harness.wecom.WaitRequestCount(t, "aibot_send_msg", 2)
+
+	admin := newIntegrationWebAdmin(t, harness)
+	pending := admin.listRegistrations(t)
+	if len(pending) != 1 || pending[0].MachineID != "mobile" {
+		t.Fatalf("pending after failed delivery = %#v", pending)
+	}
+	keys, err := harness.admin.ListKeys(context.Background(), adminproto.KeyListParams{})
+	if err != nil || len(keys.Items) != 1 || keys.Items[0].PrincipalID != principalID || keys.Items[0].MachineID != "office" {
+		t.Fatalf("keys after failed delivery = %#v, err=%v", keys, err)
+	}
+	if stale := harness.sendText(t, "registration-delivery-stale", "registration-admin", "/apr 1"); !strings.Contains(stale, "先执行 /ls-reg") {
+		t.Fatalf("stale approval reply = %q", stale)
+	}
+	harness.wecom.SetResponseError("aibot_send_msg", 0)
+	harness.stopServerForRestart(t)
+	harness.restartServer(t)
+	harness.wecom.WaitSubscribeCount(t, 2)
+	registrationStore, err := machinereg.LoadStore(filepath.Join(harness.stateDir, "registrations.json"), machinereg.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedPending := registrationStore.List()
+	if len(persistedPending) != 1 || persistedPending[0].MachineID != "mobile" {
+		t.Fatalf("pending after restart = %#v", persistedPending)
+	}
+	keys, err = harness.admin.ListKeys(context.Background(), adminproto.KeyListParams{})
+	if err != nil || len(keys.Items) != 1 || keys.Items[0].MachineID != "office" {
+		t.Fatalf("keys after restart = %#v, err=%v", keys, err)
+	}
+}
+
+func TestMachineRegistrationWeComRejectNotificationFailureStillRemovesPending(t *testing.T) {
+	harness := newHPAPHarnessWithRegistrationAdmins(t, []string{"registration-admin"})
+	defer harness.stop(t)
+	const principalID = "registration-reject-notification-user"
+
+	registrationKeyFromContent(t, harness.sendText(t, "registration-reject-notify-first", principalID, "/reg office 127.0.0.1"))
+	if reply := harness.sendText(t, "registration-reject-notify-second", principalID, "/reg mobile 127.0.0.2"); !strings.Contains(reply, "等待管理员审批") {
+		t.Fatalf("pending reply = %q", reply)
+	}
+	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
+	if reply := harness.sendText(t, "registration-reject-notify-list", "registration-admin", "/ls-reg"); !strings.Contains(reply, "机器：mobile") {
+		t.Fatalf("list reply = %q", reply)
+	}
+
+	harness.wecom.SetResponseError("aibot_send_msg", 93000)
+	t.Cleanup(func() { harness.wecom.SetResponseError("aibot_send_msg", 0) })
+	reply := harness.sendText(t, "registration-reject-notify-reject", "registration-admin", "/rej 1")
+	if !strings.Contains(reply, "已驳回，但申请人通知发送失败") || !strings.Contains(reply, registrationSnapshotReminderForTest) {
+		t.Fatalf("reject reply = %q", reply)
+	}
+	harness.wecom.WaitRequestCount(t, "aibot_send_msg", 2)
+
+	admin := newIntegrationWebAdmin(t, harness)
+	if pending := admin.listRegistrations(t); len(pending) != 0 {
+		t.Fatalf("pending after rejection = %#v", pending)
+	}
+	keys, err := harness.admin.ListKeys(context.Background(), adminproto.KeyListParams{})
+	if err != nil || len(keys.Items) != 1 || keys.Items[0].PrincipalID != principalID || keys.Items[0].MachineID != "office" {
+		t.Fatalf("keys after rejection = %#v, err=%v", keys, err)
+	}
+	harness.wecom.SetResponseError("aibot_send_msg", 0)
+	harness.stopServerForRestart(t)
+	harness.restartServer(t)
+	harness.wecom.WaitSubscribeCount(t, 2)
+	registrationStore, err := machinereg.LoadStore(filepath.Join(harness.stateDir, "registrations.json"), machinereg.StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending := registrationStore.List(); len(pending) != 0 {
+		t.Fatalf("pending after restart = %#v", pending)
+	}
+	keys, err = harness.admin.ListKeys(context.Background(), adminproto.KeyListParams{})
+	if err != nil || len(keys.Items) != 1 || keys.Items[0].MachineID != "office" {
+		t.Fatalf("keys after restart = %#v, err=%v", keys, err)
+	}
+}
+
 func TestMachineRegistrationWeComApprovalRejectsSnapshotChangedByWeb(t *testing.T) {
 	harness := newHPAPHarnessWithRegistrationAdmins(t, []string{"registration-admin"})
 	defer harness.stop(t)
@@ -197,28 +297,35 @@ func TestMachineRegistrationWeComApprovalRejectsSnapshotChangedByWeb(t *testing.
 	if reply := harness.sendText(t, "registration-race-second", principalID, "/reg mobile 127.0.0.2"); !strings.Contains(reply, "等待管理员审批") {
 		t.Fatalf("pending reply = %q", reply)
 	}
-	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 1)
-	if reply := harness.sendText(t, "registration-race-list", "registration-admin", "/ls-reg"); !strings.Contains(reply, "机器：mobile") {
+	if reply := harness.sendText(t, "registration-race-third", principalID, "/reg laptop 127.0.0.3"); !strings.Contains(reply, "等待管理员审批") {
+		t.Fatalf("second pending reply = %q", reply)
+	}
+	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+	if reply := harness.sendText(t, "registration-race-list", "registration-admin", "/ls-reg"); !strings.Contains(reply, "1. 用户："+principalID) || !strings.Contains(reply, "机器：mobile") || !strings.Contains(reply, "机器：laptop") {
 		t.Fatalf("list reply = %q", reply)
 	}
 
 	admin := newIntegrationWebAdmin(t, harness)
 	pending := admin.listRegistrations(t)
-	if len(pending) != 1 {
+	if len(pending) != 2 || pending[0].MachineID != "mobile" || pending[1].MachineID != "laptop" {
 		t.Fatalf("pending = %#v", pending)
 	}
 	approved := admin.approve(t, pending[0].RegistrationID, http.StatusOK)
 	if !approved.Approved {
 		t.Fatalf("approved = %#v", approved)
 	}
-	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 2)
+	harness.wecom.WaitCompletedRequestCount(t, "aibot_send_msg", 3)
 
 	reply := harness.sendText(t, "registration-race-stale-approve", "registration-admin", "/apr 1")
 	if !strings.Contains(reply, "列表已变化") || !strings.Contains(reply, registrationSnapshotReminderForTest) {
 		t.Fatalf("stale approval reply = %q", reply)
 	}
-	if pending = admin.listRegistrations(t); len(pending) != 0 {
+	if pending = admin.listRegistrations(t); len(pending) != 1 || pending[0].MachineID != "laptop" {
 		t.Fatalf("pending after stale approval = %#v", pending)
+	}
+	keys, err := harness.admin.ListKeys(context.Background(), adminproto.KeyListParams{})
+	if err != nil || len(keys.Items) != 2 {
+		t.Fatalf("keys after stale approval = %#v, err=%v", keys, err)
 	}
 }
 

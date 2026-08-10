@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
@@ -74,6 +75,40 @@ func TestRegistrationApprovalCoordinatorDoesNotNotifyWithoutAdmins(t *testing.T)
 	}
 }
 
+func TestRegistrationApprovalCoordinatorOnlyUsesCommittedListSnapshot(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+
+	candidate, err := coordinator.PrepareList("admin-a")
+	if err != nil {
+		t.Fatalf("PrepareList() error = %v", err)
+	}
+	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); !errors.Is(err, ErrRegistrationApprovalSnapshotMissing) {
+		t.Fatalf("Approve() before CommitList error = %v, want missing snapshot", err)
+	}
+	if err := coordinator.CommitList("admin-a", candidate); err != nil {
+		t.Fatalf("CommitList() error = %v", err)
+	}
+	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); err != nil {
+		t.Fatalf("Approve() after CommitList error = %v", err)
+	}
+}
+
+func TestRegistrationApprovalCoordinatorRejectsCandidateFromAnotherAdmin(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a", "admin-b")
+	candidate, err := coordinator.PrepareList("admin-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.CommitList("admin-b", candidate); !errors.Is(err, ErrRegistrationApprovalUnauthorized) {
+		t.Fatalf("CommitList() error = %v, want unauthorized", err)
+	}
+	if _, err := coordinator.Approve(context.Background(), "admin-b", []int{1}); !errors.Is(err, ErrRegistrationApprovalSnapshotMissing) {
+		t.Fatalf("Approve() error = %v, want missing snapshot", err)
+	}
+}
+
 func TestRegistrationApprovalCoordinatorListStoresPrivateSnapshots(t *testing.T) {
 	manager := newFakeRegistrationApprovalManager(
 		approvalRequest("reg-a", "user-a", "office", time.Date(2026, 8, 10, 8, 0, 0, 0, time.FixedZone("CST", 8*60*60))),
@@ -81,17 +116,12 @@ func TestRegistrationApprovalCoordinatorListStoresPrivateSnapshots(t *testing.T)
 	)
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a", "admin-b")
 
-	content, err := coordinator.List("admin-a")
-	if err != nil {
-		t.Fatal(err)
-	}
+	content := commitRegistrationApprovalList(t, coordinator, "admin-a")
 	if !strings.Contains(content, "1. 用户：user-a") || !strings.Contains(content, "机器：office") ||
 		!strings.Contains(content, "来源：127.0.0.1") || !strings.Contains(content, "2026-08-10T00:00:00Z") {
 		t.Fatalf("List() content = %q", content)
 	}
-	if _, err := coordinator.List("admin-b"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-b")
 	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{2}); err != nil {
 		t.Fatalf("admin-a Approve() error = %v", err)
 	}
@@ -107,9 +137,7 @@ func TestRegistrationApprovalCoordinatorAllowsGlobalListGrowth(t *testing.T) {
 	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
 	manager.appendPending(approvalRequest("reg-b", "user-b", "lab", time.Now().Add(time.Second)))
 	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); err != nil {
 		t.Fatalf("Approve() error = %v", err)
@@ -126,9 +154,7 @@ func TestRegistrationApprovalCoordinatorRejectsChangedSelectedPosition(t *testin
 	)
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
 	manager.setPending(approvalRequest("reg-b", "user-b", "lab", time.Now()))
 	_, err := coordinator.Approve(context.Background(), "admin-a", []int{1})
 	if !errors.Is(err, ErrRegistrationApprovalSnapshotChanged) {
@@ -144,9 +170,7 @@ func TestRegistrationApprovalCoordinatorInvalidatesSnapshotAfterAttempt(t *testi
 	manager.approveErrors["reg-a"] = machinereg.ErrDeliveryFailed
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
 	content, err := coordinator.Approve(context.Background(), "admin-a", []int{1})
 	if err != nil {
 		t.Fatalf("first Approve() error = %v", err)
@@ -164,14 +188,68 @@ func TestRegistrationApprovalCoordinatorInvalidatesSnapshotExplicitly(t *testing
 	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
 	if err := coordinator.Invalidate("admin-a"); err != nil {
 		t.Fatalf("Invalidate() error = %v", err)
 	}
 	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); !errors.Is(err, ErrRegistrationApprovalSnapshotMissing) {
 		t.Fatalf("Approve() error = %v, want missing snapshot", err)
+	}
+}
+
+func TestRegistrationApprovalCoordinatorRejectsInvalidSelectionIndexes(t *testing.T) {
+	tests := []struct {
+		name    string
+		indexes []int
+	}{
+		{name: "empty", indexes: nil},
+		{name: "zero", indexes: []int{0}},
+		{name: "negative", indexes: []int{-1}},
+		{name: "duplicate", indexes: []int{1, 1}},
+		{name: "oversized", indexes: []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := make([]machinereg.Request, 0, 11)
+			for index := 0; index < 11; index++ {
+				requests = append(requests, approvalRequest(fmt.Sprintf("reg-%d", index), "user-a", fmt.Sprintf("machine-%d", index), time.Now().Add(time.Duration(index)*time.Second)))
+			}
+			manager := newFakeRegistrationApprovalManager(requests...)
+			coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+			commitRegistrationApprovalList(t, coordinator, "admin-a")
+			if _, err := coordinator.Approve(context.Background(), "admin-a", test.indexes); !errors.Is(err, ErrRegistrationApprovalInvalidIndexes) {
+				t.Fatalf("Approve(%#v) error = %v, want invalid indexes", test.indexes, err)
+			}
+			if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); !errors.Is(err, ErrRegistrationApprovalSnapshotMissing) {
+				t.Fatalf("second Approve() error = %v, want missing snapshot", err)
+			}
+			if attempts := manager.approveAttemptIDs(); len(attempts) != 0 {
+				t.Fatalf("approve attempts = %#v, want none", attempts)
+			}
+		})
+	}
+}
+
+func TestRegistrationApprovalCoordinatorRejectsOutOfRangeSelection(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
+	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{2}); !errors.Is(err, ErrRegistrationApprovalSnapshotChanged) {
+		t.Fatalf("Approve() error = %v, want snapshot changed", err)
+	}
+	if attempts := manager.approveAttemptIDs(); len(attempts) != 0 {
+		t.Fatalf("approve attempts = %#v, want none", attempts)
+	}
+}
+
+func TestRegistrationApprovalCoordinatorListEmptyStoresCommittedSnapshot(t *testing.T) {
+	coordinator := newTestRegistrationApprovalCoordinator(t, newFakeRegistrationApprovalManager(), newFakeRegistrationApprovalGateway(), "admin-a")
+	content := commitRegistrationApprovalList(t, coordinator, "admin-a")
+	if content != "当前没有待审批机器注册申请。" {
+		t.Fatalf("List() content = %q", content)
+	}
+	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); !errors.Is(err, ErrRegistrationApprovalSnapshotChanged) {
+		t.Fatalf("Approve() error = %v, want changed empty snapshot", err)
 	}
 }
 
@@ -184,9 +262,7 @@ func TestRegistrationApprovalCoordinatorContinuesBatchAfterItemFailure(t *testin
 	manager.approveErrors["reg-b"] = machinereg.ErrDeliveryFailed
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
 	content, err := coordinator.Approve(context.Background(), "admin-a", []int{1, 2, 3})
 	if err != nil {
 		t.Fatalf("Approve() error = %v", err)
@@ -196,6 +272,9 @@ func TestRegistrationApprovalCoordinatorContinuesBatchAfterItemFailure(t *testin
 	}
 	if got := manager.approvedIDs(); !reflect.DeepEqual(got, []string{"reg-a", "reg-c"}) {
 		t.Fatalf("approved IDs = %#v", got)
+	}
+	if actors := manager.approveActors(); !reflect.DeepEqual(actors, []string{"wecom:admin-a", "wecom:admin-a", "wecom:admin-a"}) {
+		t.Fatalf("approve actors = %#v", actors)
 	}
 	for _, want := range []string{"1. office：已批准", "2. lab：批准失败，Key 交付失败", "3. mobile：已批准", registrationApprovalSnapshotReminder} {
 		if !strings.Contains(content, want) {
@@ -212,9 +291,7 @@ func TestRegistrationApprovalCoordinatorRejectsRegistrations(t *testing.T) {
 	manager.rejectionNotificationSent["reg-b"] = false
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
 	content, err := coordinator.Reject(context.Background(), "admin-a", []int{1, 2})
 	if err != nil {
 		t.Fatalf("Reject() error = %v", err)
@@ -230,6 +307,33 @@ func TestRegistrationApprovalCoordinatorRejectsRegistrations(t *testing.T) {
 	}
 }
 
+func TestRegistrationApprovalCoordinatorContinuesRejectBatchAfterItemFailure(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(
+		approvalRequest("reg-a", "user-a", "office", time.Now()),
+		approvalRequest("reg-b", "user-b", "lab", time.Now().Add(time.Second)),
+		approvalRequest("reg-c", "user-c", "mobile", time.Now().Add(2*time.Second)),
+	)
+	manager.rejectErrors["reg-b"] = machinereg.ErrRequestNotFound
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
+	content, err := coordinator.Reject(context.Background(), "admin-a", []int{1, 2, 3})
+	if err != nil {
+		t.Fatalf("Reject() error = %v", err)
+	}
+	if got := manager.rejectAttemptIDs(); !reflect.DeepEqual(got, []string{"reg-a", "reg-b", "reg-c"}) {
+		t.Fatalf("reject attempts = %#v", got)
+	}
+	if got := manager.rejectedIDs(); !reflect.DeepEqual(got, []string{"reg-a", "reg-c"}) {
+		t.Fatalf("rejected IDs = %#v", got)
+	}
+	for _, want := range []string{"1. office：已驳回", "2. lab：驳回失败", "3. mobile：已驳回", registrationApprovalSnapshotReminder} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("Reject() content = %q, want %q", content, want)
+		}
+	}
+}
+
 func TestRegistrationApprovalCoordinatorConcurrentSnapshotsDoNotApproveShiftedItem(t *testing.T) {
 	manager := newFakeRegistrationApprovalManager(
 		approvalRequest("reg-a", "user-a", "office", time.Now()),
@@ -237,12 +341,8 @@ func TestRegistrationApprovalCoordinatorConcurrentSnapshotsDoNotApproveShiftedIt
 	)
 	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a", "admin-b")
 
-	if _, err := coordinator.List("admin-a"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := coordinator.List("admin-b"); err != nil {
-		t.Fatal(err)
-	}
+	commitRegistrationApprovalList(t, coordinator, "admin-a")
+	commitRegistrationApprovalList(t, coordinator, "admin-b")
 	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); err != nil {
 		t.Fatal(err)
 	}
@@ -260,8 +360,8 @@ func TestRegistrationApprovalCoordinatorRejectsUnauthorizedAdmin(t *testing.T) {
 	if coordinator.IsAdmin("other") {
 		t.Fatal("IsAdmin(other) = true")
 	}
-	if _, err := coordinator.List("other"); !errors.Is(err, ErrRegistrationApprovalUnauthorized) {
-		t.Fatalf("List(other) error = %v", err)
+	if _, err := coordinator.PrepareList("other"); !errors.Is(err, ErrRegistrationApprovalUnauthorized) {
+		t.Fatalf("PrepareList(other) error = %v", err)
 	}
 }
 
@@ -283,6 +383,29 @@ func TestNewRegistrationApprovalCoordinatorRejectsInvalidAdminIDs(t *testing.T) 
 	}
 }
 
+func TestRegistrationApprovalFailureText(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "request missing", err: machinereg.ErrRequestNotFound, want: "申请已被处理或不存在。"},
+		{name: "machine exists", err: machinereg.ErrMachineExists, want: "该用户机器凭据已经存在。"},
+		{name: "delivery failed", err: machinereg.ErrDeliveryFailed, want: "Key 交付失败，申请仍保留。"},
+		{name: "rollback failed", err: &machinereg.OperationError{Kind: machinereg.ErrRollbackFailed}, want: "Key 交付失败且凭据回滚失败，请检查服务端日志。"},
+		{name: "cleanup failed", err: &machinereg.OperationError{Kind: machinereg.ErrCleanupFailed}, want: "Key 已交付但申请清理失败，请检查服务端日志。"},
+		{name: "credential conflict", err: credential.ErrCredentialConflict, want: "凭据状态冲突，申请仍保留。"},
+		{name: "unknown sensitive error", err: errors.New("token hpk_secret /private/path"), want: "操作失败，请检查服务端日志。"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := registrationApprovalFailureText(test.err); got != test.want {
+				t.Fatalf("registrationApprovalFailureText() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func newTestRegistrationApprovalCoordinator(t *testing.T, manager RegistrationApprovalManager, gateway WeComGateway, adminIDs ...string) *RegistrationApprovalCoordinator {
 	t.Helper()
 	coordinator, err := NewRegistrationApprovalCoordinator(RegistrationApprovalCoordinatorConfig{
@@ -297,6 +420,18 @@ func newTestRegistrationApprovalCoordinator(t *testing.T, manager RegistrationAp
 		t.Fatalf("NewRegistrationApprovalCoordinator() error = %v", err)
 	}
 	return coordinator
+}
+
+func commitRegistrationApprovalList(t *testing.T, coordinator *RegistrationApprovalCoordinator, adminID string) string {
+	t.Helper()
+	list, err := coordinator.PrepareList(adminID)
+	if err != nil {
+		t.Fatalf("PrepareList() error = %v", err)
+	}
+	if err := coordinator.CommitList(adminID, list); err != nil {
+		t.Fatalf("CommitList() error = %v", err)
+	}
+	return list.content
 }
 
 func approvalRequest(registrationID, principalID, machineID string, requestedAt time.Time) machinereg.Request {
@@ -414,10 +549,30 @@ func (manager *fakeRegistrationApprovalManager) approveAttemptIDs() []string {
 	return result
 }
 
+func (manager *fakeRegistrationApprovalManager) approveActors() []string {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	result := make([]string, len(manager.approveAttempts))
+	for index, call := range manager.approveAttempts {
+		result[index] = call.actor
+	}
+	return result
+}
+
 func (manager *fakeRegistrationApprovalManager) rejectedIDs() []string {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	return append([]string(nil), manager.rejectSuccesses...)
+}
+
+func (manager *fakeRegistrationApprovalManager) rejectAttemptIDs() []string {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	result := make([]string, len(manager.rejectAttempts))
+	for index, call := range manager.rejectAttempts {
+		result[index] = call.registrationID
+	}
+	return result
 }
 
 func (manager *fakeRegistrationApprovalManager) rejectActors() []string {

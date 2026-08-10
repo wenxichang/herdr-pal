@@ -229,6 +229,15 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 
 // Handle 校验并按 userid 串行处理一条企业微信单聊文本。
 func (router *ConversationRouter) Handle(ctx context.Context, message im.IncomingText) {
+	router.queueIncoming(ctx, message, true)
+}
+
+// Dispatch 按企业微信接收顺序提交消息，同一用户串行执行且不阻塞其他用户入队。
+func (router *ConversationRouter) Dispatch(ctx context.Context, message im.IncomingText) {
+	router.queueIncoming(ctx, message, false)
+}
+
+func (router *ConversationRouter) queueIncoming(ctx context.Context, message im.IncomingText, wait bool) {
 	if router == nil {
 		return
 	}
@@ -242,13 +251,51 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 		router.logger.Warn("企业微信消息被服务端拒绝", "chat_type", safeLogValue(message.ChatType), "user_hash", routerHash(message.UserID), "error_type", errorType, "reason", reason)
 		return
 	}
+	if strings.TrimSpace(message.MessageID) != "" && !router.deduper.AddIfNew(message.MessageID) {
+		router.logger.Info("企业微信重复消息已忽略", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "reason", "消息幂等标识已处理")
+		return
+	}
+	run := func(taskContext context.Context) error {
+		router.handleIncoming(taskContext, message)
+		return nil
+	}
+	var err error
+	if wait {
+		err = router.executor.Submit(ctx, message.UserID, run)
+	} else {
+		err = router.executor.Enqueue(ctx, message.UserID, run)
+	}
+	if errors.Is(err, ErrUserQueueFull) {
+		router.logger.Warn("企业微信消息排队失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
+		router.emitUserInputAuditEvent(message, "queue_full", nil)
+		noticeErr := router.executor.EnqueueOverflow(ctx, message.UserID, func(taskContext context.Context) error {
+			const content = "当前用户输入队列已满，请稍后重试。"
+			if replyErr := router.reply(taskContext, message, content); replyErr != nil {
+				if sendErr := router.sendMarkdownTo(taskContext, message.UserID, content); sendErr != nil {
+					router.logger.Warn("企业微信队列过载通知发送失败", append([]any{
+						"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID),
+					}, serverErrorLogArgs(sendErr)...)...)
+				}
+				router.logger.Warn("企业微信队列过载回调确认失败，已尝试主动通知", append([]any{
+					"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID),
+				}, serverErrorLogArgs(replyErr)...)...)
+			}
+			return nil
+		})
+		if noticeErr != nil && !errors.Is(noticeErr, ErrUserQueueFull) && ctx.Err() == nil {
+			router.logger.Warn("企业微信队列过载通知排队失败", append([]any{
+				"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID),
+			}, serverErrorLogArgs(noticeErr)...)...)
+		}
+	} else if err != nil && ctx.Err() == nil {
+		router.logger.Warn("用户消息执行失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
+	}
+}
+
+func (router *ConversationRouter) handleIncoming(ctx context.Context, message im.IncomingText) {
 	if strings.TrimSpace(message.MessageID) == "" {
 		router.logger.Warn("企业微信消息被服务端拒绝", "user_hash", routerHash(message.UserID), "error_type", "missing_message_id", "reason", "企业微信消息缺少幂等标识")
 		router.reply(ctx, message, "消息标识缺失，未执行任何操作。")
-		return
-	}
-	if !router.deduper.AddIfNew(message.MessageID) {
-		router.logger.Info("企业微信重复消息已忽略", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "reason", "消息幂等标识已处理")
 		return
 	}
 	decision := router.rateLimiter.Allow(message.UserID)
@@ -274,23 +321,10 @@ func (router *ConversationRouter) Handle(ctx context.Context, message im.Incomin
 		router.reply(ctx, message, fmt.Sprintf("输入过于频繁，请在 %d 秒后重试。", retrySeconds))
 		return
 	}
-	err := router.executor.Submit(ctx, message.UserID, func(taskContext context.Context) error {
-		router.handleAuthorized(taskContext, message)
-		return nil
-	})
-	if errors.Is(err, ErrUserQueueFull) {
-		router.logger.Warn("企业微信消息排队失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
-		router.reply(ctx, message, "当前用户输入队列已满，请稍后重试。")
-	} else if err != nil && ctx.Err() == nil {
-		router.logger.Warn("用户消息执行失败", append([]any{"user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID)}, serverErrorLogArgs(err)...)...)
-	}
+	router.handleAuthorized(ctx, message)
 }
 
 func (router *ConversationRouter) emitUserInputAudit(message im.IncomingText, decision RateLimitDecision) {
-	actionName := "invalid"
-	if action, err := parseServerAction(message.Content); err == nil {
-		actionName = serverActionName(action.kind)
-	}
 	outcome := "accepted"
 	attributes := make(map[string]string)
 	if !decision.Allowed {
@@ -300,6 +334,17 @@ func (router *ConversationRouter) emitUserInputAudit(message im.IncomingText, de
 		attributes["limit.retry_after_ms"] = strconv.FormatInt(maxInt64(decision.RetryAfter.Milliseconds(), 1), 10)
 		attributes["limit.per_second"] = strconv.Itoa(perSecond)
 		attributes["limit.per_minute"] = strconv.Itoa(perMinute)
+	}
+	router.emitUserInputAuditEvent(message, outcome, attributes)
+}
+
+func (router *ConversationRouter) emitUserInputAuditEvent(message im.IncomingText, outcome string, attributes map[string]string) {
+	actionName := "invalid"
+	if action, err := parseServerAction(message.Content); err == nil {
+		actionName = serverActionName(action.kind)
+	}
+	if attributes == nil {
+		attributes = make(map[string]string)
 	}
 	now := router.now()
 	source, hasSource := router.userInputAuditSource(message.UserID, message.Content)
@@ -501,14 +546,16 @@ func (router *ConversationRouter) handleRegistrationApproval(ctx context.Context
 		router.reply(ctx, message, ErrRegistrationApprovalUnauthorized.Error())
 		return
 	}
+	if action.kind == serverActionListRegistrations {
+		router.handleRegistrationApprovalList(ctx, message)
+		return
+	}
 
 	var (
 		content string
 		err     error
 	)
 	switch action.kind {
-	case serverActionListRegistrations:
-		content, err = router.regApproval.List(message.UserID)
 	case serverActionApproveRegistrations:
 		content, err = router.regApproval.Approve(ctx, message.UserID, action.indexes)
 	case serverActionRejectRegistrations:
@@ -517,17 +564,49 @@ func (router *ConversationRouter) handleRegistrationApproval(ctx context.Context
 		err = ErrRegistrationApprovalInvalidIndexes
 	}
 	if err != nil {
-		router.logger.Warn("企业微信注册审批命令执行失败",
-			"admin_hash", routerHash(message.UserID),
-			"message_hash", routerHash(message.MessageID),
-			"action", serverActionName(action.kind),
-			"selected_count", len(action.indexes),
-			"error_type", registrationApprovalErrorType(err),
-			"reason", safeServerErrorReason(err),
-		)
+		router.logRegistrationApprovalCommandFailure(message, action.kind, len(action.indexes), err)
 		content = registrationApprovalErrorMessage(action.kind, err)
 	}
 	router.reply(ctx, message, content)
+}
+
+func (router *ConversationRouter) handleRegistrationApprovalList(ctx context.Context, message im.IncomingText) {
+	list, err := router.regApproval.PrepareList(message.UserID)
+	if err != nil {
+		router.logRegistrationApprovalCommandFailure(message, serverActionListRegistrations, 0, err)
+		router.reply(ctx, message, registrationApprovalErrorMessage(serverActionListRegistrations, err))
+		return
+	}
+	if err := router.regApproval.Invalidate(message.UserID); err != nil {
+		router.logRegistrationApprovalCommandFailure(message, serverActionListRegistrations, 0, err)
+		router.reply(ctx, message, registrationApprovalErrorMessage(serverActionListRegistrations, err))
+		return
+	}
+	if err := router.reply(ctx, message, list.content); err != nil {
+		router.logger.Warn("企业微信注册审批列表发送失败，快照未提交",
+			"admin_hash", routerHash(message.UserID),
+			"message_hash", routerHash(message.MessageID),
+			"action", serverActionName(serverActionListRegistrations),
+			"error_type", "delivery_failed",
+			"reason", safeServerErrorReason(err),
+		)
+		return
+	}
+	if err := router.regApproval.CommitList(message.UserID, list); err != nil {
+		router.logRegistrationApprovalCommandFailure(message, serverActionListRegistrations, 0, err)
+		router.sendMarkdownTo(ctx, message.UserID, "注册审批列表快照保存失败，请重新执行 /ls-reg。")
+	}
+}
+
+func (router *ConversationRouter) logRegistrationApprovalCommandFailure(message im.IncomingText, kind serverActionKind, selectedCount int, err error) {
+	router.logger.Warn("企业微信注册审批命令执行失败",
+		"admin_hash", routerHash(message.UserID),
+		"message_hash", routerHash(message.MessageID),
+		"action", serverActionName(kind),
+		"selected_count", selectedCount,
+		"error_type", registrationApprovalErrorType(err),
+		"reason", safeServerErrorReason(err),
+	)
 }
 
 func (router *ConversationRouter) handleList(ctx context.Context, message im.IncomingText) {
@@ -1262,6 +1341,9 @@ func parseRegistrationApprovalIndexes(command string, fields []string) ([]int, e
 	if len(fields) < 2 {
 		return nil, errors.New(usage)
 	}
+	if len(fields)-1 > maxRegistrationApprovalBatch {
+		return nil, fmt.Errorf("每次最多处理 %d 个注册申请，请重新执行 /ls-reg。", maxRegistrationApprovalBatch)
+	}
 	indexes := make([]int, 0, len(fields)-1)
 	seen := make(map[int]struct{}, len(fields)-1)
 	for _, field := range fields[1:] {
@@ -1307,8 +1389,12 @@ func (unavailableRegistrationApprovalHandler) NotifyPending(context.Context, mac
 	return nil
 }
 
-func (unavailableRegistrationApprovalHandler) List(string) (string, error) {
-	return "", ErrRegistrationApprovalUnauthorized
+func (unavailableRegistrationApprovalHandler) PrepareList(string) (RegistrationApprovalList, error) {
+	return RegistrationApprovalList{}, ErrRegistrationApprovalUnauthorized
+}
+
+func (unavailableRegistrationApprovalHandler) CommitList(string, RegistrationApprovalList) error {
+	return ErrRegistrationApprovalUnauthorized
 }
 
 func (unavailableRegistrationApprovalHandler) Approve(context.Context, string, []int) (string, error) {

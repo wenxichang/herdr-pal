@@ -61,7 +61,9 @@ func TestParseServerActionRegistrationApprovalCommands(t *testing.T) {
 	}{
 		{input: "/ls-reg", wantKind: serverActionListRegistrations},
 		{input: "/apr 1 2 3", wantKind: serverActionApproveRegistrations, wantIndexes: []int{1, 2, 3}},
+		{input: "/apr 1 2 3 4 5 6 7 8 9 10", wantKind: serverActionApproveRegistrations, wantIndexes: []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
 		{input: "/rej 3 1", wantKind: serverActionRejectRegistrations, wantIndexes: []int{3, 1}},
+		{input: "/apr 1 2 3 4 5 6 7 8 9 10 11", wantErr: true},
 		{input: "/apr", wantErr: true},
 		{input: "/rej 0", wantErr: true},
 		{input: "/apr 1 1", wantErr: true},
@@ -148,15 +150,27 @@ func TestConversationRouterRejectsApprovalCommandsFromNonAdmin(t *testing.T) {
 }
 
 func TestConversationRouterInvalidatesApprovalSnapshotAfterMalformedDecision(t *testing.T) {
-	approval := &routerRegistrationApprovalHandler{admins: map[string]bool{"admin-a": true}}
-	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
-
-	router.Handle(context.Background(), routerMessage("request-invalid-apr", "message-invalid-apr", "admin-a", "/apr 1 1"))
-	if reply := gateway.LastReply(); !strings.Contains(reply, "编号不能重复") || !strings.Contains(reply, registrationApprovalSnapshotReminder) {
-		t.Fatalf("reply = %q", reply)
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "duplicate", content: "/apr 1 1", want: "编号不能重复"},
+		{name: "oversized", content: "/rej 1 2 3 4 5 6 7 8 9 10 11", want: "最多处理 10 个"},
 	}
-	if approval.invalidateCalls != 1 {
-		t.Fatalf("invalidate calls = %d", approval.invalidateCalls)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			approval := &routerRegistrationApprovalHandler{admins: map[string]bool{"admin-a": true}}
+			router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
+
+			router.Handle(context.Background(), routerMessage("request-invalid", "message-invalid", "admin-a", test.content))
+			if reply := gateway.LastReply(); !strings.Contains(reply, test.want) || !strings.Contains(reply, registrationApprovalSnapshotReminder) {
+				t.Fatalf("reply = %q", reply)
+			}
+			if approval.invalidateCalls != 1 {
+				t.Fatalf("invalidate calls = %d", approval.invalidateCalls)
+			}
+		})
 	}
 }
 
@@ -171,6 +185,222 @@ func TestConversationRouterReportsApprovalSnapshotErrors(t *testing.T) {
 	reply := gateway.LastReply()
 	if !strings.Contains(reply, "/ls-reg") || !strings.Contains(reply, registrationApprovalSnapshotReminder) {
 		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestConversationRouterDeduplicatesRegistrationDecisionMessages(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		calls   func(*routerRegistrationApprovalHandler) int
+	}{
+		{name: "approve", content: "/apr 1", calls: func(handler *routerRegistrationApprovalHandler) int { return len(handler.approveIndexes) }},
+		{name: "reject", content: "/rej 1", calls: func(handler *routerRegistrationApprovalHandler) int { return len(handler.rejectIndexes) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			approval := &routerRegistrationApprovalHandler{
+				admins: map[string]bool{"admin-a": true}, approveContent: "批准完成", rejectContent: "驳回完成",
+			}
+			router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
+			message := routerMessage("request-decision", "message-decision", "admin-a", test.content)
+
+			router.Handle(context.Background(), message)
+			router.Handle(context.Background(), message)
+
+			if calls := test.calls(approval); calls != 1 {
+				t.Fatalf("decision calls = %d, want 1", calls)
+			}
+			if replies := gateway.ReplyCount(); replies != 1 {
+				t.Fatalf("reply count = %d, want 1", replies)
+			}
+		})
+	}
+}
+
+func TestConversationRouterDispatchQueueFullReplyFollowsAcceptedMessages(t *testing.T) {
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	approval := &routerRegistrationApprovalHandler{
+		admins: map[string]bool{"admin-a": true}, approveContent: "批准完成",
+		approveStarted: started, approveRelease: release,
+	}
+	gateway := &routerGateway{}
+	relay := &routerRelay{capabilities: make(map[string]bool)}
+	router, err := NewConversationRouterWithConfig(
+		ConversationRouterConfig{RegistrationApproval: approval},
+		NewSessionCatalog(), NewUserExecutor(1), gateway, relay, deduper,
+		slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router.Dispatch(context.Background(), routerMessage("request-first", "message-first", "admin-a", "/apr 1"))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first approval did not start")
+	}
+	router.Dispatch(context.Background(), routerMessage("request-overflow", "message-overflow", "admin-a", "/help"))
+	if replies := gateway.Replies(); len(replies) != 0 {
+		t.Fatalf("replies before release = %#v, want none", replies)
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for gateway.ReplyCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if replies := gateway.Replies(); !reflect.DeepEqual(replies, []string{"批准完成", "当前用户输入队列已满，请稍后重试。"}) {
+		t.Fatalf("replies = %#v", replies)
+	}
+}
+
+func TestConversationRouterDispatchQueueFullMessageIsDeduplicated(t *testing.T) {
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	approval := &routerRegistrationApprovalHandler{
+		admins: map[string]bool{"admin-a": true}, approveContent: "批准完成",
+		approveStarted: started, approveRelease: release,
+	}
+	auditor := &routerAuditCollector{}
+	gateway := &routerGateway{}
+	router, err := NewConversationRouterWithConfig(
+		ConversationRouterConfig{RegistrationApproval: approval, Auditor: auditor},
+		NewSessionCatalog(), NewUserExecutor(1), gateway, &routerRelay{capabilities: make(map[string]bool)}, deduper,
+		slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router.Dispatch(context.Background(), routerMessage("request-first", "message-first", "admin-a", "/apr 1"))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first approval did not start")
+	}
+	overflow := routerMessage("request-overflow", "message-overflow", "admin-a", "/apr 2")
+	router.Dispatch(context.Background(), overflow)
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for gateway.ReplyCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	router.Dispatch(context.Background(), overflow)
+	time.Sleep(20 * time.Millisecond)
+
+	if calls := len(approval.approveIndexes); calls != 1 {
+		t.Fatalf("approve calls = %d, want only the accepted command", calls)
+	}
+	if replies := gateway.ReplyCount(); replies != 2 {
+		t.Fatalf("reply count = %d, want approval plus overload notice", replies)
+	}
+	events := auditor.Events()
+	if len(events) != 2 || events[1].Body != "/apr 2" || events[1].Outcome != "queue_full" {
+		t.Fatalf("audit events = %#v, want queue_full overflow event", events)
+	}
+}
+
+func TestConversationRouterDispatchDuplicateCannotClaimAcceptedMessage(t *testing.T) {
+	deduper, err := policy.NewDeduper(time.Hour, 100, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	approval := &routerRegistrationApprovalHandler{
+		admins: map[string]bool{"admin-a": true}, approveContent: "批准完成", rejectContent: "驳回完成",
+		approveStarted: started, approveRelease: release,
+	}
+	gateway := &routerGateway{}
+	router, err := NewConversationRouterWithConfig(
+		ConversationRouterConfig{RegistrationApproval: approval},
+		NewSessionCatalog(), NewUserExecutor(2), gateway, &routerRelay{capabilities: make(map[string]bool)}, deduper,
+		slog.New(slog.NewTextHandler(testDiscardWriter{}, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router.Dispatch(context.Background(), routerMessage("request-first", "message-first", "admin-a", "/apr 1"))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first approval did not start")
+	}
+	original := routerMessage("request-original", "message-original", "admin-a", "/rej 2")
+	router.Dispatch(context.Background(), original)
+	router.Dispatch(context.Background(), original)
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for gateway.ReplyCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(approval.rejectIndexes) != 1 || !reflect.DeepEqual(approval.rejectIndexes[0], []int{2}) {
+		t.Fatalf("reject calls = %#v, want accepted original once", approval.rejectIndexes)
+	}
+	if replies := gateway.Replies(); !reflect.DeepEqual(replies, []string{"批准完成", "驳回完成"}) {
+		t.Fatalf("replies = %#v", replies)
+	}
+}
+
+func TestConversationRouterInvalidatesRegistrationSnapshotWhenListReplyFails(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: coordinator})
+
+	router.Handle(context.Background(), routerMessage("request-list-old", "message-list-old", "admin-a", "/ls-reg"))
+	manager.setPending(approvalRequest("reg-b", "user-b", "lab", time.Now()))
+	gateway.FailNextResponse(errors.New("respond failed"))
+	router.Handle(context.Background(), routerMessage("request-list-failed", "message-list-failed", "admin-a", "/ls-reg"))
+	router.Handle(context.Background(), routerMessage("request-approve-after-failure", "message-approve-after-failure", "admin-a", "/apr 1"))
+
+	if got := manager.approveAttemptIDs(); len(got) != 0 {
+		t.Fatalf("approve attempts = %#v, want none", got)
+	}
+	if reply := gateway.LastReply(); !strings.Contains(reply, "先执行 /ls-reg") {
+		t.Fatalf("approval reply = %q, want missing snapshot", reply)
+	}
+}
+
+func TestConversationRouterInvalidatesRegistrationSnapshotWhenListReplyPartiallyFails(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-old", "user-old", "old", time.Now()))
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: coordinator})
+
+	router.Handle(context.Background(), routerMessage("request-list-old", "message-list-old", "admin-a", "/ls-reg"))
+	requests := make([]machinereg.Request, 0, 300)
+	for index := 0; index < 300; index++ {
+		requests = append(requests, approvalRequest(
+			fmt.Sprintf("reg-%03d", index),
+			fmt.Sprintf("user-%03d", index),
+			fmt.Sprintf("machine-%03d", index),
+			time.Now().Add(time.Duration(index)*time.Second),
+		))
+	}
+	manager.setPending(requests...)
+	content := formatPendingRegistrationApprovals(requests)
+	if parts := panel.SplitMarkdown(content, panel.WeComContentLimit); len(parts) < 2 {
+		t.Fatalf("test list split into %d parts, want at least 2", len(parts))
+	}
+	gateway.FailNextSend(errors.New("send failed"))
+	router.Handle(context.Background(), routerMessage("request-list-partial", "message-list-partial", "admin-a", "/ls-reg"))
+	router.Handle(context.Background(), routerMessage("request-reject-after-failure", "message-reject-after-failure", "admin-a", "/rej 1"))
+
+	if got := manager.rejectedIDs(); len(got) != 0 {
+		t.Fatalf("rejected IDs = %#v, want none", got)
+	}
+	if reply := gateway.LastReply(); !strings.Contains(reply, "先执行 /ls-reg") {
+		t.Fatalf("rejection reply = %q, want missing snapshot", reply)
 	}
 }
 
@@ -1753,9 +1983,11 @@ var testPNG = []byte{
 }
 
 type routerGateway struct {
-	mu      sync.Mutex
-	replies []string
-	images  [][]byte
+	mu              sync.Mutex
+	replies         []string
+	images          [][]byte
+	respondFailures []error
+	sendFailures    []error
 }
 
 type routerRegistrationRequester struct {
@@ -1777,10 +2009,13 @@ type routerRegistrationApprovalHandler struct {
 	rejectErr        error
 	notifyCalls      int
 	listCalls        int
+	commitListCalls  int
 	notifiedRequests []machinereg.Request
 	approveIndexes   [][]int
 	rejectIndexes    [][]int
 	invalidateCalls  int
+	approveStarted   chan struct{}
+	approveRelease   <-chan struct{}
 }
 
 func (handler *routerRegistrationApprovalHandler) IsAdmin(userID string) bool {
@@ -1793,13 +2028,28 @@ func (handler *routerRegistrationApprovalHandler) NotifyPending(_ context.Contex
 	return handler.notifyErr
 }
 
-func (handler *routerRegistrationApprovalHandler) List(string) (string, error) {
+func (handler *routerRegistrationApprovalHandler) PrepareList(adminID string) (RegistrationApprovalList, error) {
 	handler.listCalls++
-	return handler.listContent, handler.listErr
+	if handler.listErr != nil {
+		return RegistrationApprovalList{}, handler.listErr
+	}
+	return RegistrationApprovalList{adminID: adminID, content: handler.listContent}, nil
+}
+
+func (handler *routerRegistrationApprovalHandler) CommitList(string, RegistrationApprovalList) error {
+	handler.commitListCalls++
+	return nil
 }
 
 func (handler *routerRegistrationApprovalHandler) Approve(_ context.Context, _ string, indexes []int) (string, error) {
 	handler.approveIndexes = append(handler.approveIndexes, append([]int(nil), indexes...))
+	if handler.approveStarted != nil {
+		close(handler.approveStarted)
+		handler.approveStarted = nil
+	}
+	if handler.approveRelease != nil {
+		<-handler.approveRelease
+	}
 	return handler.approveContent, handler.approveErr
 }
 
@@ -1965,6 +2215,11 @@ func (gateway failingRouterGateway) SendMarkdownTo(context.Context, string, stri
 func (gateway *routerGateway) RespondMarkdown(_ context.Context, _ string, content string) error {
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
+	if len(gateway.respondFailures) > 0 {
+		err := gateway.respondFailures[0]
+		gateway.respondFailures = gateway.respondFailures[1:]
+		return err
+	}
 	gateway.replies = append(gateway.replies, content)
 	return nil
 }
@@ -1972,8 +2227,25 @@ func (gateway *routerGateway) RespondMarkdown(_ context.Context, _ string, conte
 func (gateway *routerGateway) SendMarkdownTo(_ context.Context, _ string, content string) error {
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
+	if len(gateway.sendFailures) > 0 {
+		err := gateway.sendFailures[0]
+		gateway.sendFailures = gateway.sendFailures[1:]
+		return err
+	}
 	gateway.replies = append(gateway.replies, content)
 	return nil
+}
+
+func (gateway *routerGateway) FailNextResponse(err error) {
+	gateway.mu.Lock()
+	gateway.respondFailures = append(gateway.respondFailures, err)
+	gateway.mu.Unlock()
+}
+
+func (gateway *routerGateway) FailNextSend(err error) {
+	gateway.mu.Lock()
+	gateway.sendFailures = append(gateway.sendFailures, err)
+	gateway.mu.Unlock()
 }
 
 func (gateway *routerGateway) SendImageTo(_ context.Context, _ string, png []byte) error {

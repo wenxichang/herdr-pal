@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/textproto"
@@ -49,6 +50,33 @@ type ServerWeComConfig struct {
 	BotID                string   `json:"bot_id"`
 	Secret               string   `json:"secret"`
 	RegistrationAdminIDs []string `json:"registration_admin_ids"`
+}
+
+// UnmarshalJSON 区分缺失字段与 null，并保持企业微信配置的严格字段校验。
+func (config *ServerWeComConfig) UnmarshalJSON(data []byte) error {
+	raw := struct {
+		BotID                string          `json:"bot_id"`
+		Secret               string          `json:"secret"`
+		RegistrationAdminIDs json.RawMessage `json:"registration_admin_ids"`
+	}{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	config.BotID = raw.BotID
+	config.Secret = raw.Secret
+	config.RegistrationAdminIDs = nil
+	if len(raw.RegistrationAdminIDs) == 0 {
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw.RegistrationAdminIDs), []byte("null")) {
+		return errors.New("registration_admin_ids 必须是数组")
+	}
+	if err := json.Unmarshal(raw.RegistrationAdminIDs, &config.RegistrationAdminIDs); err != nil {
+		return fmt.Errorf("registration_admin_ids 必须是字符串数组: %w", err)
+	}
+	return nil
 }
 
 // ListenerConfig 是 Relay WSS 监听和证书配置。

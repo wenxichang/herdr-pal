@@ -369,7 +369,7 @@ func newHPAPHarnessWithRegistrationAdmins(t *testing.T, registrationAdminIDs []s
 	configData, err := json.Marshal(map[string]any{
 		"wecom": map[string]any{
 			"bot_id": botID, "secret": secret,
-			"registration_admin_ids": append([]string(nil), registrationAdminIDs...),
+			"registration_admin_ids": append([]string{}, registrationAdminIDs...),
 		},
 		"server":     map[string]any{"listen": listenAddress, "state_dir": stateDir},
 		"admin":      map[string]any{"listen": "127.0.0.1:0"},
