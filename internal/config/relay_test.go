@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +115,76 @@ func TestLoadServerRequiresSecretInConfigurationFile(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "wecom.secret") || strings.Contains(err.Error(), "environment-secret-must-be-ignored") {
 		t.Fatalf("LoadServer() error = %v", err)
+	}
+}
+
+func TestLoadServerNormalizesRegistrationAdminIDs(t *testing.T) {
+	path := writeConfig(t, `{
+  "wecom": {
+    "bot_id": "bot-1",
+    "secret": "file-secret-value",
+    "registration_admin_ids": [" admin-a ", "admin-b"]
+  },
+  "server": {"listen": "127.0.0.1:9443"},
+  "log": {}
+}`)
+
+	loaded, err := LoadServer(path, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("LoadServer() error = %v", err)
+	}
+	want := []string{"admin-a", "admin-b"}
+	if !reflect.DeepEqual(loaded.WeCom.RegistrationAdminIDs, want) {
+		t.Fatalf("registration admin IDs = %#v, want %#v", loaded.WeCom.RegistrationAdminIDs, want)
+	}
+}
+
+func TestLoadServerAllowsEmptyRegistrationAdminIDs(t *testing.T) {
+	for _, wecom := range []string{
+		`{"bot_id":"bot","secret":"secret"}`,
+		`{"bot_id":"bot","secret":"secret","registration_admin_ids":[]}`,
+	} {
+		loaded, err := LoadServer(writeConfig(t, `{
+  "wecom": `+wecom+`,
+  "server": {"listen": "127.0.0.1:9443"},
+  "log": {}
+}`), func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("LoadServer() error = %v", err)
+		}
+		if len(loaded.WeCom.RegistrationAdminIDs) != 0 {
+			t.Fatalf("registration admin IDs = %#v, want empty", loaded.WeCom.RegistrationAdminIDs)
+		}
+	}
+}
+
+func TestLoadServerRejectsInvalidRegistrationAdminIDs(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "blank", value: `["   "]`},
+		{name: "duplicate after trim", value: `["admin-a", " admin-a "]`},
+		{name: "control character", value: `["admin\nroot"]`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeConfig(t, `{
+  "wecom": {
+    "bot_id": "bot",
+    "secret": "secret",
+    "registration_admin_ids": `+test.value+`
+  },
+  "server": {"listen": "127.0.0.1:9443"},
+  "log": {}
+}`)
+
+			_, err := LoadServer(path, func(string) string { return "" })
+			if err == nil || !strings.Contains(err.Error(), "wecom.registration_admin_ids") {
+				t.Fatalf("LoadServer() error = %v, want registration_admin_ids", err)
+			}
+		})
 	}
 }
 

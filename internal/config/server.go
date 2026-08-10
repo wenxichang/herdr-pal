@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/wenxichang/herdr-pal/internal/credential"
 )
 
 const maxAdminSocketPathBytes = 103
@@ -44,8 +46,9 @@ type serverConfigFile struct {
 
 // ServerWeComConfig 是服务端独占的企业微信机器人配置。
 type ServerWeComConfig struct {
-	BotID  string `json:"bot_id"`
-	Secret string `json:"secret"`
+	BotID                string   `json:"bot_id"`
+	Secret               string   `json:"secret"`
+	RegistrationAdminIDs []string `json:"registration_admin_ids"`
 }
 
 // ListenerConfig 是 Relay WSS 监听和证书配置。
@@ -146,6 +149,10 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 		WeCom: raw.WeCom, Server: raw.Server, Admin: raw.Admin, Audit: raw.Audit, Log: raw.Log,
 		RateLimit: RateLimitConfig{PerSecond: 1, PerMinute: 20},
 	}
+	loaded.WeCom.RegistrationAdminIDs, err = normalizeRegistrationAdminIDs(loaded.WeCom.RegistrationAdminIDs)
+	if err != nil {
+		return ServerConfig{}, err
+	}
 	if raw.RateLimit != nil {
 		loaded.RateLimit = *raw.RateLimit
 	}
@@ -199,6 +206,29 @@ func LoadServerAdmin(path string) (ServerConfig, error) {
 		return ServerConfig{}, err
 	}
 	return loaded, nil
+}
+
+func normalizeRegistrationAdminIDs(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		adminID := strings.TrimSpace(value)
+		if adminID == "" {
+			return nil, fmt.Errorf("wecom.registration_admin_ids 包含空白用户 ID")
+		}
+		if err := credential.ValidatePrincipalID(adminID); err != nil {
+			return nil, fmt.Errorf("wecom.registration_admin_ids 包含无效用户 ID: %w", err)
+		}
+		if _, exists := seen[adminID]; exists {
+			return nil, fmt.Errorf("wecom.registration_admin_ids 包含重复用户 ID: %s", adminID)
+		}
+		seen[adminID] = struct{}{}
+		normalized = append(normalized, adminID)
+	}
+	return normalized, nil
 }
 
 func validateAdmin(config AdminConfig) error {
