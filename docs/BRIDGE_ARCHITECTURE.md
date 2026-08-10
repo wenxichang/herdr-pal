@@ -10,7 +10,8 @@ Herdr Pal 由中央 Server 与每机 Pal sidecar 组成。Server 集中持有企
                        ├── WeComClient / ConversationRouter / UserExecutor
 hp-cli ── HPAP/1 ────▶ ├── AdminServer ─┐
 HTTPS 管理台 ─────────▶ ├── WebAdmin ────┴── AdminService / CredentialStore
-企业微信 /reg ─────────▶ ├── MachineRegistrationService / RegistrationStore
+企业微信 /reg、审批 ─────▶ ├── RegistrationApprovalCoordinator
+                       │          └── MachineRegistrationService / RegistrationStore
                        └── ClientHub / SessionCatalog
                                   │ HPRP/1 WSS
                      ┌────────────┴────────────┐
@@ -59,7 +60,7 @@ credential_id + principal_id + machine_id + secret_digest + allowed_sources
 
 Router 以企业微信用户 ID 为隔离边界：
 
-- 直接处理 `/ls`、独立 `/N`、`/help`，并在没有在线会话时处理 `/reg`。
+- 直接处理 `/ls`、独立 `/N`、`/help`，并在没有在线会话时处理 `/reg` 和管理员审批命令。
 - 把 `/N 内容`、`#N 内容` 的全局编号解析成 HPRP 稳定目标。
 - 将其他输入路由到当前选择，并在成功后按命令语义更新选择。
 - 按完整稳定目标维护 `/mode img|txt` 的内存覆盖；OpenCode 默认图片，其他 Agent 默认文本。
@@ -95,13 +96,23 @@ hp-cli key issue --principal-id USERID --machine-id MACHINE --source 192.168.1.2
 
 - 用户没有任何凭据且没有 pending 时，首台机器直接签发并通过当前企微响应交付一次性 Key。
 - 用户已有任意凭据或 pending 时，只在 `<state_dir>/registrations.json` 保存待审批申请。
-- Web 管理员批准后签发并主动发送 Key；交付失败删除新凭据并保留申请，便于重试。
+- Web 或企业微信管理员批准后签发并主动发送 Key；交付失败删除新凭据并保留申请，便于重试。
 - 驳回先删除申请再尽力通知用户；通知失败不恢复已经生效的决定。
 - 同一用户的 `/reg`、Web 审批和人工 Key 变更使用固定条带锁串行化，不能绕过 pending。
 
 注册文件不保存已批准或已驳回历史。完整生命周期写入
 `herdr_pal.machine_registration` OTLP/Loki 业务审计；明文 Key 不进入浏览器响应、普通日志或
 审计正文。
+
+`RegistrationApprovalCoordinator` 是 Server 内部协调层，不改变注册存储和管理协议：
+
+- 配置管理员按数组顺序轮转接收新 pending 通知，每条申请只尝试通知一人。
+- `/ls-reg` 为每位管理员保存独立的内存编号快照；Router 不保存或解释审批编号。
+- `/apr`、`/rej` 先用同一位置的 `registration_id` 复核全局列表，再只使用稳定 ID 执行。
+- 全局列表尾部新增不影响旧编号；删除或重排会整批拒绝，避免并发错批。
+- 每次审批尝试立即清除该管理员快照；批量单项失败不会阻止后续稳定 ID。
+- Web 管理台继续直接使用稳定 `registration_id`，不依赖企业微信私有快照。
+- 管理员通知失败不改变申请人的 pending 回复，也不尝试下一位管理员。
 
 ### 3.5 管理面
 

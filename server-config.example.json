@@ -1,7 +1,8 @@
 {
   "wecom": {
     "bot_id": "",
-    "secret": ""
+    "secret": "",
+    "registration_admin_ids": []
   },
   "server": {
     "listen": "0.0.0.0:9443",

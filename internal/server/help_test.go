@@ -95,3 +95,12 @@ func TestDefaultHelpIncludesMachineRegistration(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultHelpIncludesRegistrationApprovalCommands(t *testing.T) {
+	content := DefaultHelpText()
+	for _, command := range []string{"/ls-reg", "/apr 1 2 3", "/rej 1 2 3", "审批后编号快照立即失效"} {
+		if !strings.Contains(content, command) {
+			t.Fatalf("default help missing %q", command)
+		}
+	}
+}

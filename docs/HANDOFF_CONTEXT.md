@@ -35,7 +35,12 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - 企业微信 principal ID 来自已认证单聊；机器标识可由用户通过 `/reg` 提交，也可由管理员
   人工签发，二者都只绑定到机器 Key，不写入 Pal 配置。
 - 用户完全没有凭据和 pending 时，`/reg` 首台机器直接签发；已有任意凭据或 pending 时进入
-  Web-only 审批。审批 Key 交付失败会回滚凭据并保留申请。
+  待审批列表，可由 Web 管理台或配置的企业微信管理员处理。审批 Key 交付失败会回滚凭据并
+  保留申请。
+- `wecom.registration_admin_ids` 为空时关闭企微审批。新 pending 只轮转通知一位管理员；
+  通知失败不尝试下一位，下一申请继续轮转。
+- 所有配置管理员都可执行 `/ls-reg`、`/apr`、`/rej`。每位管理员的编号快照独立保存在内存，
+  每次审批尝试后立即失效；列表位置变化时整批拒绝，批量单项失败继续处理后续稳定 ID。
 - 管理员使用 `hp-cli key issue` 为每台机器签发独立 `hpk_...` Key，并必须配置至少一条
   来源地址规则。
 - Key 在服务端绑定 `(principal_id, machine_id)`；Pal 不能自行声明或覆盖身份。
@@ -60,15 +65,17 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 2. `EnsureTLS` 加载外部证书；未配置时在状态目录生成并复用自签名证书。
 3. `credential.LoadStore` 加载仅保存摘要的 HPRP 机器凭据，`machinereg.LoadStore` 加载只含
    pending 的机器注册申请。
-4. 创建共享 `machinereg.Service`，串行化 `/reg`、Web 审批和人工凭据变更。
-5. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
-6. 在 `<state_dir>/admin.sock` 启动 HPAP 管理面；失败时整个 Server 启动失败。
-7. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
-8. `/help` 每次重新读取 `help.md`，管理员修改后无需重启即可生效。
+4. 创建共享 `machinereg.Service`，串行化 `/reg`、Web/企微审批和人工凭据变更。
+5. 创建 `RegistrationApprovalCoordinator`，管理管理员轮转通知和私有编号快照。
+6. 创建 `SessionCatalog`、`ClientHub`、`UserExecutor` 和 `ConversationRouter`。
+7. 在 `<state_dir>/admin.sock` 启动 HPAP 管理面；失败时整个 Server 启动失败。
+8. 启动企业微信连接与 TLS HTTP/WebSocket 监听。
+9. `/help` 每次重新读取 `help.md`，管理员修改后无需重启即可生效。
 
 终端用户优先发送 `/reg <machine_id> <source1,source2>`。首台 Key 在当前响应中只显示一次；
-后续申请进入 Web 管理台，批准后通过主动企微消息交付。`registrations.json` 不保存审批历史，
-申请、自动签发、批准、驳回和回滚写入 `herdr_pal.machine_registration` OTLP/Loki 审计事件。
+后续申请进入待审批列表，并按配置轮转通知一位企微管理员；Web 管理台和所有配置的企微
+管理员都可处理，批准后通过主动企微消息交付。`registrations.json` 不保存审批历史，申请、
+自动签发、批准、驳回和回滚写入 `herdr_pal.machine_registration` OTLP/Loki 审计事件。
 
 管理员从企业微信管理信息或组织内账户系统取得 principal ID 后执行：
 
@@ -120,7 +127,7 @@ machine_id + slot_id + session_id
 
 - Server 先校验单聊身份和消息 ID，再完成 `msgid` 幂等去重；唯一输入随后进入按用户滚动
   窗口限速，默认每秒 1 条、60 秒内 20 条，显式配置 0 可关闭对应窗口。
-- `/ls`、独立 `/N`、`/help` 和 `/reg` 由 Server 处理。
+- `/ls`、独立 `/N`、`/help`、`/reg` 和管理员注册审批命令由 Server 处理。
 - `/N 内容` 与 `#N 内容` 先由 Server 把全局编号解析为稳定目标；前者仅在成功后切换，
   后者不改变当前选择。
 - 其余内容要求已有稳定选择，Server 发送 `command.execute`。
