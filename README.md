@@ -25,7 +25,7 @@ herdr-pal-server
 
 - 一台用于运行 `herdr-pal-server` 的内网机器。
 - 每台客户端机器已经安装并启动 Herdr。
-- Herdr 公共 Socket API protocol 必须为 `17`。
+- Herdr 公共 Socket API protocol 必须为已审计的 `17` 或 `19`。
 - 企业微信中有权限创建或使用智能机器人。
 - 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
 
@@ -41,7 +41,7 @@ herdr-pal-server
 herdr status server --json
 ```
 
-输出应显示服务正在运行，且 `protocol` 为 `17`。
+输出应显示服务正在运行，且 `protocol` 为 `17` 或 `19`。
 
 ## 构建
 
