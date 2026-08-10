@@ -160,6 +160,21 @@ func TestRegistrationApprovalCoordinatorInvalidatesSnapshotAfterAttempt(t *testi
 	}
 }
 
+func TestRegistrationApprovalCoordinatorInvalidatesSnapshotExplicitly(t *testing.T) {
+	manager := newFakeRegistrationApprovalManager(approvalRequest("reg-a", "user-a", "office", time.Now()))
+	coordinator := newTestRegistrationApprovalCoordinator(t, manager, newFakeRegistrationApprovalGateway(), "admin-a")
+
+	if _, err := coordinator.List("admin-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Invalidate("admin-a"); err != nil {
+		t.Fatalf("Invalidate() error = %v", err)
+	}
+	if _, err := coordinator.Approve(context.Background(), "admin-a", []int{1}); !errors.Is(err, ErrRegistrationApprovalSnapshotMissing) {
+		t.Fatalf("Approve() error = %v, want missing snapshot", err)
+	}
+}
+
 func TestRegistrationApprovalCoordinatorContinuesBatchAfterItemFailure(t *testing.T) {
 	manager := newFakeRegistrationApprovalManager(
 		approvalRequest("reg-a", "user-a", "office", time.Now()),
@@ -247,6 +262,24 @@ func TestRegistrationApprovalCoordinatorRejectsUnauthorizedAdmin(t *testing.T) {
 	}
 	if _, err := coordinator.List("other"); !errors.Is(err, ErrRegistrationApprovalUnauthorized) {
 		t.Fatalf("List(other) error = %v", err)
+	}
+}
+
+func TestNewRegistrationApprovalCoordinatorRejectsInvalidAdminIDs(t *testing.T) {
+	for _, adminIDs := range [][]string{
+		{" admin-a "},
+		{"admin\nroot"},
+		{"admin-a", "admin-a"},
+	} {
+		_, err := NewRegistrationApprovalCoordinator(RegistrationApprovalCoordinatorConfig{
+			AdminIDs:      adminIDs,
+			Registrations: newFakeRegistrationApprovalManager(),
+			Gateway:       newFakeRegistrationApprovalGateway(),
+			KeyDelivery:   func(context.Context, machinereg.KeyDelivery) error { return nil },
+		})
+		if !errors.Is(err, ErrInvalidRegistrationApprovalDependency) {
+			t.Fatalf("admin IDs %#v error = %v", adminIDs, err)
+		}
 	}
 }
 

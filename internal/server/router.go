@@ -355,9 +355,32 @@ func maxInt64(left, right int64) int64 {
 }
 
 func (router *ConversationRouter) handleAuthorized(ctx context.Context, message im.IncomingText) {
+	approvalCommand := registrationApprovalCommand(message.Content)
+	if approvalCommand != "" && !router.regApproval.IsAdmin(message.UserID) {
+		router.logger.Warn("企业微信注册审批命令被拒绝",
+			"admin_hash", routerHash(message.UserID),
+			"message_hash", routerHash(message.MessageID),
+			"command", approvalCommand,
+			"error_type", "unauthorized",
+		)
+		router.reply(ctx, message, ErrRegistrationApprovalUnauthorized.Error())
+		return
+	}
 	action, err := parseServerAction(message.Content)
 	if err != nil {
 		router.logger.Warn("企业微信交互解析失败", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "content_bytes", len([]byte(message.Content)), "error_type", "invalid_action", "reason", safeServerErrorReason(err))
+		if approvalCommand == "/apr" || approvalCommand == "/rej" {
+			if invalidateErr := router.regApproval.Invalidate(message.UserID); invalidateErr != nil {
+				router.logger.Warn("注册审批列表快照失效失败",
+					"admin_hash", routerHash(message.UserID),
+					"message_hash", routerHash(message.MessageID),
+					"command", approvalCommand,
+					"error_type", registrationApprovalErrorType(invalidateErr),
+				)
+			}
+			router.reply(ctx, message, err.Error()+"\n\n"+registrationApprovalSnapshotReminder)
+			return
+		}
 		if isRegistrationCommand(message.Content) || isRegistrationApprovalCommand(message.Content) {
 			router.reply(ctx, message, err.Error())
 			return
@@ -1206,21 +1229,28 @@ func isRegistrationCommand(content string) bool {
 }
 
 func isRegistrationApprovalCommand(content string) bool {
+	return registrationApprovalCommand(content) != ""
+}
+
+func registrationApprovalCommand(content string) string {
 	fields := strings.Fields(strings.TrimSpace(content))
 	if len(fields) == 0 {
-		return false
+		return ""
 	}
 	if fields[0] == "/ls-reg" || fields[0] == "/apr" || fields[0] == "/rej" {
-		return true
+		return fields[0]
 	}
 	if len(fields) < 2 || len(fields[0]) < 2 || fields[0][0] != '/' && fields[0][0] != '#' {
-		return false
+		return ""
 	}
 	if fields[1] != "/ls-reg" && fields[1] != "/apr" && fields[1] != "/rej" {
-		return false
+		return ""
 	}
 	_, err := positiveASCIIInt(fields[0][1:])
-	return err == nil
+	if err != nil {
+		return ""
+	}
+	return fields[1]
 }
 
 func isRegistrationApprovalAction(kind serverActionKind) bool {
@@ -1287,6 +1317,10 @@ func (unavailableRegistrationApprovalHandler) Approve(context.Context, string, [
 
 func (unavailableRegistrationApprovalHandler) Reject(context.Context, string, []int) (string, error) {
 	return "", ErrRegistrationApprovalUnauthorized
+}
+
+func (unavailableRegistrationApprovalHandler) Invalidate(string) error {
+	return ErrRegistrationApprovalUnauthorized
 }
 
 func registrationApprovalErrorType(err error) string {

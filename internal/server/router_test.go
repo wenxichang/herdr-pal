@@ -136,12 +136,27 @@ func TestConversationRouterRejectsApprovalCommandsFromNonAdmin(t *testing.T) {
 	approval := &routerRegistrationApprovalHandler{admins: map[string]bool{"admin-a": true}}
 	router, gateway, relay := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
 
-	router.Handle(context.Background(), routerMessage("request-other", "message-other", "user-a", "/ls-reg"))
-	if reply := gateway.LastReply(); !strings.Contains(reply, "不是注册审批管理员") || reply == noAvailableSessionsMessage {
-		t.Fatalf("reply = %q", reply)
+	for index, content := range []string{"/ls-reg", "/apr 1 1"} {
+		router.Handle(context.Background(), routerMessage("request-other-"+strconv.Itoa(index), "message-other-"+strconv.Itoa(index), "user-a", content))
+		if reply := gateway.LastReply(); !strings.Contains(reply, "不是注册审批管理员") || reply == noAvailableSessionsMessage {
+			t.Fatalf("%s reply = %q", content, reply)
+		}
 	}
 	if approval.listCalls != 0 || relay.CallCount() != 0 {
 		t.Fatalf("approval list calls = %d, relay calls = %d", approval.listCalls, relay.CallCount())
+	}
+}
+
+func TestConversationRouterInvalidatesApprovalSnapshotAfterMalformedDecision(t *testing.T) {
+	approval := &routerRegistrationApprovalHandler{admins: map[string]bool{"admin-a": true}}
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
+
+	router.Handle(context.Background(), routerMessage("request-invalid-apr", "message-invalid-apr", "admin-a", "/apr 1 1"))
+	if reply := gateway.LastReply(); !strings.Contains(reply, "编号不能重复") || !strings.Contains(reply, registrationApprovalSnapshotReminder) {
+		t.Fatalf("reply = %q", reply)
+	}
+	if approval.invalidateCalls != 1 {
+		t.Fatalf("invalidate calls = %d", approval.invalidateCalls)
 	}
 }
 
@@ -1765,6 +1780,7 @@ type routerRegistrationApprovalHandler struct {
 	notifiedRequests []machinereg.Request
 	approveIndexes   [][]int
 	rejectIndexes    [][]int
+	invalidateCalls  int
 }
 
 func (handler *routerRegistrationApprovalHandler) IsAdmin(userID string) bool {
@@ -1790,6 +1806,11 @@ func (handler *routerRegistrationApprovalHandler) Approve(_ context.Context, _ s
 func (handler *routerRegistrationApprovalHandler) Reject(_ context.Context, _ string, indexes []int) (string, error) {
 	handler.rejectIndexes = append(handler.rejectIndexes, append([]int(nil), indexes...))
 	return handler.rejectContent, handler.rejectErr
+}
+
+func (handler *routerRegistrationApprovalHandler) Invalidate(string) error {
+	handler.invalidateCalls++
+	return nil
 }
 
 func (requester *routerRegistrationRequester) Register(ctx context.Context, input machinereg.RegisterInput, deliver machinereg.KeyDeliveryFunc) (machinereg.RegisterResult, error) {

@@ -43,6 +43,7 @@ type RegistrationApprovalHandler interface {
 	List(string) (string, error)
 	Approve(context.Context, string, []int) (string, error)
 	Reject(context.Context, string, []int) (string, error)
+	Invalidate(string) error
 }
 
 // RegistrationApprovalCoordinatorConfig 定义企业微信注册审批协调器的依赖。
@@ -87,7 +88,7 @@ func NewRegistrationApprovalCoordinator(config RegistrationApprovalCoordinatorCo
 	adminIDs := append([]string(nil), config.AdminIDs...)
 	adminSet := make(map[string]struct{}, len(adminIDs))
 	for _, adminID := range adminIDs {
-		if strings.TrimSpace(adminID) == "" {
+		if strings.TrimSpace(adminID) != adminID || credential.ValidatePrincipalID(adminID) != nil {
 			return nil, ErrInvalidRegistrationApprovalDependency
 		}
 		if _, exists := adminSet[adminID]; exists {
@@ -163,6 +164,17 @@ func (coordinator *RegistrationApprovalCoordinator) List(adminID string) (string
 	coordinator.snapshots[adminID] = registrationIDs
 	coordinator.mu.Unlock()
 	return formatPendingRegistrationApprovals(requests), nil
+}
+
+// Invalidate 清除管理员最近一次待审批列表快照。
+func (coordinator *RegistrationApprovalCoordinator) Invalidate(adminID string) error {
+	if !coordinator.IsAdmin(adminID) {
+		return ErrRegistrationApprovalUnauthorized
+	}
+	coordinator.mu.Lock()
+	delete(coordinator.snapshots, adminID)
+	coordinator.mu.Unlock()
+	return nil
 }
 
 // Approve 复核管理员快照并依次批准所选稳定申请 ID。
