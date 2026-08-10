@@ -169,6 +169,7 @@ type ConversationRouter struct {
 	auditRedactor  *audit.Redactor
 	botIDHash      string
 	registrations  RegistrationRequester
+	regApproval    RegistrationApprovalHandler
 }
 
 // ConversationRouterConfig 是服务端会话路由器的展示配置。
@@ -185,6 +186,8 @@ type ConversationRouterConfig struct {
 	BotIDHash string
 	// RegistrationRequester 处理 /reg；nil 时仅返回注册服务不可用。
 	RegistrationRequester RegistrationRequester
+	// RegistrationApproval 处理企业微信管理员注册审批；nil 表示禁用。
+	RegistrationApproval RegistrationApprovalHandler
 }
 
 // NewConversationRouter 创建多用户会话路由器。
@@ -212,12 +215,15 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 	if config.RegistrationRequester == nil {
 		config.RegistrationRequester = unavailableRegistrationRequester{}
 	}
+	if config.RegistrationApproval == nil {
+		config.RegistrationApproval = unavailableRegistrationApprovalHandler{}
+	}
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
 		deduper: deduper, logger: logger, helpProvider: config.HelpProvider, requestTimeout: defaultRelayRequestTimeout,
 		activity: newUserActivityTracker(), now: time.Now, rateLimiter: config.RateLimiter,
 		auditor: config.Auditor, auditRedactor: config.AuditRedactor, botIDHash: config.BotIDHash,
-		registrations: config.RegistrationRequester,
+		registrations: config.RegistrationRequester, regApproval: config.RegistrationApproval,
 	}, nil
 }
 
@@ -352,7 +358,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	action, err := parseServerAction(message.Content)
 	if err != nil {
 		router.logger.Warn("企业微信交互解析失败", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "content_bytes", len([]byte(message.Content)), "error_type", "invalid_action", "reason", safeServerErrorReason(err))
-		if isRegistrationCommand(message.Content) {
+		if isRegistrationCommand(message.Content) || isRegistrationApprovalCommand(message.Content) {
 			router.reply(ctx, message, err.Error())
 			return
 		}
@@ -365,7 +371,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	}
 	router.logger.Debug("企业微信交互已接收", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "target_index", action.index, "switch_after", action.switchAfter, "content_bytes", len([]byte(message.Content)))
 	router.activity.Touch(message.UserID, router.now())
-	if action.kind != serverActionHelp && action.kind != serverActionRegister && !router.catalog.HasSessions(message.UserID) {
+	if action.kind != serverActionHelp && action.kind != serverActionRegister && !isRegistrationApprovalAction(action.kind) && !router.catalog.HasSessions(message.UserID) {
 		router.logger.Info("企业微信交互未路由", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "error_type", "no_sessions", "reason", "当前用户没有在线且可用的 Relay 会话")
 		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
@@ -385,6 +391,8 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		router.reply(ctx, message, helpText)
 	case serverActionRegister:
 		router.handleRegistration(ctx, message, action)
+	case serverActionListRegistrations, serverActionApproveRegistrations, serverActionRejectRegistrations:
+		router.handleRegistrationApproval(ctx, message, action)
 	case serverActionMode:
 		router.handleMode(ctx, message, action.mode)
 	case serverActionDirected:
@@ -438,6 +446,16 @@ func (router *ConversationRouter) handleRegistration(ctx context.Context, messag
 			return
 		}
 		router.reply(ctx, message, fmt.Sprintf("机器注册申请已提交，等待管理员审批。\n申请编号：%s\n审批通过后会通过企业微信发送机器 Key。", safeRouterLabel(result.Request.RegistrationID)))
+		if err := router.regApproval.NotifyPending(ctx, *result.Request); err != nil {
+			router.logger.Warn("机器注册审批通知未送达",
+				"user_hash", routerHash(message.UserID),
+				"message_hash", routerHash(message.MessageID),
+				"machine_id", safeLogValue(result.Request.MachineID),
+				"registration_id", safeLogValue(result.Request.RegistrationID),
+				"error_type", serverErrorType(err),
+				"reason", safeServerErrorReason(err),
+			)
+		}
 	case machinereg.DispositionAlreadyPending:
 		if result.Request == nil {
 			router.reply(ctx, message, "机器注册状态异常，请联系管理员。")
@@ -447,6 +465,46 @@ func (router *ConversationRouter) handleRegistration(ctx context.Context, messag
 	default:
 		router.reply(ctx, message, "机器注册状态异常，请联系管理员。")
 	}
+}
+
+func (router *ConversationRouter) handleRegistrationApproval(ctx context.Context, message im.IncomingText, action serverAction) {
+	if !router.regApproval.IsAdmin(message.UserID) {
+		router.logger.Warn("企业微信注册审批命令被拒绝",
+			"admin_hash", routerHash(message.UserID),
+			"message_hash", routerHash(message.MessageID),
+			"action", serverActionName(action.kind),
+			"error_type", "unauthorized",
+		)
+		router.reply(ctx, message, ErrRegistrationApprovalUnauthorized.Error())
+		return
+	}
+
+	var (
+		content string
+		err     error
+	)
+	switch action.kind {
+	case serverActionListRegistrations:
+		content, err = router.regApproval.List(message.UserID)
+	case serverActionApproveRegistrations:
+		content, err = router.regApproval.Approve(ctx, message.UserID, action.indexes)
+	case serverActionRejectRegistrations:
+		content, err = router.regApproval.Reject(ctx, message.UserID, action.indexes)
+	default:
+		err = ErrRegistrationApprovalInvalidIndexes
+	}
+	if err != nil {
+		router.logger.Warn("企业微信注册审批命令执行失败",
+			"admin_hash", routerHash(message.UserID),
+			"message_hash", routerHash(message.MessageID),
+			"action", serverActionName(action.kind),
+			"selected_count", len(action.indexes),
+			"error_type", registrationApprovalErrorType(err),
+			"reason", safeServerErrorReason(err),
+		)
+		content = registrationApprovalErrorMessage(action.kind, err)
+	}
+	router.reply(ctx, message, content)
 }
 
 func (router *ConversationRouter) handleList(ctx context.Context, message im.IncomingText) {
@@ -1017,6 +1075,9 @@ const (
 	serverActionMode
 	serverActionDirected
 	serverActionRegister
+	serverActionListRegistrations
+	serverActionApproveRegistrations
+	serverActionRejectRegistrations
 )
 
 type serverAction struct {
@@ -1026,6 +1087,7 @@ type serverAction struct {
 	mode        hprp.OutputMode
 	machineID   string
 	sources     []string
+	indexes     []int
 	switchAfter bool
 }
 
@@ -1074,6 +1136,23 @@ func parseServerAction(content string) (serverAction, error) {
 			}
 		}
 		return serverAction{kind: serverActionRegister, machineID: fields[1], sources: sources}, nil
+	case "/ls-reg":
+		if len(fields) != 1 {
+			return serverAction{}, errors.New("/ls-reg 用法: /ls-reg")
+		}
+		return serverAction{kind: serverActionListRegistrations}, nil
+	case "/apr":
+		indexes, err := parseRegistrationApprovalIndexes("apr", fields)
+		if err != nil {
+			return serverAction{}, err
+		}
+		return serverAction{kind: serverActionApproveRegistrations, indexes: indexes}, nil
+	case "/rej":
+		indexes, err := parseRegistrationApprovalIndexes("rej", fields)
+		if err != nil {
+			return serverAction{}, err
+		}
+		return serverAction{kind: serverActionRejectRegistrations, indexes: indexes}, nil
 	}
 	if len(fields) == 1 && strings.HasPrefix(fields[0], "/") {
 		if index, err := positiveASCIIInt(strings.TrimPrefix(fields[0], "/")); err == nil {
@@ -1100,7 +1179,7 @@ func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
 	}
 	nested, err := parseServerAction(remainder)
 	if err != nil || (nested.kind != serverActionForward && nested.kind != serverActionMode) {
-		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help、/reg 或另一个 /N。")
+		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help、/reg、注册审批命令或另一个 /N。")
 	}
 	return serverAction{
 		kind:        serverActionDirected,
@@ -1126,6 +1205,49 @@ func isRegistrationCommand(content string) bool {
 	return err == nil
 }
 
+func isRegistrationApprovalCommand(content string) bool {
+	fields := strings.Fields(strings.TrimSpace(content))
+	if len(fields) == 0 {
+		return false
+	}
+	if fields[0] == "/ls-reg" || fields[0] == "/apr" || fields[0] == "/rej" {
+		return true
+	}
+	if len(fields) < 2 || len(fields[0]) < 2 || fields[0][0] != '/' && fields[0][0] != '#' {
+		return false
+	}
+	if fields[1] != "/ls-reg" && fields[1] != "/apr" && fields[1] != "/rej" {
+		return false
+	}
+	_, err := positiveASCIIInt(fields[0][1:])
+	return err == nil
+}
+
+func isRegistrationApprovalAction(kind serverActionKind) bool {
+	return kind == serverActionListRegistrations || kind == serverActionApproveRegistrations || kind == serverActionRejectRegistrations
+}
+
+func parseRegistrationApprovalIndexes(command string, fields []string) ([]int, error) {
+	usage := fmt.Sprintf("/%s 用法: /%s 1 2 3", command, command)
+	if len(fields) < 2 {
+		return nil, errors.New(usage)
+	}
+	indexes := make([]int, 0, len(fields)-1)
+	seen := make(map[int]struct{}, len(fields)-1)
+	for _, field := range fields[1:] {
+		index, err := positiveASCIIInt(field)
+		if err != nil {
+			return nil, errors.New(usage)
+		}
+		if _, exists := seen[index]; exists {
+			return nil, errors.New("编号不能重复，请重新执行 /ls-reg。")
+		}
+		seen[index] = struct{}{}
+		indexes = append(indexes, index)
+	}
+	return indexes, nil
+}
+
 func registrationErrorType(err error) string {
 	switch {
 	case errors.Is(err, machinereg.ErrMachineExists):
@@ -1145,6 +1267,59 @@ type unavailableRegistrationRequester struct{}
 
 func (unavailableRegistrationRequester) Register(context.Context, machinereg.RegisterInput, machinereg.KeyDeliveryFunc) (machinereg.RegisterResult, error) {
 	return machinereg.RegisterResult{}, machinereg.ErrInvalidRequest
+}
+
+type unavailableRegistrationApprovalHandler struct{}
+
+func (unavailableRegistrationApprovalHandler) IsAdmin(string) bool { return false }
+
+func (unavailableRegistrationApprovalHandler) NotifyPending(context.Context, machinereg.Request) error {
+	return nil
+}
+
+func (unavailableRegistrationApprovalHandler) List(string) (string, error) {
+	return "", ErrRegistrationApprovalUnauthorized
+}
+
+func (unavailableRegistrationApprovalHandler) Approve(context.Context, string, []int) (string, error) {
+	return "", ErrRegistrationApprovalUnauthorized
+}
+
+func (unavailableRegistrationApprovalHandler) Reject(context.Context, string, []int) (string, error) {
+	return "", ErrRegistrationApprovalUnauthorized
+}
+
+func registrationApprovalErrorType(err error) string {
+	switch {
+	case errors.Is(err, ErrRegistrationApprovalUnauthorized):
+		return "unauthorized"
+	case errors.Is(err, ErrRegistrationApprovalSnapshotMissing):
+		return "snapshot_missing"
+	case errors.Is(err, ErrRegistrationApprovalSnapshotChanged):
+		return "snapshot_changed"
+	case errors.Is(err, ErrRegistrationApprovalInvalidIndexes):
+		return "invalid_indexes"
+	default:
+		return "internal"
+	}
+}
+
+func registrationApprovalErrorMessage(kind serverActionKind, err error) string {
+	message := "注册审批操作失败，请稍后重试或联系管理员。"
+	switch {
+	case errors.Is(err, ErrRegistrationApprovalUnauthorized):
+		return ErrRegistrationApprovalUnauthorized.Error()
+	case errors.Is(err, ErrRegistrationApprovalSnapshotMissing):
+		message = ErrRegistrationApprovalSnapshotMissing.Error()
+	case errors.Is(err, ErrRegistrationApprovalSnapshotChanged):
+		message = ErrRegistrationApprovalSnapshotChanged.Error()
+	case errors.Is(err, ErrRegistrationApprovalInvalidIndexes):
+		message = "注册审批编号无效，请重新执行 /ls-reg。"
+	}
+	if kind == serverActionApproveRegistrations || kind == serverActionRejectRegistrations {
+		return message + "\n\n" + registrationApprovalSnapshotReminder
+	}
+	return message
 }
 
 func positiveASCIIInt(value string) (int, error) {

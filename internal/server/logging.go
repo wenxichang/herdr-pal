@@ -131,6 +131,12 @@ func serverActionName(kind serverActionKind) string {
 		return "directed_execute"
 	case serverActionRegister:
 		return "register"
+	case serverActionListRegistrations:
+		return "registration_list"
+	case serverActionApproveRegistrations:
+		return "registration_approve"
+	case serverActionRejectRegistrations:
+		return "registration_reject"
 	default:
 		return "execute"
 	}

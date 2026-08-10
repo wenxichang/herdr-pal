@@ -52,6 +52,167 @@ func TestParseServerActionRegistration(t *testing.T) {
 	}
 }
 
+func TestParseServerActionRegistrationApprovalCommands(t *testing.T) {
+	tests := []struct {
+		input       string
+		wantKind    serverActionKind
+		wantIndexes []int
+		wantErr     bool
+	}{
+		{input: "/ls-reg", wantKind: serverActionListRegistrations},
+		{input: "/apr 1 2 3", wantKind: serverActionApproveRegistrations, wantIndexes: []int{1, 2, 3}},
+		{input: "/rej 3 1", wantKind: serverActionRejectRegistrations, wantIndexes: []int{3, 1}},
+		{input: "/apr", wantErr: true},
+		{input: "/rej 0", wantErr: true},
+		{input: "/apr 1 1", wantErr: true},
+		{input: "/apr 1,2", wantErr: true},
+		{input: "/apr 1-2", wantErr: true},
+		{input: "/rej １", wantErr: true},
+		{input: "/1 /ls-reg", wantErr: true},
+		{input: "#1 /apr 1", wantErr: true},
+	}
+
+	for _, test := range tests {
+		action, err := parseServerAction(test.input)
+		if (err != nil) != test.wantErr {
+			t.Fatalf("parseServerAction(%q) error = %v", test.input, err)
+		}
+		if err == nil && (action.kind != test.wantKind || !reflect.DeepEqual(action.indexes, test.wantIndexes)) {
+			t.Fatalf("parseServerAction(%q) = %#v", test.input, action)
+		}
+	}
+}
+
+func TestServerActionNameRegistrationApprovalCommands(t *testing.T) {
+	tests := map[serverActionKind]string{
+		serverActionListRegistrations:    "registration_list",
+		serverActionApproveRegistrations: "registration_approve",
+		serverActionRejectRegistrations:  "registration_reject",
+	}
+	for kind, want := range tests {
+		if got := serverActionName(kind); got != want {
+			t.Fatalf("serverActionName(%d) = %q, want %q", kind, got, want)
+		}
+	}
+}
+
+func TestConversationRouterAllowsAdminApprovalCommandsWithoutSessions(t *testing.T) {
+	approval := &routerRegistrationApprovalHandler{
+		admins:         map[string]bool{"admin-a": true},
+		listContent:    "待审批列表",
+		approveContent: "批准完成",
+		rejectContent:  "驳回完成",
+	}
+	router, gateway, relay := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
+
+	commands := []struct {
+		content string
+		want    string
+	}{
+		{content: "/ls-reg", want: "待审批列表"},
+		{content: "/apr 1 3", want: "批准完成"},
+		{content: "/rej 2", want: "驳回完成"},
+	}
+	for index, command := range commands {
+		router.Handle(context.Background(), routerMessage(
+			"request-admin-"+strconv.Itoa(index),
+			"message-admin-"+strconv.Itoa(index),
+			"admin-a",
+			command.content,
+		))
+		if reply := gateway.LastReply(); reply != command.want {
+			t.Fatalf("%s reply = %q", command.content, reply)
+		}
+	}
+	if approval.listCalls != 1 || !reflect.DeepEqual(approval.approveIndexes, [][]int{{1, 3}}) || !reflect.DeepEqual(approval.rejectIndexes, [][]int{{2}}) {
+		t.Fatalf("approval calls = %#v", approval)
+	}
+	if relay.CallCount() != 0 {
+		t.Fatalf("relay calls = %d", relay.CallCount())
+	}
+}
+
+func TestConversationRouterRejectsApprovalCommandsFromNonAdmin(t *testing.T) {
+	approval := &routerRegistrationApprovalHandler{admins: map[string]bool{"admin-a": true}}
+	router, gateway, relay := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
+
+	router.Handle(context.Background(), routerMessage("request-other", "message-other", "user-a", "/ls-reg"))
+	if reply := gateway.LastReply(); !strings.Contains(reply, "不是注册审批管理员") || reply == noAvailableSessionsMessage {
+		t.Fatalf("reply = %q", reply)
+	}
+	if approval.listCalls != 0 || relay.CallCount() != 0 {
+		t.Fatalf("approval list calls = %d, relay calls = %d", approval.listCalls, relay.CallCount())
+	}
+}
+
+func TestConversationRouterReportsApprovalSnapshotErrors(t *testing.T) {
+	approval := &routerRegistrationApprovalHandler{
+		admins:     map[string]bool{"admin-a": true},
+		approveErr: ErrRegistrationApprovalSnapshotMissing,
+	}
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{RegistrationApproval: approval})
+
+	router.Handle(context.Background(), routerMessage("request-apr", "message-apr", "admin-a", "/apr 1"))
+	reply := gateway.LastReply()
+	if !strings.Contains(reply, "/ls-reg") || !strings.Contains(reply, registrationApprovalSnapshotReminder) {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestConversationRouterNotifiesAdminOnlyForNewPendingRegistration(t *testing.T) {
+	tests := []struct {
+		name        string
+		disposition machinereg.Disposition
+		wantCalls   int
+	}{
+		{name: "new pending", disposition: machinereg.DispositionPending, wantCalls: 1},
+		{name: "already pending", disposition: machinereg.DispositionAlreadyPending, wantCalls: 0},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := machinereg.Request{RegistrationID: "reg-office", PrincipalID: "user-a", MachineID: "office"}
+			registration := &routerRegistrationRequester{result: machinereg.RegisterResult{Disposition: test.disposition, Request: &request}}
+			approval := &routerRegistrationApprovalHandler{admins: map[string]bool{"admin-a": true}}
+			router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{
+				RegistrationRequester: registration,
+				RegistrationApproval:  approval,
+			})
+
+			router.Handle(context.Background(), routerMessage("request-notify-"+strconv.Itoa(index), "message-notify-"+strconv.Itoa(index), "user-a", "/reg office 127.0.0.1"))
+			if approval.notifyCalls != test.wantCalls {
+				t.Fatalf("notify calls = %d, want %d", approval.notifyCalls, test.wantCalls)
+			}
+			if test.wantCalls == 1 && (len(approval.notifiedRequests) != 1 || approval.notifiedRequests[0].RegistrationID != "reg-office") {
+				t.Fatalf("notified requests = %#v", approval.notifiedRequests)
+			}
+			if reply := gateway.LastReply(); !strings.Contains(reply, "审批") {
+				t.Fatalf("reply = %q", reply)
+			}
+		})
+	}
+}
+
+func TestConversationRouterKeepsPendingReplyWhenAdminNotificationFails(t *testing.T) {
+	request := machinereg.Request{RegistrationID: "reg-office", PrincipalID: "user-a", MachineID: "office"}
+	registration := &routerRegistrationRequester{result: machinereg.RegisterResult{Disposition: machinereg.DispositionPending, Request: &request}}
+	approval := &routerRegistrationApprovalHandler{
+		admins:    map[string]bool{"admin-a": true},
+		notifyErr: errors.New("notification failed"),
+	}
+	router, gateway, _ := newRouterHarnessWithConfig(t, ConversationRouterConfig{
+		RegistrationRequester: registration,
+		RegistrationApproval:  approval,
+	})
+
+	router.Handle(context.Background(), routerMessage("request-notify-fail", "message-notify-fail", "user-a", "/reg office 127.0.0.1"))
+	if reply := gateway.LastReply(); !strings.Contains(reply, "等待管理员审批") || strings.Contains(reply, "操作失败") {
+		t.Fatalf("reply = %q", reply)
+	}
+	if approval.notifyCalls != 1 {
+		t.Fatalf("notify calls = %d", approval.notifyCalls)
+	}
+}
+
 func TestRouterHandlesRegistrationWithoutSessions(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1588,6 +1749,47 @@ type routerRegistrationRequester struct {
 	token     string
 	calls     int
 	lastInput machinereg.RegisterInput
+}
+
+type routerRegistrationApprovalHandler struct {
+	admins           map[string]bool
+	notifyErr        error
+	listContent      string
+	listErr          error
+	approveContent   string
+	approveErr       error
+	rejectContent    string
+	rejectErr        error
+	notifyCalls      int
+	listCalls        int
+	notifiedRequests []machinereg.Request
+	approveIndexes   [][]int
+	rejectIndexes    [][]int
+}
+
+func (handler *routerRegistrationApprovalHandler) IsAdmin(userID string) bool {
+	return handler != nil && handler.admins[userID]
+}
+
+func (handler *routerRegistrationApprovalHandler) NotifyPending(_ context.Context, request machinereg.Request) error {
+	handler.notifyCalls++
+	handler.notifiedRequests = append(handler.notifiedRequests, request)
+	return handler.notifyErr
+}
+
+func (handler *routerRegistrationApprovalHandler) List(string) (string, error) {
+	handler.listCalls++
+	return handler.listContent, handler.listErr
+}
+
+func (handler *routerRegistrationApprovalHandler) Approve(_ context.Context, _ string, indexes []int) (string, error) {
+	handler.approveIndexes = append(handler.approveIndexes, append([]int(nil), indexes...))
+	return handler.approveContent, handler.approveErr
+}
+
+func (handler *routerRegistrationApprovalHandler) Reject(_ context.Context, _ string, indexes []int) (string, error) {
+	handler.rejectIndexes = append(handler.rejectIndexes, append([]int(nil), indexes...))
+	return handler.rejectContent, handler.rejectErr
 }
 
 func (requester *routerRegistrationRequester) Register(ctx context.Context, input machinereg.RegisterInput, deliver machinereg.KeyDeliveryFunc) (machinereg.RegisterResult, error) {
