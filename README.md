@@ -25,7 +25,7 @@ herdr-pal-server
 
 - 一台用于运行 `herdr-pal-server` 的内网机器。
 - 每台客户端机器已经安装并启动 Herdr。
-- Herdr 公共 Socket API protocol 必须为已审计的 `17` 或 `19`。
+- Herdr 公共 Socket API protocol 必须在 `17` 到 `22` 之间（含两端）。
 - 企业微信中有权限创建或使用智能机器人。
 - 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
 
@@ -41,7 +41,7 @@ herdr-pal-server
 herdr status server --json
 ```
 
-输出应显示服务正在运行，且 `protocol` 为 `17` 或 `19`。
+输出应显示服务正在运行，且 `protocol` 在 `17` 到 `22` 之间（含两端）。
 
 ## 构建
 
@@ -609,7 +609,7 @@ session、Socket 或日志级别时，显式传入仅包含 `herdr` 和 `log` �
 ### `/ls` 没有会话
 
 - 确认目标机器上的 Herdr 正在运行。
-- 检查 `herdr status server --json` 是否显示已支持的 protocol 17 或 19。
+- 检查 `herdr status server --json` 是否显示 protocol 17 到 22。
 - 查看客户端日志是否已经连接 Relay，并成功上报会话。
 - 确认管理员签发 Key 时绑定的 principal ID 与企业微信回调中的用户身份完全一致。
 - 确认客户端使用的是为当前机器签发的完整 Key，且服务端凭据文件没有被覆盖。

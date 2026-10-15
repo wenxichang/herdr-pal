@@ -810,9 +810,9 @@ func TestSupervisorCurrentStreamEndDegradesAndReconnectsFromFreshBaseline(t *tes
 
 func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 	first := newSupervisorClient()
-	first.checkErr = fmt.Errorf("%w: version 0.6.0, supported 17 or 19, got 14", herdr.ErrProtocolMismatch)
+	first.checkErr = fmt.Errorf("%w: version 0.6.0, supported 17 through 22, got 14", herdr.ErrProtocolMismatch)
 	second := newSupervisorClient()
-	second.checkErr = fmt.Errorf("%w: version 0.8.0-preview, supported 17 or 19, got 18", herdr.ErrProtocolMismatch)
+	second.checkErr = fmt.Errorf("%w: version 0.8.0-preview, supported 17 through 22, got 16", herdr.ErrProtocolMismatch)
 	lifecycle := newSupervisorStream()
 	status := newSupervisorStream()
 	compatible := newSupervisorClient(supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)))
@@ -831,7 +831,7 @@ func TestSupervisorProtocolMismatchOnlyUsesSlowProbe(t *testing.T) {
 		"Herdr 连接周期失败",
 		"stage=check_compatible",
 		"error_type=protocol_mismatch",
-		"reason=\"Herdr 协议版本不匹配: version 0.6.0, supported 17 or 19, got 14\"",
+		"reason=\"Herdr 协议版本不匹配: version 0.6.0, supported 17 through 22, got 14\"",
 		"retry_delay=30s",
 	} {
 		if output := logs.String(); !strings.Contains(output, want) {
@@ -920,13 +920,13 @@ func TestSupervisorRejectsProtocolMismatchFromAnyInitialSnapshot(t *testing.T) {
 	}{
 		{
 			name:      "discovery",
-			snapshots: []herdr.Snapshot{supervisorSnapshotWithProtocol(18, supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))},
+			snapshots: []herdr.Snapshot{supervisorSnapshotWithProtocol(23, supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))},
 		},
 		{
 			name: "post subscribe",
 			snapshots: []herdr.Snapshot{
 				supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)),
-				supervisorSnapshotWithProtocol(18, supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)),
+				supervisorSnapshotWithProtocol(23, supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle)),
 			},
 			lifecycleStreams:  []*supervisorStream{newSupervisorStream()},
 			statusStreams:     []*supervisorStream{newSupervisorStream()},
@@ -940,7 +940,7 @@ func TestSupervisorRejectsProtocolMismatchFromAnyInitialSnapshot(t *testing.T) {
 					supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
 					supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
 				),
-				supervisorSnapshotWithProtocol(18,
+				supervisorSnapshotWithProtocol(23,
 					supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle),
 					supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusIdle),
 				),
@@ -981,7 +981,7 @@ func TestSupervisorLifecycleSnapshotProtocolMismatchUsesSlowProbeWithoutReplacin
 	lifecycle := newSupervisorStream()
 	status := newSupervisorStream()
 	baseline := supervisorSnapshot(supervisorPane("pane-1", "terminal-1", "codex", herdr.AgentStatusIdle))
-	mismatch := supervisorSnapshotWithProtocol(18, supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusDone))
+	mismatch := supervisorSnapshotWithProtocol(23, supervisorPane("pane-2", "terminal-2", "claude", herdr.AgentStatusDone))
 	client := newSupervisorClient(baseline, baseline, mismatch)
 	client.lifecycleStreams = []*supervisorStream{lifecycle}
 	client.statusStreams = []*supervisorStream{status}

@@ -47,9 +47,10 @@ func TestEvaluateRealHerdrStatus(t *testing.T) {
 	}{
 		{name: "完整兼容状态通过", output: `{"running":true,"protocol":17,"socket":" /tmp/herdr.sock "}`, wantReady: true, wantSocket: "/tmp/herdr.sock"},
 		{name: "Herdr 0.8 兼容状态通过", output: `{"running":true,"protocol":19,"socket":" /tmp/herdr-08.sock "}`, wantReady: true, wantSocket: "/tmp/herdr-08.sock"},
+		{name: "最高支持版本状态通过", output: `{"running":true,"protocol":22,"socket":" /tmp/herdr-22.sock "}`, wantReady: true, wantSocket: "/tmp/herdr-22.sock"},
 		{name: "服务未运行不要求后续字段", output: `{"running":false}`},
 		{name: "协议不兼容不要求 socket", output: `{"running":true,"protocol":14}`},
-		{name: "未审计中间协议不要求 socket", output: `{"running":true,"protocol":18}`},
+		{name: "高于支持范围的协议不要求 socket", output: `{"running":true,"protocol":23}`},
 		{name: "成功命令返回非法 JSON", output: `{`, wantErr: true},
 		{name: "缺少 running", output: `{"protocol":17,"socket":"/tmp/herdr.sock"}`, wantErr: true},
 		{name: "缺少 protocol", output: `{"running":true,"socket":"/tmp/herdr.sock"}`, wantErr: true},
@@ -244,7 +245,7 @@ func requireRealHerdr(t *testing.T) realHerdrFixture {
 		t.Fatalf("Herdr 公共 CLI 状态响应无效：%v", err)
 	}
 	if !ready {
-		t.Skipf("已安装 Herdr 尚未满足真实联调门禁：running=%t protocol=%d，需要已审计协议 17 或 19", status.Running, status.Protocol)
+		t.Skipf("已安装 Herdr 尚未满足真实联调门禁：running=%t protocol=%d，需要 protocol 17 到 22", status.Running, status.Protocol)
 	}
 
 	client := herdr.NewClient(status.Socket, nil, 5*time.Second)

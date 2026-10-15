@@ -466,8 +466,9 @@ IM 显式控制按钮
 
 ## 9. Herdr Pal 当前实现与验证
 
-Herdr Pal 客户端只允许已审计的 protocol 17 和 19，每次启动和重连都先调用 `ping` 做
-允许列表门禁；protocol 18 和未知版本继续拒绝。只有门禁通过后才会读取 discovery snapshot、建立 lifecycle/status 订阅并
+Herdr Pal 客户端每次启动和重连都先调用 `ping` 做版本门禁，只接受 protocol 17 到 22（含两端）。
+该范围是运行时接受范围；本文的源码与 Schema 兼容性审计结论仍只覆盖上文列出的版本，接受范围本身不代表每个中间版本都完成了独立审计。
+只有门禁通过后才会读取 discovery snapshot、建立 lifecycle/status 订阅并
 读取订阅后的权威 snapshot；pane/occupant 集合不稳定时继续重建状态订阅和 snapshot，
 直到订阅计划与快照一致。
 
@@ -479,7 +480,7 @@ Herdr Pal 客户端只允许已审计的 protocol 17 和 19，每次启动和重
 4. 外部没有 cursor，重复 lifecycle、重复状态展示和重复企业微信回调分别由 snapshot
    收敛、状态迁移去重和 `msgid` 幂等处理。
 
-测试目录中的 fake Herdr Server 只实现本文列出的公开 NDJSON protocol 17/19 子集：
+测试目录中的 fake Herdr Server 只实现本文列出的公开 NDJSON API 子集：
 `ping`、`session.snapshot`、`agent.get`、`agent.read`、`agent.prompt`、
 `agent.send_keys`、`events.subscribe`、事件注入和订阅断线。它不导入、复制或模拟 Herdr
 私有 `AppState`、PTY 或 Rust 模块。
@@ -496,7 +497,7 @@ HERDR_PAL_INTEGRATION=1 \
 go test ./internal/integration -run '^TestRealHerdr$' -count=1 -v
 ```
 
-测试先执行公共 CLI `herdr status server --json`。只有运行中服务返回已审计的 protocol 17 或 19
+测试先执行公共 CLI `herdr status server --json`。只有运行中服务返回 protocol 17 到 22
 才继续调用真实 `ping`、`session.snapshot`、`agent.get` 和 `agent.read`，并覆盖
 `herdr-pal -i` 的 `/ls`、`/N`、`/con` 只读路径；企业微信侧不参与，也不需要 Secret。
 
@@ -520,5 +521,6 @@ go test ./internal/integration -run '^TestRealHerdrLivePrompt$' -count=1 -v
 `~/.config/herdr`。两套 CLI 的配置目录和 Socket 不同，真实测试必须通过 `PATH` 明确
 选择 debug 二进制。2026-08-09 对 Herdr 0.8.0/protocol 19 完成源码与生成 Schema 对比；
 Pal 使用的请求、响应和事件结构没有破坏性变化，但尚未记录真实 0.8.0 输入联调结果。
-运行时只接受显式允许的 17 和 19，并非“17 或更高”；输出侧仍按本文既有结论处理：`revision` 固定为 0，且没有公共
+2026-10-15 将运行时版本门禁范围扩展为 17 到 22；Herdr 当前源码声明 protocol 22，Pal 使用的公开 API 方法与必要字段仍在当前 Schema 中。
+输出侧仍按本文既有结论处理：`revision` 固定为 0，且没有公共
 `pane.output_changed` 输出流。

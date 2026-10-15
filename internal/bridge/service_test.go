@@ -114,7 +114,7 @@ func TestServiceDirectImageRejectsUnauditedSnapshotProtocol(t *testing.T) {
 	target := service.CurrentTargets()[0]
 	snapshot := testSnapshot()
 	snapshot.Version = "0.8.0-preview"
-	snapshot.Protocol = 18
+	snapshot.Protocol = 23
 	fake.setSnapshot(snapshot)
 
 	_, err := service.captureDirectTerminalImage(context.Background(), fake, target, panel.PageSize)
@@ -122,7 +122,7 @@ func TestServiceDirectImageRejectsUnauditedSnapshotProtocol(t *testing.T) {
 		t.Fatalf("captureDirectTerminalImage() error = %v，期望协议不匹配", err)
 	}
 	if got := fake.readSourceCalls(); len(got) != 0 {
-		t.Fatalf("未审计协议仍读取终端：%#v", got)
+		t.Fatalf("范围外协议仍读取终端：%#v", got)
 	}
 }
 
