@@ -201,7 +201,13 @@ Herdr 不可用时向 HPRP 暴露空会话。
 ### 4.3 Service、PolicyGuard 与 Notifier
 
 Service 解析 `/con`、分页、`/key`、`/enter`、`/slash` 和普通 prompt。普通文本只允许
-实时 `idle` 或 `done`；prompt stalled 时最多补发一次经过目标复核的 Enter。图片模式先
+实时 `idle` 或 `done`；发送不带 `wait` 的 prompt 后，每隔 500ms 通过 `agent.get` 检查，
+最多 3 次。仍无变化再等 3 秒，重新核验 occupant 和状态，仅在原目标仍未变化时补一次
+受审计的 Enter，然后再以 500ms 间隔检查 3 次。任一检查发现状态或 `state_change_seq`
+变化即成功；两轮均未变化才报错。prompt 不重发，读取失败或请求取消时停止。
+提交已确认且尚未补键时，同一 pane、terminal 和 Agent 的新会话沿用安全重绑定；物理
+目标更换或补键后的身份变化使旧选择失效。
+图片模式先
 重新读取 `session.snapshot` 获取当前 pane 几何，再把 `visible` ANSI 快照直接渲染为
 16px PNG8，不以交互 Panel Buffer 作为图片输入；随后独立读取 `recent_unwrapped` 纯文本
 作为审计和降级内容。交互缓存只维护分页状态，`/pageup` 继续使用 `recent` 快照保留历史

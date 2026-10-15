@@ -1668,11 +1668,7 @@ func (c *supervisorClient) ReadVisibleANSI(context.Context, string, int) (herdr.
 	return herdr.ReadResult{}, nil
 }
 
-func (c *supervisorClient) PromptUntilStateChange(context.Context, string, string) (herdr.AgentInfo, error) {
-	return herdr.AgentInfo{}, nil
-}
-
-func (c *supervisorClient) WaitForStateChange(context.Context, string, uint64, time.Duration) (herdr.AgentInfo, error) {
+func (c *supervisorClient) SubmitPrompt(context.Context, string, string) (herdr.AgentInfo, error) {
 	return herdr.AgentInfo{}, nil
 }
 

@@ -29,9 +29,8 @@ var (
 )
 
 const (
-	promptRecoveryTimeout = 5 * time.Second
-	keySequenceInterval   = 100 * time.Millisecond
-	keyReadbackDelay      = 200 * time.Millisecond
+	keySequenceInterval = 100 * time.Millisecond
+	keyReadbackDelay    = 200 * time.Millisecond
 )
 
 type keyIntervalWaiter func(context.Context, time.Duration) error
@@ -48,10 +47,8 @@ type HerdrAPI interface {
 	ReadRecentANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
 	// ReadVisibleANSI 读取目标当前可见终端页面的 ANSI 快照。
 	ReadVisibleANSI(ctx context.Context, target string, lines int) (herdr.ReadResult, error)
-	// PromptUntilStateChange 向目标发送普通文本并等待首次状态变化。
-	PromptUntilStateChange(ctx context.Context, target, text string) (herdr.AgentInfo, error)
-	// WaitForStateChange 等待目标的状态变化序列离开 baseline。
-	WaitForStateChange(ctx context.Context, target string, baseline uint64, timeout time.Duration) (herdr.AgentInfo, error)
+	// SubmitPrompt 向目标提交普通文本，不要求 Herdr 等待状态变化。
+	SubmitPrompt(ctx context.Context, target, text string) (herdr.AgentInfo, error)
 	// SendKey 向目标发送一个已校验的 UI 按键。
 	SendKey(ctx context.Context, target, key string) error
 }
@@ -464,15 +461,11 @@ func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, tex
 		s.reply(ctx, message.RequestID, fmt.Sprintf("Agent 当前状态为 %s，暂不接受普通文本。", safeLabel(string(current.AgentStatus))))
 		return
 	}
-	changed, err := client.PromptUntilStateChange(ctx, target.PaneID, text)
+	changed, err := client.SubmitPrompt(ctx, target.PaneID, text)
+	promptAccepted := err == nil
 	if err == nil && !session.MatchesAgent(target, changed) {
 		release()
-		if s.rebindExpected(target, changed) {
-			s.reply(ctx, message.RequestID, fmt.Sprintf("消息已发送，Agent 会话已切换并已自动选择新会话。当前状态：%s。", safeLabel(string(changed.AgentStatus))))
-		} else {
-			s.invalidateExpected(target)
-			s.reply(ctx, message.RequestID, targetChangedAfterPromptMessage)
-		}
+		s.replyPromptTargetChanged(ctx, message.RequestID, target, changed)
 		return
 	}
 	if err != nil && !isPromptStalled(err) {
@@ -480,69 +473,37 @@ func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, tex
 		s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
 		return
 	}
-	if err != nil {
-		audits, auditErr := prepareKeyAudits(message.UserID, target, "enter", time.Now().UTC())
-		if auditErr != nil {
-			release()
-			s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
-			return
-		}
-		rechecked, getErr := client.GetAgent(ctx, target.PaneID)
-		if getErr != nil {
-			s.keyAudit.RecordKeyAudit(audits.failed)
-			release()
-			s.reply(ctx, message.RequestID, unavailableMessage)
-			return
-		}
-		if !session.MatchesAgent(target, rechecked) {
-			s.keyAudit.RecordKeyAudit(audits.rejected)
-			release()
-			s.invalidateExpected(target)
-			s.reply(ctx, message.RequestID, targetChangedMessage)
-			return
-		}
-		if promptStateChanged(current, rechecked) {
-			s.keyAudit.RecordKeyAudit(audits.rejected)
-			release()
-			s.replyPromptSuccess(ctx, message.RequestID, rechecked.AgentStatus)
-			return
-		}
-		if !canAcceptPrompt(rechecked.AgentStatus) {
-			s.keyAudit.RecordKeyAudit(audits.rejected)
-			release()
-			s.reply(ctx, message.RequestID, fmt.Sprintf("Agent 当前状态为 %s，未补发 Enter。", safeLabel(string(rechecked.AgentStatus))))
-			return
-		}
-		if sendErr := client.SendKey(ctx, target.PaneID, "enter"); sendErr != nil {
-			s.keyAudit.RecordKeyAudit(audits.failed)
-			release()
-			s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
-			return
-		}
-		s.keyAudit.RecordKeyAudit(audits.sent)
-		changed, err = client.WaitForStateChange(ctx, target.PaneID, current.StateChangeSeq, promptRecoveryTimeout)
+	if err != nil || !promptStateChanged(current, changed) {
+		changed, err = s.confirmPromptState(ctx, client, target, current, message.UserID)
 		if err != nil {
 			release()
-			if errors.Is(err, herdr.ErrAgentStateChangeTimeout) {
+			switch {
+			case ctx.Err() != nil:
+				return
+			case errors.Is(err, errPromptTargetChanged) && promptAccepted:
+				s.replyPromptTargetChanged(ctx, message.RequestID, target, changed)
+			case errors.Is(err, session.ErrSelectionInvalid), errors.Is(err, errPromptTargetChanged):
+				s.invalidateExpected(target)
+				s.reply(ctx, message.RequestID, targetChangedMessage)
+			case errors.Is(err, herdr.ErrAgentStateChangeTimeout):
 				s.reply(ctx, message.RequestID, "消息已送入终端，但未检测到 Agent 状态变化，请检查 Agent 界面。")
-			} else {
-				s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
+			default:
+				s.reply(ctx, message.RequestID, unavailableMessage)
 			}
-			return
-		}
-		if !session.MatchesAgent(target, changed) {
-			release()
-			s.invalidateExpected(target)
-			s.reply(ctx, message.RequestID, targetChangedMessage)
 			return
 		}
 	}
 	release()
-	if !promptStateChanged(current, changed) {
-		s.reply(ctx, message.RequestID, "消息已送入终端，但未检测到 Agent 状态变化，请检查 Agent 界面。")
-		return
-	}
 	s.replyPromptSuccess(ctx, message.RequestID, changed.AgentStatus)
+}
+
+func (s *Service) replyPromptTargetChanged(ctx context.Context, requestID string, expected session.Target, current herdr.AgentInfo) {
+	if s.rebindExpected(expected, current) {
+		s.reply(ctx, requestID, fmt.Sprintf("消息已发送，Agent 会话已切换并已自动选择新会话。当前状态：%s。", safeLabel(string(current.AgentStatus))))
+	} else {
+		s.invalidateExpected(expected)
+		s.reply(ctx, requestID, targetChangedAfterPromptMessage)
+	}
 }
 
 func canAcceptPrompt(status herdr.AgentStatus) bool {

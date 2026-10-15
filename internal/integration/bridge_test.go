@@ -57,35 +57,79 @@ func TestLegacyDirectBridgeEndToEnd(t *testing.T) {
 		assertCallParams(t, calls[0], map[string]any{
 			"target": "pane-1",
 			"text":   "继续实现端到端测试",
-			"wait": map[string]any{
-				"until": []any{"idle", "working", "blocked", "done", "unknown"},
-			},
 		})
+		var params map[string]any
+		if err := json.Unmarshal(calls[0].Params, &params); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := params["wait"]; exists {
+			t.Fatal("prompt 不应要求 Herdr 额外等待状态变化")
+		}
 		getCalls := harness.herdr.WaitCallCount(t, "agent.get", 1)
 		assertCallParams(t, getCalls[0], map[string]any{"target": "pane-1"})
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
 	})
 
-	t.Run("prompt 未触发状态变化时补发一次 enter", func(t *testing.T) {
+	for _, recovered := range []bool{false, true} {
+		name := "prompt 两轮复查耗尽后报错"
+		if recovered {
+			name = "prompt 补发一次 enter 后检测到状态变化"
+		}
+		t.Run(name, func(t *testing.T) {
+			harness := newBridgeHarness(t, herdr.AgentStatusIdle)
+			defer harness.stop(t)
+			harness.herdr.SetPromptUnchanged(1)
+			if recovered {
+				harness.herdr.SetEnterTransition(herdr.AgentStatusWorking)
+			}
+			harness.selectFirst(t)
+			initialGets := len(harness.herdr.Calls("agent.get"))
+			initialReplies := len(harness.wecom.CompletedRequests("aibot_respond_msg"))
+
+			requestID := harness.wecom.InjectText(t, "message-prompt-recovery", testUserID, "single", "继续执行")
+			harness.herdr.WaitCallCount(t, "agent.get", initialGets+4)
+			keyCalls := harness.herdr.WaitCallCount(t, "agent.send_keys", 1)
+			assertCallParams(t, keyCalls[0], map[string]any{"target": "pane-1", "keys": []any{"enter"}})
+			replies := harness.wecom.WaitCompletedRequestCount(t, "aibot_respond_msg", initialReplies+1)
+			reply := replies[len(replies)-1]
+			want := "消息已送入终端，但未检测到 Agent 状态变化"
+			getCount := 8
+			if recovered {
+				want = "已发送，Agent 状态已变为 working"
+				getCount = 6
+			}
+			if reply.RequestID != requestID || !strings.Contains(reply.Content, want) {
+				t.Fatalf("prompt 复查耗尽回复 = %q", reply.Content)
+			}
+			promptCalls := harness.herdr.WaitCallCount(t, "agent.prompt", 1)
+			assertCallParams(t, promptCalls[0], map[string]any{
+				"target": "pane-1",
+				"text":   "继续执行",
+			})
+			assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.get")) }, initialGets+getCount)
+			assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
+			assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.send_keys")) }, 1)
+		})
+	}
+
+	t.Run("prompt 状态延迟到达时复查成功且不补发 enter", func(t *testing.T) {
 		harness := newBridgeHarness(t, herdr.AgentStatusIdle)
 		defer harness.stop(t)
-		harness.herdr.SetPromptWaitStalls(1)
-		harness.herdr.SetEnterTransition(herdr.AgentStatusWorking)
+		harness.herdr.SetPromptUnchanged(1)
 		harness.selectFirst(t)
+		initialGets := len(harness.herdr.Calls("agent.get"))
+		initialReplies := len(harness.wecom.CompletedRequests("aibot_respond_msg"))
 
-		reply := harness.send(t, "message-prompt-recovery", testUserID, "single", "继续执行")
-		if !strings.Contains(reply.Content, "working") {
-			t.Fatalf("prompt 恢复回复 = %q", reply.Content)
+		requestID := harness.wecom.InjectText(t, "message-prompt-late-state", testUserID, "single", "继续执行")
+		harness.herdr.WaitCallCount(t, "agent.get", initialGets+2)
+		harness.herdr.SetSnapshot(integrationSnapshot("session-1", herdr.AgentStatusWorking))
+		replies := harness.wecom.WaitCompletedRequestCount(t, "aibot_respond_msg", initialReplies+1)
+		reply := replies[len(replies)-1]
+		if reply.RequestID != requestID || !strings.Contains(reply.Content, "已发送，Agent 状态已变为 working") {
+			t.Fatalf("延迟状态回复 = %#v", reply)
 		}
-		promptCalls := harness.herdr.WaitCallCount(t, "agent.prompt", 1)
-		assertCallParams(t, promptCalls[0], map[string]any{
-			"target": "pane-1",
-			"text":   "继续执行",
-		})
-		keyCalls := harness.herdr.WaitCallCount(t, "agent.send_keys", 1)
-		assertCallParams(t, keyCalls[0], map[string]any{"target": "pane-1", "keys": []any{"enter"}})
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
-		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.send_keys")) }, 1)
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.send_keys")) }, 0)
 	})
 
 	t.Run("working 状态拒绝普通文本", func(t *testing.T) {

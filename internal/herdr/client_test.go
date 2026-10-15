@@ -745,6 +745,20 @@ func TestClientPromptSendsExactParameters(t *testing.T) {
 	}
 }
 
+func TestClientSubmitPromptDoesNotWaitAndDecodesAgent(t *testing.T) {
+	agent := validAgentInfo(t)
+	agent["agent_status"] = "idle"
+	agent["state_change_seq"] = float64(7)
+	client := newBusinessTestClient(t, `{"type":"agent_prompted","agent":`+mustJSON(t, agent)+`}`, businessRequestCheck("agent.prompt", map[string]any{
+		"target": "p1", "text": "运行测试",
+	}))
+
+	got, err := client.SubmitPrompt(context.Background(), "p1", "运行测试")
+	if err != nil || got.AgentStatus != AgentStatusIdle || got.StateChangeSeq != 7 {
+		t.Fatalf("SubmitPrompt() = %+v, %v", got, err)
+	}
+}
+
 func TestClientPromptUntilStateChangeSendsWaitAndDecodesAgent(t *testing.T) {
 	agent := validAgentInfo(t)
 	agent["agent_status"] = "working"

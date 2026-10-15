@@ -2627,7 +2627,7 @@ func (f *fakeManagedHerdr) ReadVisibleANSI(ctx context.Context, target string, l
 	return f.ReadRecent(ctx, target, lines)
 }
 
-func (f *fakeManagedHerdr) PromptUntilStateChange(context.Context, string, string) (herdr.AgentInfo, error) {
+func (f *fakeManagedHerdr) SubmitPrompt(context.Context, string, string) (herdr.AgentInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.prompts++

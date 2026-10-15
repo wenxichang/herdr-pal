@@ -181,6 +181,12 @@ Bot Secret、OTLP Header、`hpk_...` 和常见认证 Header 在审计入队前�
 7. 每 10 秒重新读取权威 snapshot，弥补生命周期事件缺失或延迟。
 8. 用基线替换 Registry，开放输入和 HPRP 上报。
 
+普通文本只发送一次不带 `wait` 的 `agent.prompt`，由 Pal 控制状态确认时间：每隔 500ms
+通过 `agent.get` 检查，最多 3 次；无变化再等 3 秒，复核原目标仍未变化后补一次受审计的
+Enter；随后再检查 3 次，每次间隔 500ms，仍无变化才报错。任一检查发现状态或
+`state_change_seq` 变化即成功。提交已确认且尚未补键时，同一物理 Agent 的新会话自动
+重绑定；物理目标更换、补键后的身份变化、读取失败或请求取消时停止，不自动批准 blocked。
+
 不要依赖：
 
 - `PaneReadResult.revision`：当前固定为 `0`。

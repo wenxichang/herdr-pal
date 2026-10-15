@@ -203,22 +203,27 @@ func (c *Client) readRecent(ctx context.Context, target string, lines int, sourc
 
 // Prompt 向 target 对应的 Agent 发送普通文本输入。
 func (c *Client) Prompt(ctx context.Context, target, text string) error {
+	_, err := c.SubmitPrompt(ctx, target, text)
+	return err
+}
+
+// SubmitPrompt 提交普通文本并返回提交响应中的 Agent 信息，不要求 Herdr 等待状态变化。
+func (c *Client) SubmitPrompt(ctx context.Context, target, text string) (AgentInfo, error) {
 	if err := validateTarget(target); err != nil {
-		return err
+		return AgentInfo{}, err
 	}
 	var result agentResult
 	if err := c.call(ctx, "agent.prompt", agentPromptParams{Target: target, Text: text}, &result); err != nil {
-		return err
+		return AgentInfo{}, err
 	}
 	if err := validateResultType(result.Type, "agent_prompted"); err != nil {
-		return err
+		return AgentInfo{}, err
 	}
 	var wire wireAgentInfo
 	if err := decodeRequiredPayload(result.Agent, "agent", &wire); err != nil {
-		return err
+		return AgentInfo{}, err
 	}
-	_, err := agentInfoFromWire(wire)
-	return err
+	return agentInfoFromWire(wire)
 }
 
 // PromptUntilStateChange 向 target 发送普通文本，并等待首次可观察的 Agent 状态变化。

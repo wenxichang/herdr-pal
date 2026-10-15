@@ -281,15 +281,21 @@ pane ID 和 Agent name；允许 terminal ID 的 `resolve_terminal_target` 是另
 }
 ```
 
-Herdr Pal 不显式传 `timeout_ms`，使用 Herdr prompt effect 固定的约 5 秒窗口。成功响应
-必须是包含完整 `AgentInfo` 的 `agent_prompted`，其中 protocol 17 和 19 的
-`state_change_seq` 用于确认请求提交后确实发生了 Agent 生命周期变化；无变化时 Herdr
-返回 `agent_prompt_stalled`。
+Herdr 带 `wait` 的 prompt 在未显式传 `timeout_ms` 时使用约 5 秒的 prompt effect
+窗口。成功响应为包含完整 `AgentInfo` 的 `agent_prompted`，未观察到变化时可返回
+`agent_prompt_stalled`。Pal 当前使用不带 `wait` 的提交方式，避免额外叠加这一等待窗口，
+由 bridge 通过状态和 `state_change_seq` 确认结果。
 
-bridge 只在初始实时状态为 `idle` 或 `done` 时提交普通文本。收到 stalled 后先重新调用
-`agent.get`：occupant、序列或状态不符合预期时不发送按键；仍为原 occupant、原序列且
-仍是 `idle`/`done` 时，只补发一次受审计的 `enter`，随后最多轮询 5 秒
-`state_change_seq`。`blocked` 不会触发自动 Enter。
+bridge 只在初始实时状态为 `idle` 或 `done` 时提交普通文本。状态未变化时，每隔 500ms
+调用 `agent.get`，最多检查 3 次；仍无变化再等 3 秒，重新读取并核验 occupant 与状态。
+只有原目标仍为原状态、原序列时才补发一次受策略检查和审计的 Enter，随后再以 500ms
+间隔检查 3 次，仍无变化才提示检查 Agent 界面。等待总计最多约 6 秒，不含 API 调用耗时。
+任一检查发现状态或序列变化即成功；目标更换、读取失败或取消时停止，不重发 prompt，
+也不会向已变为 `blocked` 的 Agent 自动补发 Enter。
+
+不带 `wait` 的提交响应可能仍包含旧会话身份。提交成功后、补键前的检查若观察到同一
+pane、terminal 和 Agent 的新会话，复用 `RebindSelected` 更新选择。物理目标更换、未确认
+提交成功或补键后才观察到身份变化时，仍按目标失效处理。
 
 ### 6.3 交互式 UI 按键
 
@@ -445,9 +451,11 @@ Herdr 提供的精确增量游标。
 IM 普通文本
     → 校验用户和会话绑定
     → agent.get 校验 occupant 与 idle/done
-    → 带 wait 的 agent.prompt 确认状态变化
-    → stalled 时复核后最多补发一次 Enter
-    → 再按 state_change_seq 确认结果
+    → 不带 wait 的 agent.prompt 提交一次
+    → 每隔 500ms 检查状态，最多 3 次
+    → 无变化再等 3 秒，复核目标与状态后补发一次受审计的 Enter
+    → 每隔 500ms 再检查状态，最多 3 次
+    → 按状态或 state_change_seq 确认结果
 
 IM 显式控制按钮
     → 策略校验
@@ -485,9 +493,9 @@ Herdr Pal 客户端每次启动和重连都先调用 `ping` 做版本门禁，�
 `agent.send_keys`、`events.subscribe`、事件注入和订阅断线。它不导入、复制或模拟 Herdr
 私有 `AppState`、PTY 或 Rust 模块。
 
-fake Herdr 还可按公开响应模拟 `agent_prompt_stalled`，并在收到恢复 Enter 后更新
-`state_change_seq`。端到端测试覆盖正常 prompt、working 状态拒绝，以及 stalled 后只
-补发一次 Enter 并等待状态变化。
+fake Herdr 可模拟 prompt 提交后状态未变化、延迟的状态变化和补 Enter 后的状态变化。
+端到端测试覆盖正常 prompt、working 状态拒绝、延迟状态到达，以及补键后成功或两轮
+检查耗尽；确认 prompt 只发送一次，恢复 Enter 最多发送一次。
 
 可选真实测试命令：
 

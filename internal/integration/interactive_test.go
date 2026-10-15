@@ -65,9 +65,6 @@ func TestInteractiveBridgeEndToEnd(t *testing.T) {
 	assertCallParams(t, promptCalls[0], map[string]any{
 		"target": "pane-1",
 		"text":   interactivePrompt,
-		"wait": map[string]any{
-			"until": []any{"idle", "working", "blocked", "done", "unknown"},
-		},
 	})
 
 	keyReply := sendInteractiveLine(t, application, "/key sp")

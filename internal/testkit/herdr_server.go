@@ -41,6 +41,7 @@ type HerdrServer struct {
 	subscribeCount   map[string]int
 	connections      map[net.Conn]struct{}
 	promptWaitStalls int
+	promptUnchanged  int
 	enterTransition  *herdr.AgentStatus
 	closed           bool
 	available        bool
@@ -138,6 +139,17 @@ func (s *HerdrServer) SetPromptWaitStalls(count int) {
 	}
 	s.mu.Lock()
 	s.promptWaitStalls = count
+	s.mu.Unlock()
+	s.signal()
+}
+
+// SetPromptUnchanged 设置后续不带 wait 的 agent.prompt 保持状态不变的次数。
+func (s *HerdrServer) SetPromptUnchanged(count int) {
+	if count < 0 {
+		panic("prompt 状态不变次数不能为负数")
+	}
+	s.mu.Lock()
+	s.promptUnchanged = count
 	s.mu.Unlock()
 	s.signal()
 }
@@ -413,6 +425,14 @@ func (s *HerdrServer) handleRequest(connection net.Conn, request herdrRequest) {
 			return
 		}
 		if params.Wait == nil {
+			s.mu.Lock()
+			if s.promptUnchanged > 0 {
+				s.promptUnchanged--
+			} else {
+				agent, _ = s.transitionAgentLocked(agent.PaneID, herdr.AgentStatusWorking)
+			}
+			s.mu.Unlock()
+			s.signal()
 			result = map[string]any{"type": "agent_prompted", "agent": agentWire(agent)}
 			break
 		}
