@@ -23,7 +23,11 @@ fi
 go vet ./...
 go test ./...
 
+npm --prefix plugins/dsh-herdr-pal run build
+node --test plugins/dsh-herdr-pal/test/*.test.mjs
+
 mkdir -p dist
+npm pack ./plugins/dsh-herdr-pal --pack-destination dist --ignore-scripts
 VERSION="${VERSION:-$(git describe --tags --always --dirty)}"
 COMMIT="${COMMIT:-$(git rev-parse --short HEAD)}"
 BUILT_AT="${BUILT_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"

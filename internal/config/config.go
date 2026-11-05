@@ -27,6 +27,7 @@ type WeComConfig struct {
 
 // HerdrConfig 是 Herdr 本地 Socket 连接配置。
 type HerdrConfig struct {
+	Disabled   bool   `json:"disabled,omitempty"`
 	Session    string `json:"session"`
 	SocketPath string `json:"socket_path"`
 }

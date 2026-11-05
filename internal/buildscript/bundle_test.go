@@ -201,6 +201,7 @@ chmod 0755 "target/$target/release/herdr"
 func TestBuildScriptBundleEntryBuildsPalThenDelegates(t *testing.T) {
 	sourceRoot := repositoryRoot(t)
 	root := t.TempDir()
+	copyDSHPlugin(t, sourceRoot, root)
 	buildData, err := os.ReadFile(filepath.Join(sourceRoot, "build.sh"))
 	if err != nil {
 		t.Fatal(err)

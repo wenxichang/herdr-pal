@@ -14,6 +14,7 @@ import (
 func TestBuildScriptProducesReleaseArchitectureMatrix(t *testing.T) {
 	root := repositoryRoot(t)
 	temporaryRoot := t.TempDir()
+	copyDSHPlugin(t, root, temporaryRoot)
 	buildScript, err := os.ReadFile(filepath.Join(root, "build.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -119,6 +120,13 @@ exit 0
 		if !strings.Contains(logText, invocation) || !strings.Contains(logText, "-o dist/"+target.name) {
 			t.Errorf("%s/%s build invocation missing for %s:\n%s", target.goos, target.goarch, target.name, logText)
 		}
+	}
+}
+
+func copyDSHPlugin(t *testing.T, sourceRoot, targetRoot string) {
+	t.Helper()
+	if err := os.CopyFS(filepath.Join(targetRoot, "plugins", "dsh-herdr-pal"), os.DirFS(filepath.Join(sourceRoot, "plugins", "dsh-herdr-pal"))); err != nil {
+		t.Fatal(err)
 	}
 }
 

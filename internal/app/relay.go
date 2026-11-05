@@ -13,6 +13,7 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
+	"github.com/wenxichang/herdr-pal/internal/dsh"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -50,6 +51,9 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	logger, err := newLogger(stderr, loaded.Log.Level)
 	if err != nil {
 		return newConfigError(err.Error())
+	}
+	if loaded.Herdr.Disabled {
+		return runDSHRelay(ctx, loaded, logger)
 	}
 	runner := options.Runner
 	if runner == nil {
@@ -123,9 +127,6 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	if err := service.SetTerminalRenderer(renderer); err != nil {
 		return fmt.Errorf("绑定终端图片渲染器: %w", err)
 	}
-	if err := relay.SetExecutor(service); err != nil {
-		return fmt.Errorf("绑定 Relay 执行器: %w", err)
-	}
 	notifier, err := bridge.NewNotifier(relay, herdrClient.GetAgent)
 	if err != nil {
 		return fmt.Errorf("创建状态通知器: %w", err)
@@ -135,6 +136,20 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	})
 	if err != nil {
 		return fmt.Errorf("创建 Herdr Supervisor: %w", err)
+	}
+	var executor relayclient.Executor = service
+	runSupervisor := supervisor.Run
+	if loaded.DSH.URL != "" {
+		client, err := dsh.NewClient(loaded.DSH.URL, loaded.DSH.Token)
+		if err != nil {
+			return err
+		}
+		dshExecutor := dsh.NewExecutor(client, relay, guard)
+		executor = relayclient.NewExecutorMux(service, dshExecutor)
+		runSupervisor = func(ctx context.Context) error { return runBackendPair(ctx, supervisor.Run, dshExecutor.Run) }
+	}
+	if err := relay.SetExecutor(executor); err != nil {
+		return fmt.Errorf("绑定 Relay 执行器: %w", err)
 	}
 
 	herdrSession := strings.TrimSpace(loaded.Herdr.Session)
@@ -149,7 +164,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		"herdr_session", herdrSession,
 		"socket_hash", socketHash,
 	)
-	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, supervisor.Run, defaultShutdownTimeout)
+	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, runSupervisor, defaultShutdownTimeout)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		logger.Error("Herdr Pal Relay 客户端停止",
 			"component", relayComponentName(runErr),

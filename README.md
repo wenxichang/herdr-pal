@@ -20,6 +20,8 @@ herdr-pal-server
 - 一个用户可以接入多台机器，并在同一个企业微信单聊中切换会话。
 - Pal 与 Server 使用公开的 HPRP/1 协议；每台机器使用一把由服务端签发的独立 Key。
 - `herdr-pal -i` 可以脱离企业微信，在本机终端中直接操作 Herdr Agent。
+- 可选安装本仓库的 [dsh 第三方插件](plugins/dsh-herdr-pal/README.md)，在同一企微列表中选择
+  DeepSeek Harness 已加载会话及最近两周的历史会话，并继续聊天；也可单独运行 dsh 后端。
 
 ## 使用前准备
 
@@ -28,6 +30,7 @@ herdr-pal-server
 - Herdr 公共 Socket API protocol 必须在 `17` 到 `22` 之间（含两端）；已验证官方 `v0.9.5`。
 - 企业微信中有权限创建或使用智能机器人。
 - 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
+- 插件构建和集成测试还需要 Node.js 22+ 与 npm；纯 Herdr 的已构建客户端不需要 Node.js。
 
 支持的平台：
 
@@ -52,6 +55,7 @@ herdr status server --json
 
 构建产物：
 
+- `dist/dsh-herdr-pal-0.1.2.tgz`：dsh 第三方插件安装包，支持内网离线导入。
 - `dist/herdr-pal-darwin-amd64`
 - `dist/herdr-pal-darwin-arm64`
 - `dist/herdr-pal-linux-amd64`
@@ -72,7 +76,7 @@ herdr status server --json
 - `dist/herdr-pal`
 - `dist/hp-cli`
 
-公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Bundle。Intel/AMD x64 选择
+公开 GitHub Release 提供 Linux 和 macOS 的 Herdr Bundle，以及 dsh 插件 `.tgz` 和校验文件。Intel/AMD x64 选择
 `amd64`，Apple Silicon 或 ARM64 Linux 选择 `arm64`。`./build.sh` 仍会生成 Pal、Server、
 `hp-cli` 的分平台二进制；Windows AMD64 客户端 Beta 需要从源码构建，不发布 Windows
 服务端。

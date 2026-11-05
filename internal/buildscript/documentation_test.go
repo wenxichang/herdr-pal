@@ -34,7 +34,7 @@ func TestREADMEReflectsCurrentInstallerAndReleasePolicy(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"Key 会在终端回显",
-		"公开 GitHub Release 当前只提供 Linux 和 macOS 的 Herdr Bundle",
+		"公开 GitHub Release 提供 Linux 和 macOS 的 Herdr Bundle，以及 dsh 插件",
 		"Windows AMD64 客户端 Beta 需要从源码构建",
 	} {
 		if !strings.Contains(content, expected) {

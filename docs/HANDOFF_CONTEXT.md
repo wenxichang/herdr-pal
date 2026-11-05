@@ -1,5 +1,22 @@
 # Herdr Pal 交接上下文
 
+## 2026-11-05 dsh 接入补充
+
+- 新增第三方插件 `plugins/dsh-herdr-pal`，目标版本 dsh `0.2.1-rc.5` 的 web profile。
+- 企微 `/ls` 合并 Herdr 与 dsh，`/N`、普通消息、`/con` 和文本分页复用既有链路。
+- 用户要求历史范围限制为两周：列出当前已加载根会话和最近 14 天历史，按 dsh 列表
+  `updatedAt` 判断；查看不恢复，首次发消息才恢复并调用 `followup`。
+- 新增可选配置 `dsh.url/token`；`herdr.disabled=true` 支持不依赖 Herdr 的独立 dsh 模式。
+  `-i` 仍只支持 Herdr。插件没有企微凭据，不提供按键或审批接口。
+- `build.sh` 生成 `dist/dsh-herdr-pal-0.1.2.tgz`；构建与测试新增 Node.js 22+/npm 依赖。
+- `/con` 按用户补充要求仅展示聊天正文：从原始 append 事件筛选真实用户输入和助手文本，
+  排除工具、推理、内部注入及压缩摘要；多轮聊天与分页保留，不读取浏览器视口。
+- 本地集成测试 `TestDSHPluginThroughProductionAppAndWeComRouter` 使用真实插件 HTTP、
+  生产 Pal/HPRP/Router，模型与企微使用 fake。隔离真实 dsh 已验证插件加载、持久化历史
+  列表和文本读取；不声称验证了真实 LLM 回复或实际企微投递。
+- 安装步骤与限制见 [插件 README](../plugins/dsh-herdr-pal/README.md)，实现记录见
+  [接入计划](DSH_INTEGRATION_PLAN.md)。
+
 ## 1. 当前状态
 
 Herdr Pal 是 Herdr 与企业微信之间的独立 bridge：

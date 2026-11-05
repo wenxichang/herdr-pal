@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/credential"
+	"github.com/wenxichang/herdr-pal/internal/dsh"
 )
 
 // ClientConfig 是 herdr-pal 网络模式的完整配置。
@@ -15,6 +16,13 @@ type ClientConfig struct {
 	Relay RelayConfig `json:"relay"`
 	Herdr HerdrConfig `json:"herdr"`
 	Log   LogConfig   `json:"log"`
+	DSH   DSHConfig   `json:"dsh,omitempty"`
+}
+
+// DSHConfig 是可选的本机 dsh 插件地址与认证信息。
+type DSHConfig struct {
+	URL   string `json:"url"`
+	Token string `json:"token"`
 }
 
 // RelayConfig 是客户端连接中央 Relay Server 的配置。
@@ -55,6 +63,14 @@ func LoadClient(path string) (ClientConfig, error) {
 	loaded, err := decodeFile[ClientConfig](path)
 	if err != nil {
 		return ClientConfig{}, err
+	}
+	if loaded.DSH.URL != "" || loaded.DSH.Token != "" {
+		if err := dsh.ValidateConfig(loaded.DSH.URL, loaded.DSH.Token); err != nil {
+			return ClientConfig{}, err
+		}
+	}
+	if loaded.Herdr.Disabled && loaded.DSH.URL == "" {
+		return ClientConfig{}, fmt.Errorf("禁用 Herdr 时必须配置 dsh")
 	}
 	endpoint, err := url.Parse(strings.TrimSpace(loaded.Relay.URL))
 	if err != nil || endpoint.Scheme != "wss" || endpoint.Host == "" {

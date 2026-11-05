@@ -20,3 +20,8 @@ sidecar 配置需要自行迁移。
 安装完成后先启动 Herdr，再在另一个终端执行安装器打印的 Pal 命令，并保持该终端运行。
 默认安装路径的命令是 `~/.local/bin/herdr-pal -config ~/.config/herdr-pal/config.json`。
 `live-handoff` 不会启动 Pal。最后在企业微信中执行 `/ls` 验证连接。
+
+需要连接 DeepSeek Harness 时，下载同一 Release 中的 `dsh-herdr-pal-*.tgz`，按
+[dsh 插件说明](https://github.com/wenxichang/herdr-pal/blob/main/plugins/dsh-herdr-pal/README.md)
+安装和配置。插件支持内网离线导入；可同时接入 Herdr 与 dsh，也可在 Pal 配置中设置
+`herdr.disabled=true` 只连接 dsh。
