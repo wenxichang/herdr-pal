@@ -16,7 +16,7 @@ herdr-pal-server
 ```
 
 - `herdr-pal-server` 连接企业微信机器人，一套机器人只运行一个服务端。
-- 每台运行 Herdr 的机器通过 Herdr `[[sidecar]]` 启动并守护一个 `herdr-pal` 客户端。
+- 每台运行 Herdr 的机器手动启动一个 `herdr-pal` 客户端，并保持它持续运行。
 - 一个用户可以接入多台机器，并在同一个企业微信单聊中切换会话。
 - Pal 与 Server 使用公开的 HPRP/1 协议；每台机器使用一把由服务端签发的独立 Key。
 - `herdr-pal -i` 可以脱离企业微信，在本机终端中直接操作 Herdr Agent。
@@ -25,7 +25,7 @@ herdr-pal-server
 
 - 一台用于运行 `herdr-pal-server` 的内网机器。
 - 每台客户端机器已经安装并启动 Herdr。
-- Herdr 公共 Socket API protocol 必须在 `17` 到 `22` 之间（含两端）。
+- Herdr 公共 Socket API protocol 必须在 `17` 到 `22` 之间（含两端）；已验证官方 `v0.9.5`。
 - 企业微信中有权限创建或使用智能机器人。
 - 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
 
@@ -372,12 +372,20 @@ Linux 和 macOS 推荐直接使用同时包含 Herdr、Herdr Pal 和安装器的
   避免旁人看到。
 - 把 `herdr` 和 `herdr-pal` 安装为同目录的真实文件，旧文件先生成带时间戳的备份。
 - 合并并备份 `~/.config/herdr-pal/config.json` 和 `~/.config/herdr/config.toml`。
-- 添加幂等的 `[[sidecar]] command = ["herdr-pal"]`，让 Herdr 在自身生命周期内启动、守护并
-  停止 Pal。
+- 只生成配置，不安装系统用户服务；自动移除旧安装器标记的 Pal sidecar 块。官方 Herdr
+  不支持 `[[sidecar]]`，未受管的此类配置需要先自行迁移，安装器不会静默删除。
 - 检测到 Herdr 已运行时，询问是否执行 `live-handoff`，默认执行且不会清空现有 pane。
 
-安装完成后不需要手工启动 `herdr-pal`。启动 Herdr，或让安装器完成 `live-handoff`，再回到
-企业微信执行 `/ls`。
+安装完成后先启动 Herdr，再在另一个终端执行安装器打印的 Pal 启动命令，并保持该终端
+运行。默认安装目录的命令是：
+
+```sh
+~/.local/bin/herdr-pal -config ~/.config/herdr-pal/config.json
+```
+
+随后回到企业微信执行 `/ls`。`live-handoff` 只升级 Herdr，不会启动 Pal。旧 fork 用户如需
+保留 sidecar，可在手工调用 `herdr-pal setup` 时显式指定 `--startup sidecar`；默认是
+`--startup manual`。
 
 高级用户需要手工部署或排错时，Pal 配置仍使用：
 

@@ -25,6 +25,8 @@ type Request struct {
 	HerdrBinaryPath  string
 	RelayURL         string
 	RelayKey         string
+	// StartupMode 为空或 manual 时仅生成配置；sidecar 仅适用于支持该扩展的旧 Herdr。
+	StartupMode string
 }
 
 // Result 返回本次写入保留的旧配置备份路径。
@@ -69,7 +71,15 @@ func Apply(ctx context.Context, request Request, options Options) (Result, error
 	if err := validateClientConfig(clientCandidate); err != nil {
 		return Result{}, err
 	}
-	herdrCandidate, err := mergeHerdrConfig(herdrExisting)
+	var herdrCandidate []byte
+	switch request.StartupMode {
+	case "", "manual":
+		herdrCandidate, err = removeManagedPalSidecar(herdrExisting)
+	case "sidecar":
+		herdrCandidate, err = mergeHerdrConfig(herdrExisting)
+	default:
+		return Result{}, fmt.Errorf("启动方式必须为 manual 或 sidecar")
+	}
 	if err != nil {
 		return Result{}, err
 	}

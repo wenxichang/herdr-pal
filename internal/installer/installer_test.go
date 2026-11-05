@@ -23,6 +23,7 @@ func TestApplyWritesValidatedClientAndHerdrConfigs(t *testing.T) {
 		HerdrBinaryPath:  herdrBinary,
 		RelayURL:         "wss://relay.example/hprp",
 		RelayKey:         validMachineKey,
+		StartupMode:      "sidecar",
 	}, Options{
 		Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) },
 		CheckHerdrConfig: func(_ context.Context, binaryPath, targetPath string, candidate []byte) error {
@@ -153,4 +154,33 @@ func assertFileContains(t *testing.T, path, want string) {
 	if !strings.Contains(string(data), want) {
 		t.Fatalf("%s missing %q:\n%s", path, want, data)
 	}
+}
+
+func TestApplyManualStartupMigratesManagedSidecarAndBacksUp(t *testing.T) {
+	directory := t.TempDir()
+	request := Request{
+		ClientConfigPath: filepath.Join(directory, "pal.json"),
+		HerdrConfigPath:  filepath.Join(directory, "herdr.toml"),
+		HerdrBinaryPath:  "/test/herdr", RelayURL: "wss://relay.example/hprp", RelayKey: validMachineKey,
+	}
+	existing := "onboarding = false\n\n" + managedSidecarBlock
+	if err := os.WriteFile(request.HerdrConfigPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	options := Options{CheckHerdrConfig: func(_ context.Context, _, _ string, candidate []byte) error {
+		if string(candidate) != "onboarding = false\n\n" {
+			t.Fatalf("迁移候选配置错误: %q", candidate)
+		}
+		return nil
+	}}
+	result, err := Apply(context.Background(), request, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContent(t, result.HerdrBackupPath, existing)
+	assertFileContent(t, request.HerdrConfigPath, "onboarding = false\n\n")
+	if _, err := Apply(context.Background(), request, options); err != nil {
+		t.Fatalf("重复安装失败: %v", err)
+	}
+	assertFileContent(t, request.HerdrConfigPath, "onboarding = false\n\n")
 }

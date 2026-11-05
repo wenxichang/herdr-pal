@@ -147,6 +147,7 @@ else
 fi
 if ! printf '%s\n' "$relay_key" | "$pal_target" setup \
 	--url "$relay_url" \
+	--startup manual \
 	--config "$client_config" \
 	--herdr-config "$herdr_config" \
 	--herdr-bin "$herdr_target"; then
@@ -169,7 +170,7 @@ esac
 
 server_status=$(HERDR_CONFIG_PATH=$herdr_config "$herdr_target" status server --json 2>/dev/null || true)
 if printf '%s\n' "$server_status" | grep -Eq '"running"[[:space:]]*:[[:space:]]*true'; then
-	printf '\n检测到 Herdr 正在运行，立即执行 live-handoff 加载新版本和 Sidecar？[Y/n]: '
+	printf '\n检测到 Herdr 正在运行，立即执行 live-handoff 加载新版本？[Y/n]: '
 	IFS= read -r handoff_choice || handoff_choice=''
 	case "$handoff_choice" in
 		'' | y | Y | yes | YES)
@@ -177,12 +178,22 @@ if printf '%s\n' "$server_status" | grep -Eq '"running"[[:space:]]*:[[:space:]]*
 				printf '%s\n' "live-handoff 未成功，现有 Herdr 保持运行；请稍后手工重启 Herdr。" >&2
 			fi
 			;;
-		*) printf '%s\n' "已跳过 live-handoff，请手工重启 Herdr 以启动 Sidecar。" ;;
+		*) printf '%s\n' "已跳过 live-handoff，请稍后手工重启 Herdr 以加载新版本。" ;;
 	esac
 fi
 
 printf '\nHerdr Bundle %s 安装完成。\n' "$BUNDLE_VERSION"
 printf 'Herdr: %s\nHerdr Pal: %s\n' "$herdr_target" "$pal_target"
+printf '启动 Herdr 后，请在另一个终端手动启动 Pal，并保持该终端运行：\n'
+quote_shell() {
+	printf "'"
+	printf '%s' "$1" | sed "s/'/'\\\\''/g"
+	printf "'"
+}
+quote_shell "$pal_target"
+printf ' -config '
+quote_shell "$client_config"
+printf '\n'
 printf '回到企业微信执行 /ls 验证连接。\n'
 
 # 保留成功安装产生的二进制备份，便于用户回滚。

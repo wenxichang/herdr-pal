@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,6 +93,7 @@ func TestRunSetupRejectsInvalidArgumentsAndInput(t *testing.T) {
 		{name: "empty key", args: []string{"--url", "wss://relay.example/hprp", "--herdr-bin", "/tmp/herdr"}, stdin: "\n"},
 		{name: "extra input", args: []string{"--url", "wss://relay.example/hprp", "--herdr-bin", "/tmp/herdr"}, stdin: validSetupKey + "\nextra\n"},
 		{name: "unknown flag", args: []string{"--unknown"}},
+		{name: "invalid startup", args: []string{"--url", "wss://relay.example/hprp", "--herdr-bin", "/tmp/herdr", "--startup", "auto"}, stdin: validSetupKey + "\n"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -143,3 +145,48 @@ func TestRunSetupRedactsKeyFromExecutorError(t *testing.T) {
 }
 
 const validSetupKey = "hpk_7_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+func TestRunSetupDefaultsToManualStartupForOfficialHerdr(t *testing.T) {
+	directory := t.TempDir()
+	clientPath := filepath.Join(directory, "pal.json")
+	herdrPath := filepath.Join(directory, "herdr.toml")
+	var stdout, stderr bytes.Buffer
+	code := runSetup(context.Background(), []string{
+		"--url", "wss://relay.example/hprp", "--config", clientPath,
+		"--herdr-config", herdrPath, "--herdr-bin", "/test/herdr",
+	}, strings.NewReader(validSetupKey+"\n"), &stdout, &stderr,
+		func(ctx context.Context, request installer.Request, _ installer.Options) (installer.Result, error) {
+			return installer.Apply(ctx, request, installer.Options{
+				CheckHerdrConfig: func(_ context.Context, _, _ string, candidate []byte) error {
+					if strings.Contains(string(candidate), "[[sidecar]]") {
+						return errors.New("unknown config section [[sidecar]]; ignoring section")
+					}
+					return nil
+				},
+			})
+		})
+	if code != 0 {
+		t.Fatalf("setup() = %d: %s", code, &stderr)
+	}
+	if _, err := os.Stat(clientPath); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "手动启动") {
+		t.Fatalf("缺少手动启动提示: %s", &stdout)
+	}
+}
+
+func TestRunSetupPreservesExplicitLegacySidecarMode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var got installer.Request
+	code := runSetup(context.Background(), []string{
+		"--url", "wss://relay.example/hprp", "--herdr-bin", "/test/herdr", "--startup", "sidecar",
+	}, strings.NewReader(validSetupKey+"\n"), &stdout, &stderr,
+		func(_ context.Context, request installer.Request, _ installer.Options) (installer.Result, error) {
+			got = request
+			return installer.Result{}, nil
+		})
+	if code != 0 || got.StartupMode != "sidecar" || strings.Contains(stdout.String(), "手动启动") {
+		t.Fatalf("旧 sidecar 模式未保留: code=%d mode=%q stdout=%s stderr=%s", code, got.StartupMode, &stdout, &stderr)
+	}
+}

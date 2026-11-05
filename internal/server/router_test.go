@@ -708,7 +708,7 @@ func TestRouterAllowsHelpWhenNoSessions(t *testing.T) {
 		"./install.sh",
 		"默认 `~/.local/bin`",
 		"机器 Key",
-		"Sidecar",
+		"默认启动命令",
 		"live-handoff",
 		"~/.config/herdr-pal/config.json",
 		"~/.config/herdr/config.toml",

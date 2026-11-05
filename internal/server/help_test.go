@@ -59,14 +59,14 @@ func TestFileHelpProviderRejectsUnavailableContent(t *testing.T) {
 	}
 }
 
-func TestDefaultHelpUsesSidecarBundleInstallation(t *testing.T) {
+func TestDefaultHelpUsesManualBundleInstallation(t *testing.T) {
 	help := DefaultHelpText()
 	for _, want := range []string{
 		"herdr-bundle-<版本>-<系统>-<架构>.tar.gz",
 		"./install.sh",
 		"/ls",
 		"/N",
-		"Sidecar",
+		"默认启动命令",
 		"Key 会在终端回显",
 	} {
 		if !strings.Contains(help, want) {

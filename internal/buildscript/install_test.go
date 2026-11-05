@@ -92,6 +92,12 @@ func TestBundleInstallScriptInstallsConfiguresAndHandsOff(t *testing.T) {
 	if !strings.Contains(string(output), "PATH") {
 		t.Fatalf("installer output should include PATH hint:\n%s", output)
 	}
+	if !strings.Contains(string(output), "手动启动 Pal") || !strings.Contains(string(output), "'"+filepath.Join(canonicalTarget, "herdr-pal")+"'") {
+		t.Fatalf("安装器必须提供实际安装路径的手动启动命令:\n%s", output)
+	}
+	if strings.Contains(string(output), "加载新版本和 Sidecar") {
+		t.Fatalf("安装器不能声称官方 Herdr 会启动 Sidecar:\n%s", output)
+	}
 }
 
 func TestBundleInstallScriptSupportsCustomDirectoryAndRejectsHandoff(t *testing.T) {
@@ -121,6 +127,38 @@ func TestBundleInstallScriptSupportsCustomDirectoryAndRejectsHandoff(t *testing.
 	}
 	if strings.Contains(string(logData), "server live-handoff") {
 		t.Fatalf("live handoff should not run:\n%s", logData)
+	}
+}
+
+func TestBundleManualStartCommandPreservesSpecialPaths(t *testing.T) {
+	bundle, home := t.TempDir(), t.TempDir()
+	target := filepath.Join(t.TempDir(), "Pal's bin $PATH")
+	logPath := filepath.Join(t.TempDir(), "commands.log")
+	renderInstallTemplate(t, filepath.Join(repositoryRoot(t), "packaging", "bundle", "install.sh"), filepath.Join(bundle, "install.sh"), runtime.GOOS, runtime.GOARCH)
+	writeFakeBundleBinaries(t, bundle)
+	command := exec.Command("/bin/sh", filepath.Join(bundle, "install.sh"))
+	command.Env = append(os.Environ(), "HOME="+home, "INSTALL_TEST_LOG="+logPath,
+		"EXPECTED_KEY="+bundleInstallTestKey, "PATH=/usr/bin:/bin")
+	command.Stdin = strings.NewReader(target + "\nwss://relay.example/hprp\n" + bundleInstallTestKey + "\nn\n")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh: %v\n%s", err, output)
+	}
+	startLine := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "'") {
+			startLine = line
+		}
+	}
+	if startLine == "" {
+		t.Fatalf("未输出启动命令: %s", output)
+	}
+	// 执行用户会复制的命令，验证引号、空格和美元符号不会被 shell 改写。
+	writeExecutable(t, filepath.Join(target, "herdr-pal"), "#!/bin/sh\n[ \"$#\" = 2 ] && [ \"$1\" = -config ] && [ \"$2\" = \"$EXPECTED_CONFIG\" ]\n")
+	start := exec.Command("/bin/sh", "-c", startLine)
+	start.Env = append(os.Environ(), "EXPECTED_CONFIG="+filepath.Join(home, ".config", "herdr-pal", "config.json"))
+	if output, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("复制启动命令失败: %v\n%s", err, output)
 	}
 }
 
@@ -224,7 +262,7 @@ IFS= read -r received_key
 [ "${SETUP_FAIL:-0}" != "1" ]
 mkdir -p "$(dirname "$client_config")" "$(dirname "$herdr_config")"
 printf '%s\n' '{}' > "$client_config"
-printf '%s\n' '[[sidecar]]' 'command = ["herdr-pal"]' > "$herdr_config"
+printf '%s\n' 'onboarding = false' > "$herdr_config"
 `)
 }
 

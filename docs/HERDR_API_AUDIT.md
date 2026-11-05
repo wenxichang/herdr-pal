@@ -6,15 +6,16 @@
 
 - Herdr 源码目录：`/Users/wxc/Code/herdr`
 - 初始基线提交：`2a20e90 fix: preserve physical escape on windows`
-- 兼容版本：Herdr `v0.7.5`/protocol 17、Herdr `v0.8.0`/protocol 19
+- 已审计版本：Herdr `v0.7.5`/protocol 17、`v0.8.0`/protocol 19、官方 `v0.9.5`/protocol 22
 - 审计日期：`2026-07-23`
 - Herdr Pal 实现复核：`2026-07-24`
 - Herdr 0.8.0 兼容复核：`2026-08-09`
+- 官方 Herdr 0.9.5 兼容复核：`2026-11-05`（详见第 10 节）
 - 本文中的源码路径均相对于 Herdr 仓库根目录。
 
 结论只覆盖上述已审计版本。protocol 19 的升级来自 Herdr 原生客户端键盘事件 wire format，
-Pal 使用的公共 NDJSON API 保持 Schema version 1；运行时仍必须通过协议允许列表拒绝未经
-审计的中间版本和未来版本。
+Pal 使用的公共 NDJSON API 保持 Schema version 1；运行时通过 protocol 17–22 的版本范围拒绝未支持的未来版本；
+范围内各版本的审计深度见下文。
 
 ## 2. 协议和传输
 
@@ -532,3 +533,37 @@ Pal 使用的请求、响应和事件结构没有破坏性变化，但尚未记�
 2026-10-15 将运行时版本门禁范围扩展为 17 到 22；Herdr 当前源码声明 protocol 22，Pal 使用的公开 API 方法与必要字段仍在当前 Schema 中。
 输出侧仍按本文既有结论处理：`revision` 固定为 0，且没有公共
 `pane.output_changed` 输出流。
+
+## 10. 官方 Herdr 0.9.5 兼容性与 Bundle 迁移
+
+2026-11-05 复核 [官方最新正式版 v0.9.5](https://github.com/herdrdev/herdr/releases/tag/v0.9.5)，
+提交为 `2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`。主分支同时核对至
+`ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`；其公开 JSON Schema 与 v0.9.5 相同，
+均为 protocol 22 / schema_version 1。主分支仅做源码、Schema 检查，不声称已实机验证。
+
+Pal 的 NDJSON 信封、`session.snapshot`、`agent.get/read/prompt/send_keys` 参数和响应，
+以及 lifecycle / pane 状态订阅保持兼容，无需扩大 protocol 门禁。`state_change_seq`
+虽然在 Schema 中允许缺省，当前官方实现仍序列化该字段；Pal 的输入确认继续要求该序列。
+新增的可选字段不影响现有解码。`revision` 不用作快照游标，也不依赖公共输出事件流。
+
+实际不兼容点位于安装流程：旧 Bundle 使用 fork 提供的 `[[sidecar]]`，官方版本没有此
+配置，`herdr config check` 返回非零并报告 unknown config section。修复后：
+
+- `herdr-pal setup` 默认为 `--startup manual`，只生成配置，由用户手动启动 Pal。
+- 不安装系统用户服务，不通过 plugin startup hook 守护进程。
+- 旧安装器标记的标准 Pal sidecar 块会备份并移除；异常标记或块中含其他设置时拒绝迁移。
+- 未受管 sidecar 保留，若官方 CLI 拒绝则停止安装，要求用户自行迁移。
+- 旧 fork 可显式指定 `--startup sidecar`；Herdr live-handoff 不再被描述为启动 Pal 的手段。
+
+新增隔离集成测试：
+
+```sh
+HERDR_PAL_TEST_HERDR=/绝对路径/官方herdr \
+  go test ./internal/integration -run '^TestOfficialHerdrCompatibility$' -count=1 -v
+```
+
+测试建立临时 HOME、XDG 配置/状态目录和独立 Herdr 进程，只通过公开 API 创建测试 pane
+与上报测试状态，验证配置迁移和备份、ping、空/非空 snapshot、lifecycle 与状态订阅、
+`agent.get`、三种终端快照读取，以及本地交互 `/ls`、`/1`、`/con`。已在官方 macOS ARM64
+v0.9.5 上通过；不访问 IM 网络，不向用户现有 Agent 发送输入，也不声称完成真实 LLM prompt
+联调。发布的其他平台验证二进制架构、官方资产摘要、Pal 交叉编译和 Bundle 校验和。

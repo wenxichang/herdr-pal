@@ -92,3 +92,48 @@ func TestMergeHerdrConfigRejectsInvalidContent(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoveManagedPalSidecarPreservesOtherSettings(t *testing.T) {
+	prefix := "onboarding = false\n\n"
+	suffix := "\n[advanced]\nscrollback_limit_bytes = 1234\n"
+	for _, existing := range []string{prefix + managedSidecarBlock + suffix, prefix + suffix, managedSidecarBlock, ""} {
+		got, err := removeManagedPalSidecar([]byte(existing))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := strings.ReplaceAll(existing, managedSidecarBlock, "")
+		if string(got) != want {
+			t.Fatalf("配置迁移修改了无关内容: %q，期望 %q", got, want)
+		}
+		again, err := removeManagedPalSidecar(got)
+		if err != nil || string(again) != want {
+			t.Fatalf("重复迁移不幂等: %q, %v", again, err)
+		}
+	}
+}
+
+func TestRemoveManagedPalSidecarKeepsUnmanagedSidecars(t *testing.T) {
+	existing := "[[sidecar]]\ncommand = [\"metrics-agent\"]\n\n"
+	got, err := removeManagedPalSidecar([]byte(existing + managedSidecarBlock))
+	if err != nil || string(got) != existing {
+		t.Fatalf("未受管的配置被修改: %q, %v", got, err)
+	}
+}
+
+func TestRemoveManagedPalSidecarRejectsAmbiguousBlocks(t *testing.T) {
+	for _, content := range []string{
+		managedSidecarBegin + "\n[[sidecar]]\ncommand = [\"herdr-pal\"]\n",
+		managedSidecarBlock + managedSidecarBlock,
+		managedSidecarEnd + "\n" + managedSidecarBegin + "\n",
+		strings.ReplaceAll(managedSidecarBlock, "herdr-pal", "another-program"),
+		strings.ReplaceAll(managedSidecarBlock, managedSidecarEnd, "[ui]\nmouse_capture = true\n"+managedSidecarEnd),
+		"value = '''\n" + managedSidecarBlock + "'''\n",
+		managedSidecarBegin + " extra\n[[sidecar]]\ncommand = [\"herdr-pal\"]\n" + managedSidecarEnd + "\n",
+		managedSidecarBlock + "onboarding = false\n",
+		managedSidecarBlock + "[sidecar.settings]\nenabled = true\n",
+	} {
+		if _, err := removeManagedPalSidecar([]byte(content)); err == nil {
+			t.Fatalf("应拒绝不明确的受管块: %q", content)
+		}
+	}
+}

@@ -24,9 +24,11 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	clientConfigPath := flags.String("config", "", "Herdr Pal JSON 配置路径")
 	herdrConfigPath := flags.String("herdr-config", "", "Herdr config.toml 路径")
 	herdrBinaryPath := flags.String("herdr-bin", "", "用于校验配置的 Herdr 二进制路径")
+	startupMode := flags.String("startup", "manual", "启动方式：manual 或旧 Herdr 的 sidecar")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "用法: herdr-pal setup --url wss://server/hprp --herdr-bin /path/to/herdr [--config path] [--herdr-config path]")
 		fmt.Fprintln(stderr, "机器 Key 必须通过标准输入的第一行传入。")
+		fmt.Fprintln(stderr, "默认仅生成配置，手动启动 Pal；旧 Herdr 可指定 --startup sidecar。")
 	}
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -39,6 +41,10 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	if flags.NArg() != 0 || strings.TrimSpace(*relayURL) == "" || strings.TrimSpace(*herdrBinaryPath) == "" {
 		fmt.Fprintln(stderr, "安装配置缺少必填参数。")
 		flags.Usage()
+		return 2
+	}
+	if *startupMode != "manual" && *startupMode != "sidecar" {
+		fmt.Fprintln(stderr, "启动方式必须为 manual 或 sidecar。")
 		return 2
 	}
 	if execute == nil {
@@ -73,6 +79,7 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		HerdrBinaryPath:  *herdrBinaryPath,
 		RelayURL:         strings.TrimSpace(*relayURL),
 		RelayKey:         key,
+		StartupMode:      *startupMode,
 	}, installer.Options{})
 	if err != nil {
 		fmt.Fprintf(stderr, "安装配置失败：%s\n", redactSetupSecret(err.Error(), key))
@@ -86,6 +93,9 @@ func runSetup(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	}
 	if result.HerdrBackupPath != "" {
 		fmt.Fprintf(stdout, "Herdr 备份: %s\n", result.HerdrBackupPath)
+	}
+	if *startupMode == "manual" {
+		fmt.Fprintln(stdout, "配置已就绪，请手动启动 herdr-pal（自定义配置请使用 -config 指定路径）。")
 	}
 	return 0
 }

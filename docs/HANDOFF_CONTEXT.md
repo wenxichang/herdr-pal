@@ -2,7 +2,7 @@
 
 ## 1. 当前状态
 
-Herdr Pal 是 Herdr 与企业微信之间的独立 sidecar bridge：
+Herdr Pal 是 Herdr 与企业微信之间的独立 bridge：
 
 - `herdr-pal-server` 独占企业微信智能机器人长连接，并监听 HPRP/1 WSS。
 - 每台运行 Herdr 的机器启动一个 `herdr-pal`，只访问本机 Herdr 公共 Socket。
@@ -58,6 +58,10 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - 不自动批准权限请求；按键必须由用户显式触发并通过本地策略。
 - HPAP 只支持 Unix Domain Socket；Windows 只构建 Pal，不构建 Server 或 `hp-cli`。
 - 当前凭据文件格式为 version 2，不兼容 HPAP 实施前的无来源规则旧记录。
+
+官方 Herdr v0.9.5（protocol 22）没有旧 fork 的 `[[sidecar]]` 扩展。Bundle 默认仅生成
+配置，由用户手动启动 Pal；升级时备份并移除旧安装器标记的 sidecar 块。未受管配置不
+静默删除，最终由 Herdr `config check` 校验。`setup --startup sidecar` 保留旧 fork 支持。
 
 ## 3. 部署与身份流程
 

@@ -2,7 +2,7 @@
 
 ## 1. 架构目标
 
-Herdr Pal 由中央 Server 与每机 Pal sidecar 组成。Server 集中持有企业微信机器人连接；Pal
+Herdr Pal 由中央 Server 与每机独立 Pal 进程 组成。Server 集中持有企业微信机器人连接；Pal
 只访问本机 Herdr 公共 Socket，并通过 HPRP/1 WSS 上报会话与执行用户功能。
 
 ```text
@@ -24,6 +24,8 @@ HTTPS 管理台 ─────────▶ ├── WebAdmin ────�
                      ▼                          ▼
                    Herdr                      Herdr
 ```
+
+官方 Herdr Bundle 只生成配置，Pal 由用户手动启动，不依赖 Herdr 的进程守护扩展。
 
 固定边界：
 

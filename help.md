@@ -55,12 +55,12 @@ OpenCode 默认使用图片模式，其他 Agent 默认使用文本模式；模�
    `./install.sh`
 
 5. 按提示选择安装目录，默认 `~/.local/bin`；然后输入 Server URL 和机器 Key。Key 会在终端回显，请确认粘贴完整并注意避免旁人看到。
-6. 安装器会备份旧文件、配置 Herdr Sidecar，并在 Herdr 正在运行时询问是否立即 `live-handoff`。
-7. 启动或切换 Herdr 后回到企业微信，发送 `/ls` 验证接入。
+6. 安装器会备份旧文件、生成配置，并在 Herdr 正在运行时询问是否立即 `live-handoff`。
+7. 启动 Herdr 后，在另一个终端执行安装器打印的 Pal 启动命令并保持运行，再回到企业微信发送 `/ls`。
 
 正常安装不需要手工编辑配置。高级用户可以检查：
 
 - Herdr Pal：`~/.config/herdr-pal/config.json`
 - Herdr：`~/.config/herdr/config.toml`
 
-Herdr 与 `herdr-pal` 会安装在同一目录。Herdr 启动后由 Sidecar 在其生命周期内自动启动、守护并停止 Herdr Pal。
+Herdr 与 `herdr-pal` 会安装在同一目录。默认启动命令为 `~/.local/bin/herdr-pal`；安装器不配置自动启动，`live-handoff` 也不会启动 Pal。
