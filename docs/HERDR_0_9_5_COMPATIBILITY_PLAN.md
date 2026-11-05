@@ -21,7 +21,7 @@
 - [x] 在隔离 Herdr v0.9.5 实例验证 ping、snapshot、订阅、Agent 读取及安装配置校验；
   测试不访问 IM 网络，不向用户现有 Agent 发送输入。
 - [x] 执行 `./unittest.sh`、`./build.sh` 并自审变更。
-- [ ] 提交中文 conventional commit。
+- [x] 提交中文 conventional commit。
 - [ ] 以 v0.6.2 构建 Pal，使用官方 v0.9.5 四平台二进制（核验上游 SHA-256）生成 Bundle，
   检查架构、归档内容、版本及校验和。
 - [ ] 推送 herdr-pal main 和 annotated tag，发布四个 Bundle 与四个校验文件，复核远端。
@@ -47,3 +47,4 @@
 - 首轮全量测试发现两项帮助文本断言仍要求 Sidecar，已同步为手动启动说明。
 - 全量普通与竞态测试共 70 个包次通过，`./build.sh` 完成全部平台构建。
 - 真实 macOS ARM64 安装迁移验证通过，macOS x64 官方二进制版本检查通过。
+- 归档实查发现 macOS AppleDouble 元数据，补充原始 tar 流回归测试并设置 `COPYFILE_DISABLE=1`；单个平台实包已确认只含四个预期文件。

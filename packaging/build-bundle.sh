@@ -168,7 +168,7 @@ chmod 0644 "$bundle_root/README.md"
 mkdir -p "$repo_root/dist"
 archive_path=$repo_root/dist/$bundle_name.tar.gz
 rm -f "$archive_path" "$archive_path.sha256"
-tar -C "$temporary_root" -czf "$archive_path" "$bundle_name"
+COPYFILE_DISABLE=1 tar -C "$temporary_root" -czf "$archive_path" "$bundle_name"
 
 archive_name=$(basename "$archive_path")
 if command -v sha256sum >/dev/null 2>&1; then

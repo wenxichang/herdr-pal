@@ -1,11 +1,15 @@
 package buildscript
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -30,6 +34,12 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 			writeExecutable(t, filepath.Join(fakeBin, "file"), "#!/bin/sh\nprintf '%s\\n' \"$BUNDLE_TEST_FILE_OUTPUT\"\n")
 			herdrBinary := filepath.Join(root, "prebuilt-herdr")
 			writeExecutable(t, herdrBinary, "#!/bin/sh\nexit 0\n")
+			if runtime.GOOS == "darwin" {
+				// 模拟下载二进制携带扩展属性，避免发布 macOS AppleDouble 元数据。
+				if output, err := exec.Command("xattr", "-w", "com.herdr-pal.test", "bundle-metadata", herdrBinary).CombinedOutput(); err != nil {
+					t.Fatalf("设置测试扩展属性失败: %v\n%s", err, output)
+				}
+			}
 			writeExecutable(t, filepath.Join(root, "dist", "herdr-pal-"+target.name), "#!/bin/sh\nexit 0\n")
 
 			command := exec.Command("/bin/sh", filepath.Join(root, "packaging", "build-bundle.sh"),
@@ -56,6 +66,7 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatalf("tar list error = %v\n%s", err, listOutput)
 			}
+			assertBundleHasNoAppleMetadata(t, archivePath)
 			rootName := "herdr-bundle-v0.5.0-" + target.name
 			for _, want := range []string{
 				rootName + "/herdr",
@@ -95,6 +106,34 @@ func TestBuildBundlePackagesReleaseMatrix(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func assertBundleHasNoAppleMetadata(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	compressed, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compressed.Close()
+	// macOS tar -t 会隐藏 AppleDouble，直接读取归档以核验实际发布内容。
+	archive := tar.NewReader(compressed)
+	for {
+		entry, err := archive.Next()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(filepath.Base(entry.Name), "._") {
+			t.Fatalf("归档包含 macOS 元数据文件: %s", entry.Name)
+		}
 	}
 }
 
