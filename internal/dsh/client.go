@@ -111,6 +111,56 @@ func (c *Client) Sessions(ctx context.Context) ([]Session, error) {
 	return result.Sessions, nil
 }
 
+// Approval 是插件暴露的一条待决定审批；不包含工具参数正文。
+type Approval struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionId"`
+	ToolName  string `json:"toolName"`
+	CallID    string `json:"callId"`
+	Reason    string `json:"reason"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// Approvals 读取当前等待决定的审批列表。
+func (c *Client) Approvals(ctx context.Context) ([]Approval, error) {
+	var result struct {
+		Protocol  int        `json:"protocol"`
+		Approvals []Approval `json:"approvals"`
+	}
+	if err := c.call(ctx, "approvals", struct{}{}, &result); err != nil {
+		return nil, err
+	}
+	if result.Protocol != 1 || len(result.Approvals) > 64 {
+		return nil, errors.New("dsh 审批列表无效")
+	}
+	for _, approval := range result.Approvals {
+		if approval.ID == "" || len(approval.ID) > 128 || approval.ToolName == "" {
+			return nil, errors.New("dsh 审批条目无效")
+		}
+	}
+	return result.Approvals, nil
+}
+
+// AnswerApproval 提交一次审批决定；decision 只能是 allow 或 deny。
+func (c *Client) AnswerApproval(ctx context.Context, id, decision string) error {
+	if decision != "allow" && decision != "deny" {
+		return errors.New("审批决定无效")
+	}
+	var result struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := c.call(ctx, "approvals/answer", struct {
+		ID       string `json:"id"`
+		Decision string `json:"decision"`
+	}{ID: id, Decision: decision}, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return errors.New("dsh 未接受该审批决定")
+	}
+	return nil
+}
+
 func displayLabel(value string) string {
 	value = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {

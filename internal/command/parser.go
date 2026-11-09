@@ -30,6 +30,12 @@ const (
 	KindHelp
 	// KindPrompt 请求发送普通文本提示。
 	KindPrompt
+	// KindApprovals 请求列出等待决定的远程审批。
+	KindApprovals
+	// KindApprove 请求批准一次远程审批。
+	KindApprove
+	// KindDeny 请求拒绝一次远程审批。
+	KindDeny
 )
 
 // Action 是输入文本对应的桥接动作。
@@ -58,6 +64,9 @@ const helpText = `输入帮助：
 /key KEYS           发送按键；逗号或空白分隔，最多 32 个
 /enter              等同 /key enter
 /slash TEXT         将 /TEXT 作为普通消息发送给 Agent
+/approvals          列出等待你决定的审批
+/approve [N]        批准第 N 个审批（缺省为唯一待审），仅本次生效
+/deny [N]           拒绝第 N 个审批
 
 按键支持 up、down、esc、space、单个 ASCII 字母或数字；dn 等同 down，sp 等同 space。
 相邻按键间隔 100ms；全部发送后等待 200ms，再读取控制台。enter 只能单独发送，不能出现在多键队列中。
@@ -100,6 +109,12 @@ func Parse(input string) (Action, error) {
 		return parseKeys(strings.TrimSpace(strings.TrimPrefix(trimmed, "/key")))
 	case "/slash":
 		return parseSlash(trimmed)
+	case "/approvals":
+		return parseAlias(fields, command, Action{Kind: KindApprovals})
+	case "/approve":
+		return parseApproval(fields, command, KindApprove)
+	case "/deny":
+		return parseApproval(fields, command, KindDeny)
 	default:
 		return Action{}, invalidCommand(generalUsage)
 	}
@@ -118,6 +133,21 @@ func parseSelectIndex(value, usage string) (Action, error) {
 		return Action{}, invalidCommand(usage)
 	}
 	return Action{Kind: KindSelect, Index: index}, nil
+}
+
+func parseApproval(fields []string, command string, kind Kind) (Action, error) {
+	usage := command + " 用法: " + command + " [序号]"
+	if len(fields) > 2 {
+		return Action{}, invalidCommand(usage)
+	}
+	if len(fields) == 1 {
+		return Action{Kind: kind}, nil
+	}
+	index, err := strconv.Atoi(fields[1])
+	if err != nil || index <= 0 {
+		return Action{}, invalidCommand(usage)
+	}
+	return Action{Kind: kind, Index: index}, nil
 }
 
 func parseKeys(raw string) (Action, error) {

@@ -12,7 +12,7 @@ export function sessionText(agent) {
 }
 
 /** 启动仅供本机 Pal 使用的认证接口；返回地址及异步关闭函数。 */
-export async function createBridge({ agents, createUserMessage, sessionController, sessionQuery }, { token, port = 17842, capacity = 4096 } = {}) {
+export async function createBridge({ agents, createUserMessage, sessionController, sessionQuery }, { token, port = 17842, capacity = 4096, broker } = {}) {
   if (typeof token !== 'string' || !/^[\x21-\x7e]{32,256}$/.test(token)) throw new Error('DSH_PAL_TOKEN 必须为 32 到 256 个可打印 ASCII 字符');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('端口无效');
   const secret = Buffer.from(digest(token));
@@ -63,6 +63,13 @@ export async function createBridge({ agents, createUserMessage, sessionControlle
       if (agent) return { text: sessionText(agent) };
       const history = await sessionQuery.readSession(request.id);
       return { text: conversationText(history.events) };
+    }
+    if (path === '/v1/approvals') return { protocol: 1, approvals: broker ? broker.list() : [] };
+    if (path === '/v1/approvals/answer') {
+      if (typeof request.id !== 'string' || !request.id || request.id.length > 128 ||
+          (request.decision !== 'allow' && request.decision !== 'deny')) throw fail(400, 'invalid_approval');
+      if (!broker || !broker.answer(request.id, request.decision)) throw fail(404, 'approval_not_found');
+      return { accepted: true };
     }
     if (path !== '/v1/prompt') throw fail(404, 'method_not_found');
     if (typeof request.request_id !== 'string' || !request.request_id || request.request_id.length > 256 ||

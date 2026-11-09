@@ -3,6 +3,7 @@ package dsh
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -22,6 +23,12 @@ type API interface {
 	Sessions(context.Context) ([]Session, error)
 	Prompt(context.Context, Session, string, string) error
 	Read(context.Context, Session) (string, error)
+}
+
+// ApprovalAPI 是可选的审批能力；插件未启用时 Executor 不感知审批。
+type ApprovalAPI interface {
+	Approvals(context.Context) ([]Approval, error)
+	AnswerApproval(context.Context, string, string) error
 }
 
 // Sink 接收命令回复及轻量状态通知。
@@ -232,8 +239,88 @@ func (e *Executor) HandleMessage(ctx context.Context, message im.IncomingText) {
 		}
 		reply(strings.Join(e.buffer.Render(), "\n"))
 	case command.KindKey:
-		reply("dsh 不支持终端按键或远程审批，请在 dsh 界面处理。")
+		reply("dsh 不支持终端按键，请在 dsh 界面处理。")
+	case command.KindApprovals:
+		text, err := e.approvalList(ctx)
+		if err != nil {
+			reply(err.Error())
+			return
+		}
+		reply(text)
+	case command.KindApprove, command.KindDeny:
+		decision := "deny"
+		if action.Kind == command.KindApprove {
+			decision = "allow"
+		}
+		text, err := e.answerApproval(ctx, decision, action.Index)
+		if err != nil {
+			reply(err.Error())
+			return
+		}
+		reply(text)
 	default:
 		reply("请使用 /ls、/N、/con 或普通文本操作 dsh。")
 	}
+}
+
+var errApprovalUnsupported = errors.New("该 dsh 插件未启用审批接口")
+
+func (e *Executor) pendingApprovals(ctx context.Context) ([]Approval, error) {
+	api, ok := e.api.(ApprovalAPI)
+	if !ok {
+		return nil, errApprovalUnsupported
+	}
+	return api.Approvals(ctx)
+}
+
+// approvalList 渲染当前待审列表；序号即 /approve、/deny 使用的编号。
+func (e *Executor) approvalList(ctx context.Context) (string, error) {
+	list, err := e.pendingApprovals(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(list) == 0 {
+		return "当前没有等待决定的审批。", nil
+	}
+	var b strings.Builder
+	b.WriteString("待审批：")
+	for i, approval := range list {
+		fmt.Fprintf(&b, "\n%d. %s", i+1, approval.ToolName)
+		if approval.Reason != "" {
+			fmt.Fprintf(&b, " — %s", approval.Reason)
+		}
+	}
+	b.WriteString("\n回复 /approve N 批准一次，或 /deny N 拒绝；本地面板同样可以处理。")
+	return b.String(), nil
+}
+
+// answerApproval 按序号（缺省要求唯一）提交决定，另一条通道会自动失效。
+func (e *Executor) answerApproval(ctx context.Context, decision string, index int) (string, error) {
+	list, err := e.pendingApprovals(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(list) == 0 {
+		return "当前没有等待决定的审批。", nil
+	}
+	var chosen Approval
+	if index > 0 {
+		if index > len(list) {
+			return "", fmt.Errorf("序号超出范围：当前 %d 个待审", len(list))
+		}
+		chosen = list[index-1]
+	} else {
+		if len(list) != 1 {
+			return "", fmt.Errorf("有 %d 个待审审批，请使用 /approvals 查看序号", len(list))
+		}
+		chosen = list[0]
+	}
+	api, _ := e.api.(ApprovalAPI)
+	if err := api.AnswerApproval(ctx, chosen.ID, decision); err != nil {
+		return "", err
+	}
+	if decision == "allow" {
+		return fmt.Sprintf("已批准（仅本次）：%s。", chosen.ToolName), nil
+	}
+	return fmt.Sprintf("已拒绝：%s。", chosen.ToolName), nil
 }
