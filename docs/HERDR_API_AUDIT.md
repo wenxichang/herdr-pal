@@ -287,8 +287,17 @@ Herdr 带 `wait` 的 prompt 在未显式传 `timeout_ms` 时使用约 5 秒的 p
 `agent_prompt_stalled`。Pal 当前使用不带 `wait` 的提交方式，避免额外叠加这一等待窗口，
 由 bridge 通过状态和 `state_change_seq` 确认结果。
 
-bridge 只在初始实时状态为 `idle` 或 `done` 时提交普通文本。状态未变化时，每隔 500ms
-调用 `agent.get`，最多检查 3 次；仍无变化再等 3 秒，重新读取并核验 occupant 与状态。
+`working` 状态下提交不会改变 `agent_status` 与 `state_change_seq`（2026-11-07 本机实测：
+对 `agent_status=working` 的目标连续执行两次 `herdr agent prompt <pane> "<文本>"`，均返回
+`agent_prompted`，`herdr agent list` 中两项均保持原值），因此 working 起点的排队回复不
+依赖状态变化确认。
+
+bridge 在初始实时状态为 `idle`、`done` 或 `working` 时提交普通文本；`working` 起点
+提交成功且提交响应未显示状态或序号变化时直接回复排队结果，不进入下面的状态确认，
+其余状态在提交前拒绝。提交返回
+`agent_prompt_stalled`，或提交被接受但状态与序号未变化时，每隔 500ms 调用 `agent.get`，最多检查
+3 次；仍无变化再等 3 秒，
+重新读取并核验 occupant 与状态。
 只有原目标仍为原状态、原序列时才补发一次受策略检查和审计的 Enter，随后再以 500ms
 间隔检查 3 次，仍无变化才提示检查 Agent 界面。等待总计最多约 6 秒，不含 API 调用耗时。
 任一检查发现状态或序列变化即成功；目标更换、读取失败或取消时停止，不重发 prompt，
@@ -451,8 +460,9 @@ Herdr 提供的精确增量游标。
 
 IM 普通文本
     → 校验用户和会话绑定
-    → agent.get 校验 occupant 与 idle/done
+    → agent.get 校验 occupant 与可提交状态（idle/done/working）
     → 不带 wait 的 agent.prompt 提交一次
+    → working 起点提交成功：直接回复排队结果
     → 每隔 500ms 检查状态，最多 3 次
     → 无变化再等 3 秒，复核目标与状态后补发一次受审计的 Enter
     → 每隔 500ms 再检查状态，最多 3 次
@@ -495,7 +505,7 @@ Herdr Pal 客户端每次启动和重连都先调用 `ping` 做版本门禁，�
 私有 `AppState`、PTY 或 Rust 模块。
 
 fake Herdr 可模拟 prompt 提交后状态未变化、延迟的状态变化和补 Enter 后的状态变化。
-端到端测试覆盖正常 prompt、working 状态拒绝、延迟状态到达，以及补键后成功或两轮
+端到端测试覆盖正常 prompt、working 状态排队发送、延迟状态到达，以及补键后成功或两轮
 检查耗尽；确认 prompt 只发送一次，恢复 Enter 最多发送一次。
 
 可选真实测试命令：

@@ -616,16 +616,17 @@ func TestServicePromptRebindsSessionChangedAfterSubmission(t *testing.T) {
 	}
 }
 
-func TestServicePromptOnlyAcceptsIdleAndDone(t *testing.T) {
+func TestServicePromptAcceptsIdleDoneAndWorking(t *testing.T) {
 	tests := []struct {
-		status herdr.AgentStatus
-		sent   bool
+		status    herdr.AgentStatus
+		sent      bool
+		wantReply string
 	}{
-		{status: herdr.AgentStatusIdle, sent: true},
-		{status: herdr.AgentStatusDone, sent: true},
-		{status: herdr.AgentStatusWorking, sent: false},
-		{status: herdr.AgentStatusBlocked, sent: false},
-		{status: herdr.AgentStatusUnknown, sent: false},
+		{status: herdr.AgentStatusIdle, sent: true, wantReply: "working"},
+		{status: herdr.AgentStatusDone, sent: true, wantReply: "working"},
+		{status: herdr.AgentStatusWorking, sent: true, wantReply: "排队"},
+		{status: herdr.AgentStatusBlocked, sent: false, wantReply: "等待用户处理"},
+		{status: herdr.AgentStatusUnknown, sent: false, wantReply: "unknown"},
 	}
 
 	for _, test := range tests {
@@ -635,7 +636,11 @@ func TestServicePromptOnlyAcceptsIdleAndDone(t *testing.T) {
 			current := agentInfo("pane-1", "terminal-1", "codex")
 			current.AgentStatus = test.status
 			fake.setAgent(current)
+			// 真实 Herdr 中 working 提交不改变状态与序号，其余起点的回复依赖状态变化。
 			fake.promptResult = changedAgent(current, herdr.AgentStatusWorking)
+			if test.status == herdr.AgentStatusWorking {
+				fake.promptResult = current
+			}
 
 			service.HandleMessage(context.Background(), incoming("prompt-status-"+string(test.status), "prompt"))
 
@@ -643,14 +648,36 @@ func TestServicePromptOnlyAcceptsIdleAndDone(t *testing.T) {
 				t.Fatalf("prompt calls = %d, sent = %v", got, test.sent)
 			}
 			reply := fakeIMFromService(t, service).lastReply()
-			if test.sent {
-				if !strings.Contains(reply, "working") {
-					t.Fatalf("success reply = %q", reply)
+			if !strings.Contains(reply, test.wantReply) {
+				t.Fatalf("reply = %q, want %q", reply, test.wantReply)
+			}
+			if test.status == herdr.AgentStatusWorking {
+				if got := len(fake.keys()); got != 0 {
+					t.Fatalf("working prompt sent %d keys, want none", got)
 				}
-			} else if !strings.Contains(reply, string(test.status)) {
-				t.Fatalf("rejected reply = %q, want status %s", reply, test.status)
+				if got := len(fake.gets()); got != 1 {
+					t.Fatalf("working prompt made %d get calls, want 1", got)
+				}
 			}
 		})
+	}
+}
+
+func TestServiceWorkingPromptRepliesSuccessWhenSubmissionChangesState(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	current := agentInfo("pane-1", "terminal-1", "codex")
+	current.AgentStatus = herdr.AgentStatusWorking
+	fake.setAgent(current)
+	fake.promptResult = changedAgent(current, herdr.AgentStatusDone)
+
+	service.HandleMessage(context.Background(), incoming("prompt-working-changed", "prompt"))
+
+	if got := len(fake.prompts()); got != 1 {
+		t.Fatalf("prompt calls = %d, want 1", got)
+	}
+	if reply := fakeIMFromService(t, service).lastReply(); !strings.Contains(reply, "状态已变为 done") {
+		t.Fatalf("reply = %q, want 状态已变为 done", reply)
 	}
 }
 

@@ -132,16 +132,24 @@ func TestLegacyDirectBridgeEndToEnd(t *testing.T) {
 		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.send_keys")) }, 0)
 	})
 
-	t.Run("working 状态拒绝普通文本", func(t *testing.T) {
+	t.Run("working 状态排队发送且不补发 enter", func(t *testing.T) {
 		harness := newBridgeHarness(t, herdr.AgentStatusWorking)
 		defer harness.stop(t)
+		harness.herdr.SetPromptUnchanged(1)
 		harness.selectFirst(t)
 
-		reply := harness.send(t, "message-working-prompt", testUserID, "single", "不得发送")
-		if !strings.Contains(reply.Content, "working") {
-			t.Fatalf("working 拒绝回复 = %q", reply.Content)
+		initialGets := len(harness.herdr.Calls("agent.get"))
+		reply := harness.send(t, "message-working-prompt", testUserID, "single", "继续执行")
+		if !strings.Contains(reply.Content, "已排队等待执行") {
+			t.Fatalf("working 排队回复 = %q", reply.Content)
 		}
-		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 0)
+		assertCallParams(t, harness.herdr.Calls("agent.prompt")[0], map[string]any{
+			"target": "pane-1",
+			"text":   "继续执行",
+		})
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.prompt")) }, 1)
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.get")) }, initialGets+1)
+		assertStableCount(t, func() int { return len(harness.herdr.Calls("agent.send_keys")) }, 0)
 	})
 
 	t.Run("显式 enter 与连续按键逐键发送并各刷新一次控制台", func(t *testing.T) {
