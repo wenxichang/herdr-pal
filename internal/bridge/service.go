@@ -458,6 +458,10 @@ func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, tex
 	}
 	if !canAcceptPrompt(current.AgentStatus) {
 		release()
+		if current.AgentStatus == herdr.AgentStatusBlocked {
+			s.reply(ctx, message.RequestID, blockedPromptMessage)
+			return
+		}
 		s.reply(ctx, message.RequestID, fmt.Sprintf("Agent 当前状态为 %s，暂不接受普通文本。", safeLabel(string(current.AgentStatus))))
 		return
 	}
@@ -471,6 +475,12 @@ func (s *Service) handlePrompt(ctx context.Context, message im.IncomingText, tex
 	if err != nil && !isPromptStalled(err) {
 		release()
 		s.reply(ctx, message.RequestID, "发送失败，请稍后重试。")
+		return
+	}
+	// Agent 运行中提交后状态与序号都不会变化，状态变化无法作为送达回执；按排队输入直接回复，跳过会补发 Enter 的确认流程。提交响应已变化时说明 Agent 当场转入新状态，交由下面的成功回复。
+	if promptAccepted && current.AgentStatus == herdr.AgentStatusWorking && !promptStateChanged(current, changed) {
+		release()
+		s.reply(ctx, message.RequestID, queuedPromptMessage)
 		return
 	}
 	if err != nil || !promptStateChanged(current, changed) {
@@ -507,7 +517,7 @@ func (s *Service) replyPromptTargetChanged(ctx context.Context, requestID string
 }
 
 func canAcceptPrompt(status herdr.AgentStatus) bool {
-	return status == herdr.AgentStatusIdle || status == herdr.AgentStatusDone
+	return status == herdr.AgentStatusIdle || status == herdr.AgentStatusDone || status == herdr.AgentStatusWorking
 }
 
 func promptStateChanged(before, after herdr.AgentInfo) bool {
@@ -1229,6 +1239,8 @@ func (s *Service) logIMDeliveryFailure(message, requestID string, partIndex, par
 const unavailableMessage = "Herdr 暂不可用，操作未执行，请稍后重试。"
 const targetChangedMessage = "目标 Agent 已变化，请重新执行 /ls 并使用 /N 选择目标。"
 const targetChangedAfterPromptMessage = "消息已发送，但 Agent 会话在发送过程中发生变化。为避免后续消息投递到错误会话，请重新执行 /ls 并使用 /N 选择目标。"
+const blockedPromptMessage = "Agent 正在等待用户处理，请在 Herdr 界面完成后再发送。"
+const queuedPromptMessage = "已发送，Agent 正在运行，已排队等待执行。"
 
 func safeCommandError(err error) string {
 	if errors.Is(err, command.ErrInvalidCommand) {

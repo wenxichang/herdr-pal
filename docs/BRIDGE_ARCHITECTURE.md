@@ -220,8 +220,12 @@ Herdr 不可用时向 HPRP 暴露空会话。
 
 ### 4.3 Service、PolicyGuard 与 Notifier
 
-Service 解析 `/con`、分页、`/key`、`/enter`、`/slash` 和普通 prompt。普通文本只允许
-实时 `idle` 或 `done`；发送不带 `wait` 的 prompt 后，每隔 500ms 通过 `agent.get` 检查，
+Service 解析 `/con`、分页、`/key`、`/enter`、`/slash` 和普通 prompt。普通文本允许
+实时 `idle`、`done` 和 `working`；`working` 表示 Agent 正在执行，文本作为排队输入交给
+Agent 自行处理，提交成功后立即回复，不进入状态确认。`blocked` 与 `unknown` 不接受。
+发送不带 `wait` 的 prompt 后，`working` 起点、提交成功且提交响应未显示状态或序号变化时，
+直接回复排队结果并跳过下面的确认流程；提交返回 `agent_prompt_stalled`，或提交被接受但状态与序号未变化时，每隔
+500ms 通过 `agent.get` 检查，
 最多 3 次。仍无变化再等 3 秒，重新核验 occupant 和状态，仅在原目标仍未变化时补一次
 受审计的 Enter，然后再以 500ms 间隔检查 3 次。任一检查发现状态或 `state_change_seq`
 变化即成功；两轮均未变化才报错。prompt 不重发，读取失败或请求取消时停止。
