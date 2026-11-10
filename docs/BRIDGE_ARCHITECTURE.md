@@ -1,22 +1,33 @@
 # Herdr Pal Bridge 架构
 
-## dsh 可选后端（2026-11-05）
+## dsh 可选后端（2026-11-10 原生 API）
 
-除下文既有 Herdr 后端外，Pal 可配置本仓库 `plugins/dsh-herdr-pal` 插件。插件通过 dsh
-公开 Cordis 服务提供独立本机 HTTP JSON v1 接口，仅监听回环并要求 Bearer token；该接口
-不复用 Herdr RPC，也不修改 Herdr。`internal/dsh` 负责客户端、目录同步和文本命令执行，
-`relayclient.ExecutorMux` 合并后端目录，复用 HPRP、企微 Router、机器身份与全局编号。
+除下文既有 Herdr 后端外，Pal 可直接连接 dsh 自带的本机 Remote API，不再安装或读取
+任何 dsh 插件。`internal/dsh` 负责宿主发现、认证、HTTP RPC、`$events` Mux、目录同步和
+文本命令执行；`relayclient.ExecutorMux` 合并后端目录，复用 HPRP、企微 Router、机器身份
+与全局编号。旧的 Node 插件与过渡客户端已删除，构建和测试不再需要 Node.js。
 
-插件列出已加载根会话和按 dsh `updatedAt` 判定最近 14 天的历史；读取历史不激活 Agent，
-发送时通过公开 `sessionController.resolveAgent` 恢复，再调用 `followup`。插件实例与
-Agent incarnation 防止旧选择误投；恢复原历史会话保持 incarnation。只返回用户/助手文本，
-正文来自 `snapshotEvents` / `sessionQuery.readSession` 的原始 append 事件；用户输入必须
-具有 `source.kind=user`，助手仅保留 text 块，排除工具、推理、内部注入和压缩替换。
-不提供终端按键或审批。普通文本仅允许 idle。完整配置、协议边界和限制见
-[插件说明](../plugins/dsh-herdr-pal/README.md)。
+- 发现：macOS 自动发现 dsh web 与 Desktop；Linux 自动发现 web；Windows 必须显式配置
+  `dsh.url` 与 `dsh.home`。显式 URL 也用于集成测试和自定义部署。
+- 认证：从 `<DSH_HOME>/.credentials.yaml` 的浏览器会话记录生成绑定
+  `127.0.0.1:<port>` 的短期 HMAC Cookie；认证材料不落盘、不写日志。每次请求重新生成。
+- 目录：只列出 `agentAvailable=true` 的会话，过滤子代理和迁移中会话；web 与 Desktop
+  各自维护控制权，条目不会重叠。没有可控制会话时提供“新建会话”宿主入口。
+- 读取：`session/projections` 取切点，`session/page` 读取尾页；只投影真实用户输入
+  （`source.kind=user`）和助手 text 块，排除工具、推理、内部注入和压缩替换。
+- 输入：普通文本使用 `session/prompt` 的 `mode="queue"`；IM 消息 ID 作为 `requestId`
+  由 dsh 去重。存在待审批事项时拒绝普通文本，避免误当批准。
+- 审批：Mux `$events` 的 `waterfall` 进入待答表；审批只允许 `allowed-once` / `rejected`，
+  由用户显式 `/answer` 提交，不提供“始终允许”。持续问题走
+  `session/projections` + `userQuestions/answer`。
+- 新建：`/new-session` 锚定当前 dsh 宿主，调用 `session/create` 与 `session/rename`，
+  通过 HPRP `created_target` 让 Server 确认快照后切换选择。
+- 生命周期：每个宿主目标身份包含 `hostRef` 与 Generation；宿主消失、重启或目录读取
+  失败时只撤下该宿主目标，不影响其他宿主和 Herdr，Pal 进程继续运行。
 
-Herdr 关闭时可配置 `herdr.disabled=true` 独立运行 dsh 后端。下文 Herdr 专属的 Socket、
-pane 生命周期和终端快照规则继续仅适用于 Herdr。
+旧 `dsh.token` 配置会被拒绝并提示删除。Herdr 关闭时可配置 `herdr.disabled=true` 独立
+运行 dsh 后端。下文 Herdr 专属的 Socket、pane 生命周期和终端快照规则继续仅适用于
+Herdr。
 
 ## 1. 架构目标
 

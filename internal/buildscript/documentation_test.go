@@ -34,11 +34,22 @@ func TestREADMEReflectsCurrentInstallerAndReleasePolicy(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"Key 会在终端回显",
-		"公开 GitHub Release 提供 Linux 和 macOS 的 Herdr Bundle，以及 dsh 插件",
+		"公开 GitHub Release 提供 Linux 和 macOS 的 Herdr Bundle 及各自校验文件",
 		"Windows AMD64 客户端 Beta 需要从源码构建",
+		"自动发现本机正在运行的 dsh web 与 Desktop 宿主",
+		"旧 `dsh.token` 配置已移除",
 	} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("README 缺少当前发布说明 %q", expected)
+		}
+	}
+	for _, removed := range []string{
+		"plugins/dsh-herdr-pal",
+		"dsh-herdr-pal-0.1.2.tgz",
+		"Node.js 22+",
+	} {
+		if strings.Contains(content, removed) {
+			t.Fatalf("README 仍包含已移除的 dsh 插件内容 %q", removed)
 		}
 	}
 }

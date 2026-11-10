@@ -1,21 +1,24 @@
 # Herdr Pal 交接上下文
 
-## 2026-11-05 dsh 接入补充
+## 2026-11-10 dsh 原生 API 接入
 
-- 新增第三方插件 `plugins/dsh-herdr-pal`，目标版本 dsh `0.2.1-rc.5` 的 web profile。
-- 企微 `/ls` 合并 Herdr 与 dsh，`/N`、普通消息、`/con` 和文本分页复用既有链路。
-- 用户要求历史范围限制为两周：列出当前已加载根会话和最近 14 天历史，按 dsh 列表
-  `updatedAt` 判断；查看不恢复，首次发消息才恢复并调用 `followup`。
-- 新增可选配置 `dsh.url/token`；`herdr.disabled=true` 支持不依赖 Herdr 的独立 dsh 模式。
-  `-i` 仍只支持 Herdr。插件没有企微凭据，不提供按键或审批接口。
-- `build.sh` 生成 `dist/dsh-herdr-pal-0.1.2.tgz`；构建与测试新增 Node.js 22+/npm 依赖。
-- `/con` 按用户补充要求仅展示聊天正文：从原始 append 事件筛选真实用户输入和助手文本，
-  排除工具、推理、内部注入及压缩摘要；多轮聊天与分页保留，不读取浏览器视口。
-- 本地集成测试 `TestDSHPluginThroughProductionAppAndWeComRouter` 使用真实插件 HTTP、
-  生产 Pal/HPRP/Router，模型与企微使用 fake。隔离真实 dsh 已验证插件加载、持久化历史
-  列表和文本读取；不声称验证了真实 LLM 回复或实际企微投递。
-- 安装步骤与限制见 [插件 README](../plugins/dsh-herdr-pal/README.md)，实现记录见
-  [接入计划](DSH_INTEGRATION_PLAN.md)。
+- 删除 `plugins/dsh-herdr-pal/` 与过渡包 `internal/dshlegacy/`；Pal 直接使用 dsh 自带
+  本机 Remote API。旧 `dsh.token` 配置会报错，需删除该字段。
+- 自动发现 dsh web 与 Desktop；只列 `agentAvailable=true` 的会话，无控制权冷历史不显示。
+  macOS 自动发现，Linux 发现 web，Windows 需显式配置 `dsh.url` 和 `dsh.home`。
+- 认证读取 `<DSH_HOME>/.credentials.yaml` 生成短期 Cookie；HTTP RPC 使用固定 endpoint
+  白名单，`$events` 通过 Mux WebSocket 接收 `ready/waterfall/cancel`。
+- `/con` 只展示真实用户输入和助手 text 块；普通文本以 `mode="queue"` 提交并用 IM 消息 ID
+  去重；待审批时拒绝普通文本。
+- `/answer` 支持审批与多题表单，审批只允许 `allowed-once` / `rejected`，多题逐题收集后
+  一次提交。`/new-session` 通过 `session/create` + `session/rename` 创建并自动切换。
+- `build.sh` 不再构建、测试或打包 Node 插件；`unittest.sh` 不再调用 Node。
+- 集成测试改用 `internal/testkit/dsh_native.go` 的 fake 原生宿主，覆盖生产
+  Pal/HPRP/企微 Router 的目录、读取、排队发送、审批、多题、新建会话和宿主消失。
+  `internal/dsh/backend_test.go` 继续覆盖 web/Desktop 双宿主不重叠。
+- 旧插件安装与 14 天历史方案作为历史记录保留在
+  [DSH_INTEGRATION_PLAN.md](DSH_INTEGRATION_PLAN.md) 和
+  [DSH_CODE_REVIEW.md](DSH_CODE_REVIEW.md)，均已被原生方案取代。
 
 ## 1. 当前状态
 
@@ -226,6 +229,7 @@ Enter；随后再检查 3 次，每次间隔 500ms，仍无变化才报错。任
 - `internal/server`：在线目录、HPRP Hub、用户执行器和企业微信路由。
 - `internal/relayclient`：Pal 的 HPRP 连接、快照、命令幂等和输出上报。
 - `internal/herdr`：公共 NDJSON 请求、订阅和平台传输。
+- `internal/dsh`：dsh 原生宿主发现、Cookie 认证、RPC、`$events` Mux、目录、正文和交互。
 - `internal/session`：本机会话索引、选择和 occupant 身份。
 - `internal/bridge`：Service、Notifier 和 EventSupervisor。
 - `internal/terminalimage`：Pal 侧内嵌字体、ANSI 终端页和 PNG8 渲染限制。

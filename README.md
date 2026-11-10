@@ -20,8 +20,8 @@ herdr-pal-server
 - 一个用户可以接入多台机器，并在同一个企业微信单聊中切换会话。
 - Pal 与 Server 使用公开的 HPRP/1 协议；每台机器使用一把由服务端签发的独立 Key。
 - `herdr-pal -i` 可以脱离企业微信，在本机终端中直接操作 Herdr Agent。
-- 可选安装本仓库的 [dsh 第三方插件](plugins/dsh-herdr-pal/README.md)，在同一企微列表中选择
-  DeepSeek Harness 已加载会话及最近两周的历史会话，并继续聊天；也可单独运行 dsh 后端。
+- 可选接入 DeepSeek Harness（dsh）：Pal 直接使用 dsh 自带的本机 Remote API，自动发现
+  正在运行的 dsh web 与 Desktop 宿主，无需安装插件、Node.js 或配置 token。
 
 ## 使用前准备
 
@@ -30,7 +30,7 @@ herdr-pal-server
 - Herdr 公共 Socket API protocol 必须在 `17` 到 `22` 之间（含两端）；已验证官方 `v0.9.5`。
 - 企业微信中有权限创建或使用智能机器人。
 - 从源码构建需要 Go 1.26.5 或更高的兼容补丁版本；`go.mod` 会自动请求该工具链。
-- 插件构建和集成测试还需要 Node.js 22+ 与 npm；纯 Herdr 的已构建客户端不需要 Node.js。
+- 构建和测试只依赖 Go，不需要 Node.js 或 npm。
 
 支持的平台：
 
@@ -55,7 +55,6 @@ herdr status server --json
 
 构建产物：
 
-- `dist/dsh-herdr-pal-0.1.2.tgz`：dsh 第三方插件安装包，支持内网离线导入。
 - `dist/herdr-pal-darwin-amd64`
 - `dist/herdr-pal-darwin-arm64`
 - `dist/herdr-pal-linux-amd64`
@@ -76,7 +75,7 @@ herdr status server --json
 - `dist/herdr-pal`
 - `dist/hp-cli`
 
-公开 GitHub Release 提供 Linux 和 macOS 的 Herdr Bundle，以及 dsh 插件 `.tgz` 和校验文件。Intel/AMD x64 选择
+公开 GitHub Release 提供 Linux 和 macOS 的 Herdr Bundle 及各自校验文件。Intel/AMD x64 选择
 `amd64`，Apple Silicon 或 ARM64 Linux 选择 `arm64`。`./build.sh` 仍会生成 Pal、Server、
 `hp-cli` 的分平台二进制；Windows AMD64 客户端 Beta 需要从源码构建，不发布 Windows
 服务端。
@@ -492,6 +491,34 @@ Pal 后续也不能重连。临时排查连接时使用 `hp-cli connection disco
 多台机器接入时，`/ls` 会统一编号。编号可能随机器或会话变化，重新执行 `/ls` 后应按
 最新列表选择。
 
+## 接入 DeepSeek Harness（可选）
+
+Pal 直接连接 dsh 自带的本机 Remote API，不需要安装 dsh 插件、Node.js 或 npm：
+
+- 自动发现本机正在运行的 dsh web 与 Desktop 宿主；也可以在 Pal 配置中显式填写
+  `dsh.url`、`dsh.home` 和 `dsh.variant`。
+- `/ls` 只列出当前宿主持有 Agent 控制权的会话，不列出无控制权的冷历史；历史会话被
+  dsh 恢复为 live 后才会出现。宿主的 web 与 Desktop 条目不会交叉。
+- `/con` 只显示真实用户输入和助手文本，不显示工具调用、推理或内部注入。
+- `/answer` 回答审批或问题；审批只提交“允许本次”或“拒绝”，不会自动批准。
+- `/new-session` 新建 dsh 会话并自动切换；目录必须已经存在，Pal 不会自动创建。
+- 旧 `dsh.token` 配置已移除，出现时会直接报配置错误，请删除 `token` 字段。
+- 已安装旧插件 `herdr-pal-bridge` 的用户可从 dsh profile 中移除该插件；不卸载也不会被
+  新 Pal 使用，但旧插件仍会监听旧端口，建议清理。
+
+只运行 dsh 后端时使用以下 Pal 配置：
+
+```json
+{
+  "relay": { "url": "wss://服务端地址:9443", "key": "hpk_...", "skip_verify": true },
+  "herdr": { "disabled": true },
+  "dsh": { "url": "", "home": "", "variant": "auto" }
+}
+```
+
+`dsh.url` 为空时自动发现；`dsh.home` 为空时使用 dsh 进程环境中的 `DSH_HOME` 或
+`~/.dsh`。Windows 不自动发现，需要同时显式填写 `url` 和 `home`。
+
 ## 企业微信命令
 
 | 输入 | 作用 |
@@ -514,6 +541,8 @@ Pal 后续也不能重连。临时排查连接时使用 `hp-cli connection disco
 | `/key space`、`/key esc` | 发送空格或 Esc |
 | `/key down,space,down` | 连续发送多个按键 |
 | `/slash clear` | 向 Agent 发送 `/clear` |
+| `/answer 1` | dsh：回答审批或问题，审批 1 为允许本次、2 为拒绝 |
+| `/new-session 标题 /绝对目录` | dsh：新建会话并自动切换，目录必须已存在 |
 | 普通文本 | 发送给当前选择的 Agent |
 
 定向前缀后的内容可以是普通文本或 `/con`、`/key`、`/enter`、`/slash` 等客户端命令，
