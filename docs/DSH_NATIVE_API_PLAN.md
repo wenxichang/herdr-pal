@@ -1,5 +1,7 @@
 # dsh 免插件原生 API 接入实施计划
 
+> 已完成（2026-11-10）——这是实施记录，不是待执行计划；过渡期的 `internal/dshlegacy` 已删除，Task 1/17 中的过渡步骤不再适用。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 用 Go 直接接入 dsh 自带 Remote API，替换 Node 插件，支持多宿主会话、读取、排队发送、审批回答和新建会话。
@@ -1319,6 +1321,8 @@ git commit -m "refactor: 移除 dsh Node 插件并改用原生 API"
 
 **Files:**
 - Create: `internal/dsh/real_darwin_test.go`（opt-in，默认 skip）
+- Modify: `docs/DSH_NATIVE_API_PLAN.md`（顶部加“已完成/历史实施记录”横幅，说明过渡期
+  `internal/dshlegacy` 已删除，不要把 Task 1/17 的过渡步骤当作待执行操作）
 - No production code changes.
 
 - [ ] **Step 1: 格式与静态检查**
