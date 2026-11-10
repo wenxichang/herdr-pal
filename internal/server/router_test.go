@@ -1977,6 +1977,47 @@ func TestNewSessionUsesOnlyDSHHostEntryWhenNoSessions(t *testing.T) {
 	}
 }
 
+func TestNewSessionUsesSelectedHostEntryAmongMultipleHosts(t *testing.T) {
+	router, _, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			dshTestHostEntry(1, "dsh-host:host-1"),
+			dshTestHostEntry(2, "dsh-host:host-2"),
+		},
+	})
+	entries := router.catalog.CreateNumberedSnapshot("user-a")
+	if len(entries) != 2 || entries[1].Ref.SlotID != "dsh-host:host-2" {
+		t.Fatalf("entries = %#v, want 两个宿主入口且第二个为 host-2", entries)
+	}
+	if err := router.catalog.SetSelection("user-a", entries[1].Ref); err != nil {
+		t.Fatal(err)
+	}
+
+	router.Handle(context.Background(), routerMessage("request-host-2", "message-host-2", "user-a", "/new-session 新会话"))
+
+	calls := relay.Calls()
+	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, entries[1].Ref) {
+		t.Fatalf("relay calls = %#v, want execute on selected host entry %#v", calls, entries[1].Ref)
+	}
+}
+
+func TestNewSessionReplyDoesNotDuplicateSwitchNotice(t *testing.T) {
+	content := hprp.Content{
+		Type: hprp.ContentTypeText,
+		Text: "已在 /tmp 新建 dsh 会话「新任务」。\n已切换到新会话。",
+	}
+	reply := newSessionReply("/new-session 新任务 /tmp", &content, true)
+	if count := strings.Count(reply, "已切换到新会话。"); count != 1 {
+		t.Fatalf("reply = %q, 切换提示出现 %d 次, want 1", reply, count)
+	}
+
+	content.Text = "已在 /tmp 新建 dsh 会话「新任务」。"
+	reply = newSessionReply("/new-session 新任务 /tmp", &content, true)
+	if count := strings.Count(reply, "已切换到新会话。"); count != 1 {
+		t.Fatalf("Pal 未返回切换提示时应补充一次，reply = %q, count = %d", reply, count)
+	}
+}
+
 func TestNewSessionRequiresSelectionForMultipleHosts(t *testing.T) {
 	router, gateway, relay := newRouterHarness(t)
 	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{

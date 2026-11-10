@@ -16,9 +16,11 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/command"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -197,8 +199,12 @@ func (e *Executor) refresh(ctx context.Context) {
 	list, sessionsErr := e.api.Sessions(ctx)
 	pending, pendingErr := e.api.Pending(ctx)
 
+	// 复制上一次目录，避免后续在锁外读取时与 /new-session 的写入并发。
 	e.mu.RLock()
-	previous := e.sessions
+	previous := make(map[string]executorSession, len(e.sessions))
+	for key, state := range e.sessions {
+		previous[key] = state
+	}
 	e.mu.RUnlock()
 
 	next := make(map[string]executorSession, len(list))
@@ -494,11 +500,26 @@ func (e *Executor) sessionTarget(s SessionSummary) session.Target {
 		OccupantKey:  "session:" + shortHash(e.host.Generation, s.ID),
 		Agent:        dshAgent,
 		DisplayAgent: dshDisplayAgent,
-		Title:        title,
+		Title:        truncateLabel(title, hprp.MaxLabelBytes),
 		Status:       status,
-		Workspace:    workspace,
+		Workspace:    truncateLabel(workspace, hprp.MaxLabelBytes),
 		Tab:          e.host.Variant,
 	}
+}
+
+// truncateLabel 按 UTF-8 边界把展示标签截断到字节上限。
+//
+// dsh 标题长度不受 HPRP 约束；超过 MaxLabelBytes 会让 Server 拒绝整个会话快照，
+// 导致 Pal 反复重连并连带撤下其他目标，因此必须在生成目标时截断。
+func truncateLabel(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
 }
 
 // shortHash 返回以 NUL 连接各段后 SHA-256 的前 16 个十六进制字符。
@@ -681,7 +702,19 @@ func (e *Executor) pendingDecisionPrompt(ctx context.Context, sessionID string) 
 	if !ok {
 		return "", false
 	}
-	return formatDecision(decision, 0), true
+	return formatDecision(decision, e.decisionQuestionIndex(sessionID, decision)), true
+}
+
+// decisionQuestionIndex 返回多题收集期间当前应展示的问题下标。
+//
+// 只有收集状态属于同一决策和 revision 时才采用其 QuestionIx；否则显示第一题。
+func (e *Executor) decisionQuestionIndex(sessionID string, decision Decision) int {
+	state, ok := e.answerState(sessionID)
+	if !ok || state.DecisionID != decision.NativeID || state.Revision != decision.Revision ||
+		state.QuestionIx < 0 || state.QuestionIx >= len(decision.Questions) {
+		return 0
+	}
+	return state.QuestionIx
 }
 
 // selectPendingDecision 按设计文档的规则选择待答项。
@@ -724,13 +757,13 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 		return
 	}
 
-	state, active := e.answerStates[sessionID]
+	state, active := e.answerState(sessionID)
 	var decision Decision
 	if active {
 		current, ok := decisionByID(decisions, state.DecisionID)
 		if !ok || current.Revision != state.Revision ||
 			state.QuestionIx < 0 || state.QuestionIx >= len(current.Questions) {
-			delete(e.answerStates, sessionID)
+			e.clearAnswerState(sessionID)
 			reply(executorDecisionChangedMessage)
 			return
 		}
@@ -759,7 +792,7 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 
 	if state.QuestionIx+1 < len(decision.Questions) {
 		state.QuestionIx++
-		e.answerStates[sessionID] = state
+		e.storeAnswerState(sessionID, state)
 		reply(fmt.Sprintf("已记录第 %d/%d 题答案。\n\n%s",
 			state.QuestionIx, len(decision.Questions), formatDecision(decision, state.QuestionIx)))
 		return
@@ -767,12 +800,12 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 
 	value, err := buildAnswerValue(decision, state.Answers)
 	if err != nil {
-		delete(e.answerStates, sessionID)
+		e.clearAnswerState(sessionID)
 		reply("回答无效，请重新执行 /con 查看并回答。")
 		return
 	}
 	receipt, err := e.api.SubmitAnswer(ctx, decision, value)
-	delete(e.answerStates, sessionID)
+	e.clearAnswerState(sessionID)
 	if err != nil {
 		message := strings.TrimSpace(receipt.Message)
 		if message == "" {
@@ -786,6 +819,30 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 		return
 	}
 	reply("已提交。")
+}
+
+// answerState 读取会话未提交的答案收集进度。
+//
+// 读取来自终端快照 goroutine，写入来自命令处理 goroutine，必须使用 e.mu 同步。
+func (e *Executor) answerState(sessionID string) (AnswerState, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	state, ok := e.answerStates[sessionID]
+	return state, ok
+}
+
+// storeAnswerState 记录会话的答案收集进度。
+func (e *Executor) storeAnswerState(sessionID string, state AnswerState) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.answerStates[sessionID] = state
+}
+
+// clearAnswerState 丢弃会话的答案收集进度。
+func (e *Executor) clearAnswerState(sessionID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.answerStates, sessionID)
 }
 
 // handleNewSession 在当前宿主上创建会话并立即切换选择。

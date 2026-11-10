@@ -339,6 +339,71 @@ func TestHPRPClientAuthenticatesReportsSnapshotAndExecutesCommand(t *testing.T) 
 	}
 }
 
+func TestHPRPClientImageSnapshotOnTextOnlyExecutorFallsBack(t *testing.T) {
+	// 回归：执行器只返回文本而请求为 img 时，旧实现返回 ok + text 模式内容，
+	// Server 会因模式不匹配关闭整条连接。修复后应按 fallback 契约返回 failed + 文本，
+	// 连接保持可用。
+	token, record, err := credential.Issue(1, "user-a", "home-mac", []credential.SourceRule{"127.0.0.1", "::1"}, nil, time.Now(), bytes.NewReader(make([]byte, 48)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub, err := server.NewClientHub(server.NewSessionCatalog(), hprpClientVerifier{record: record}, server.HubConfig{}, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayServer := httptest.NewTLSServer(hub)
+	defer relayServer.Close()
+	executor := &terminalExecutor{
+		targets: []session.Target{{
+			PaneID: "pane-1", OccupantKey: "session-1", Agent: "dsh", DisplayAgent: "DeepSeek Harness",
+			Title: "任务", Status: herdr.AgentStatusIdle,
+		}},
+		selected: fakeSelection{PaneID: "pane-1", OccupantHash: "session-1"},
+		snapshotContent: im.TerminalContent{
+			Mode: im.OutputModeText, Text: "dsh 文本快照",
+			Page: &im.TerminalPage{Current: 1, Total: 1}, CapturedAt: time.Now().UTC(),
+		},
+	}
+	client, err := New(Config{
+		URL: "wss" + strings.TrimPrefix(relayServer.URL, "https"), Key: token, SkipVerify: true,
+		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
+		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.sink = client
+	if err := client.SetExecutor(executor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	eventuallyClient(t, func() bool { return hub.Catalog().HasSessions("user-a") })
+	entries := hub.Catalog().CreateNumberedSnapshot("user-a")
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	target := entries[0].Ref
+
+	result, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeImage, 100)
+	if err != nil {
+		t.Fatalf("图片请求应降级为文本而不是关闭连接：%v", err)
+	}
+	if result.Outcome != hprp.OutcomeFailed || result.Error == nil || result.Error.Code != hprp.CodeTerminalImageFailed ||
+		result.Content != nil || result.FallbackContent == nil ||
+		result.FallbackContent.Mode != hprp.OutputModeText || result.FallbackContent.Text != "dsh 文本快照" {
+		t.Fatalf("terminal snapshot fallback = %#v", result)
+	}
+
+	// 连接仍然可用：紧接着的文本快照请求必须成功。
+	textResult, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeText, 100)
+	if err != nil || textResult.Outcome != hprp.OutcomeOK || textResult.Content == nil || textResult.Content.Text != "dsh 文本快照" {
+		t.Fatalf("后续文本快照 = %#v, %v", textResult, err)
+	}
+}
+
 func TestHPRPClientReportsUnknownRequiredMessageBeforeDisconnect(t *testing.T) {
 	received := make(chan hprp.Envelope, 1)
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

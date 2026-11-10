@@ -690,14 +690,30 @@ func (client *Client) handleTerminalSnapshot(current *clientSession, envelope hp
 		request.MaxLines,
 	)
 	if readErr == nil {
-		encoded, encodeErr := encodeTerminalContent(content)
-		if encodeErr == nil {
-			client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
-				Outcome: hprp.OutcomeOK, Target: request.Target, Content: &encoded,
-			})
-			return
+		if request.Mode == hprp.OutputModeImage && content.Mode != im.OutputModeImage {
+			// 执行器不支持图片（例如 dsh 只提供文本）时必须走 HPRP 的失败降级契约：
+			// 直接返回 text 模式的成功结果会因模式不匹配被 Server 关闭整条连接。
+			content.Mode = im.OutputModeText
+			content.Image = nil
+			fallback, fallbackErr := encodeTerminalContent(content)
+			if fallbackErr == nil {
+				client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+					Outcome: hprp.OutcomeFailed, Target: request.Target, FallbackContent: &fallback,
+					Error: &hprp.Error{Code: hprp.CodeTerminalImageFailed, Message: "终端图片生成失败", Retryable: false},
+				})
+				return
+			}
+			readErr = fallbackErr
+		} else {
+			encoded, encodeErr := encodeTerminalContent(content)
+			if encodeErr == nil {
+				client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+					Outcome: hprp.OutcomeOK, Target: request.Target, Content: &encoded,
+				})
+				return
+			}
+			readErr = encodeErr
 		}
-		readErr = encodeErr
 	}
 	if request.Mode == hprp.OutputModeImage && content.Page != nil && !content.CapturedAt.IsZero() {
 		content.Mode = im.OutputModeText

@@ -759,6 +759,7 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 func (router *ConversationRouter) resolveDSHAnchor(userID string, selected CatalogEntry, hasSelection bool) (CatalogEntry, error) {
 	entries := router.catalog.CreateNumberedSnapshot(userID)
 	if hasSelection && isDSHCatalogEntry(selected) {
+		var firstHost *CatalogEntry
 		var firstSession *CatalogEntry
 		selectedPresent := false
 		for index := range entries {
@@ -766,15 +767,25 @@ func (router *ConversationRouter) resolveDSHAnchor(userID string, selected Catal
 			if entry.Ref.MachineID != selected.Ref.MachineID || !isDSHCatalogEntry(entry) {
 				continue
 			}
-			if isDSHHostCatalogEntry(entry) {
-				return entry, nil
-			}
 			if sameSessionRef(entry.Ref, selected.Ref) {
 				selectedPresent = true
+			}
+			if isDSHHostCatalogEntry(entry) {
+				if firstHost == nil {
+					firstHost = &entries[index]
+				}
+				continue
 			}
 			if firstSession == nil {
 				firstSession = &entries[index]
 			}
+		}
+		// 选中的宿主入口仍在目录中时必须复用它，否则多宿主入口会落到第一个宿主。
+		if selectedPresent && isDSHHostCatalogEntry(selected) {
+			return selected, nil
+		}
+		if firstHost != nil {
+			return *firstHost, nil
 		}
 		if selectedPresent {
 			return selected, nil
@@ -880,7 +891,12 @@ func newSessionReply(command string, content *hprp.Content, created bool) string
 		body = "命令：" + strings.TrimSpace(command)
 	}
 	if created {
-		return body + "\n已切换到新会话。"
+		// Pal 的创建结果通常已经包含切换提示；只在缺失时补充，避免重复整句。
+		const switched = "已切换到新会话。"
+		if strings.Contains(body, switched) {
+			return body
+		}
+		return body + "\n" + switched
 	}
 	return body + "\n请执行 /ls 后用 /N 选择新会话。"
 }

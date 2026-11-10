@@ -6,16 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wenxichang/herdr-pal/internal/herdr"
+	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
+	"github.com/wenxichang/herdr-pal/internal/relayclient"
 	"github.com/wenxichang/herdr-pal/internal/session"
 )
 
@@ -1120,4 +1127,106 @@ func TestExecutorRejectsUnauthorizedAndMissingMessageID(t *testing.T) {
 	if reply := sink.lastReply(); !strings.Contains(reply, "消息标识缺失") {
 		t.Fatalf("回复 = %q, want 消息标识缺失提示", reply)
 	}
+}
+
+func TestExecutorTruncatesOversizedLabelsForHPRPSnapshot(t *testing.T) {
+	executor, api, _ := newExecutorFixture(t, testValidHost())
+	chineseTitle := strings.Repeat("中", 256) // 768 字节，超过 HPRP 的 512 字节标签上限。
+	emojiTitle := strings.Repeat("🙂", 256)   // 1024 字节，截断必须落在 UTF-8 边界。
+	api.sessions = []SessionSummary{
+		{ID: "s1", Title: chineseTitle, Cwd: "/tmp/" + chineseTitle, Available: true},
+		{ID: "s2", Title: emojiTitle, Cwd: "/tmp/" + emojiTitle, Available: true},
+	}
+
+	executor.refresh(context.Background())
+	targets := executor.CurrentTargets()
+	if len(targets) != 2 {
+		t.Fatalf("CurrentTargets() 数量 = %d, want 2", len(targets))
+	}
+	for _, target := range targets {
+		if len(target.Title) > hprp.MaxLabelBytes || !utf8.ValidString(target.Title) {
+			t.Fatalf("Title 长度 = %d（%q），必须 <= %d 且 UTF-8 有效", len(target.Title), target.Title, hprp.MaxLabelBytes)
+		}
+		if len(target.Workspace) > hprp.MaxLabelBytes || !utf8.ValidString(target.Workspace) {
+			t.Fatalf("Workspace 长度 = %d（%q），必须 <= %d 且 UTF-8 有效", len(target.Workspace), target.Workspace, hprp.MaxLabelBytes)
+		}
+	}
+
+	// 用生产快照构建器验证整条快照可通过 Server 校验，而不是只检查单个字段。
+	snapshot := relayclient.BuildSnapshot(1, targets)
+	if err := hprp.ValidateSessionSnapshot(snapshot); err != nil {
+		t.Fatalf("ValidateSessionSnapshot() 返回错误：%v（快照 = %#v）", err, snapshot)
+	}
+	if got := snapshot.Sessions[0].Display.Title; got != strings.Repeat("中", hprp.MaxLabelBytes/3) {
+		t.Fatalf("中文标题截断结果 = %q，want 170 个完整字符", got)
+	}
+}
+
+func TestExecutorReadShowsCurrentQuestionDuringCollection(t *testing.T) {
+	executor, api, sink := newExecutorFixture(t, testValidHost())
+	api.sessions = []SessionSummary{{ID: "s1", Title: "任务", Available: true}}
+	api.decisions = []Decision{testTwoQuestionForm("s1", "rev-1")}
+	api.readText = "用户：开始"
+	target := selectExecutorSession(t, executor, api, "s1")
+
+	executor.HandleMessage(context.Background(), executorIncoming("answer-first", "/answer 1"))
+	if reply := sink.lastReply(); !strings.Contains(reply, "第二题") {
+		t.Fatalf("第一题回答后应推进到第二题：%q", reply)
+	}
+
+	executor.HandleMessage(context.Background(), executorIncoming("con-progress", "/con"))
+	reply := sink.lastReply()
+	if !strings.Contains(reply, "(2/2)") || !strings.Contains(reply, "第二题") || strings.Contains(reply, "第一题") {
+		t.Fatalf("/con 应展示当前第 2 题而不是第 1 题：%q", reply)
+	}
+
+	content, err := executor.ReadTerminalSnapshot(context.Background(), target.PaneID, target.OccupantKey, im.OutputModeText, panel.PageSize)
+	if err != nil {
+		t.Fatalf("ReadTerminalSnapshot() 返回错误：%v", err)
+	}
+	if !strings.Contains(content.Text, "(2/2)") || !strings.Contains(content.Text, "第二题") {
+		t.Fatalf("终端快照应展示当前题目：%q", content.Text)
+	}
+}
+
+func TestExecutorRefreshPendingFailureConcurrentNewSession(t *testing.T) {
+	// 回归：Pending 失败时 carryForwardBlocking 曾在锁外读取 e.sessions，
+	// 与 /new-session 的写入并发会触发 concurrent map read/write。
+	executor, api, _ := newExecutorFixture(t, testValidHost())
+	executor.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	// 本测试只关注目录 map；移除 sink 避免通知测试替身成为并发噪声来源。
+	executor.sink = nil
+	api.pendingErr = errors.New("Mux 不可用")
+	api.createResult = CreatedSession{ID: "created", Title: "并发任务"}
+	for index := 0; index < 128; index++ {
+		api.sessions = append(api.sessions, SessionSummary{
+			ID: fmt.Sprintf("s%03d", index), Title: fmt.Sprintf("任务 %03d", index), Available: true,
+		})
+	}
+	executor.refresh(context.Background())
+	targets := executor.CurrentTargets()
+	if len(targets) == 0 {
+		t.Fatal("初始目录为空")
+	}
+	if err := executor.SelectTarget(targets[0].PaneID, targets[0].OccupantKey); err != nil {
+		t.Fatalf("SelectTarget() 返回错误：%v", err)
+	}
+
+	var stop atomic.Bool
+	var refreshers sync.WaitGroup
+	for worker := 0; worker < 2; worker++ {
+		refreshers.Add(1)
+		go func() {
+			defer refreshers.Done()
+			for !stop.Load() {
+				executor.refresh(context.Background())
+			}
+		}()
+	}
+	for index := 0; index < 200; index++ {
+		executor.HandleMessage(context.Background(),
+			executorIncoming(fmt.Sprintf("new-session-%d", index), "/new-session 并发任务 /tmp"))
+	}
+	stop.Store(true)
+	refreshers.Wait()
 }
