@@ -1,4 +1,8 @@
-# dsh 接入安装前审核（2026-11-05）
+# dsh 接入安装前审核（2026-11-05，历史）
+
+> **已被取代（2026-11-10）**：本文审核的是已删除的 Node 插件与 `internal/dshlegacy`。
+> Pal 现直接使用 dsh 本机 Remote API，不再安装插件、读取 `dsh.token` 或依赖 Node.js。
+> 当前方案见 [原生 API 设计](DSH_NATIVE_API_DESIGN.md)；以下内容仅保留历史记录。
 
 范围：当前工作区 dsh 插件、Go 客户端与执行器、HPRP 组合路由、配置、构建与相关测试。
 执行方式：主审与独立只读复核，不采用 subagent-driven 实现流程。

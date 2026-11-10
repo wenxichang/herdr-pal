@@ -29,7 +29,7 @@ func mergeClientConfig(existing []byte, relayURL, relayKey string) ([]byte, erro
 	}
 	for field := range root {
 		switch field {
-		case "relay", "herdr", "log":
+		case "relay", "herdr", "log", "dsh":
 		default:
 			return nil, fmt.Errorf("客户端配置包含未知字段 %q", field)
 		}

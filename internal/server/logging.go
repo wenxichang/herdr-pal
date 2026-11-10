@@ -141,6 +141,10 @@ func serverActionName(kind serverActionKind) string {
 		return "registration_approve"
 	case serverActionRejectRegistrations:
 		return "registration_reject"
+	case serverActionAnswer:
+		return "answer"
+	case serverActionNewSession:
+		return "new_session"
 	default:
 		return "execute"
 	}

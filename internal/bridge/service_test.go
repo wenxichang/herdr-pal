@@ -419,6 +419,40 @@ func TestServiceHelpDoesNotCallHerdr(t *testing.T) {
 	}
 }
 
+func TestBridgeRejectsDSHCommands(t *testing.T) {
+	service, fake := newTestService(t)
+	selectTarget(t, service)
+	baselineCalls := fake.callCount()
+
+	tests := []struct {
+		name      string
+		messageID string
+		content   string
+	}{
+		{name: "answer", messageID: "dsh-answer-reject", content: "/answer 1"},
+		{name: "new session", messageID: "dsh-new-session-reject", content: "/new-session"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service.HandleMessage(context.Background(), incoming(tt.messageID, tt.content))
+
+			reply := fakeIMFromService(t, service).lastReply()
+			if !strings.Contains(reply, "当前目标不支持") || !strings.Contains(reply, "dsh") {
+				t.Fatalf("%q reply = %q, want dsh unsupported notice", tt.content, reply)
+			}
+			if got := fake.callCount(); got != baselineCalls {
+				t.Fatalf("%q called Herdr: %d calls, want %d", tt.content, got, baselineCalls)
+			}
+			if got := fake.prompts(); len(got) != 0 {
+				t.Fatalf("%q sent prompts: %#v", tt.content, got)
+			}
+			if got := fake.keys(); len(got) != 0 {
+				t.Fatalf("%q sent keys: %#v", tt.content, got)
+			}
+		})
+	}
+}
+
 func TestServiceSelectShorthandUsesListSnapshot(t *testing.T) {
 	service, fake := newTestService(t)
 	service.HandleMessage(context.Background(), incoming("short-list", "/ls"))

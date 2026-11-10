@@ -1,4 +1,9 @@
-# dsh 插件接入设计与实施计划
+# dsh 插件接入设计与实施计划（历史，已废弃）
+
+> **已被取代（2026-11-10）**：本文记录旧的 Node 插件方案。Pal 现已改为直接连接 dsh
+> 本机 Remote API，`plugins/dsh-herdr-pal/` 与 `internal/dshlegacy/` 均已删除，`build.sh`
+> 不再构建或打包插件。当前实现见 [原生 API 设计](DSH_NATIVE_API_DESIGN.md) 和
+> [交接上下文](HANDOFF_CONTEXT.md)。以下内容仅用于保留历史决策记录。
 
 目标：在本仓库提供第三方 dsh 插件，让企微沿用 `/ls`、`/N`、普通消息和 `/con` 操作 dsh。
 

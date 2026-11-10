@@ -365,6 +365,9 @@ func (s *Service) HandleMessage(ctx context.Context, message im.IncomingText) {
 		s.handlePrompt(ctx, message, action.Text)
 	case command.KindKey:
 		s.handleKeys(ctx, message, action.Keys)
+	case command.KindAnswer, command.KindNewSession:
+		// Herdr 目标没有 dsh 原生审批或会话创建能力，必须在动作分发前拒绝。
+		s.reply(ctx, message.RequestID, "当前目标不支持该 dsh 命令；请在 dsh 会话中使用。")
 	default:
 		s.reply(ctx, message.RequestID, "命令暂不支持。")
 	}

@@ -190,10 +190,14 @@ type CommandExecute struct {
 }
 
 // CommandResult 是基础命令唯一的最终同步结果。
+//
+// CreatedTarget 用于 /new-session 等命令在另一个 slot 创建的新目标；旧接收方
+// 忽略该可选字段，仍可通过会话快照自行切换。
 type CommandResult struct {
 	Outcome           Outcome  `json:"outcome"`
 	Content           *Content `json:"content,omitempty"`
 	ReplacementTarget *Target  `json:"replacement_target,omitempty"`
+	CreatedTarget     *Target  `json:"created_target,omitempty"`
 	Error             *Error   `json:"error,omitempty"`
 }
 

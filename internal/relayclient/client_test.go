@@ -320,6 +320,71 @@ func TestClientUsesReboundTargetForExecutePush(t *testing.T) {
 	}
 }
 
+func TestRelayClientIncludesCreatedTargetAfterSnapshot(t *testing.T) {
+	hub, relayServer := startRelayClientHub(t)
+	outbound := &resolvingRelayOutboundRecorder{
+		catalog: hub.Catalog(),
+		results: make(chan resolvedPush, 1),
+	}
+	if err := hub.SetOutboundSink(outbound); err != nil {
+		t.Fatal(err)
+	}
+	created := session.Target{
+		PaneID: "pane-2", TerminalID: "terminal-2", OccupantKey: "occ-created", Agent: "dsh",
+		DisplayAgent: "DeepSeek Harness", Title: "new session", Status: herdr.AgentStatusIdle, Workspace: "web", Tab: "main",
+	}
+	executor := &fakeExecutor{
+		targets: []session.Target{{
+			PaneID: "pane-1", TerminalID: "terminal-1", OccupantKey: "occ-1", Agent: "dsh",
+			DisplayAgent: "DeepSeek Harness", Title: "old session", Status: herdr.AgentStatusIdle, Workspace: "web", Tab: "main",
+		}},
+		createdOnHandle: &created,
+		pushContent:     "created push",
+	}
+	client, err := New(Config{
+		URL: relayClientURL(relayServer), Key: relayClientTestKey(t), SkipVerify: true,
+		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
+		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.sink = client
+	if err := client.SetExecutor(executor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	eventuallyClient(t, func() bool { return len(hub.Catalog().CreateNumberedSnapshot("user-a")) == 1 })
+	anchor := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-1"}
+	result, err := hub.Execute(context.Background(), "user-a", anchor, im.IncomingText{
+		MessageID: "message-new-session", UserID: "user-a", Content: "/new-session",
+	})
+	if err != nil || result.StructuredContent == nil {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	wantCreated := hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "occ-created"}
+	if result.CreatedTarget == nil || *result.CreatedTarget != wantCreated {
+		t.Fatalf("created target = %#v, want %#v", result.CreatedTarget, wantCreated)
+	}
+	if result.SelectedTarget != nil {
+		t.Fatalf("unexpected replacement target = %#v", result.SelectedTarget)
+	}
+	if _, err := hub.Catalog().ResolveTarget("user-a", wantCreated); err != nil {
+		t.Fatalf("created target was not confirmed by snapshot: %v", err)
+	}
+	select {
+	case pushed := <-outbound.results:
+		if pushed.err != nil || pushed.push.Target != wantCreated {
+			t.Fatalf("push = %#v, error = %v, want target %#v", pushed.push, pushed.err, wantCreated)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing push for created target")
+	}
+}
+
 func TestClientStrictTLSDoesNotTrustAutoTestCertificate(t *testing.T) {
 	hub, relayServer := startRelayClientHub(t)
 	executor := &fakeExecutor{}
@@ -486,13 +551,15 @@ func relayClientURL(relayServer *httptest.Server) string {
 }
 
 type fakeExecutor struct {
-	mu             sync.Mutex
-	targets        []session.Target
-	selected       fakeSelection
-	sink           im.ReplySink
-	pushContent    string
-	rebindOnHandle *session.Target
-	handleCount    int
+	mu              sync.Mutex
+	targets         []session.Target
+	selected        fakeSelection
+	sink            im.ReplySink
+	pushContent     string
+	rebindOnHandle  *session.Target
+	createdOnHandle *session.Target
+	createdTarget   *session.Target
+	handleCount     int
 }
 
 type fakeSelection struct {
@@ -537,11 +604,29 @@ func (executor *fakeExecutor) HandleMessage(ctx context.Context, message im.Inco
 		executor.targets[0] = rebound
 		executor.selected = fakeSelection{PaneID: rebound.PaneID, OccupantHash: rebound.OccupantKey}
 	}
+	if executor.createdOnHandle != nil {
+		created := *executor.createdOnHandle
+		executor.targets = append(executor.targets, created)
+		executor.selected = fakeSelection{PaneID: created.PaneID, OccupantHash: created.OccupantKey}
+		executor.createdTarget = &created
+		executor.createdOnHandle = nil
+	}
 	executor.mu.Unlock()
 	_ = executor.sink.RespondMarkdown(ctx, message.RequestID, "handled: "+message.Content)
 	if executor.pushContent != "" {
 		_ = executor.sink.SendMarkdown(ctx, executor.pushContent)
 	}
+}
+
+func (executor *fakeExecutor) TakeCreatedTarget() (session.Target, bool) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.createdTarget == nil {
+		return session.Target{}, false
+	}
+	created := *executor.createdTarget
+	executor.createdTarget = nil
+	return created, true
 }
 
 func (executor *fakeExecutor) ReadTerminalSnapshot(

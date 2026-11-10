@@ -116,6 +116,140 @@ func TestParseInvalidCommands(t *testing.T) {
 	}
 }
 
+func TestParseAnswer(t *testing.T) {
+	t.Parallel()
+
+	numberList := func(start, end int) string {
+		values := make([]string, 0, end-start+1)
+		for value := start; value <= end; value++ {
+			values = append(values, strconv.Itoa(value))
+		}
+		return strings.Join(values, ",")
+	}
+	indexRange := func(start, end int) []int {
+		values := make([]int, 0, end-start+1)
+		for value := start; value <= end; value++ {
+			values = append(values, value)
+		}
+		return values
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		want  Action
+	}{
+		{name: "index list", input: "/answer 1,2,3", want: Action{Kind: KindAnswer, Indexes: []int{1, 2, 3}}},
+		{name: "index with custom text", input: "/answer 5 自定义答案", want: Action{Kind: KindAnswer, Indexes: []int{5}, Text: "自定义答案"}},
+		{name: "plain text", input: "/answer 纯文本答案", want: Action{Kind: KindAnswer, Text: "纯文本答案"}},
+		{name: "mixed separators", input: "/answer 1, 2  3", want: Action{Kind: KindAnswer, Indexes: []int{1, 2, 3}}},
+		{name: "deduplicate indexes", input: "/answer 2,2,1,2", want: Action{Kind: KindAnswer, Indexes: []int{2, 1}}},
+		{name: "leading zeros", input: "/answer 01,002", want: Action{Kind: KindAnswer, Indexes: []int{1, 2}}},
+		{name: "text preserves inner spacing", input: "/answer 1  自定义  答案", want: Action{Kind: KindAnswer, Indexes: []int{1}, Text: "自定义  答案"}},
+		{name: "text starting with digits and letters", input: "/answer 1 2号选项", want: Action{Kind: KindAnswer, Indexes: []int{1}, Text: "2号选项"}},
+		{name: "surrounding whitespace", input: "  /answer   3   完成  ", want: Action{Kind: KindAnswer, Indexes: []int{3}, Text: "完成"}},
+		{name: "max 32 indexes", input: "/answer " + numberList(1, 32), want: Action{Kind: KindAnswer, Indexes: indexRange(1, 32)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := Parse(tt.input)
+			if err != nil {
+				t.Fatalf("Parse(%q) returned an error: %v", tt.input, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Parse(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+		})
+	}
+
+	overflowIndex := strconv.FormatUint(uint64(math.MaxInt)+1, 10)
+	invalid := []struct {
+		name  string
+		input string
+	}{
+		{name: "missing answer", input: "/answer"},
+		{name: "zero index", input: "/answer 0"},
+		{name: "separators only", input: "/answer , ,"},
+		{name: "too many indexes", input: "/answer " + numberList(1, 33)},
+		{name: "overflow index", input: "/answer " + overflowIndex},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Parse(tt.input)
+			if !errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("Parse(%q) error = %v, want errors.Is(err, ErrInvalidCommand)", tt.input, err)
+			}
+			if !strings.Contains(err.Error(), "用法") {
+				t.Fatalf("Parse(%q) error = %q, want usage guidance", tt.input, err)
+			}
+		})
+	}
+}
+
+func TestParseNewSession(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  Action
+	}{
+		{name: "defaults", input: "/new-session", want: Action{Kind: KindNewSession, Title: "默认标题"}},
+		{name: "title only", input: "/new-session 修复登录", want: Action{Kind: KindNewSession, Title: "修复登录"}},
+		{name: "title and absolute directory", input: "/new-session 修复登录 /Users/me/work", want: Action{Kind: KindNewSession, Title: "修复登录", Directory: "/Users/me/work"}},
+		{name: "absolute directory only", input: "/new-session /Users/me/work", want: Action{Kind: KindNewSession, Title: "默认标题", Directory: "/Users/me/work"}},
+		{name: "home directory", input: "/new-session 修复登录 ~/work", want: Action{Kind: KindNewSession, Title: "修复登录", Directory: "~/work"}},
+		{name: "bare home", input: "/new-session ~", want: Action{Kind: KindNewSession, Title: "默认标题", Directory: "~"}},
+		{name: "relative directory", input: "/new-session 修复登录 ./work", want: Action{Kind: KindNewSession, Title: "修复登录", Directory: "./work"}},
+		{name: "parent directory", input: "/new-session 修复登录 ../work", want: Action{Kind: KindNewSession, Title: "修复登录", Directory: "../work"}},
+		{name: "plain relative word is title", input: "/new-session work", want: Action{Kind: KindNewSession, Title: "work"}},
+		{name: "multi token title", input: "/new-session 修复 登录 问题", want: Action{Kind: KindNewSession, Title: "修复 登录 问题"}},
+		{name: "normalize whitespace", input: "  /new-session   修复   登录  ", want: Action{Kind: KindNewSession, Title: "修复 登录"}},
+		{name: "title truncated to 256 runes", input: "/new-session " + strings.Repeat("长", 300), want: Action{Kind: KindNewSession, Title: strings.Repeat("长", maxSessionTitleRunes)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := Parse(tt.input)
+			if err != nil {
+				t.Fatalf("Parse(%q) returned an error: %v", tt.input, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Parse(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseUnknownSlashStillRejected(t *testing.T) {
+	t.Parallel()
+
+	for _, input := range []string{"/answers", "/new-sessions", "/new_session", "/answerx 1", "/new-sessionx /tmp"} {
+		_, err := Parse(input)
+		if !errors.Is(err, ErrInvalidCommand) {
+			t.Fatalf("Parse(%q) error = %v, want errors.Is(err, ErrInvalidCommand)", input, err)
+		}
+	}
+}
+
+func TestHelpTextDocumentsDSHCommands(t *testing.T) {
+	t.Parallel()
+
+	help := HelpText()
+	for _, want := range []string{"/answer", "/new-session", "dsh"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("HelpText() = %q, want %q", help, want)
+		}
+	}
+}
+
 func TestHelpTextDocumentsSupportedCommands(t *testing.T) {
 	t.Parallel()
 

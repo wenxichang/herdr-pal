@@ -86,7 +86,16 @@ func TestClientStatusEventContainsConfirmedSnapshotSequenceAndNoContent(t *testi
 	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
 		hello := readClientHPRPEnvelope(t, connection)
 		completeClientHandshake(t, connection, hello.ID, terminalCapabilities())
-		envelopeReceived <- readClientHPRPEnvelope(t, connection)
+		for {
+			envelope := readClientHPRPEnvelope(t, connection)
+			if envelope.Type == hprp.TypeSessionSnapshot {
+				// 状态通知发送前客户端会先上报并等待快照确认。
+				ackClientSnapshot(t, connection, envelope)
+				continue
+			}
+			envelopeReceived <- envelope
+			return
+		}
 	})
 	client, _, cancel, done := startScriptedClient(t, relayServer, &terminalExecutor{})
 	defer stopScriptedClient(cancel, done)
@@ -105,13 +114,96 @@ func TestClientStatusEventContainsConfirmedSnapshotSequenceAndNoContent(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if notification.Kind != hprp.NotificationKindAgentStatusChanged || notification.SnapshotSequence != 1 ||
+	// 初始快照序号为 1，通知前的强制快照因此为 2。
+	if notification.Kind != hprp.NotificationKindAgentStatusChanged || notification.SnapshotSequence != 2 ||
 		notification.Data == nil || notification.Data.PreviousStatus != hprp.StatusWorking || notification.Data.Status != hprp.StatusDone {
 		t.Fatalf("notification = %#v", notification)
 	}
 	if bytes.Contains(envelope.Payload, []byte(`"content"`)) {
 		t.Fatalf("status event contains content: %s", envelope.Payload)
 	}
+}
+
+func TestClientSendNotificationReportsSnapshotBeforeSending(t *testing.T) {
+	handshakeDone := make(chan struct{})
+	snapshotReceived := make(chan hprp.SessionSnapshot, 1)
+	notificationReceived := make(chan hprp.NotificationEvent, 1)
+	relayServer := newScriptedRelayServer(t, func(connection *websocket.Conn) {
+		hello := readClientHPRPEnvelope(t, connection)
+		completeClientHandshake(t, connection, hello.ID, terminalCapabilities())
+		close(handshakeDone)
+
+		snapshotEnvelope := readClientHPRPEnvelope(t, connection)
+		if snapshotEnvelope.Type != hprp.TypeSessionSnapshot {
+			t.Errorf("通知前首个帧类型 = %s，期望 session.snapshot", snapshotEnvelope.Type)
+			return
+		}
+		snapshot, err := hprp.DecodePayload[hprp.SessionSnapshot](snapshotEnvelope)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		snapshotReceived <- snapshot
+		ackClientSnapshot(t, connection, snapshotEnvelope)
+
+		notificationEnvelope := readClientHPRPEnvelope(t, connection)
+		notification, err := hprp.DecodePayload[hprp.NotificationEvent](notificationEnvelope)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		notificationReceived <- notification
+	})
+	executor := &terminalExecutor{}
+	client, _, cancel, done := startScriptedClient(t, relayServer, executor)
+	defer stopScriptedClient(cancel, done)
+	<-handshakeDone
+	eventuallyClient(t, func() bool { return client.currentSession() != nil })
+
+	// 新目标只存在于本地执行器，Server 尚未在已确认快照中看到它。
+	newTarget := session.Target{
+		PaneID: "pane-2", OccupantKey: "session-2", Agent: "codex", Status: herdr.AgentStatusIdle,
+	}
+	executor.SetTargets(append(executor.CurrentTargets(), newTarget))
+	err := client.SendNotification(context.Background(), im.NotificationTarget{
+		PaneID: "pane-2", OccupantHash: "session-2", Agent: "codex",
+	}, im.NotificationEvent{
+		Kind: im.NotificationKindAgentStatusChanged, PreviousStatus: hprp.StatusWorking,
+		Status: hprp.StatusDone, OccurredAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("SendNotification() error = %v", err)
+	}
+
+	snapshot := <-snapshotReceived
+	if snapshot.Sequence != 2 {
+		t.Fatalf("通知前快照序号 = %d，期望 2", snapshot.Sequence)
+	}
+	found := false
+	for _, current := range snapshot.Sessions {
+		if current.SlotID == "pane-2" && current.SessionID == "session-2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("通知前快照未包含新目标：%#v", snapshot.Sessions)
+	}
+	notification := <-notificationReceived
+	if notification.SnapshotSequence != snapshot.Sequence {
+		t.Fatalf("通知快照序号 = %d，期望已确认快照 %d", notification.SnapshotSequence, snapshot.Sequence)
+	}
+}
+
+// ackClientSnapshot 确认一条客户端快照，供脚本化 Relay 服务端继续读取后续帧。
+func ackClientSnapshot(t *testing.T, connection *websocket.Conn, envelope hprp.Envelope) {
+	t.Helper()
+	snapshot, err := hprp.DecodePayload[hprp.SessionSnapshot](envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClientHPRPEnvelope(t, connection, hprp.TypeSessionSnapshotResult, "snapshot-result", envelope.ID, hprp.SnapshotResult{
+		Outcome: hprp.OutcomeOK, AppliedSequence: snapshot.Sequence,
+	})
 }
 
 func TestClientSendsTargetInvalidatedAfterTargetLeavesLocalSnapshot(t *testing.T) {
@@ -336,6 +428,71 @@ func TestHPRPClientAuthenticatesReportsSnapshotAndExecutesCommand(t *testing.T) 
 	result, err := hub.Execute(context.Background(), "user-a", entries[0].Ref, imMessage("message-hprp", "prompt"))
 	if err != nil || result.StructuredContent == nil || result.StructuredContent.Text != "handled: prompt" {
 		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+}
+
+func TestHPRPClientImageSnapshotOnTextOnlyExecutorFallsBack(t *testing.T) {
+	// 回归：执行器只返回文本而请求为 img 时，旧实现返回 ok + text 模式内容，
+	// Server 会因模式不匹配关闭整条连接。修复后应按 fallback 契约返回 failed + 文本，
+	// 连接保持可用。
+	token, record, err := credential.Issue(1, "user-a", "home-mac", []credential.SourceRule{"127.0.0.1", "::1"}, nil, time.Now(), bytes.NewReader(make([]byte, 48)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub, err := server.NewClientHub(server.NewSessionCatalog(), hprpClientVerifier{record: record}, server.HubConfig{}, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayServer := httptest.NewTLSServer(hub)
+	defer relayServer.Close()
+	executor := &terminalExecutor{
+		targets: []session.Target{{
+			PaneID: "pane-1", OccupantKey: "session-1", Agent: "dsh", DisplayAgent: "DeepSeek Harness",
+			Title: "任务", Status: herdr.AgentStatusIdle,
+		}},
+		selected: fakeSelection{PaneID: "pane-1", OccupantHash: "session-1"},
+		snapshotContent: im.TerminalContent{
+			Mode: im.OutputModeText, Text: "dsh 文本快照",
+			Page: &im.TerminalPage{Current: 1, Total: 1}, CapturedAt: time.Now().UTC(),
+		},
+	}
+	client, err := New(Config{
+		URL: "wss" + strings.TrimPrefix(relayServer.URL, "https"), Key: token, SkipVerify: true,
+		Version: "test", PollInterval: 10 * time.Millisecond, SnapshotInterval: time.Hour,
+		Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.sink = client
+	if err := client.SetExecutor(executor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	eventuallyClient(t, func() bool { return hub.Catalog().HasSessions("user-a") })
+	entries := hub.Catalog().CreateNumberedSnapshot("user-a")
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	target := entries[0].Ref
+
+	result, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeImage, 100)
+	if err != nil {
+		t.Fatalf("图片请求应降级为文本而不是关闭连接：%v", err)
+	}
+	if result.Outcome != hprp.OutcomeFailed || result.Error == nil || result.Error.Code != hprp.CodeTerminalImageFailed ||
+		result.Content != nil || result.FallbackContent == nil ||
+		result.FallbackContent.Mode != hprp.OutputModeText || result.FallbackContent.Text != "dsh 文本快照" {
+		t.Fatalf("terminal snapshot fallback = %#v", result)
+	}
+
+	// 连接仍然可用：紧接着的文本快照请求必须成功。
+	textResult, err := hub.FetchTerminalSnapshot(context.Background(), "user-a", target, hprp.OutputModeText, 100)
+	if err != nil || textResult.Outcome != hprp.OutcomeOK || textResult.Content == nil || textResult.Content.Text != "dsh 文本快照" {
+		t.Fatalf("后续文本快照 = %#v, %v", textResult, err)
 	}
 }
 

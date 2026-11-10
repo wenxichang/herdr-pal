@@ -1,5 +1,0 @@
-- insert:
-    - id: herdr-pal-bridge
-      name: dsh-herdr-pal
-      config:
-        port: 17842

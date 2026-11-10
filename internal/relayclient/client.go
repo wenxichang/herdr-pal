@@ -257,7 +257,18 @@ func (client *Client) respondContent(ctx context.Context, requestID string, cont
 		Outcome: hprp.OutcomeOK,
 		Content: &content,
 	}
-	if selected, err := client.selectedTarget(); err == nil && selected.MachineID == activeTarget.MachineID &&
+	// CreatedTarget 优先于同 slot 替换：/new-session 会在新 slot 创建目标。
+	// 必须先上报并确认新快照，Server 才能校验该目标存在。
+	if created, ok, err := client.takeCreatedTarget(ctx); err != nil {
+		return err
+	} else if ok {
+		result.CreatedTarget = &created
+		client.executionMu.Lock()
+		if client.activeRequestID == requestID && client.activeTarget == activeTarget {
+			client.activeTarget = created
+		}
+		client.executionMu.Unlock()
+	} else if selected, err := client.selectedTarget(); err == nil && selected.MachineID == activeTarget.MachineID &&
 		selected.SlotID == activeTarget.SlotID && selected.SessionID != activeTarget.SessionID {
 		if err := client.reportCurrentSnapshot(ctx); err != nil {
 			return err
@@ -305,6 +316,10 @@ func (client *Client) sendContent(content hprp.Content) error {
 }
 
 // SendNotification 发送携带稳定本机目标的主动通知；断线时直接失败且不缓存。
+//
+// 发送状态通知前必须上报并等待 Server 确认当前快照：Server 只接受已出现在
+// 确认快照中的目标，否则会按协议错误关闭整条 HPRP 连接。目标失效通知描述的是
+// 目标离开快照，不需要也不应等待新的确认快照。
 func (client *Client) SendNotification(ctx context.Context, target im.NotificationTarget, event im.NotificationEvent) error {
 	current := client.currentSession()
 	if current == nil {
@@ -312,6 +327,9 @@ func (client *Client) SendNotification(ctx context.Context, target im.Notificati
 	}
 	if event.Kind != im.NotificationKindTargetInvalidated {
 		if _, err := client.resolveLocalTarget(current.machineID, target.PaneID, target.OccupantHash); err != nil {
+			return err
+		}
+		if err := client.reportCurrentSnapshot(ctx); err != nil {
 			return err
 		}
 	}
@@ -679,14 +697,30 @@ func (client *Client) handleTerminalSnapshot(current *clientSession, envelope hp
 		request.MaxLines,
 	)
 	if readErr == nil {
-		encoded, encodeErr := encodeTerminalContent(content)
-		if encodeErr == nil {
-			client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
-				Outcome: hprp.OutcomeOK, Target: request.Target, Content: &encoded,
-			})
-			return
+		if request.Mode == hprp.OutputModeImage && content.Mode != im.OutputModeImage {
+			// 执行器不支持图片（例如 dsh 只提供文本）时必须走 HPRP 的失败降级契约：
+			// 直接返回 text 模式的成功结果会因模式不匹配被 Server 关闭整条连接。
+			content.Mode = im.OutputModeText
+			content.Image = nil
+			fallback, fallbackErr := encodeTerminalContent(content)
+			if fallbackErr == nil {
+				client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+					Outcome: hprp.OutcomeFailed, Target: request.Target, FallbackContent: &fallback,
+					Error: &hprp.Error{Code: hprp.CodeTerminalImageFailed, Message: "终端图片生成失败", Retryable: false},
+				})
+				return
+			}
+			readErr = fallbackErr
+		} else {
+			encoded, encodeErr := encodeTerminalContent(content)
+			if encodeErr == nil {
+				client.writeTerminalSnapshotResult(current, envelope.ID, hprp.TerminalSnapshotResult{
+					Outcome: hprp.OutcomeOK, Target: request.Target, Content: &encoded,
+				})
+				return
+			}
+			readErr = encodeErr
 		}
-		readErr = encodeErr
 	}
 	if request.Mode == hprp.OutputModeImage && content.Page != nil && !content.CapturedAt.IsZero() {
 		content.Mode = im.OutputModeText
@@ -781,7 +815,9 @@ func (client *Client) writeCachedCommand(current *clientSession, requestID strin
 		return
 	}
 	target := cached.target
-	if cached.result.ReplacementTarget != nil {
+	if cached.result.CreatedTarget != nil {
+		target = *cached.result.CreatedTarget
+	} else if cached.result.ReplacementTarget != nil {
 		target = *cached.result.ReplacementTarget
 	}
 	for index, output := range cached.outputs {
@@ -874,6 +910,30 @@ func (client *Client) localExecutor() Executor {
 	client.executorMu.RLock()
 	defer client.executorMu.RUnlock()
 	return client.executor
+}
+
+// takeCreatedTarget 领取执行器新建的目标，并确认新目标已经出现在上报快照中。
+func (client *Client) takeCreatedTarget(ctx context.Context) (hprp.Target, bool, error) {
+	provider, ok := client.localExecutor().(CreatedTargetProvider)
+	if !ok {
+		return hprp.Target{}, false, nil
+	}
+	created, ok := provider.TakeCreatedTarget()
+	if !ok {
+		return hprp.Target{}, false, nil
+	}
+	if err := client.reportCurrentSnapshot(ctx); err != nil {
+		return hprp.Target{}, false, err
+	}
+	current := client.currentSession()
+	if current == nil {
+		return hprp.Target{}, false, ErrUnavailable
+	}
+	target, err := client.resolveLocalTarget(current.machineID, created.PaneID, created.OccupantKey)
+	if err != nil {
+		return hprp.Target{}, false, err
+	}
+	return target, true, nil
 }
 
 func (client *Client) selectedTarget() (hprp.Target, error) {

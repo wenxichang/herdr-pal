@@ -5,8 +5,6 @@ export GOTOOLCHAIN=go1.26.5+auto
 
 cd "$(dirname "$0")"
 
-node --test plugins/dsh-herdr-pal/test/*.test.mjs
-
 if [ -n "$(gofmt -l .)" ]; then
 	printf '%s\n' "请先运行 gofmt。" >&2
 	exit 1

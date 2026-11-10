@@ -14,7 +14,6 @@ import (
 func TestBuildScriptProducesReleaseArchitectureMatrix(t *testing.T) {
 	root := repositoryRoot(t)
 	temporaryRoot := t.TempDir()
-	copyDSHPlugin(t, root, temporaryRoot)
 	buildScript, err := os.ReadFile(filepath.Join(root, "build.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +87,16 @@ exit 0
 			t.Errorf("missing native convenience output %s: %v", name, err)
 		}
 	}
+	// dsh 已改用原生 Remote API，发布产物中不再生成 Node 插件 tgz。
+	distEntries, err := os.ReadDir(filepath.Join(temporaryRoot, "dist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range distEntries {
+		if strings.HasSuffix(entry.Name(), ".tgz") {
+			t.Errorf("build.sh 不应生成 %s", entry.Name())
+		}
+	}
 	checksumData, err := os.ReadFile(filepath.Join(temporaryRoot, "dist", "SHA256SUMS"))
 	if err != nil {
 		t.Fatalf("missing SHA256SUMS: %v", err)
@@ -120,13 +129,6 @@ exit 0
 		if !strings.Contains(logText, invocation) || !strings.Contains(logText, "-o dist/"+target.name) {
 			t.Errorf("%s/%s build invocation missing for %s:\n%s", target.goos, target.goarch, target.name, logText)
 		}
-	}
-}
-
-func copyDSHPlugin(t *testing.T, sourceRoot, targetRoot string) {
-	t.Helper()
-	if err := os.CopyFS(filepath.Join(targetRoot, "plugins", "dsh-herdr-pal"), os.DirFS(filepath.Join(sourceRoot, "plugins", "dsh-herdr-pal"))); err != nil {
-		t.Fatal(err)
 	}
 }
 

@@ -627,6 +627,41 @@ Server 本地等待超时后，可以忽略与近期已过期 `reply_to` 精确�
 服务端只允许自动接受同一 `machine_id` 和同一 `slot_id` 的替换目标。其他变化返回
 `target.session_changed`，不能自动改选。
 
+### 10.3 新建会话目标（created_target）
+
+命令（当前用于 dsh 的 `/new-session`）如果创建了一个新的逻辑会话，Pal 可以在
+`command.result` 中额外返回 `created_target`。它表示“本次命令新建、且已经进入已确认快照”
+的目标，允许与命令锚点位于不同 `slot_id`：
+
+```json
+{
+  "outcome": "ok",
+  "content": {
+    "type": "text/plain",
+    "text": "已新建 dsh 会话并切换。"
+  },
+  "created_target": {
+    "machine_id": "office-pc",
+    "slot_id": "dsh:session-2",
+    "session_id": "session-opaque-id-2"
+  }
+}
+```
+
+协议约束：
+
+- Pal 必须在返回 `command.result` 前上报包含该目标的新快照并收到 `session.snapshot.result`；
+  Server 必须拒绝目标不在已确认快照中的 `created_target`。
+- `created_target` 必须与命令锚点使用同一 `machine_id`；允许不同 `slot_id`，不要求满足
+  `replacement_target` 的同 slot 约束。
+- 当前 Pal 只在没有新建目标时返回 `replacement_target`；两者都表示命令后的新选择，
+  不应同时出现。
+- Server 可以选择自动把用户选择切换到 `created_target`；切换失败不得回滚已经创建的会话。
+
+兼容规则：`created_target` 是可选字段，接收方必须忽略自己未知的 `command.result` 字段。
+尚未支持该字段的旧 Server 会按普通成功结果处理，用户仍可通过 `/ls` 和 `/N` 手动选择新会话；
+旧 Pal 不会返回该字段，新 Server 保持原有选择不变。因此该字段的引入不要求双端同时升级。
+
 ## 11. 用户 Feature 调用
 
 双方协商 `feature.invoke.v1`，并且 hello 已选择具体 Feature 版本后，Server 可以使用

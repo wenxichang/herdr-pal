@@ -32,6 +32,20 @@ const backgroundNotificationActivityWindow = 2 * time.Minute
 
 const noAvailableSessionsMessage = "当前没有可用会话，可使用 /reg <机器标识> <来源地址> 注册机器；使用 /help 获取安装帮助。"
 
+const (
+	// dshAgentName 是 dsh 目标在目录中的 Agent 标识。
+	dshAgentName = "dsh"
+	// dshHostTab 是 dsh 宿主入口的展示标签，用于识别可新建会话的宿主。
+	dshHostTab = "dsh-host"
+)
+
+var (
+	// ErrNoDSHHost 表示用户当前没有任何在线的 dsh 宿主或会话。
+	ErrNoDSHHost = errors.New("没有在线的 dsh 宿主")
+	// ErrDSHAnchorAmbiguous 表示存在多个 dsh 宿主且无法确定新建位置。
+	ErrDSHAnchorAmbiguous = errors.New("请先 /ls 和 /N 选择 dsh 宿主")
+)
+
 //go:embed default_help.md
 var serverHelpTextTemplate string
 
@@ -65,9 +79,12 @@ type RegistrationRequester interface {
 }
 
 // RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
+//
+// CreatedTarget 表示客户端新建的会话目标，允许与命令锚点位于不同 slot。
 type RelayExecution struct {
 	StructuredContent *hprp.Content
 	SelectedTarget    *hprp.Target
+	CreatedTarget     *hprp.Target
 }
 
 // SendCommandOutput 复核后续分段的稳定来源，并发送给所属企业微信用户。
@@ -376,7 +393,7 @@ func (router *ConversationRouter) userInputAuditSource(userID, content string) (
 	case serverActionSelect, serverActionDirected:
 		entry, err := router.catalog.ResolveNumbered(userID, action.index)
 		return entry, err == nil
-	case serverActionForward, serverActionMode:
+	case serverActionForward, serverActionMode, serverActionAnswer:
 		entry, err := router.catalog.Selected(userID)
 		return entry, err == nil
 	default:
@@ -439,7 +456,8 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	}
 	router.logger.Debug("企业微信交互已接收", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "target_index", action.index, "switch_after", action.switchAfter, "content_bytes", len([]byte(message.Content)))
 	router.activity.Touch(message.UserID, router.now())
-	if action.kind != serverActionHelp && action.kind != serverActionRegister && !isRegistrationApprovalAction(action.kind) && !router.catalog.HasSessions(message.UserID) {
+	if action.kind != serverActionHelp && action.kind != serverActionRegister && action.kind != serverActionNewSession &&
+		!isRegistrationApprovalAction(action.kind) && !router.catalog.HasSessions(message.UserID) {
 		router.logger.Info("企业微信交互未路由", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "error_type", "no_sessions", "reason", "当前用户没有在线且可用的 Relay 会话")
 		router.reply(ctx, message, noAvailableSessionsMessage)
 		return
@@ -469,6 +487,11 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		} else {
 			router.handleDirectedExecute(ctx, message, action)
 		}
+	case serverActionAnswer:
+		// /answer 保持原样转发到当前选择的 dsh 会话。
+		router.handleExecute(ctx, message)
+	case serverActionNewSession:
+		router.handleNewSession(ctx, message, action)
 	default:
 		router.handleExecute(ctx, message)
 	}
@@ -727,6 +750,152 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 	}
 }
 
+// resolveDSHAnchor 选择 /new-session 的锚点目标。
+//
+// 已选中的 dsh 目标仍存在时直接作为锚点（无论它是宿主入口还是会话）：只有该
+// 目标的宿主执行器才知道新建请求应落在这个宿主上，不能替换成同机器其他宿主的
+// 入口。选中目标消失后才退回同机器第一个可用宿主入口或会话。
+// 没有选中时，只接受唯一 dsh 宿主入口或唯一一个 dsh 会话，避免在多个宿主间猜测：
+// 同一机器上的 web/Desktop 会话属于不同宿主；同变体的多个会话也无法从目标字段
+// 区分是同一宿主还是多个宿主，因此保守要求用户先 /ls 和 /N 选择。
+func (router *ConversationRouter) resolveDSHAnchor(userID string, selected CatalogEntry, hasSelection bool) (CatalogEntry, error) {
+	// 只读目录：/new-session 的锚点解析不能改写用户已看到的 /N 编号快照。
+	entries := router.catalog.CatalogEntries(userID)
+	if hasSelection && isDSHCatalogEntry(selected) {
+		for _, entry := range entries {
+			if sameSessionRef(entry.Ref, selected.Ref) {
+				return selected, nil
+			}
+		}
+		var firstHost *CatalogEntry
+		var firstSession *CatalogEntry
+		for index := range entries {
+			entry := entries[index]
+			if entry.Ref.MachineID != selected.Ref.MachineID || !isDSHCatalogEntry(entry) {
+				continue
+			}
+			if isDSHHostCatalogEntry(entry) {
+				if firstHost == nil {
+					firstHost = &entries[index]
+				}
+				continue
+			}
+			if firstSession == nil {
+				firstSession = &entries[index]
+			}
+		}
+		if firstHost != nil {
+			return *firstHost, nil
+		}
+		if firstSession != nil {
+			return *firstSession, nil
+		}
+		return CatalogEntry{}, ErrTargetChanged
+	}
+
+	hostEntries := make([]CatalogEntry, 0, 1)
+	sessions := make([]CatalogEntry, 0, 1)
+	for _, entry := range entries {
+		if !isDSHCatalogEntry(entry) {
+			continue
+		}
+		if isDSHHostCatalogEntry(entry) {
+			hostEntries = append(hostEntries, entry)
+			continue
+		}
+		sessions = append(sessions, entry)
+	}
+	if len(hostEntries) == 1 {
+		return hostEntries[0], nil
+	}
+	if len(hostEntries) == 0 {
+		switch len(sessions) {
+		case 0:
+			return CatalogEntry{}, ErrNoDSHHost
+		case 1:
+			return sessions[0], nil
+		}
+	}
+	return CatalogEntry{}, ErrDSHAnchorAmbiguous
+}
+
+func isDSHCatalogEntry(entry CatalogEntry) bool {
+	return entry.Session.Display.Agent == dshAgentName
+}
+
+func isDSHHostCatalogEntry(entry CatalogEntry) bool {
+	return isDSHCatalogEntry(entry) && entry.Session.Display.Tab == dshHostTab
+}
+
+// handleNewSession 把原始 /new-session 命令转发给 dsh 锚点，并在新目标确认后切换选择。
+func (router *ConversationRouter) handleNewSession(ctx context.Context, message im.IncomingText, action serverAction) {
+	selected, selectedErr := router.catalog.Selected(message.UserID)
+	anchor, err := router.resolveDSHAnchor(message.UserID, selected, selectedErr == nil)
+	if err != nil {
+		router.logInteractionError(message, "new_session", "resolve_dsh_anchor", hprp.Target{}, err)
+		if errors.Is(err, ErrTargetChanged) {
+			router.reply(ctx, message, safeRouterError(err))
+		} else {
+			router.reply(ctx, message, err.Error())
+		}
+		return
+	}
+	newSessionMessage := message
+	newSessionMessage.Content = action.content
+	newSessionMessage.OutputMode = im.OutputMode(router.effectiveOutputMode(message.UserID, anchor))
+	requestContext, cancel := context.WithTimeout(ctx, router.requestTimeout)
+	result, err := router.relay.Execute(requestContext, message.UserID, anchor.Ref, newSessionMessage)
+	if err != nil {
+		cancel()
+		router.logInteractionError(message, "new_session", "relay_execute", anchor.Ref, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			router.reply(ctx, message, "操作可能已经提交，请执行 /ls 查看新会话；服务端不会自动重试。")
+			return
+		}
+		router.reply(ctx, message, safeRouterError(err))
+		return
+	}
+	if result.CreatedTarget == nil {
+		cancel()
+		router.logger.Info("dsh 新建会话未返回目标", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "new_session", "anchor", safeLogValue(anchor.Ref.SlotID))
+		router.reply(ctx, message, newSessionReply(action.content, result.StructuredContent, false))
+		return
+	}
+	created := *result.CreatedTarget
+	if err := router.catalog.RebindCreated(requestContext, message.UserID, anchor.Ref, created); err != nil {
+		cancel()
+		router.logInteractionError(message, "new_session", "rebind_created", created, err)
+		router.reply(ctx, message, "新会话已创建，但切换当前会话失败；请执行 /ls 后用 /N 选择新会话。")
+		return
+	}
+	cancel()
+	router.logInteractionSuccess(message, "new_session", created)
+	router.reply(ctx, message, newSessionReply(action.content, result.StructuredContent, true))
+}
+
+// newSessionReply 组合 dsh 返回的创建结果与切换提示。
+//
+// dsh 执行器把标题、目录、重命名失败和创建失败原因都放在文本结果里，必须优先展示；
+// Pal 没有返回文本时才用原始命令作为回退正文。
+func newSessionReply(command string, content *hprp.Content, created bool) string {
+	body := ""
+	if content != nil && content.Type == hprp.ContentTypeText {
+		body = strings.TrimSpace(content.Text)
+	}
+	if body == "" {
+		body = "命令：" + strings.TrimSpace(command)
+	}
+	if created {
+		// Pal 的创建结果通常已经包含切换提示；只在缺失时补充，避免重复整句。
+		const switched = "已切换到新会话。"
+		if strings.Contains(body, switched) {
+			return body
+		}
+		return body + "\n" + switched
+	}
+	return body + "\n请执行 /ls 后用 /N 选择新会话。"
+}
+
 func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, message im.IncomingText, action serverAction) {
 	entry, err := router.catalog.ResolveNumbered(message.UserID, action.index)
 	if err != nil {
@@ -857,6 +1026,14 @@ func (router *ConversationRouter) effectiveOutputMode(userID string, entry Catal
 }
 
 func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, userID string, source CatalogEntry, result RelayExecution) (CatalogEntry, error) {
+	// 新建会话位于新 slot，优先级高于同 slot occupant 替换。
+	if result.CreatedTarget != nil {
+		created := *result.CreatedTarget
+		if err := router.catalog.RebindCreated(ctx, userID, source.Ref, created); err != nil {
+			return CatalogEntry{}, err
+		}
+		return router.catalog.ResolveTarget(userID, created)
+	}
 	if result.SelectedTarget == nil {
 		return source, nil
 	}
@@ -1180,6 +1357,8 @@ const (
 	serverActionListRegistrations
 	serverActionApproveRegistrations
 	serverActionRejectRegistrations
+	serverActionAnswer
+	serverActionNewSession
 )
 
 type serverAction struct {
@@ -1255,6 +1434,12 @@ func parseServerAction(content string) (serverAction, error) {
 			return serverAction{}, err
 		}
 		return serverAction{kind: serverActionRejectRegistrations, indexes: indexes}, nil
+	case "/answer":
+		// 原样转发给 Pal：选项编号与自定义文本的细节由 dsh 执行器校验。
+		return serverAction{kind: serverActionAnswer, content: content}, nil
+	case "/new-session":
+		// 原样转发给 Pal：标题与目录由 dsh 执行器解析，Server 只负责选择锚点。
+		return serverAction{kind: serverActionNewSession, content: content}, nil
 	}
 	if len(fields) == 1 && strings.HasPrefix(fields[0], "/") {
 		if index, err := positiveASCIIInt(strings.TrimPrefix(fields[0], "/")); err == nil {

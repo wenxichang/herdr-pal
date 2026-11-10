@@ -215,6 +215,19 @@ func (catalog *SessionCatalog) CreateNumberedSnapshot(userID string) []CatalogEn
 	return cloneEntries(entries)
 }
 
+// CatalogEntries 返回当前在线目录的只读副本，不修改用户的 /N 编号快照。
+//
+// 供只需读取目标目录的路由逻辑使用；与 CreateNumberedSnapshot 不同，调用它
+// 不会改变用户已经看到的编号顺序。
+func (catalog *SessionCatalog) CatalogEntries(userID string) []CatalogEntry {
+	if catalog == nil {
+		return nil
+	}
+	catalog.mu.RLock()
+	defer catalog.mu.RUnlock()
+	return cloneEntries(catalog.entriesLocked(userID))
+}
+
 // ResolveNumbered 按最近一次列表中的一开始编号解析并复核当前稳定目标。
 func (catalog *SessionCatalog) ResolveNumbered(userID string, index int) (CatalogEntry, error) {
 	if catalog == nil {
@@ -349,6 +362,44 @@ func (catalog *SessionCatalog) RebindSelection(ctx context.Context, userID strin
 			return ErrTargetChanged
 		}
 		if entry, exists := catalog.findEntryLocked(userID, replacement); exists {
+			selected := entry.Ref
+			routing.selected = &selected
+			routing.invalidated = nil
+			catalog.routing[userID] = routing
+			catalog.signalUpdateLocked()
+			catalog.mu.Unlock()
+			return nil
+		}
+		updates := catalog.updates
+		catalog.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-updates:
+		}
+	}
+}
+
+// RebindCreated 等待新建会话的目标出现在目录后，把它切换为当前选择。
+//
+// 与 RebindSelection 不同，新建目标允许位于不同 SlotID；expected 只用于确认
+// 新旧目标属于同一机器。目标必须先进入已确认快照才会被选中。
+func (catalog *SessionCatalog) RebindCreated(ctx context.Context, userID string, expected, created hprp.Target) error {
+	if catalog == nil || hprp.ValidateTarget(expected) != nil || hprp.ValidateTarget(created) != nil ||
+		expected.MachineID != created.MachineID {
+		return ErrTargetChanged
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		catalog.mu.Lock()
+		if _, online := catalog.machines[ClientKey{UserID: userID, MachineID: created.MachineID}]; !online {
+			catalog.mu.Unlock()
+			return ErrTargetChanged
+		}
+		if entry, exists := catalog.findEntryLocked(userID, created); exists {
+			routing := catalog.routing[userID]
 			selected := entry.Ref
 			routing.selected = &selected
 			routing.invalidated = nil

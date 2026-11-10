@@ -104,3 +104,12 @@ func TestDefaultHelpIncludesRegistrationApprovalCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultHelpIncludesDSHCommands(t *testing.T) {
+	content := DefaultHelpText()
+	for _, fragment := range []string{"/answer", "/new-session", "仅 dsh"} {
+		if !strings.Contains(content, fragment) {
+			t.Fatalf("default help missing %q", fragment)
+		}
+	}
+}

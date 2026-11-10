@@ -310,6 +310,79 @@ func TestCatalogRebindSelectionDoesNotOverwriteNewSelection(t *testing.T) {
 	}
 }
 
+func TestCatalogRebindCreatedAllowsDifferentSlot(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-anchor", "anchor"),
+			hprpSession(2, "pane-2", "occ-created", "created"),
+		},
+	})
+	anchor := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-anchor"}
+	created := hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "occ-created"}
+	if err := catalog.SetSelection("user-a", anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.RebindCreated(context.Background(), "user-a", anchor, created); err != nil {
+		t.Fatalf("RebindCreated() error = %v", err)
+	}
+	selected, err := catalog.Selected("user-a")
+	if err != nil || selected.Ref != created {
+		t.Fatalf("Selected() = %#v, %v, want created %#v", selected, err, created)
+	}
+
+	otherMachine := hprp.Target{MachineID: "office-pc", SlotID: "pane-2", SessionID: "occ-created"}
+	if err := catalog.RebindCreated(context.Background(), "user-a", anchor, otherMachine); !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("RebindCreated(other machine) error = %v, want ErrTargetChanged", err)
+	}
+	missing := hprp.Target{MachineID: "home-mac", SlotID: "pane-9", SessionID: "occ-missing"}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := catalog.RebindCreated(ctx, "user-a", anchor, missing); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RebindCreated(missing target) error = %v, want DeadlineExceeded", err)
+	}
+	selected, err = catalog.Selected("user-a")
+	if err != nil || selected.Ref != created {
+		t.Fatalf("Selected() after rejection = %#v, %v, want created %#v", selected, err, created)
+	}
+}
+
+func TestCatalogRebindCreatedWaitsForSnapshot(t *testing.T) {
+	catalog := NewSessionCatalog()
+	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{hprpSession(1, "pane-1", "occ-anchor", "anchor")},
+	})
+	anchor := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-anchor"}
+	created := hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "occ-created"}
+	if err := catalog.SetSelection("user-a", anchor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- catalog.RebindCreated(ctx, "user-a", anchor, created) }()
+	select {
+	case err := <-done:
+		t.Fatalf("RebindCreated() returned before snapshot: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{
+			hprpSession(1, "pane-1", "occ-anchor", "anchor"),
+			hprpSession(2, "pane-2", "occ-created", "created"),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("RebindCreated() error = %v", err)
+	}
+	selected, err := catalog.Selected("user-a")
+	if err != nil || selected.Ref != created {
+		t.Fatalf("Selected() = %#v, %v, want created %#v", selected, err, created)
+	}
+}
+
 func TestCatalogWaitForTargetDoesNotChangeSelection(t *testing.T) {
 	catalog := NewSessionCatalog()
 	attachSnapshot(t, catalog, "conn-1", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{

@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,14 +20,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/interactive"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/relayclient"
 	"github.com/wenxichang/herdr-pal/internal/session"
+	"github.com/wenxichang/herdr-pal/internal/testkit"
 	"github.com/wenxichang/herdr-pal/internal/wecom"
 )
 
@@ -2044,6 +2049,135 @@ func TestSafeRelayRuntimeReasonRedactsUserIDAndEndpointDetails(t *testing.T) {
 	}
 }
 
+func TestAppStartsDSHOnlyBackendFromEmptyConfig(t *testing.T) {
+	fakeDSH := newFakeDSHHost(t)
+	relay := newFakeRelayServer(t)
+	setTestCacheHome(t)
+	relayKey := testRelayKey(t)
+	var logs synchronizedBuffer
+	configPath := writeRelayTestConfig(t, map[string]any{
+		"relay": map[string]any{"url": relay.URL(), "key": relayKey, "skip_verify": true},
+		"herdr": map[string]any{"disabled": true},
+		"dsh":   map[string]any{"url": fakeDSH.URL(), "home": fakeDSH.Home(), "variant": "web"},
+		"log":   map[string]any{"level": "info"},
+	})
+
+	running := startRelayApp(t, configPath, &logs)
+	snapshot := relay.waitSnapshot(t, func(snapshot hprp.SessionSnapshot) bool {
+		return snapshotHasAgent(snapshot, "dsh")
+	})
+	dshSession := sessionForAgent(t, snapshot, "dsh")
+	if !strings.HasPrefix(dshSession.SlotID, "dsh:") || !strings.HasPrefix(dshSession.SessionID, "session:") ||
+		dshSession.Display.DisplayAgent != "DeepSeek Harness" || dshSession.Display.Title != "dsh-session" ||
+		dshSession.Display.Tab != "web" {
+		t.Fatalf("dsh 快照目标 = %#v", dshSession)
+	}
+	if fakeDSH.sessionListCalls() == 0 || fakeDSH.muxConnections() == 0 {
+		t.Fatalf("dsh 会话列表/mux 连接 = %d/%d，期望后端已启动",
+			fakeDSH.sessionListCalls(), fakeDSH.muxConnections())
+	}
+	if err := running.stop(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunRelay() error = %v, want context.Canceled", err)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "Herdr Pal dsh 后端启动") {
+		t.Fatalf("dsh 启动日志缺失: %s", output)
+	}
+	for _, sensitive := range []string{relayKey, fakeDSHSecret, "dsh-auth-"} {
+		if strings.Contains(output, sensitive) {
+			t.Fatalf("dsh 日志泄露敏感值 %q: %s", sensitive, output)
+		}
+	}
+}
+
+func TestAppCombinesHerdrAndDSHBackends(t *testing.T) {
+	fakeHerdr := testkit.NewHerdrServer(t, appHerdrSnapshot())
+	fakeDSH := newFakeDSHHost(t)
+	relay := newFakeRelayServer(t)
+	setTestCacheHome(t)
+	configPath := writeRelayTestConfig(t, map[string]any{
+		"relay": map[string]any{"url": relay.URL(), "key": testRelayKey(t), "skip_verify": true},
+		"herdr": map[string]any{"socket_path": fakeHerdr.SocketPath()},
+		"dsh":   map[string]any{"url": fakeDSH.URL(), "home": fakeDSH.Home(), "variant": "web"},
+		"log":   map[string]any{"level": "info"},
+	})
+
+	running := startRelayApp(t, configPath, io.Discard)
+	snapshot := relay.waitSnapshot(t, func(snapshot hprp.SessionSnapshot) bool {
+		return snapshotHasAgent(snapshot, "codex") && snapshotHasAgent(snapshot, "dsh")
+	})
+	if herdrSession := sessionForAgent(t, snapshot, "codex"); herdrSession.SlotID != "pane-1" {
+		t.Fatalf("Herdr 快照目标 = %#v", herdrSession)
+	}
+	if dshSession := sessionForAgent(t, snapshot, "dsh"); !strings.HasPrefix(dshSession.SlotID, "dsh:") {
+		t.Fatalf("dsh 快照目标 = %#v", dshSession)
+	}
+	if err := running.stop(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunRelay() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAppRejectsLegacyDSHToken(t *testing.T) {
+	relay := newFakeRelayServer(t)
+	configPath := writeRelayTestConfig(t, map[string]any{
+		"relay": map[string]any{"url": relay.URL(), "key": testRelayKey(t), "skip_verify": true},
+		"herdr": map[string]any{"disabled": true},
+		"dsh":   map[string]any{"token": "legacy-token"},
+	})
+
+	err := RunRelay(context.Background(), Options{ConfigPath: configPath, Stderr: io.Discard, Stdout: io.Discard})
+	if !errors.Is(err, ErrConfig) || !strings.Contains(err.Error(), "dsh.token 已移除：Pal 现在直接连接 dsh Remote API") {
+		t.Fatalf("RunRelay() error = %v，期望启动前返回配置迁移错误", err)
+	}
+	if got := relay.connections.Load(); got != 0 {
+		t.Fatalf("配置迁移错误前已建立 %d 个 Relay 连接", got)
+	}
+}
+
+func TestRunRelayMixedModeAcquiresDSHLock(t *testing.T) {
+	setTestCacheHome(t)
+	relay := newFakeRelayServer(t)
+	dshConfig := config.DSHConfig{URL: "http://127.0.0.1:17842", Home: t.TempDir(), Variant: "web"}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockDir := filepath.Join(cacheDir, "herdr-pal")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟另一个实例（dsh-only 或其他混合实例）已持有同一 dsh 宿主锁。
+	held, err := processlock.Acquire(filepath.Join(lockDir, dshLockName(dshConfig)+".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Release() }()
+
+	configPath := writeRelayTestConfig(t, map[string]any{
+		"relay": map[string]any{"url": relay.URL(), "key": testRelayKey(t), "skip_verify": true},
+		"herdr": map[string]any{"socket_path": "/tmp/herdr-pal-mixed-lock-test.sock"},
+		"dsh":   map[string]any{"url": dshConfig.URL, "home": dshConfig.Home, "variant": "web"},
+	})
+
+	err = RunRelay(context.Background(), Options{ConfigPath: configPath, Stderr: io.Discard, Stdout: io.Discard})
+	if !errors.Is(err, processlock.ErrAlreadyRunning) || !strings.Contains(err.Error(), "dsh 进程锁") {
+		t.Fatalf("RunRelay() error = %v，期望明确的 dsh 进程锁冲突", err)
+	}
+	if got := relay.connections.Load(); got != 0 {
+		t.Fatalf("dsh 锁冲突前已建立 %d 个 Relay 连接", got)
+	}
+}
+
+func TestDSHLockNameSeparatesAutoDiscoveryAndExplicitURL(t *testing.T) {
+	if got, want := dshLockName(config.DSHConfig{}), shortHash("dsh:auto"); got != want {
+		t.Fatalf("自动发现锁名 = %q, want %q", got, want)
+	}
+	explicit := config.DSHConfig{URL: "http://127.0.0.1:17842"}
+	if got, want := dshLockName(explicit), shortHash("dsh:http://127.0.0.1:17842"); got != want {
+		t.Fatalf("显式 URL 锁名 = %q, want %q", got, want)
+	}
+}
+
 func testOptions(t *testing.T) Options {
 	t.Helper()
 	dependencies := defaultAppDependencies()
@@ -2703,4 +2837,328 @@ func retainsFakeLock(lock *fakeLock) bool {
 		}
 	}
 	return false
+}
+
+// fakeDSHSecret 是 32 字节零密钥的 base64url 表示，只用于测试认证文件。
+const fakeDSHSecret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// fakeDSHHost 实现 dsh Remote API 的会话目录与 Mux 握手子集。
+type fakeDSHHost struct {
+	server *httptest.Server
+	home   string
+	stop   chan struct{}
+
+	mu        sync.Mutex
+	listCalls int
+	muxConns  int
+}
+
+func newFakeDSHHost(t *testing.T) *fakeDSHHost {
+	t.Helper()
+	host := &fakeDSHHost{home: t.TempDir(), stop: make(chan struct{})}
+	credentialPath := filepath.Join(host.home, ".credentials.yaml")
+	content := "version: 1\nrecords:\n  client-connection/browser-session:\n    kind: grant\n    payload:\n      version: 1\n      secret: " + fakeDSHSecret + "\n"
+	if err := os.WriteFile(credentialPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("写入 dsh 测试认证文件: %v", err)
+	}
+	if err := os.Chmod(credentialPath, 0o600); err != nil {
+		t.Fatalf("设置 dsh 测试认证文件权限: %v", err)
+	}
+	host.server = httptest.NewServer(http.HandlerFunc(host.handle))
+	t.Cleanup(func() {
+		close(host.stop)
+		host.server.Close()
+	})
+	return host
+}
+
+func (h *fakeDSHHost) handle(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/api/session/list":
+		h.handleSessionList(w, r)
+	case "/api/remote.mux":
+		h.handleMux(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *fakeDSHHost) handleSessionList(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	h.listCalls++
+	h.mu.Unlock()
+	var request struct {
+		RPCID string `json:"rpcId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type":  "server-response",
+		"rpcId": request.RPCID,
+		"result": map[string]any{
+			"ok": true,
+			"value": map[string]any{
+				"items": []any{map[string]any{
+					"sessionId":      "session-dsh-1",
+					"agentAvailable": true,
+					"running":        false,
+					"cwd":            "/tmp/dsh-project",
+					"updatedAt":      int64(1),
+					"projections":    map[string]any{"values": map[string]any{"title": "dsh-session"}},
+				}},
+			},
+		},
+	})
+}
+
+func (h *fakeDSHHost) handleMux(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	h.muxConns++
+	h.mu.Unlock()
+	connection, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer connection.CloseNow()
+	ready := `{"streamId":"events","type":"item","value":{"type":"ready","clientId":"client-1"}}`
+	if err := connection.Write(r.Context(), websocket.MessageText, []byte(ready)); err != nil {
+		return
+	}
+	select {
+	case <-r.Context().Done():
+	case <-h.stop:
+	}
+}
+
+func (h *fakeDSHHost) URL() string { return h.server.URL }
+
+func (h *fakeDSHHost) Home() string { return h.home }
+
+func (h *fakeDSHHost) sessionListCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.listCalls
+}
+
+func (h *fakeDSHHost) muxConnections() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.muxConns
+}
+
+// fakeRelayServer 完成 HPRP 握手并记录 Pal 上报的会话快照。
+type fakeRelayServer struct {
+	server      *httptest.Server
+	connections atomic.Int32
+	snapshots   chan hprp.SessionSnapshot
+}
+
+func newFakeRelayServer(t *testing.T) *fakeRelayServer {
+	t.Helper()
+	relay := &fakeRelayServer{snapshots: make(chan hprp.SessionSnapshot, 64)}
+	relay.server = httptest.NewTLSServer(http.HandlerFunc(relay.handle))
+	t.Cleanup(relay.server.Close)
+	return relay
+}
+
+func (r *fakeRelayServer) handle(w http.ResponseWriter, request *http.Request) {
+	r.connections.Add(1)
+	connection, err := websocket.Accept(w, request, &websocket.AcceptOptions{Subprotocols: []string{hprp.Subprotocol}})
+	if err != nil {
+		return
+	}
+	defer connection.CloseNow()
+	ctx := request.Context()
+	hello, err := readRelayHPRPEnvelope(ctx, connection)
+	if err != nil || hello.Type != hprp.TypeHelloClient {
+		return
+	}
+	if err := writeRelayHPRPEnvelope(ctx, connection, hprp.TypeHelloServer, "hello-server", hello.ID, fakeRelayServerHello()); err != nil {
+		return
+	}
+	for {
+		envelope, err := readRelayHPRPEnvelope(ctx, connection)
+		if err != nil {
+			return
+		}
+		if envelope.Type != hprp.TypeSessionSnapshot {
+			continue
+		}
+		snapshot, err := hprp.DecodePayload[hprp.SessionSnapshot](envelope)
+		if err != nil {
+			return
+		}
+		if err := writeRelayHPRPEnvelope(ctx, connection, hprp.TypeSessionSnapshotResult, "snapshot-result", envelope.ID, hprp.SnapshotResult{
+			Outcome: hprp.OutcomeOK, AppliedSequence: snapshot.Sequence,
+		}); err != nil {
+			return
+		}
+		select {
+		case r.snapshots <- snapshot:
+		default:
+		}
+	}
+}
+
+func (r *fakeRelayServer) URL() string {
+	return "wss" + strings.TrimPrefix(r.server.URL, "https")
+}
+
+func (r *fakeRelayServer) waitSnapshot(t *testing.T, match func(hprp.SessionSnapshot) bool) hprp.SessionSnapshot {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case snapshot := <-r.snapshots:
+			if match == nil || match(snapshot) {
+				return snapshot
+			}
+		case <-timer.C:
+			t.Fatal("未在期限内观察到期望的 Relay 会话快照")
+			return hprp.SessionSnapshot{}
+		}
+	}
+}
+
+func fakeRelayServerHello() hprp.ServerHello {
+	return hprp.ServerHello{
+		ConnectionID: "connection-1", MachineID: "home-mac",
+		Capabilities: []string{
+			hprp.CapabilityCommandOutputV1, hprp.CapabilityTerminalSnapshotV1, hprp.CapabilityTerminalImageV1,
+		},
+		Features: map[string]hprp.FeatureOffer{},
+		Limits: hprp.ServerLimits{
+			MaxMessageBytes: hprp.MaxMessageBytes, MaxSessions: hprp.MaxSessions, MaxInflightCommands: 1,
+			MaxInflightFeatures: 0, MaxOutputBytes: hprp.MaxContentBytes,
+			MaxTerminalTextBytes: hprp.MaxTerminalTextBytes, MaxTerminalImageBytes: hprp.MaxTerminalImageBytes,
+			IdempotencyWindowMS: 600_000,
+		},
+		Heartbeat: hprp.HeartbeatConfig{PingIntervalMS: 20_000, IdleTimeoutMS: 60_000},
+	}
+}
+
+func readRelayHPRPEnvelope(ctx context.Context, connection *websocket.Conn) (hprp.Envelope, error) {
+	messageType, data, err := connection.Read(ctx)
+	if err != nil {
+		return hprp.Envelope{}, err
+	}
+	if messageType != websocket.MessageText {
+		return hprp.Envelope{}, errors.New("Relay 收到非文本帧")
+	}
+	return hprp.Decode(data)
+}
+
+func writeRelayHPRPEnvelope(ctx context.Context, connection *websocket.Conn, messageType hprp.Type, id, replyTo string, payload any) error {
+	envelope, err := hprp.NewEnvelope(messageType, id, replyTo, false, payload)
+	if err != nil {
+		return err
+	}
+	encoded, err := hprp.Encode(envelope)
+	if err != nil {
+		return err
+	}
+	return connection.Write(ctx, websocket.MessageText, encoded)
+}
+
+func appHerdrSnapshot() herdr.Snapshot {
+	agent, display, title := "codex", "Codex", "实现 Herdr Pal"
+	session := &herdr.AgentSession{Source: "codex", Agent: agent, Kind: "id", Value: "session-herdr"}
+	return herdr.Snapshot{
+		Version: "0.8.0-test", Protocol: herdr.Protocol17,
+		Panes: []herdr.Pane{{
+			PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1",
+			Agent: &agent, DisplayAgent: &display, Title: &title, AgentStatus: herdr.AgentStatusIdle, AgentSession: session,
+		}},
+		Agents: []herdr.AgentInfo{{
+			PaneID: "pane-1", TerminalID: "terminal-1", WorkspaceID: "workspace-1", TabID: "tab-1",
+			Agent: &agent, DisplayAgent: &display, Title: &title, AgentStatus: herdr.AgentStatusIdle, AgentSession: session,
+		}},
+	}
+}
+
+func snapshotHasAgent(snapshot hprp.SessionSnapshot, agent string) bool {
+	for _, session := range snapshot.Sessions {
+		if session.Display.Agent == agent {
+			return true
+		}
+	}
+	return false
+}
+
+func sessionForAgent(t *testing.T, snapshot hprp.SessionSnapshot, agent string) hprp.Session {
+	t.Helper()
+	for _, session := range snapshot.Sessions {
+		if session.Display.Agent == agent {
+			return session
+		}
+	}
+	t.Fatalf("Relay 快照中没有 %q 目标: %#v", agent, snapshot.Sessions)
+	return hprp.Session{}
+}
+
+func writeRelayTestConfig(t *testing.T, value map[string]any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("编码测试配置: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("写入测试配置: %v", err)
+	}
+	return path
+}
+
+func setTestCacheHome(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+}
+
+func testRelayKey(t *testing.T) string {
+	t.Helper()
+	key, _, err := credential.Issue(
+		1, "user", "machine", []credential.SourceRule{"127.0.0.1"}, nil, time.Unix(1, 0),
+		bytes.NewReader(bytes.Repeat([]byte{0x31}, 48)),
+	)
+	if err != nil {
+		t.Fatalf("credential.Issue() error = %v", err)
+	}
+	return key
+}
+
+type runningRelayApp struct {
+	cancel context.CancelFunc
+	done   chan error
+	once   sync.Once
+	err    error
+}
+
+func startRelayApp(t *testing.T, configPath string, stderr io.Writer) *runningRelayApp {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	app := &runningRelayApp{cancel: cancel, done: make(chan error, 1)}
+	go func() {
+		app.done <- RunRelay(ctx, Options{ConfigPath: configPath, Stderr: stderr, Stdout: io.Discard})
+	}()
+	t.Cleanup(func() { _ = app.stop(t) })
+	return app
+}
+
+func (a *runningRelayApp) stop(t *testing.T) error {
+	t.Helper()
+	a.once.Do(func() {
+		a.cancel()
+		select {
+		case a.err = <-a.done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("RunRelay 未在退出期限内停止")
+		}
+	})
+	return a.err
 }

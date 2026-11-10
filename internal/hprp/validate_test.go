@@ -125,6 +125,30 @@ func TestValidateResultOutcomeUsesMessageSubset(t *testing.T) {
 	}
 }
 
+func TestValidateCommandResultRejectsInvalidCreatedTarget(t *testing.T) {
+	valid := CommandResult{
+		Outcome: OutcomeOK,
+		CreatedTarget: &Target{
+			MachineID: "home-mac", SlotID: "dsh-host:pane-2", SessionID: "session:created",
+		},
+	}
+	if err := ValidateCommandResult(valid); err != nil {
+		t.Fatalf("ValidateCommandResult() error = %v", err)
+	}
+	for _, invalid := range []Target{
+		{SlotID: valid.CreatedTarget.SlotID, SessionID: valid.CreatedTarget.SessionID},
+		{MachineID: valid.CreatedTarget.MachineID, SessionID: valid.CreatedTarget.SessionID},
+		{MachineID: valid.CreatedTarget.MachineID, SlotID: valid.CreatedTarget.SlotID},
+	} {
+		result := valid
+		created := invalid
+		result.CreatedTarget = &created
+		if err := ValidateCommandResult(result); !errors.Is(err, ErrInvalidTarget) {
+			t.Fatalf("ValidateCommandResult(%#v) error = %v, want ErrInvalidTarget", invalid, err)
+		}
+	}
+}
+
 func TestValidateCommandExecuteRequiresStableTargetIdempotencyAndText(t *testing.T) {
 	valid := CommandExecute{
 		IdempotencyKey: "message-1",

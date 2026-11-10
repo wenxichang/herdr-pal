@@ -472,6 +472,23 @@ func (connection *clientConnection) replaceCommandTarget(commandID string, targe
 	return nil
 }
 
+// replaceCreatedCommandTarget 把 /new-session 命令的后续输出路由到同机器的新 slot。
+func (connection *clientConnection) replaceCreatedCommandTarget(commandID string, target hprp.Target) error {
+	if hprp.ValidateTarget(target) != nil {
+		return ErrTargetChanged
+	}
+	connection.commandMu.Lock()
+	defer connection.commandMu.Unlock()
+	route, exists := connection.commandRoutes[commandID]
+	if !exists || route.target.MachineID != target.MachineID {
+		return ErrTargetChanged
+	}
+	route.target = target
+	route.expiresAt = time.Now().Add(defaultCommandRouteTTL)
+	connection.commandRoutes[commandID] = route
+	return nil
+}
+
 func (connection *clientConnection) acceptCommandOutput(envelope hprp.Envelope, output hprp.CommandOutput) (bool, error) {
 	if !connection.supportsCapability(hprp.CapabilityCommandOutputV1) {
 		return false, fmt.Errorf("%w: command.output.v1 未协商", hprp.ErrInvalidMessage)

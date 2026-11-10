@@ -21,7 +21,9 @@ sidecar 配置需要自行迁移。
 默认安装路径的命令是 `~/.local/bin/herdr-pal -config ~/.config/herdr-pal/config.json`。
 `live-handoff` 不会启动 Pal。最后在企业微信中执行 `/ls` 验证连接。
 
-需要连接 DeepSeek Harness 时，下载同一 Release 中的 `dsh-herdr-pal-*.tgz`，按
-[dsh 插件说明](https://github.com/wenxichang/herdr-pal/blob/main/plugins/dsh-herdr-pal/README.md)
-安装和配置。插件支持内网离线导入；可同时接入 Herdr 与 dsh，也可在 Pal 配置中设置
-`herdr.disabled=true` 只连接 dsh。
+需要连接 DeepSeek Harness（dsh）时无需安装任何插件：Pal 会自动发现本机正在运行的
+dsh web 与 Desktop 宿主，也可在 Pal 配置中显式填写 `dsh.url`、`dsh.home` 和
+`dsh.variant`。旧 `dsh.token` 配置已移除，出现时会报错；已安装旧 `herdr-pal-bridge`
+插件的用户可从 dsh profile 中移除。也可在 Pal 配置中设置 `herdr.disabled=true` 只连接
+dsh。详见仓库 [README](https://github.com/wenxichang/herdr-pal/blob/main/README.md) 的
+“接入 DeepSeek Harness（可选）”章节。
