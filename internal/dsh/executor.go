@@ -686,8 +686,9 @@ func (e *Executor) pendingDecisionPrompt(ctx context.Context, sessionID string) 
 
 // selectPendingDecision 按设计文档的规则选择待答项。
 //
-// 优先第一个 blocking 决策；没有 blocking 时回退到第一个 supported 的持续问题
-// （call:<callId>），持续问题本身不进入 blocked 状态。
+// 优先第一个 blocking 决策；没有 blocking 时回退到第一个 supported 决策。
+// 定时 waterfall 问题（event:<eventId>）与持续问题（call:<callId>）都符合回退条件；
+// 持续问题本身不进入 blocked 状态。
 func selectPendingDecision(decisions []Decision) (Decision, bool) {
 	for _, decision := range decisions {
 		if decision.Blocking {
@@ -695,7 +696,7 @@ func selectPendingDecision(decisions []Decision) (Decision, bool) {
 		}
 	}
 	for _, decision := range decisions {
-		if decision.Supported && strings.HasPrefix(decision.NativeID, "call:") {
+		if decision.Supported {
 			return decision, true
 		}
 	}

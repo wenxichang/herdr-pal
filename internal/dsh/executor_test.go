@@ -793,6 +793,77 @@ func TestExecutorAnswerFallsBackToContinuedQuestion(t *testing.T) {
 	}
 }
 
+func TestExecutorTimedWaterfallQuestionShownAndAnswerable(t *testing.T) {
+	executor, api, sink := newExecutorFixture(t, testValidHost())
+	api.sessions = []SessionSummary{{ID: "s1", Title: "任务", Available: true}}
+	timed := Decision{
+		NativeID:  "event:timed-1",
+		SessionID: "s1",
+		Kind:      decisionKindForm,
+		Title:     "dsh 提问",
+		Questions: []Question{{
+			ID:       "tq",
+			Title:    "定时问题",
+			Kind:     questionKindSingle,
+			Options:  []Option{{Value: "X", Label: "选项 X"}, {Value: "Y", Label: "选项 Y"}},
+			Required: true,
+		}},
+		Revision:  "rev-timed",
+		Blocking:  false,
+		Supported: true,
+	}
+	continued := Decision{
+		NativeID:  "call:c-cont",
+		SessionID: "s1",
+		Kind:      decisionKindForm,
+		Title:     "dsh 提问",
+		Questions: []Question{{ID: "cq", Title: "持续问题", Kind: questionKindText, Required: true}},
+		Revision:  "rev-cont",
+		Blocking:  false,
+		Supported: true,
+	}
+	// 决策顺序与 Client.Decisions 一致：waterfall 在前，投影持续问题在后。
+	api.decisions = []Decision{timed, continued}
+	api.readText = "用户：开始"
+	api.submitReceipt = AnswerReceipt{Confirmed: true, Message: "已提交，dsh 已确认。"}
+	target := selectExecutorSession(t, executor, api, "s1")
+
+	executor.HandleMessage(context.Background(), executorIncoming("timed-con", "/con"))
+	reply := sink.lastReply()
+	if !strings.Contains(reply, "定时问题") || !strings.Contains(reply, "1. 选项 X") || !strings.Contains(reply, "/answer") {
+		t.Fatalf("/con 未展示定时 waterfall 问题：%q", reply)
+	}
+	if strings.Contains(reply, "持续问题") {
+		t.Fatalf("/con 应选择决策顺序中的第一个 supported 决策：%q", reply)
+	}
+
+	content, err := executor.ReadTerminalSnapshot(context.Background(), target.PaneID, target.OccupantKey, im.OutputModeText, panel.PageSize)
+	if err != nil {
+		t.Fatalf("ReadTerminalSnapshot() 返回错误：%v", err)
+	}
+	if !strings.Contains(content.Text, "定时问题") || strings.Contains(content.Text, "持续问题") {
+		t.Fatalf("ReadTerminalSnapshot() 未按同一规则展示定时问题：%q", content.Text)
+	}
+
+	executor.HandleMessage(context.Background(), executorIncoming("timed-answer", "/answer 2"))
+	if len(api.submitCalls) != 1 {
+		t.Fatalf("定时 waterfall 问题应可回答，got %#v", api.submitCalls)
+	}
+	call := api.submitCalls[0]
+	// event: 前缀由 Client.SubmitAnswer 路由到 $events/result；call: 前缀才走
+	// userQuestions/answer（见 answers_test.go 的端点测试）。
+	if call.decision.NativeID != "event:timed-1" || call.decision.Kind != decisionKindForm {
+		t.Fatalf("提交决策 = %#v, want event:timed-1 form", call.decision)
+	}
+	value, ok := call.value.(answerValue)
+	if !ok || len(value.Answers) != 1 || len(value.Answers[0].Selected) != 1 || value.Answers[0].Selected[0] != "Y" {
+		t.Fatalf("定时问题提交值错误：%#v", call.value)
+	}
+	if reply := sink.lastReply(); !strings.Contains(reply, "已提交") {
+		t.Fatalf("回复 = %q, want 提交回执", reply)
+	}
+}
+
 func TestExecutorAnswerRejectsStaleRevision(t *testing.T) {
 	executor, api, sink := newExecutorFixture(t, testValidHost())
 	api.sessions = []SessionSummary{{ID: "s1", Title: "任务", Available: true}}
