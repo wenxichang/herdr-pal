@@ -45,9 +45,11 @@ var (
 // Client 是单个 dsh 宿主的高层客户端，负责目录、正文和交互操作。
 //
 // 每个 Client 只绑定一个已认证的本机宿主；宿主重启后应丢弃并重新发现。
+// Mux 待答订阅需要由 Run 单独维持；目录、读取和发送不依赖 Mux。
 type Client struct {
 	host   Host
 	rpc    *rpcClient
+	mux    *Mux
 	logger *slog.Logger
 }
 
@@ -76,6 +78,7 @@ func NewClient(host Host, logger *slog.Logger) *Client {
 	return &Client{
 		host:   host,
 		rpc:    newRPCClient(host),
+		mux:    newMux(host, logger),
 		logger: logger,
 	}
 }
