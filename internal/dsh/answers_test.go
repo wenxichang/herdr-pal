@@ -65,6 +65,90 @@ func newAnswerClient(t *testing.T, value any, ok bool) (*Client, <-chan answerRP
 	return client, captured
 }
 
+// newContinuedAnswerClient 构造同时响应 session/projections 与 userQuestions/answer 的客户端。
+//
+// projection 是 session/projections 的返回值；answerValue/answerOK 控制
+// userQuestions/answer 的结果。所有调用按顺序写入返回的 channel。
+func newContinuedAnswerClient(t *testing.T, projection any, answerValue any, answerOK bool) (*Client, <-chan answerRPCCall) {
+	t.Helper()
+	captured := make(chan answerRPCCall, 4)
+	fixture := newRPCTestFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("读取请求体: %v", err)
+			http.Error(w, "read failed", http.StatusInternalServerError)
+			return
+		}
+		var request struct {
+			RPCID   string `json:"rpcId"`
+			Payload struct {
+				Args json.RawMessage `json:"args"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Errorf("解析请求帧: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		captured <- answerRPCCall{path: r.URL.Path, args: request.Payload.Args}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/session/projections":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":   "server-response",
+				"rpcId":  request.RPCID,
+				"result": map[string]any{"ok": true, "value": projection},
+			})
+		case !answerOK:
+			_, _ = fmt.Fprintf(w,
+				`{"type":"server-response","rpcId":%q,"result":{"ok":false,"error":{"code":"denied","message":"rejected"}}}`,
+				request.RPCID,
+			)
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":   "server-response",
+				"rpcId":  request.RPCID,
+				"result": map[string]any{"ok": true, "value": answerValue},
+			})
+		}
+	})
+	client := NewClient(fixture.client.host, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	client.rpc = fixture.client
+	return client, captured
+}
+
+// drainAnswerCalls 读取已经完成的全部 RPC 调用；RPC 同步返回，调用结束后 channel 已就绪。
+func drainAnswerCalls(captured <-chan answerRPCCall) []answerRPCCall {
+	var calls []answerRPCCall
+	for {
+		select {
+		case call := <-captured:
+			calls = append(calls, call)
+		default:
+			return calls
+		}
+	}
+}
+
+// continuedDecisionFixture 构造来自会话投影的持续问题决策及其原始投影。
+func continuedDecisionFixture(t *testing.T) (Decision, json.RawMessage) {
+	t.Helper()
+	projection := projectionsWithActive(t, continuedEntry("call-1", "continued", map[string]any{
+		"id":       "q1",
+		"question": "选择方案",
+		"options":  []map[string]any{{"label": "方案 A"}, {"label": "方案 B"}},
+	}))
+	decisions, err := decisionsFromProjections(decisionTestSession, projection, nil)
+	if err != nil {
+		t.Fatalf("构造持续问题决策: %v", err)
+	}
+	if len(decisions) != 1 {
+		t.Fatalf("持续问题决策数 = %d，期望 1", len(decisions))
+	}
+	return decisions[0], projection
+}
+
 // optionQuestion 构造带选项的问题。
 func optionQuestion(kind string, values ...string) Question {
 	options := make([]Option, 0, len(values))
@@ -262,7 +346,7 @@ func TestBuildAnswerValueForApprovalAndForm(t *testing.T) {
 }
 
 func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
-	t.Run("审批使用当前clientId并观察cancel", func(t *testing.T) {
+	t.Run("审批使用当前clientId并本地确认", func(t *testing.T) {
 		client, captured := newAnswerClient(t, map[string]any{}, true)
 		item := pendingWaterfall(t, "event-1", decisionTestSession, "approval/request",
 			approvalPayload("Bash", "tool-1", "原因"))
@@ -276,7 +360,6 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 		mux.clientID = "current-client"
 		mux.items[item.EventID] = item
 		mux.order = []string{item.EventID}
-		mux.canceled[item.EventID] = 1
 		client.mux = mux
 
 		receipt, err := client.SubmitAnswer(context.Background(), decision, "allowed-once")
@@ -285,6 +368,9 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 		}
 		if !receipt.Confirmed || receipt.Message == "" {
 			t.Errorf("审批回执 = %+v，期望已确认", receipt)
+		}
+		if snapshot := mux.Snapshot(); len(snapshot.Items) != 0 {
+			t.Errorf("本地确认后待答项应移除，实际 %+v", snapshot.Items)
 		}
 
 		call := <-captured
@@ -310,19 +396,27 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 		}
 	})
 
-	t.Run("审批未观察到cancel时返回未确认", func(t *testing.T) {
-		client, captured := newAnswerClient(t, map[string]any{}, true)
+	t.Run("本地无法确认时返回未确认", func(t *testing.T) {
 		item := pendingWaterfall(t, "event-1", decisionTestSession, "approval/request",
 			approvalPayload("Bash", "tool-1", "原因"))
 		decisions, err := decisionsFrom(decisionTestSession, PendingSnapshot{ClientID: "client-1", Items: []PendingItem{item}}, nil)
 		if err != nil {
 			t.Fatalf("构造审批决策: %v", err)
 		}
-		mux := newMux(client.host, nil)
+		var mux *Mux
+		fixture := newRPCTestFixture(t, func(w http.ResponseWriter, r *http.Request) {
+			// 模拟请求在途时 Mux 断线换代：旧 clientId 不能再确认。
+			mux.reset()
+			rpcID := readRPCID(t, r)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"type":"server-response","rpcId":%q,"result":{"ok":true,"value":{}}}`, rpcID)
+		})
+		client := NewClient(fixture.client.host, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		client.rpc = fixture.client
+		mux = newMux(client.host, nil)
 		mux.clientID = "client-1"
 		mux.items[item.EventID] = item
 		mux.order = []string{item.EventID}
-		mux.cancelWait = 10 * time.Millisecond
 		client.mux = mux
 
 		receipt, err := client.SubmitAnswer(context.Background(), decisions[0], "rejected")
@@ -330,10 +424,7 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 			t.Fatalf("提交审批: %v", err)
 		}
 		if receipt.Confirmed || receipt.Message == "" {
-			t.Errorf("未观察到 cancel 时应返回未确认: %+v", receipt)
-		}
-		if call := <-captured; call.path != "/api/$events/result" {
-			t.Errorf("请求路径 = %q", call.path)
+			t.Errorf("Mux 已换代时应返回未确认: %+v", receipt)
 		}
 	})
 
@@ -376,10 +467,10 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 		}
 	})
 
-	t.Run("持续问题提交到userQuestions", func(t *testing.T) {
-		client, captured := newAnswerClient(t, true, true)
-		decision := Decision{NativeID: "call:call-1", SessionID: decisionTestSession, Kind: "form", Supported: true}
-		value := map[string]any{"answers": []any{map[string]any{"id": "q1", "selected": []string{"A"}}}}
+	t.Run("持续问题复核投影后提交到userQuestions", func(t *testing.T) {
+		decision, projection := continuedDecisionFixture(t)
+		client, captured := newContinuedAnswerClient(t, projection, true, true)
+		value := map[string]any{"answers": []any{map[string]any{"id": "q1", "selected": []string{"方案 A"}}}}
 
 		receipt, err := client.SubmitAnswer(context.Background(), decision, value)
 		if err != nil {
@@ -388,7 +479,14 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 		if !receipt.Confirmed || receipt.Message == "" {
 			t.Errorf("持续问题回执 = %+v", receipt)
 		}
-		call := <-captured
+		calls := drainAnswerCalls(captured)
+		if len(calls) != 2 {
+			t.Fatalf("RPC 调用数 = %d，期望先复核投影再提交回答: %+v", len(calls), calls)
+		}
+		if calls[0].path != "/api/session/projections" {
+			t.Errorf("第一个请求路径 = %q，期望 /api/session/projections", calls[0].path)
+		}
+		call := calls[1]
 		if call.path != "/api/userQuestions/answer" {
 			t.Errorf("请求路径 = %q，期望 /api/userQuestions/answer", call.path)
 		}
@@ -408,8 +506,8 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 	})
 
 	t.Run("持续问题未被接受时返回未确认", func(t *testing.T) {
-		client, _ := newAnswerClient(t, false, true)
-		decision := Decision{NativeID: "call:call-1", SessionID: decisionTestSession, Kind: "form", Supported: true}
+		decision, projection := continuedDecisionFixture(t)
+		client, _ := newContinuedAnswerClient(t, projection, false, true)
 		receipt, err := client.SubmitAnswer(context.Background(), decision, map[string]any{"answers": []any{}})
 		if err != nil {
 			t.Fatalf("提交持续问题: %v", err)
@@ -420,8 +518,8 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 	})
 
 	t.Run("持续问题RPC失败返回错误", func(t *testing.T) {
-		client, _ := newAnswerClient(t, nil, false)
-		decision := Decision{NativeID: "call:call-1", SessionID: decisionTestSession, Kind: "form", Supported: true}
+		decision, projection := continuedDecisionFixture(t)
+		client, _ := newContinuedAnswerClient(t, projection, nil, false)
 		receipt, err := client.SubmitAnswer(context.Background(), decision, map[string]any{"answers": []any{}})
 		if err == nil {
 			t.Fatal("RPC 失败应返回错误")
@@ -443,4 +541,95 @@ func TestSubmitAnswerUsesEventOrCallEndpoint(t *testing.T) {
 		default:
 		}
 	})
+}
+
+func TestSubmitAnswerConfirmsLocallyAfterAcceptedEvent(t *testing.T) {
+	client, captured := newAnswerClient(t, map[string]any{}, true)
+	item := pendingWaterfall(t, "event-1", decisionTestSession, "approval/request",
+		approvalPayload("Bash", "tool-1", "原因"))
+	decisions, err := decisionsFrom(decisionTestSession, PendingSnapshot{ClientID: "client-1", Items: []PendingItem{item}}, nil)
+	if err != nil {
+		t.Fatalf("构造审批决策: %v", err)
+	}
+	mux := newMux(client.host, nil)
+	mux.clientID = "client-1"
+	mux.items[item.EventID] = item
+	mux.order = []string{item.EventID}
+	// 服务器不会发送 cancel；把等待上限设大以证明提交路径不依赖它。
+	mux.cancelWait = 2 * time.Second
+	client.mux = mux
+
+	started := time.Now()
+	receipt, err := client.SubmitAnswer(context.Background(), decisions[0], "allowed-once")
+	if err != nil {
+		t.Fatalf("提交审批: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("提交路径不应等待服务器 cancel，实际耗时 %v", elapsed)
+	}
+	if !receipt.Confirmed || receipt.Message == "" {
+		t.Errorf("事件提交成功后应本地确认，回执 = %+v", receipt)
+	}
+	if snapshot := mux.Snapshot(); len(snapshot.Items) != 0 {
+		t.Errorf("本地确认后待答项应移除，实际 %+v", snapshot.Items)
+	}
+	if !mux.WaitCancel(context.Background(), "event-1") {
+		t.Fatal("本地确认后 WaitCancel 应立即返回 true")
+	}
+	select {
+	case call := <-captured:
+		if call.path != "/api/$events/result" {
+			t.Errorf("请求路径 = %q，期望 /api/$events/result", call.path)
+		}
+	case <-time.After(muxTestTimeout):
+		t.Fatal("未收到事件回答请求")
+	}
+}
+
+func TestSubmitAnswerRejectsStaleContinuedQuestion(t *testing.T) {
+	decision, _ := continuedDecisionFixture(t)
+	value := map[string]any{"answers": []any{map[string]any{"id": "q1", "selected": []string{"方案 A"}}}}
+	originalQuestion := map[string]any{
+		"id":       "q1",
+		"question": "选择方案",
+		"options":  []map[string]any{{"label": "方案 A"}, {"label": "方案 B"}},
+	}
+
+	cases := []struct {
+		name       string
+		projection json.RawMessage
+	}{
+		{
+			name: "revision变化",
+			projection: projectionsWithActive(t, continuedEntry("call-1", "continued", map[string]any{
+				"id":       "q1",
+				"question": "修改后的问题",
+				"options":  []map[string]any{{"label": "方案 A"}, {"label": "方案 B"}},
+			})),
+		},
+		{
+			name:       "状态非continued",
+			projection: projectionsWithActive(t, continuedEntry("call-1", "open", originalQuestion)),
+		},
+		{
+			name:       "问题已结束",
+			projection: projectionsWithActive(t),
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, captured := newContinuedAnswerClient(t, testCase.projection, true, true)
+			receipt, err := client.SubmitAnswer(context.Background(), decision, value)
+			if !errors.Is(err, errDecisionStale) {
+				t.Fatalf("错误 = %v，期望 errDecisionStale", err)
+			}
+			if receipt.Confirmed || receipt.Message == "" {
+				t.Errorf("过期持续问题回执 = %+v，期望未确认提示", receipt)
+			}
+			calls := drainAnswerCalls(captured)
+			if len(calls) != 1 || calls[0].path != "/api/session/projections" {
+				t.Fatalf("过期问题不应调用 userQuestions/answer，实际调用 %+v", calls)
+			}
+		})
+	}
 }

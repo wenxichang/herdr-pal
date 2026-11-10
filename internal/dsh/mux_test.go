@@ -621,6 +621,106 @@ func TestMuxWaitCancel(t *testing.T) {
 	run.stillRunning(t)
 }
 
+func TestConfirmSubmittedRemovesPendingAndConfirms(t *testing.T) {
+	fake := newMuxTestHost(t, func(conn *websocket.Conn, stop <-chan struct{}) {
+		if err := readMuxOpen(conn); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := writeMuxFrame(conn, muxReady("client-one")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := writeMuxFrame(conn, muxWaterfall("event-1", "agent-1", map[string]any{"kind": "approval"})); err != nil {
+			t.Error(err)
+			return
+		}
+		<-stop
+	})
+	mux := newTestMux(t, fake)
+	// 本地确认不应等待服务器 cancel；把等待上限设大以暴露错误实现。
+	mux.cancelWait = 2 * time.Second
+	run := startTestMux(t, mux)
+
+	waitForMux(t, "待答项入表", func() bool {
+		snapshot := mux.Snapshot()
+		return snapshot.ClientID == "client-one" && len(snapshot.Items) == 1
+	})
+
+	started := time.Now()
+	if !mux.ConfirmSubmitted("client-one", "event-1") {
+		t.Fatal("当前身份与待答事件应确认成功")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("ConfirmSubmitted 不应等待服务器 cancel，实际耗时 %v", elapsed)
+	}
+	if snapshot := mux.Snapshot(); len(snapshot.Items) != 0 {
+		t.Errorf("确认后待答表应移除 event-1，实际 %+v", snapshot.Items)
+	}
+	if !mux.WaitCancel(context.Background(), "event-1") {
+		t.Fatal("本地确认后 WaitCancel 应立即返回 true")
+	}
+	if mux.ConfirmSubmitted("client-one", "event-1") {
+		t.Fatal("重复确认同一事件应返回 false")
+	}
+	run.stillRunning(t)
+}
+
+func TestConfirmSubmittedRejectsStaleClientOrEvent(t *testing.T) {
+	fake := newMuxTestHost(t, func(conn *websocket.Conn, stop <-chan struct{}) {
+		if err := readMuxOpen(conn); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := writeMuxFrame(conn, muxReady("client-one")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := writeMuxFrame(conn, muxWaterfall("event-1", "agent-1", map[string]any{"kind": "approval"})); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := writeMuxFrame(conn, muxWaterfall("event-2", "agent-2", map[string]any{"kind": "question"})); err != nil {
+			t.Error(err)
+			return
+		}
+		<-stop
+	})
+	mux := newTestMux(t, fake)
+	mux.cancelWait = 10 * time.Millisecond
+	run := startTestMux(t, mux)
+
+	waitForMux(t, "两条待答项", func() bool { return len(mux.Snapshot().Items) == 2 })
+
+	if mux.ConfirmSubmitted("stale-client", "event-1") {
+		t.Fatal("旧 clientId 不应确认成功")
+	}
+	if snapshot := mux.Snapshot(); len(snapshot.Items) != 2 {
+		t.Fatalf("旧 clientId 失败后待答表不应变化，实际 %+v", snapshot.Items)
+	}
+	if mux.ConfirmSubmitted("client-one", "unknown-event") {
+		t.Fatal("未知 eventId 不应确认成功")
+	}
+	if snapshot := mux.Snapshot(); len(snapshot.Items) != 2 {
+		t.Fatalf("未知 eventId 失败后待答表不应变化，实际 %+v", snapshot.Items)
+	}
+	if mux.WaitCancel(context.Background(), "event-1") {
+		t.Fatal("失败的确认不应记录 cancel 事实")
+	}
+
+	if !mux.ConfirmSubmitted("client-one", "event-1") {
+		t.Fatal("失败尝试后当前事件仍应可确认")
+	}
+	snapshot := mux.Snapshot()
+	if len(snapshot.Items) != 1 || snapshot.Items[0].EventID != "event-2" {
+		t.Fatalf("确认后仅应保留 event-2，实际 %+v", snapshot.Items)
+	}
+	if !mux.ConfirmSubmitted("client-one", "event-2") {
+		t.Fatal("剩余事件应可确认")
+	}
+	run.stillRunning(t)
+}
+
 func TestSubmitEventAnswerUsesCorrelatedRPC(t *testing.T) {
 	type captured struct {
 		method string

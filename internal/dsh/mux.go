@@ -33,7 +33,7 @@ const (
 	muxBackoffInitial = time.Second
 	// muxBackoffMax 是重连延迟上限。
 	muxBackoffMax = 30 * time.Second
-	// muxCancelWaitDefault 是提交答案后等待 cancel 的默认上限。
+	// muxCancelWaitDefault 是 WaitCancel 的默认等待上限。
 	muxCancelWaitDefault = 2 * time.Second
 	// muxIdentifierMaxBytes 限制 clientId/eventId/agentId 长度。
 	muxIdentifierMaxBytes = 512
@@ -392,16 +392,7 @@ func (m *Mux) handleCancel(raw json.RawMessage) error {
 	}
 
 	m.mu.Lock()
-	if item, ok := m.items[value.EventID]; ok {
-		delete(m.items, value.EventID)
-		m.totalBytes -= len(item.Raw)
-		for index, id := range m.order {
-			if id == value.EventID {
-				m.order = append(m.order[:index], m.order[index+1:]...)
-				break
-			}
-		}
-	}
+	m.removePendingLocked(value.EventID)
 	m.recordCanceledLocked(value.EventID)
 	signal := m.replaceCancelSignalLocked()
 	m.mu.Unlock()
@@ -409,7 +400,50 @@ func (m *Mux) handleCancel(raw json.RawMessage) error {
 	return nil
 }
 
-// recordCanceledLocked 记录最近取消的 eventId，供提交答案后的竞态确认。
+// ConfirmSubmitted 在 $events/result 提交成功后本地注销待答事件。
+//
+// dsh 不会向成功提交的客户端发送原生 cancel，因此必须由本地确认：只有 clientID 仍是
+// 当前 Mux 身份且 eventID 仍在待答表中时，才移除事件、记录取消事实并唤醒等待者。
+// 身份已换代或事件已不在时返回 false，且不改变待答表。
+func (m *Mux) ConfirmSubmitted(clientID, eventID string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	if m.clientID == "" || m.clientID != clientID {
+		m.mu.Unlock()
+		return false
+	}
+	item, ok := m.removePendingLocked(eventID)
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	m.recordCanceledLocked(item.EventID)
+	signal := m.replaceCancelSignalLocked()
+	m.mu.Unlock()
+	close(signal)
+	return true
+}
+
+// removePendingLocked 从待答表移除事件并维护顺序与大小预算；调用方必须持有 m.mu。
+func (m *Mux) removePendingLocked(eventID string) (PendingItem, bool) {
+	item, ok := m.items[eventID]
+	if !ok {
+		return PendingItem{}, false
+	}
+	delete(m.items, eventID)
+	m.totalBytes -= len(item.Raw)
+	for index, id := range m.order {
+		if id == eventID {
+			m.order = append(m.order[:index], m.order[index+1:]...)
+			break
+		}
+	}
+	return item, true
+}
+
+// recordCanceledLocked 记录最近取消或本地确认的 eventId，供提交答案后的竞态确认。
 func (m *Mux) recordCanceledLocked(eventID string) {
 	m.cancelSeq++
 	m.canceled[eventID] = m.cancelSeq
@@ -467,9 +501,9 @@ func (m *Mux) Snapshot() PendingSnapshot {
 	return PendingSnapshot{ClientID: m.clientID, Items: items}
 }
 
-// WaitCancel 等待 eventID 在等待上限内被 dsh 取消。
+// WaitCancel 等待 eventID 在等待上限内被取消或本地确认。
 //
-// 已记录过的 cancel 立即返回 true；事件从未出现且未取消时立即返回 false；
+// 已记录过的 cancel/确认立即返回 true；事件从未出现且未取消时立即返回 false；
 // 事件仍在待答表中时最多等待 cancelWait 或 ctx 结束。
 func (m *Mux) WaitCancel(ctx context.Context, eventID string) bool {
 	if m == nil {

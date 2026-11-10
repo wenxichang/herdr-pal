@@ -40,7 +40,7 @@ type Answer struct {
 
 // AnswerReceipt 是提交回答后的确认结果。
 //
-// Confirmed=false 不代表请求一定失败：Mux 未在等待窗口内观察到 cancel，
+// Confirmed=false 不代表请求一定失败：Mux 已换代导致本地无法注销待答事件，
 // 或 dsh 返回未接受时，需要用户核对原生界面。
 type AnswerReceipt struct {
 	// Confirmed 表示是否观察到 dsh 确认。
@@ -246,9 +246,10 @@ func validateQuestionAnswer(question Question, answer Answer) error {
 // SubmitAnswer 提交一次完整回答，不自动重试。
 //
 // waterfall 审批/问题（NativeID 为 event:<id>）先重新读取 Mux 待答表，确认事件仍存在、
-// 属于同一会话且 revision 未变化，再用当前 clientId 调用 $events/result，并在最多
-// 2 秒内等待 cancel 以给出 Confirmed。持续问题（call:<id>）调用 userQuestions/answer，
-// 只有 dsh 返回 true 才视为已进入原生队列。
+// 属于同一会话且 revision 未变化，再用当前 clientId 调用 $events/result；成功后由本地
+// Mux 注销待答事件并给出 Confirmed，不依赖 dsh 发送取消。持续问题（call:<id>）先重新
+// 读取 session/projections，确认同一 callId 仍可回答且 revision 未变化，再调用
+// userQuestions/answer；只有 dsh 返回 true 才视为已进入原生队列。
 func (c *Client) SubmitAnswer(ctx context.Context, decision Decision, value any) (AnswerReceipt, error) {
 	if c == nil {
 		return answerFailure("dsh 客户端不可用。"), errors.New("dsh 客户端不可用")
@@ -317,10 +318,11 @@ func (c *Client) submitEventDecision(ctx context.Context, decision Decision, eve
 	if err := c.SubmitEventAnswer(ctx, snapshot.ClientID, eventID, value); err != nil {
 		return answerFailure("提交 dsh 审批失败；请核对 dsh 原生界面。"), err
 	}
-	if c.mux != nil && c.mux.WaitCancel(ctx, eventID) {
+	// dsh 不会向成功提交的客户端发送原生 cancel；必须由本地注销待答事件。
+	if c.mux != nil && c.mux.ConfirmSubmitted(snapshot.ClientID, eventID) {
 		return AnswerReceipt{Confirmed: true, Message: "已提交，dsh 已确认。"}, nil
 	}
-	return answerFailure("已提交，但未观察到 dsh 确认；请核对 dsh 原生界面。"), nil
+	return answerFailure("已提交，但本地无法确认；请核对 dsh 原生界面。"), nil
 }
 
 // submitContinuedDecision 处理投影中持续问题的回答。
@@ -331,6 +333,12 @@ func (c *Client) submitContinuedDecision(ctx context.Context, decision Decision,
 	}
 	if value == nil {
 		return answerFailure("回答内容为空；请刷新后重试。"), fmt.Errorf("%w: 回答内容为空", errAnswerInvalid)
+	}
+	if err := c.verifyContinuedDecision(ctx, decision, callID); err != nil {
+		if errors.Is(err, errDecisionStale) {
+			return answerFailure("该问题已变化或结束；请重新 /con 后重试。"), err
+		}
+		return answerFailure("dsh 问题状态暂不可用；请稍后重试。"), err
 	}
 	raw, err := c.rpc.call(ctx, "userQuestions/answer", map[string]any{
 		"agentId": decision.SessionID,
@@ -349,6 +357,38 @@ func (c *Client) submitContinuedDecision(ctx context.Context, decision Decision,
 		return AnswerReceipt{Confirmed: true, Message: "已回答，dsh 已接收。"}, nil
 	}
 	return answerFailure("dsh 未接受该回答；请核对 dsh 原生界面。"), nil
+}
+
+// verifyContinuedDecision 在提交持续问题前重新读取会话投影。
+//
+// callId 可跨轮次复用，只按 callId 回答可能命中已修订或已结束的问题；必须确认同一
+// callId 仍处于 continued（Supported）且 revision 与用户看到的一致，否则不提交。
+// 读取或解析失败返回普通错误，状态不匹配返回 errDecisionStale。
+func (c *Client) verifyContinuedDecision(ctx context.Context, decision Decision, callID string) error {
+	raw, err := c.rpc.call(ctx, "session/projections", projectionsArgs{
+		Request: projectionsRequest{SessionID: decision.SessionID},
+	})
+	if err != nil {
+		return fmt.Errorf("复核 dsh 持续问题失败: %w", err)
+	}
+	decisions, err := decisionsFromProjections(decision.SessionID, raw, nil)
+	if err != nil {
+		return fmt.Errorf("复核 dsh 持续问题失败: %w", err)
+	}
+	nativeID := "call:" + callID
+	for _, candidate := range decisions {
+		if candidate.NativeID != nativeID {
+			continue
+		}
+		if !candidate.Supported {
+			return fmt.Errorf("%w: callId %q 当前状态不接受远程回答", errDecisionStale, callID)
+		}
+		if candidate.Revision != decision.Revision {
+			return fmt.Errorf("%w: callId %q 的 revision 已变化", errDecisionStale, callID)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: callId %q 已不在持续问题列表中", errDecisionStale, callID)
 }
 
 // pendingItem 在当前待答快照中查找指定事件。
