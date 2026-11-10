@@ -26,11 +26,14 @@
 `/mode img` 当前会话使用终端图片，保留颜色和选中样式
 `/mode txt` 当前会话使用纯文本
 `/slash clear` 向 Agent 发送 `/clear`
+`/answer 1,2,3 文本` 回答 dsh 审批或问题（仅 dsh）
+`/new-session 标题 /绝对目录` 新建 dsh 会话并自动切换（仅 dsh）
 普通文字直接发送给当前 Agent
 `/help` 显示本帮助
 
 OpenCode 默认使用图片模式，其他 Agent 默认使用文本模式；模式只在 Server 本次运行期间保存。
 定向前缀不能用于 `/ls`、`/help`、`/reg`、管理员审批命令或另一个 `/N`。
+`/answer` 和 `/new-session` 仅对 DeepSeek Harness（dsh）可用；新建会话的目录必须已存在，不会自动创建。
 
 【按键操作】
 `/key up`、`/key down` 发送方向键
