@@ -752,12 +752,15 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 
 // resolveDSHAnchor 选择 /new-session 的锚点目标。
 //
-// 选中 dsh 目标时优先使用同机器的宿主入口，否则使用同机器第一个 dsh 会话；
+// 选中 dsh 目标时优先使用同机器的宿主入口；没有宿主入口时使用选中的 dsh 会话本身，
+// 只有选中目标已从目录消失时才退回同机器第一个 dsh 会话。这样新建会话始终落在
+// 用户当前所选会话的宿主上。
 // 没有可用选中时，只接受唯一宿主入口或唯一机器上的 dsh 会话，避免在多个宿主间猜测。
 func (router *ConversationRouter) resolveDSHAnchor(userID string, selected CatalogEntry, hasSelection bool) (CatalogEntry, error) {
 	entries := router.catalog.CreateNumberedSnapshot(userID)
 	if hasSelection && isDSHCatalogEntry(selected) {
 		var firstSession *CatalogEntry
+		selectedPresent := false
 		for index := range entries {
 			entry := entries[index]
 			if entry.Ref.MachineID != selected.Ref.MachineID || !isDSHCatalogEntry(entry) {
@@ -766,9 +769,15 @@ func (router *ConversationRouter) resolveDSHAnchor(userID string, selected Catal
 			if isDSHHostCatalogEntry(entry) {
 				return entry, nil
 			}
+			if sameSessionRef(entry.Ref, selected.Ref) {
+				selectedPresent = true
+			}
 			if firstSession == nil {
 				firstSession = &entries[index]
 			}
+		}
+		if selectedPresent {
+			return selected, nil
 		}
 		if firstSession != nil {
 			return *firstSession, nil
@@ -843,7 +852,7 @@ func (router *ConversationRouter) handleNewSession(ctx context.Context, message 
 	if result.CreatedTarget == nil {
 		cancel()
 		router.logger.Info("dsh 新建会话未返回目标", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "new_session", "anchor", safeLogValue(anchor.Ref.SlotID))
-		router.reply(ctx, message, "新建命令已执行，但未收到新会话目标；请执行 /ls 后用 /N 选择新会话。")
+		router.reply(ctx, message, newSessionReply(action.content, result.StructuredContent, false))
 		return
 	}
 	created := *result.CreatedTarget
@@ -855,7 +864,25 @@ func (router *ConversationRouter) handleNewSession(ctx context.Context, message 
 	}
 	cancel()
 	router.logInteractionSuccess(message, "new_session", created)
-	router.reply(ctx, message, fmt.Sprintf("命令：%s\n已切换到新会话。", strings.TrimSpace(action.content)))
+	router.reply(ctx, message, newSessionReply(action.content, result.StructuredContent, true))
+}
+
+// newSessionReply 组合 dsh 返回的创建结果与切换提示。
+//
+// dsh 执行器把标题、目录、重命名失败和创建失败原因都放在文本结果里，必须优先展示；
+// Pal 没有返回文本时才用原始命令作为回退正文。
+func newSessionReply(command string, content *hprp.Content, created bool) string {
+	body := ""
+	if content != nil && content.Type == hprp.ContentTypeText {
+		body = strings.TrimSpace(content.Text)
+	}
+	if body == "" {
+		body = "命令：" + strings.TrimSpace(command)
+	}
+	if created {
+		return body + "\n已切换到新会话。"
+	}
+	return body + "\n请执行 /ls 后用 /N 选择新会话。"
 }
 
 func (router *ConversationRouter) handleDirectedExecute(ctx context.Context, message im.IncomingText, action serverAction) {

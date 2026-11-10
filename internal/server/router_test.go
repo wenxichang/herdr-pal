@@ -1932,7 +1932,7 @@ func TestNewSessionUsesSelectedDSHSessionHost(t *testing.T) {
 		}); err != nil {
 			return RelayExecution{}, err
 		}
-		content := hprp.Content{Type: hprp.ContentTypeText, Text: "已创建"}
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "已在 /tmp 新建 dsh 会话「新会话」。\n标题设置失败，当前标题可能为会话 ID。"}
 		return RelayExecution{StructuredContent: &content, CreatedTarget: &created}, nil
 	}
 
@@ -1946,7 +1946,8 @@ func TestNewSessionUsesSelectedDSHSessionHost(t *testing.T) {
 	if calls[0].message.Content != command {
 		t.Fatalf("executed content = %q, want %q", calls[0].message.Content, command)
 	}
-	if reply := gateway.LastReply(); !strings.Contains(reply, command) || !strings.Contains(reply, "已切换到新会话") {
+	if reply := gateway.LastReply(); !strings.Contains(reply, "已在 /tmp 新建 dsh 会话「新会话」。") ||
+		!strings.Contains(reply, "标题设置失败") || !strings.Contains(reply, "已切换到新会话") {
 		t.Fatalf("reply = %q", reply)
 	}
 	selected, err := router.catalog.Selected("user-a")
@@ -2057,6 +2058,56 @@ func TestNewSessionWithoutDSHReportsUnavailable(t *testing.T) {
 	}
 	if reply := gateway.LastReply(); !strings.Contains(reply, "没有在线的 dsh 宿主") {
 		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestNewSessionSurfacesPalFailureReason(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	session := dshTestSession(1, "dsh:session-1", "session:1", "web", "现有会话")
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{session},
+	})
+	relay.execute = func(_ context.Context, _ string, _ hprp.Target, _ im.IncomingText) (RelayExecution, error) {
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "目录不存在或不是目录，请提供已存在的目录。"}
+		return RelayExecution{StructuredContent: &content}, nil
+	}
+
+	router.Handle(context.Background(), routerMessage("request-bad-dir", "message-bad-dir", "user-a", "/new-session 新会话 /missing"))
+
+	reply := gateway.LastReply()
+	if !strings.Contains(reply, "目录不存在或不是目录") {
+		t.Fatalf("reply = %q, want Pal failure reason", reply)
+	}
+	if !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/N") {
+		t.Fatalf("reply = %q, want /ls and /N hint", reply)
+	}
+	if strings.Contains(reply, "已切换到新会话") {
+		t.Fatalf("reply = %q, must not claim a switch without created target", reply)
+	}
+	selected, err := router.catalog.Selected("user-a")
+	if err != nil || !sameSessionRef(selected.Ref, hprp.Target{MachineID: "home-mac", SlotID: "dsh:session-1", SessionID: "session:1"}) {
+		t.Fatalf("Selected() = %#v, %v, want existing session", selected, err)
+	}
+}
+
+func TestNewSessionPrefersSelectedDSHSessionOverFirstSession(t *testing.T) {
+	router, _, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			dshTestSession(1, "dsh:session-1", "session:1", "web", "第一个会话"),
+			dshTestSession(2, "dsh:session-2", "session:2", "web", "选中的会话"),
+		},
+	})
+	entries := router.catalog.CreateNumberedSnapshot("user-a")
+	if err := router.catalog.SetSelection("user-a", entries[1].Ref); err != nil {
+		t.Fatal(err)
+	}
+
+	router.Handle(context.Background(), routerMessage("request-selected", "message-selected", "user-a", "/new-session 新会话"))
+
+	calls := relay.Calls()
+	if len(calls) != 1 || !sameSessionRef(calls[0].target, entries[1].Ref) {
+		t.Fatalf("relay calls = %#v, want execute on selected session %#v", calls, entries[1].Ref)
 	}
 }
 
