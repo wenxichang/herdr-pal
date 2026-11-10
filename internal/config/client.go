@@ -3,12 +3,14 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/credential"
-	"github.com/wenxichang/herdr-pal/internal/dsh"
+	"github.com/wenxichang/herdr-pal/internal/dshlegacy"
 )
 
 // ClientConfig 是 herdr-pal 网络模式的完整配置。
@@ -16,13 +18,34 @@ type ClientConfig struct {
 	Relay RelayConfig `json:"relay"`
 	Herdr HerdrConfig `json:"herdr"`
 	Log   LogConfig   `json:"log"`
-	DSH   DSHConfig   `json:"dsh,omitempty"`
+	DSH   *DSHConfig  `json:"dsh,omitempty"`
 }
 
-// DSHConfig 是可选的本机 dsh 插件地址与认证信息。
+// DSHConfig 是本机 dsh 后端配置；出现该节点即启用 dsh 后端。
 type DSHConfig struct {
-	URL   string `json:"url"`
-	Token string `json:"token"`
+	URL     string `json:"url,omitempty"`
+	Home    string `json:"home,omitempty"`
+	Variant string `json:"variant,omitempty"`
+	// Token 仅为旧 Node 插件路径过渡保留，原生模式不再需要。
+	Token string `json:"token,omitempty"`
+}
+
+// UnmarshalJSON 严格读取 dsh 原生字段，并暂时接受旧插件 token。
+func (config *DSHConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		URL     string `json:"url"`
+		Home    string `json:"home"`
+		Variant string `json:"variant"`
+		Token   string `json:"token"`
+	}
+	if err := decodeStrict(bytes.NewReader(data), &raw); err != nil {
+		return err
+	}
+	config.URL = raw.URL
+	config.Home = raw.Home
+	config.Variant = raw.Variant
+	config.Token = raw.Token
+	return nil
 }
 
 // RelayConfig 是客户端连接中央 Relay Server 的配置。
@@ -58,18 +81,44 @@ func (config RelayConfig) MarshalJSON() ([]byte, error) {
 	}{config.URL, config.Key, config.SkipVerify})
 }
 
+// validateDSHConfig 校验原生 dsh 后端配置；旧插件 token 由 LoadClient 按需校验。
+func validateDSHConfig(cfg DSHConfig) error {
+	if cfg.URL != "" {
+		endpoint, err := url.Parse(cfg.URL)
+		if err != nil || endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" || endpoint.Port() == "" ||
+			endpoint.User != nil || endpoint.Path != "" || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+			return errors.New("dsh.url 必须是 http://127.0.0.1:端口，不能包含路径或凭据")
+		}
+	}
+	if cfg.Home != "" && !filepath.IsAbs(cfg.Home) {
+		return errors.New("dsh.home 必须是绝对路径")
+	}
+	switch cfg.Variant {
+	case "", "auto", "web", "desktop":
+	default:
+		return errors.New("dsh.variant 只能是 auto、web 或 desktop")
+	}
+	return nil
+}
+
 // LoadClient 加载并校验 herdr-pal HPRP 网络模式配置。
 func LoadClient(path string) (ClientConfig, error) {
 	loaded, err := decodeFile[ClientConfig](path)
 	if err != nil {
 		return ClientConfig{}, err
 	}
-	if loaded.DSH.URL != "" || loaded.DSH.Token != "" {
-		if err := dsh.ValidateConfig(loaded.DSH.URL, loaded.DSH.Token); err != nil {
+	if loaded.DSH != nil {
+		if err := validateDSHConfig(*loaded.DSH); err != nil {
 			return ClientConfig{}, err
 		}
+		// 旧插件配置同时包含 url 与 token 时才按旧规则校验；仅 token 保持过渡兼容。
+		if loaded.DSH.Token != "" && loaded.DSH.URL != "" {
+			if err := dshlegacy.ValidateConfig(loaded.DSH.URL, loaded.DSH.Token); err != nil {
+				return ClientConfig{}, err
+			}
+		}
 	}
-	if loaded.Herdr.Disabled && loaded.DSH.URL == "" {
+	if loaded.Herdr.Disabled && loaded.DSH == nil {
 		return ClientConfig{}, fmt.Errorf("禁用 Herdr 时必须配置 dsh")
 	}
 	endpoint, err := url.Parse(strings.TrimSpace(loaded.Relay.URL))

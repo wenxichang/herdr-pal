@@ -1,4 +1,4 @@
-package dsh
+package dshlegacy
 
 import (
 	"context"

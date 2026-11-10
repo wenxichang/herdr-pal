@@ -1,5 +1,5 @@
-// Package dsh 将本机 dsh 插件的受限接口适配为 Pal 会话能力。
-package dsh
+// Package dshlegacy 保留旧 dsh Node 插件客户端，仅用于原生 API 迁移期间的过渡兼容。
+package dshlegacy
 
 import (
 	"bytes"

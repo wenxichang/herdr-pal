@@ -8,6 +8,11 @@
     "session": "",
     "socket_path": ""
   },
+  "dsh": {
+    "url": "",
+    "home": "",
+    "variant": "auto"
+  },
   "log": {
     "level": "info"
   }

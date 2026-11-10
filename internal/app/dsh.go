@@ -8,7 +8,7 @@ import (
 	"strconv"
 
 	"github.com/wenxichang/herdr-pal/internal/config"
-	"github.com/wenxichang/herdr-pal/internal/dsh"
+	"github.com/wenxichang/herdr-pal/internal/dshlegacy"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/relayclient"
@@ -16,6 +16,9 @@ import (
 )
 
 func runDSHRelay(ctx context.Context, loaded config.ClientConfig, logger *slog.Logger) (runErr error) {
+	if loaded.DSH == nil {
+		return newConfigError("缺少 dsh 配置")
+	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return err
@@ -34,7 +37,7 @@ func runDSHRelay(ctx context.Context, loaded config.ClientConfig, logger *slog.L
 	if err != nil {
 		return err
 	}
-	client, err := dsh.NewClient(loaded.DSH.URL, loaded.DSH.Token)
+	client, err := dshlegacy.NewClient(loaded.DSH.URL, loaded.DSH.Token)
 	if err != nil {
 		return err
 	}
@@ -42,7 +45,7 @@ func runDSHRelay(ctx context.Context, loaded config.ClientConfig, logger *slog.L
 	if err != nil {
 		return err
 	}
-	executor := dsh.NewExecutor(client, relay, guard)
+	executor := dshlegacy.NewExecutor(client, relay, guard)
 	if err := relay.SetExecutor(executor); err != nil {
 		return err
 	}

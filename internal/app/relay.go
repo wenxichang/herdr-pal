@@ -13,7 +13,7 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
-	"github.com/wenxichang/herdr-pal/internal/dsh"
+	"github.com/wenxichang/herdr-pal/internal/dshlegacy"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -139,12 +139,12 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	}
 	var executor relayclient.Executor = service
 	runSupervisor := supervisor.Run
-	if loaded.DSH.URL != "" {
-		client, err := dsh.NewClient(loaded.DSH.URL, loaded.DSH.Token)
+	if loaded.DSH != nil && loaded.DSH.URL != "" {
+		client, err := dshlegacy.NewClient(loaded.DSH.URL, loaded.DSH.Token)
 		if err != nil {
 			return err
 		}
-		dshExecutor := dsh.NewExecutor(client, relay, guard)
+		dshExecutor := dshlegacy.NewExecutor(client, relay, guard)
 		executor = relayclient.NewExecutorMux(service, dshExecutor)
 		runSupervisor = func(ctx context.Context) error { return runBackendPair(ctx, supervisor.Run, dshExecutor.Run) }
 	}
