@@ -42,3 +42,47 @@ func TestMuxRoutesByExactTarget(t *testing.T) {
 		t.Fatal("selection did not switch backend")
 	}
 }
+
+// createdTargetExecutor 在 fakeExecutor 基础上实现可选的 NewSession 目标领取。
+type createdTargetExecutor struct {
+	fakeExecutor
+	created session.Target
+	ok      bool
+}
+
+func (executor *createdTargetExecutor) TakeCreatedTarget() (session.Target, bool) {
+	target, ok := executor.created, executor.ok
+	executor.created, executor.ok = session.Target{}, false
+	return target, ok
+}
+
+func TestMuxTakeCreatedTargetDelegatesToSelectedBackend(t *testing.T) {
+	herdr := &fakeExecutor{targets: []session.Target{{PaneID: "herdr", OccupantKey: "h"}}}
+	dsh := &createdTargetExecutor{
+		fakeExecutor: fakeExecutor{targets: []session.Target{{PaneID: "dsh:one", OccupantKey: "d"}}},
+		created:      session.Target{PaneID: "dsh:created", OccupantKey: "c"},
+		ok:           true,
+	}
+	mux := NewExecutorMux(herdr, dsh)
+
+	if _, ok := mux.TakeCreatedTarget(); ok {
+		t.Fatal("未选择后端时不应返回 created target")
+	}
+	if err := mux.SelectTarget("dsh:one", "d"); err != nil {
+		t.Fatal(err)
+	}
+	target, ok := mux.TakeCreatedTarget()
+	if !ok || target.PaneID != "dsh:created" {
+		t.Fatalf("TakeCreatedTarget() = (%#v, %v), want dsh:created", target, ok)
+	}
+	if _, ok := mux.TakeCreatedTarget(); ok {
+		t.Fatal("created target 必须被领取后清除")
+	}
+
+	if err := mux.SelectTarget("herdr", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mux.TakeCreatedTarget(); ok {
+		t.Fatal("未实现可选接口的后端必须返回 false")
+	}
+}

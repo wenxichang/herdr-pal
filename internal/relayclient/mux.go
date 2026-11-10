@@ -85,3 +85,24 @@ func (m *ExecutorMux) ReadTerminalSnapshot(ctx context.Context, paneID, occupant
 	}
 	return b.ReadTerminalSnapshot(ctx, paneID, occupant, mode, maxLines)
 }
+
+// CreatedTargetProvider 是执行器的可选能力：/new-session 成功后领取新目标。
+type CreatedTargetProvider interface {
+	// TakeCreatedTarget 返回并清除最近一次创建的目标；没有时返回 false。
+	TakeCreatedTarget() (session.Target, bool)
+}
+
+// TakeCreatedTarget 委托当前选中后端领取新建会话目标。
+//
+// 只有实现 CreatedTargetProvider 的后端（dsh Backend）才返回目标；Herdr
+// 后端不实现该接口，因此固定返回 false。
+func (m *ExecutorMux) TakeCreatedTarget() (session.Target, bool) {
+	m.mu.RLock()
+	b := m.selected
+	m.mu.RUnlock()
+	provider, ok := b.(CreatedTargetProvider)
+	if !ok {
+		return session.Target{}, false
+	}
+	return provider.TakeCreatedTarget()
+}
