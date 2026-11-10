@@ -322,11 +322,23 @@ func (hub *ClientHub) Execute(ctx context.Context, userID string, target hprp.Ta
 	if result.ReplacementTarget != nil && (result.ReplacementTarget.MachineID != target.MachineID || result.ReplacementTarget.SlotID != target.SlotID) {
 		return RelayExecution{}, ErrTargetChanged
 	}
+	if result.CreatedTarget != nil {
+		if result.CreatedTarget.MachineID != target.MachineID {
+			return RelayExecution{}, ErrTargetChanged
+		}
+		if _, err := hub.catalog.ResolveTarget(userID, *result.CreatedTarget); err != nil {
+			return RelayExecution{}, err
+		}
+	}
 	if result.Outcome != hprp.OutcomeOK {
 		return RelayExecution{}, mapCommandFailure(result)
 	}
 	keepRoute = true
-	return RelayExecution{StructuredContent: result.Content, SelectedTarget: result.ReplacementTarget}, nil
+	return RelayExecution{
+		StructuredContent: result.Content,
+		SelectedTarget:    result.ReplacementTarget,
+		CreatedTarget:     result.CreatedTarget,
+	}, nil
 }
 
 func (hub *ClientHub) serveConnection(parent context.Context, socket *websocket.Conn, connectionID string, identity credential.Identity, key ClientKey, source netip.Addr) {
@@ -482,6 +494,16 @@ func (hub *ClientHub) readLoop(connection *clientConnection) {
 				}
 				if resultErr == nil {
 					resultErr = connection.replaceCommandTarget(envelope.ReplyTo, *result.ReplacementTarget)
+				}
+			}
+			if resultErr == nil && result.CreatedTarget != nil {
+				if result.CreatedTarget.MachineID != connection.key.MachineID {
+					resultErr = ErrTargetChanged
+				} else {
+					_, resultErr = hub.catalog.ResolveTarget(connection.key.UserID, *result.CreatedTarget)
+				}
+				if resultErr == nil {
+					resultErr = connection.replaceCreatedCommandTarget(envelope.ReplyTo, *result.CreatedTarget)
 				}
 			}
 			if resultErr != nil {

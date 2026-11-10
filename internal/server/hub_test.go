@@ -180,6 +180,50 @@ func TestHPRPHubRejectsReplacementTargetMissingFromConfirmedSnapshot(t *testing.
 	}
 }
 
+func TestHPRPHubRejectsCreatedTargetForAnotherMachineOrMissingSnapshot(t *testing.T) {
+	tests := []struct {
+		name    string
+		created hprp.Target
+	}{
+		{
+			name:    "another machine",
+			created: hprp.Target{MachineID: "office-pc", SlotID: "pane-2", SessionID: "session-2"},
+		},
+		{
+			name:    "missing from snapshot",
+			created: hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "session-2"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hub, server := startHPRPHubServer(t, HubConfig{}, discardHPRPLogger())
+			client := dialHPRPReady(t, server)
+			defer client.Close(websocket.StatusNormalClosure, "test complete")
+			target := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "session-1"}
+			done := make(chan error, 1)
+			go func() {
+				_, err := hub.Execute(context.Background(), "user-a", target, im.IncomingText{
+					MessageID: "message-invalid-created", Content: "/new-session",
+				})
+				done <- err
+			}()
+			command := readHPRPTestEnvelope(t, client)
+			created := test.created
+			writeHPRPTestEnvelope(t, client, hprp.TypeCommandResult, "result-invalid-created", command.ID, hprp.CommandResult{
+				Outcome: hprp.OutcomeOK, CreatedTarget: &created,
+			})
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("invalid created target was accepted")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Execute() did not reject invalid created target")
+			}
+		})
+	}
+}
+
 func TestHPRPHubRoutesCommandOutputAndNotification(t *testing.T) {
 	hub, server := startHPRPHubServer(t, HubConfig{}, discardHPRPLogger())
 	sink := &hprpOutboundRecorder{outputs: make(chan hprp.CommandOutput, 1), notifications: make(chan hprp.NotificationEvent, 1)}

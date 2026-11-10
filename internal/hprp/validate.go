@@ -159,6 +159,11 @@ func ValidateCommandResult(result CommandResult) error {
 			return err
 		}
 	}
+	if result.CreatedTarget != nil {
+		if err := ValidateTarget(*result.CreatedTarget); err != nil {
+			return err
+		}
+	}
 	return validateResultError(result.Outcome, result.Error)
 }
 

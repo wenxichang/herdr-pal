@@ -367,6 +367,44 @@ func (catalog *SessionCatalog) RebindSelection(ctx context.Context, userID strin
 	}
 }
 
+// RebindCreated 等待新建会话的目标出现在目录后，把它切换为当前选择。
+//
+// 与 RebindSelection 不同，新建目标允许位于不同 SlotID；expected 只用于确认
+// 新旧目标属于同一机器。目标必须先进入已确认快照才会被选中。
+func (catalog *SessionCatalog) RebindCreated(ctx context.Context, userID string, expected, created hprp.Target) error {
+	if catalog == nil || hprp.ValidateTarget(expected) != nil || hprp.ValidateTarget(created) != nil ||
+		expected.MachineID != created.MachineID {
+		return ErrTargetChanged
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		catalog.mu.Lock()
+		if _, online := catalog.machines[ClientKey{UserID: userID, MachineID: created.MachineID}]; !online {
+			catalog.mu.Unlock()
+			return ErrTargetChanged
+		}
+		if entry, exists := catalog.findEntryLocked(userID, created); exists {
+			routing := catalog.routing[userID]
+			selected := entry.Ref
+			routing.selected = &selected
+			routing.invalidated = nil
+			catalog.routing[userID] = routing
+			catalog.signalUpdateLocked()
+			catalog.mu.Unlock()
+			return nil
+		}
+		updates := catalog.updates
+		catalog.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-updates:
+		}
+	}
+}
+
 // Selected 返回仍存在且 occupant 未变化的当前选择；没有选择且仅有一个会话时自动选中它。
 func (catalog *SessionCatalog) Selected(userID string) (CatalogEntry, error) {
 	if catalog == nil {

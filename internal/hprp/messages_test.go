@@ -2,6 +2,7 @@ package hprp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -53,6 +54,30 @@ func TestFeatureMessagesKeepUserLevelObjectsOpaque(t *testing.T) {
 	decoded, err := DecodePayload[FeatureInvoke](envelope)
 	if err != nil || decoded.Feature != invoke.Feature || string(decoded.Target) != string(invoke.Target) {
 		t.Fatalf("DecodePayload() = %#v, %v", decoded, err)
+	}
+}
+
+func TestCommandResultRoundTripsCreatedTarget(t *testing.T) {
+	created := Target{MachineID: "home-mac", SlotID: "dsh-host:session-9", SessionID: "session:9"}
+	envelope, err := NewEnvelope(TypeCommandResult, "result-1", "command-1", false, CommandResult{
+		Outcome: OutcomeOK, CreatedTarget: &created,
+	})
+	if err != nil {
+		t.Fatalf("NewEnvelope() error = %v", err)
+	}
+	if !strings.Contains(string(envelope.Payload), `"created_target"`) {
+		t.Fatalf("payload = %s, want created_target", envelope.Payload)
+	}
+	decoded, err := DecodePayload[CommandResult](envelope)
+	if err != nil || decoded.CreatedTarget == nil || *decoded.CreatedTarget != created {
+		t.Fatalf("DecodePayload() = %#v, %v, want created target %#v", decoded, err, created)
+	}
+	withoutTarget, err := NewEnvelope(TypeCommandResult, "result-2", "command-2", false, CommandResult{Outcome: OutcomeOK})
+	if err != nil {
+		t.Fatalf("NewEnvelope() error = %v", err)
+	}
+	if strings.Contains(string(withoutTarget.Payload), "created_target") {
+		t.Fatalf("optional field was not omitted: %s", withoutTarget.Payload)
 	}
 }
 

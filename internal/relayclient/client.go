@@ -257,7 +257,18 @@ func (client *Client) respondContent(ctx context.Context, requestID string, cont
 		Outcome: hprp.OutcomeOK,
 		Content: &content,
 	}
-	if selected, err := client.selectedTarget(); err == nil && selected.MachineID == activeTarget.MachineID &&
+	// CreatedTarget 优先于同 slot 替换：/new-session 会在新 slot 创建目标。
+	// 必须先上报并确认新快照，Server 才能校验该目标存在。
+	if created, ok, err := client.takeCreatedTarget(ctx); err != nil {
+		return err
+	} else if ok {
+		result.CreatedTarget = &created
+		client.executionMu.Lock()
+		if client.activeRequestID == requestID && client.activeTarget == activeTarget {
+			client.activeTarget = created
+		}
+		client.executionMu.Unlock()
+	} else if selected, err := client.selectedTarget(); err == nil && selected.MachineID == activeTarget.MachineID &&
 		selected.SlotID == activeTarget.SlotID && selected.SessionID != activeTarget.SessionID {
 		if err := client.reportCurrentSnapshot(ctx); err != nil {
 			return err
@@ -781,7 +792,9 @@ func (client *Client) writeCachedCommand(current *clientSession, requestID strin
 		return
 	}
 	target := cached.target
-	if cached.result.ReplacementTarget != nil {
+	if cached.result.CreatedTarget != nil {
+		target = *cached.result.CreatedTarget
+	} else if cached.result.ReplacementTarget != nil {
 		target = *cached.result.ReplacementTarget
 	}
 	for index, output := range cached.outputs {
@@ -874,6 +887,30 @@ func (client *Client) localExecutor() Executor {
 	client.executorMu.RLock()
 	defer client.executorMu.RUnlock()
 	return client.executor
+}
+
+// takeCreatedTarget 领取执行器新建的目标，并确认新目标已经出现在上报快照中。
+func (client *Client) takeCreatedTarget(ctx context.Context) (hprp.Target, bool, error) {
+	provider, ok := client.localExecutor().(CreatedTargetProvider)
+	if !ok {
+		return hprp.Target{}, false, nil
+	}
+	created, ok := provider.TakeCreatedTarget()
+	if !ok {
+		return hprp.Target{}, false, nil
+	}
+	if err := client.reportCurrentSnapshot(ctx); err != nil {
+		return hprp.Target{}, false, err
+	}
+	current := client.currentSession()
+	if current == nil {
+		return hprp.Target{}, false, ErrUnavailable
+	}
+	target, err := client.resolveLocalTarget(current.machineID, created.PaneID, created.OccupantKey)
+	if err != nil {
+		return hprp.Target{}, false, err
+	}
+	return target, true, nil
 }
 
 func (client *Client) selectedTarget() (hprp.Target, error) {

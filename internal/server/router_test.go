@@ -1275,6 +1275,34 @@ func TestRouterCurrentExecutionRebindsReplacementReturnedByClient(t *testing.T) 
 	}
 }
 
+func TestRouterCreatedTargetTakesPriorityOverReplacementTarget(t *testing.T) {
+	router, gateway, relay := selectedRouterHarness(t)
+	replacement := hprp.Target{MachineID: "home-mac", SlotID: "pane-1", SessionID: "occ-new"}
+	created := hprp.Target{MachineID: "home-mac", SlotID: "pane-2", SessionID: "occ-created"}
+	relay.execute = func(context.Context, string, hprp.Target, im.IncomingText) (RelayExecution, error) {
+		if err := router.catalog.ApplySnapshot("conn-1", hprp.SessionSnapshot{
+			Sequence: 2, Sessions: []hprp.Session{
+				hprpSession(1, "pane-1", replacement.SessionID, "replacement"),
+				hprpSession(2, "pane-2", created.SessionID, "created"),
+			},
+		}); err != nil {
+			return RelayExecution{}, err
+		}
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: "已创建会话"}
+		return RelayExecution{StructuredContent: &content, SelectedTarget: &replacement, CreatedTarget: &created}, nil
+	}
+
+	router.Handle(context.Background(), routerMessage("request-created", "message-created", "user-a", "prompt"))
+
+	selected, err := router.catalog.Selected("user-a")
+	if err != nil || !sameSessionRef(selected.Ref, created) {
+		t.Fatalf("Selected() = %#v, %v, want created %#v", selected, err, created)
+	}
+	if !strings.Contains(gateway.LastReply(), "已创建会话") {
+		t.Fatalf("reply = %q", gateway.LastReply())
+	}
+}
+
 func TestRouterRejectsGroupAndDuplicateMessagesBeforeRelay(t *testing.T) {
 	router, gateway, relay := selectedRouterHarness(t)
 	group := routerMessage("request-group", "message-group", "user-a", "prompt")

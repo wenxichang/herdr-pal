@@ -65,9 +65,12 @@ type RegistrationRequester interface {
 }
 
 // RelayExecution 是客户端首段回复及执行期间发生的 Agent 会话替换信息。
+//
+// CreatedTarget 表示客户端新建的会话目标，允许与命令锚点位于不同 slot。
 type RelayExecution struct {
 	StructuredContent *hprp.Content
 	SelectedTarget    *hprp.Target
+	CreatedTarget     *hprp.Target
 }
 
 // SendCommandOutput 复核后续分段的稳定来源，并发送给所属企业微信用户。
@@ -857,6 +860,14 @@ func (router *ConversationRouter) effectiveOutputMode(userID string, entry Catal
 }
 
 func (router *ConversationRouter) rebindSelectedExecution(ctx context.Context, userID string, source CatalogEntry, result RelayExecution) (CatalogEntry, error) {
+	// 新建会话位于新 slot，优先级高于同 slot occupant 替换。
+	if result.CreatedTarget != nil {
+		created := *result.CreatedTarget
+		if err := router.catalog.RebindCreated(ctx, userID, source.Ref, created); err != nil {
+			return CatalogEntry{}, err
+		}
+		return router.catalog.ResolveTarget(userID, created)
+	}
 	if result.SelectedTarget == nil {
 		return source, nil
 	}
