@@ -155,6 +155,237 @@ func (c *Client) Sessions(ctx context.Context) ([]SessionSummary, error) {
 	return sessions, nil
 }
 
+const (
+	// readFastMaxMessages 是尾部快路径一次请求的消息上限。
+	readFastMaxMessages = 100
+	// readFallbackMaxMessages 是降级分页时单页的消息上限。
+	readFallbackMaxMessages = 32
+	// readFallbackMaxPages 限制降级分页最多向更早历史追读的页数。
+	readFallbackMaxPages = 4
+	// readTargetMessages 是最终展示窗口的消息条数，追读满该数量即可停止。
+	readTargetMessages = 100
+)
+
+var (
+	// errHistoryUnavailable 表示会话尚未完成顺序投影，无法只读访问历史。
+	errHistoryUnavailable = errors.New("dsh 历史暂不可读，请在原生界面完成初始化或迁移")
+	// errHistoryTooLarge 表示历史超过读取预算；调用方不得展示半截正文。
+	errHistoryTooLarge = errors.New("dsh 历史过大，无法读取")
+	// errPageMalformed 表示 session/page 返回值缺少分页字段。
+	errPageMalformed = errors.New("dsh 历史分页格式无效")
+)
+
+// projectionsRequest 是 session/projections 的请求参数。
+type projectionsRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+// projectionsArgs 对应远程 API 的 {"request": ...} 外层。
+type projectionsArgs struct {
+	Request projectionsRequest `json:"request"`
+}
+
+// sessionAddress 标识 session/page 的目标会话。
+type sessionAddress struct {
+	Kind      string `json:"kind"`
+	SessionID string `json:"sessionId"`
+}
+
+// pageRequest 是 session/page 的请求参数。
+type pageRequest struct {
+	Address     sessionAddress `json:"address"`
+	ThroughSeq  int64          `json:"throughSeq"`
+	BeforeSeq   *uint64        `json:"beforeSeq,omitempty"`
+	MaxMessages int            `json:"maxMessages"`
+}
+
+// pageArgs 对应远程 API 的 {"request": ...} 外层。
+type pageArgs struct {
+	Request pageRequest `json:"request"`
+}
+
+// sessionPage 是 session/page 返回值中本模块使用的字段。
+type sessionPage struct {
+	records []json.RawMessage
+	hasMore bool
+}
+
+// Read 读取会话已持久化的聊天正文。
+//
+// 先以 session/projections 取得顺序投影切点，再用 session/page 读取尾页；
+// 尾页响应超过 RPC 上限或分页不可信时改为 32 条一页向上追读，最多 4 页或
+// 100 条消息。仍无法完整读取时返回 errHistoryTooLarge，不返回部分正文。
+func (c *Client) Read(ctx context.Context, sessionID string) (string, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return "", err
+	}
+	asOfSeq, err := c.sequencedCut(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+
+	raw, err := c.rpc.call(ctx, "session/page", pageArgs{Request: pageRequest{
+		Address:     sessionAddress{Kind: "session", SessionID: sessionID},
+		ThroughSeq:  asOfSeq,
+		MaxMessages: readFastMaxMessages,
+	}})
+	if err == nil {
+		page, parseErr := parseSessionPage(raw)
+		if parseErr == nil {
+			text, transcriptErr := conversationText(page.records)
+			if transcriptErr != nil {
+				return "", fmt.Errorf("读取 dsh 会话正文失败: %w", transcriptErr)
+			}
+			return text, nil
+		}
+		err = parseErr
+	}
+	// 只有分页层面的失败才值得降级；认证、网络或业务错误直接失败，不重复请求。
+	if !isPageFallbackError(err) {
+		return "", fmt.Errorf("读取 dsh 会话正文失败: %w", err)
+	}
+	return c.readFallback(ctx, sessionID, asOfSeq)
+}
+
+// sequencedCut 返回可比较的顺序投影切点；非 sequenced 或切点无效时失败关闭。
+func (c *Client) sequencedCut(ctx context.Context, sessionID string) (int64, error) {
+	raw, err := c.rpc.call(ctx, "session/projections", projectionsArgs{
+		Request: projectionsRequest{SessionID: sessionID},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("读取 dsh 会话投影失败: %w", err)
+	}
+
+	var value struct {
+		Kind    string `json:"kind"`
+		AsOfSeq *int64 `json:"asOfSeq"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, fmt.Errorf("%w: 投影格式无效", errHistoryUnavailable)
+	}
+	if value.Kind != "sequenced" || value.AsOfSeq == nil || *value.AsOfSeq < -1 {
+		return 0, errHistoryUnavailable
+	}
+	return *value.AsOfSeq, nil
+}
+
+// parseSessionPage 解析分页返回值；records 与 hasMore 缺失都视为不可信分页。
+func parseSessionPage(raw json.RawMessage) (sessionPage, error) {
+	var value struct {
+		Records []json.RawMessage `json:"records"`
+		HasMore *bool             `json:"hasMore"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil || value.Records == nil || value.HasMore == nil {
+		return sessionPage{}, errPageMalformed
+	}
+	return sessionPage{records: value.Records, hasMore: *value.HasMore}, nil
+}
+
+// isPageFallbackError 判断快路径失败是否可以由小页分页重试恢复。
+func isPageFallbackError(err error) bool {
+	return errors.Is(err, errRPCResponseTooLarge) || errors.Is(err, errPageMalformed)
+}
+
+// readFallback 从切点向上按 32 条一页追读，直到历史读完或已覆盖最近 100 条消息。
+//
+// 任何无法确认完整性的分页结果都返回 errHistoryTooLarge，避免把半截历史
+// 当成完整正文展示。页面按从新到旧收集，投影前再恢复为时间顺序。
+func (c *Client) readFallback(ctx context.Context, sessionID string, throughSeq int64) (string, error) {
+	var newestFirst [][]json.RawMessage
+	var beforeSeq *uint64
+	for pageIndex := 0; pageIndex < readFallbackMaxPages; pageIndex++ {
+		raw, err := c.rpc.call(ctx, "session/page", pageArgs{Request: pageRequest{
+			Address:     sessionAddress{Kind: "session", SessionID: sessionID},
+			ThroughSeq:  throughSeq,
+			BeforeSeq:   beforeSeq,
+			MaxMessages: readFallbackMaxMessages,
+		}})
+		if err != nil {
+			if errors.Is(err, errRPCResponseTooLarge) {
+				return "", fmt.Errorf("%w: 单页响应超过 RPC 上限", errHistoryTooLarge)
+			}
+			return "", fmt.Errorf("读取 dsh 会话正文失败: %w", err)
+		}
+
+		page, parseErr := parseSessionPage(raw)
+		if parseErr != nil {
+			return "", fmt.Errorf("%w: %v", errHistoryTooLarge, parseErr)
+		}
+		newestFirst = append(newestFirst, page.records)
+		if !page.hasMore {
+			return projectPages(newestFirst)
+		}
+
+		first, seqErr := firstRecordSeq(page.records)
+		if seqErr != nil {
+			return "", fmt.Errorf("%w: %v", errHistoryTooLarge, seqErr)
+		}
+		if beforeSeq != nil && first >= *beforeSeq {
+			return "", fmt.Errorf("%w: 分页游标未推进", errHistoryTooLarge)
+		}
+		count, countErr := projectedMessageCount(newestFirst)
+		if countErr != nil {
+			return "", fmt.Errorf("读取 dsh 会话正文失败: %w", countErr)
+		}
+		// 更早的事件不可能进入最近 100 条窗口，已覆盖时无需继续追读。
+		if count >= readTargetMessages {
+			return projectPages(newestFirst)
+		}
+		if pageIndex == readFallbackMaxPages-1 {
+			return "", fmt.Errorf("%w: 超过 %d 页仍未读完", errHistoryTooLarge, readFallbackMaxPages)
+		}
+		beforeSeq = &first
+	}
+	return "", errHistoryTooLarge
+}
+
+// firstRecordSeq 返回一页记录中的最小事件序号，用于计算下一页的 beforeSeq。
+func firstRecordSeq(records []json.RawMessage) (uint64, error) {
+	var first uint64
+	found := false
+	for _, raw := range records {
+		var record transcriptRecord
+		if err := json.Unmarshal(raw, &record); err != nil || record.Event.Seq == nil {
+			return 0, errPageMalformed
+		}
+		if seq := *record.Event.Seq; !found || seq < first {
+			first = seq
+			found = true
+		}
+	}
+	if !found {
+		return 0, errPageMalformed
+	}
+	return first, nil
+}
+
+// flattenPages 把从新到旧收集的页面恢复为按事件时间顺序排列的记录。
+func flattenPages(newestFirst [][]json.RawMessage) []json.RawMessage {
+	records := make([]json.RawMessage, 0)
+	for index := len(newestFirst) - 1; index >= 0; index-- {
+		records = append(records, newestFirst[index]...)
+	}
+	return records
+}
+
+// projectedMessageCount 统计当前已收集页面投影后的可见消息数。
+func projectedMessageCount(newestFirst [][]json.RawMessage) (int, error) {
+	messages, err := projectMessages(flattenPages(newestFirst))
+	if err != nil {
+		return 0, err
+	}
+	return len(messages), nil
+}
+
+// projectPages 按时间顺序投影已收集页面。
+func projectPages(newestFirst [][]json.RawMessage) (string, error) {
+	text, err := conversationText(flattenPages(newestFirst))
+	if err != nil {
+		return "", fmt.Errorf("读取 dsh 会话正文失败: %w", err)
+	}
+	return text, nil
+}
+
 // validateSessionID 要求会话 ID 非空、不超过 512 字节且不含控制字符。
 // 会话 ID 会进入日志与目标映射，因此不接受任何需要转义的字符。
 func validateSessionID(id string) error {
