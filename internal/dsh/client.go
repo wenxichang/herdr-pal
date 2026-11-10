@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -18,14 +19,27 @@ const (
 	sessionListLimit = 256
 	// sessionIDMaxBytes 限制会话 ID 长度；ID 会进入目标映射，必须有限。
 	sessionIDMaxBytes = 512
+	// promptMaxTextBytes 限制单条消息文本的 UTF-8 字节数，与设计文档的 16 KiB 上限一致。
+	promptMaxTextBytes = 16 * 1024
+	// requestIDMaxBytes 限制 IM 消息 ID 长度，避免超长身份进入 dsh 持久化消息。
+	requestIDMaxBytes = 256
+	// titleMaxRunes 限制新建会话标题长度；标题会进入目录展示。
+	titleMaxRunes = 256
 )
 
 var (
-	errSessionListMalformed = errors.New("dsh 会话目录格式无效")
-	errSessionListTooMany   = errors.New("dsh 会话目录超过 8192 条限制")
-	errSessionCapacity      = errors.New("dsh 可控制会话超过 256 条限制")
-	errSessionIDInvalid     = errors.New("dsh 会话 ID 无效")
-	errSessionIDDuplicate   = errors.New("dsh 会话 ID 重复")
+	errSessionListMalformed  = errors.New("dsh 会话目录格式无效")
+	errSessionListTooMany    = errors.New("dsh 会话目录超过 8192 条限制")
+	errSessionCapacity       = errors.New("dsh 可控制会话超过 256 条限制")
+	errSessionIDInvalid      = errors.New("dsh 会话 ID 无效")
+	errSessionIDDuplicate    = errors.New("dsh 会话 ID 重复")
+	errPromptTextEmpty       = errors.New("dsh 消息文本不能为空")
+	errPromptTextTooLong     = errors.New("dsh 消息文本超过 16 KiB 限制")
+	errPromptTextInvalid     = errors.New("dsh 消息文本不是合法 UTF-8")
+	errRequestIDInvalid      = errors.New("dsh 请求 ID 无效")
+	errPromptNotAccepted     = errors.New("dsh 未接受消息发送")
+	errTitleInvalid          = errors.New("dsh 会话标题无效")
+	errCreateResponseInvalid = errors.New("dsh 新建会话响应格式无效")
 )
 
 // Client 是单个 dsh 宿主的高层客户端，负责目录、正文和交互操作。
@@ -384,6 +398,182 @@ func projectPages(newestFirst [][]json.RawMessage) (string, error) {
 		return "", fmt.Errorf("读取 dsh 会话正文失败: %w", err)
 	}
 	return text, nil
+}
+
+// promptContentPart 是 session/prompt 的文本内容块。
+type promptContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// promptRequest 是 session/prompt 的请求参数；mode 固定为 queue。
+type promptRequest struct {
+	SessionID string              `json:"sessionId"`
+	RequestID string              `json:"requestId"`
+	Mode      string              `json:"mode"`
+	Content   []promptContentPart `json:"content"`
+}
+
+// promptArgs 对应远程 API 的 {"request": ...} 外层。
+type promptArgs struct {
+	Request promptRequest `json:"request"`
+}
+
+// createRequest 是 session/create 的请求参数。
+type createRequest struct {
+	Cwd string `json:"cwd"`
+}
+
+// createArgs 对应远程 API 的 {"request": ...} 外层。
+type createArgs struct {
+	Request createRequest `json:"request"`
+}
+
+// renameRequest 是 session/rename 的请求参数。
+type renameRequest struct {
+	SessionID string `json:"sessionId"`
+	Title     string `json:"title"`
+}
+
+// renameArgs 对应远程 API 的 {"request": ...} 外层。
+type renameArgs struct {
+	Request renameRequest `json:"request"`
+}
+
+// CreatedSession 是新建会话的结果。
+type CreatedSession struct {
+	// ID 是 dsh 确认的会话 ID。
+	ID string
+	// Title 是 dsh 接受的标题；未设置标题或重命名失败时为空。
+	Title string
+	// RenameFailed 表示会话已创建但标题设置失败；此时仍应使用 ID。
+	RenameFailed bool
+}
+
+// Prompt 以排队模式向会话发送一条纯文本消息。
+//
+// requestID 是幂等关联 ID（通常取 IM 消息 ID），同一 ID 重复提交由 dsh 去重。
+// 文本为空、超过 16 KiB 或 requestID 无效时在发出请求前拒绝；写入失败不自动重试。
+func (c *Client) Prompt(ctx context.Context, sessionID, requestID, text string) error {
+	if err := validateSessionID(sessionID); err != nil {
+		return err
+	}
+	if err := validateRequestID(requestID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(text) == "" {
+		return errPromptTextEmpty
+	}
+	if len(text) > promptMaxTextBytes {
+		return fmt.Errorf("%w: 最多 %d 字节", errPromptTextTooLong, promptMaxTextBytes)
+	}
+	if !utf8.ValidString(text) {
+		return errPromptTextInvalid
+	}
+
+	raw, err := c.rpc.call(ctx, "session/prompt", promptArgs{Request: promptRequest{
+		SessionID: sessionID,
+		RequestID: requestID,
+		Mode:      "queue",
+		Content:   []promptContentPart{{Type: "text", Text: text}},
+	}})
+	if err != nil {
+		return fmt.Errorf("发送 dsh 消息失败: %w", err)
+	}
+
+	var value struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%w: %v", errPromptNotAccepted, err)
+	}
+	if !value.Accepted {
+		return errPromptNotAccepted
+	}
+	return nil
+}
+
+// Create 在指定目录新建会话，并在给出标题时设置标题。
+//
+// 标题在创建前校验，避免产生无法命名的会话。创建成功后重命名失败不会丢失
+// 会话：返回已创建的 ID，并以 RenameFailed 标识标题未生效。
+func (c *Client) Create(ctx context.Context, cwd, title string) (CreatedSession, error) {
+	if title != "" {
+		if err := validateTitle(title); err != nil {
+			return CreatedSession{}, err
+		}
+	}
+
+	raw, err := c.rpc.call(ctx, "session/create", createArgs{Request: createRequest{Cwd: cwd}})
+	if err != nil {
+		return CreatedSession{}, fmt.Errorf("新建 dsh 会话失败: %w", err)
+	}
+	var value struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return CreatedSession{}, fmt.Errorf("%w: %v", errCreateResponseInvalid, err)
+	}
+	if err := validateSessionID(value.SessionID); err != nil {
+		return CreatedSession{}, fmt.Errorf("新建 dsh 会话返回的 ID 无效: %w", err)
+	}
+
+	created := CreatedSession{ID: value.SessionID}
+	if title == "" {
+		return created, nil
+	}
+
+	renameRaw, err := c.rpc.call(ctx, "session/rename", renameArgs{Request: renameRequest{
+		SessionID: created.ID,
+		Title:     title,
+	}})
+	if err != nil {
+		created.RenameFailed = true
+		return created, nil
+	}
+	var renamed struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal(renameRaw, &renamed); err != nil || validateTitle(renamed.Title) != nil {
+		created.RenameFailed = true
+		return created, nil
+	}
+	created.Title = renamed.Title
+	return created, nil
+}
+
+// validateRequestID 要求请求 ID 非空、不超过 256 字节、是合法 UTF-8 且不含控制字符。
+func validateRequestID(id string) error {
+	if id == "" {
+		return fmt.Errorf("%w: 为空", errRequestIDInvalid)
+	}
+	if len(id) > requestIDMaxBytes {
+		return fmt.Errorf("%w: 超过 %d 字节", errRequestIDInvalid, requestIDMaxBytes)
+	}
+	if !utf8.ValidString(id) {
+		return fmt.Errorf("%w: 不是合法 UTF-8", errRequestIDInvalid)
+	}
+	if strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return fmt.Errorf("%w: 含控制字符", errRequestIDInvalid)
+	}
+	return nil
+}
+
+// validateTitle 要求标题是合法 UTF-8、不超过 256 个 rune、不含控制字符且并非纯空白。
+func validateTitle(title string) error {
+	if !utf8.ValidString(title) {
+		return fmt.Errorf("%w: 不是合法 UTF-8", errTitleInvalid)
+	}
+	if utf8.RuneCountInString(title) > titleMaxRunes {
+		return fmt.Errorf("%w: 超过 %d 个 rune", errTitleInvalid, titleMaxRunes)
+	}
+	if strings.IndexFunc(title, unicode.IsControl) >= 0 {
+		return fmt.Errorf("%w: 含控制字符", errTitleInvalid)
+	}
+	if strings.TrimSpace(title) == "" {
+		return fmt.Errorf("%w: 为空或仅含空白", errTitleInvalid)
+	}
+	return nil
 }
 
 // validateSessionID 要求会话 ID 非空、不超过 512 字节且不含控制字符。
