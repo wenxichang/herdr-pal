@@ -13,7 +13,6 @@ import (
 
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
-	"github.com/wenxichang/herdr-pal/internal/dshlegacy"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -139,14 +138,13 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	}
 	var executor relayclient.Executor = service
 	runSupervisor := supervisor.Run
-	if loaded.DSH != nil && loaded.DSH.URL != "" {
-		client, err := dshlegacy.NewClient(loaded.DSH.URL, loaded.DSH.Token)
+	if loaded.DSH != nil {
+		backend, err := newDSHBackend(*loaded.DSH, relay, guard, logger.With("component", "dsh_backend", "credential_id", loaded.Relay.CredentialID))
 		if err != nil {
-			return err
+			return fmt.Errorf("创建 dsh 后端: %w", err)
 		}
-		dshExecutor := dshlegacy.NewExecutor(client, relay, guard)
-		executor = relayclient.NewExecutorMux(service, dshExecutor)
-		runSupervisor = func(ctx context.Context) error { return runBackendPair(ctx, supervisor.Run, dshExecutor.Run) }
+		executor = relayclient.NewExecutorMux(service, backend)
+		runSupervisor = func(ctx context.Context) error { return runBackendPair(ctx, supervisor.Run, backend.Run) }
 	}
 	if err := relay.SetExecutor(executor); err != nil {
 		return fmt.Errorf("绑定 Relay 执行器: %w", err)
@@ -163,6 +161,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		"skip_verify", loaded.Relay.SkipVerify,
 		"herdr_session", herdrSession,
 		"socket_hash", socketHash,
+		"dsh_variant", dshVariantForConfig(loaded.DSH),
 	)
 	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, runSupervisor, defaultShutdownTimeout)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {

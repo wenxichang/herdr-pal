@@ -11,10 +11,10 @@ func TestDSHValidation(t *testing.T) {
 		ok          bool
 	}{
 		{"missing backend", `{"herdr":{"disabled":true}}`, false},
-		{"remote", `{"dsh":{"url":"http://example.com:123","token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`, false},
-		{"dsh only", `{"herdr":{"disabled":true},"dsh":{"url":"http://127.0.0.1:17842","token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`, true},
-		{"mixed", `{"dsh":{"url":"http://127.0.0.1:17842","token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`, true},
-		{"short token", `{"dsh":{"url":"http://127.0.0.1:17842","token":"short"}}`, false},
+		{"remote", `{"dsh":{"url":"http://example.com:123"}}`, false},
+		{"dsh only", `{"herdr":{"disabled":true},"dsh":{"url":"http://127.0.0.1:17842"}}`, true},
+		{"mixed", `{"dsh":{"url":"http://127.0.0.1:17842"}}`, true},
+		{"legacy token", `{"dsh":{"url":"http://127.0.0.1:17842","token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := loadDSHClientConfig(t, test.value); (err == nil) != test.ok {
@@ -50,13 +50,15 @@ func TestDSHConfigNativeMode(t *testing.T) {
 	})
 }
 
-func TestDSHConfigKeepsLegacyTokenDuringMigration(t *testing.T) {
-	loaded, err := loadDSHClientConfig(t, `{"dsh":{"token":"x"}}`)
-	if err != nil {
-		t.Fatalf("过渡期仅 token 应可加载：%v", err)
-	}
-	if loaded.DSH == nil || loaded.DSH.Token != "x" {
-		t.Fatalf("DSH = %#v，期望保留旧 token", loaded.DSH)
+func TestDSHConfigRejectsLegacyToken(t *testing.T) {
+	for _, value := range []string{
+		`{"dsh":{"token":"x"}}`,
+		`{"dsh":{"url":"http://127.0.0.1:17842","token":"x"}}`,
+	} {
+		_, err := loadDSHClientConfig(t, value)
+		if err == nil || !strings.Contains(err.Error(), "dsh.token 已移除：Pal 现在直接连接 dsh Remote API") {
+			t.Fatalf("LoadClient(%s) error = %v，期望迁移提示", value, err)
+		}
 	}
 }
 

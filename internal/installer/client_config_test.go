@@ -84,6 +84,31 @@ func TestMergeClientConfigRemovesLegacyIdentityFields(t *testing.T) {
 	}
 }
 
+func TestMergeClientConfigPreservesDSHBackend(t *testing.T) {
+	existing := []byte(`{
+  "relay":{"url":"wss://old.example/hprp","key":"hpk_1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","skip_verify":false},
+  "herdr":{"disabled":true},
+  "dsh":{"url":"http://127.0.0.1:17842","home":"/tmp/dsh-home","variant":"desktop"},
+  "log":{"level":"debug"}
+}`)
+
+	merged, err := mergeClientConfig(existing, "wss://new.example/hprp", validMachineKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got config.ClientConfig
+	if err := json.Unmarshal(merged, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DSH == nil || got.DSH.URL != "http://127.0.0.1:17842" ||
+		got.DSH.Home != "/tmp/dsh-home" || got.DSH.Variant != "desktop" {
+		t.Fatalf("dsh 配置未保留: %#v\n%s", got.DSH, merged)
+	}
+	if !got.Herdr.Disabled || got.Relay.URL != "wss://new.example/hprp" {
+		t.Fatalf("安装合并改变了其它字段: %+v", got)
+	}
+}
+
 func TestMergeClientConfigRejectsInvalidInput(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -95,6 +120,7 @@ func TestMergeClientConfigRejectsInvalidInput(t *testing.T) {
 		{name: "invalid key", url: "wss://relay.example/hprp", key: "hpk_invalid"},
 		{name: "multiple json values", existing: `{}` + "\n{}", url: "wss://relay.example/hprp", key: validMachineKey},
 		{name: "invalid relay object", existing: `{"relay":[]}`, url: "wss://relay.example/hprp", key: validMachineKey},
+		{name: "unknown top-level field", existing: `{"unknown":{}}`, url: "wss://relay.example/hprp", key: validMachineKey},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

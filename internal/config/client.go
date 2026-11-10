@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/credential"
-	"github.com/wenxichang/herdr-pal/internal/dshlegacy"
 )
 
 // ClientConfig 是 herdr-pal 网络模式的完整配置。
@@ -26,11 +25,9 @@ type DSHConfig struct {
 	URL     string `json:"url,omitempty"`
 	Home    string `json:"home,omitempty"`
 	Variant string `json:"variant,omitempty"`
-	// Token 仅为旧 Node 插件路径过渡保留，原生模式不再需要。
-	Token string `json:"token,omitempty"`
 }
 
-// UnmarshalJSON 严格读取 dsh 原生字段，并暂时接受旧插件 token。
+// UnmarshalJSON 严格读取 dsh 原生字段，并对已移除的旧插件 token 返回迁移提示。
 func (config *DSHConfig) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		URL     string `json:"url"`
@@ -41,10 +38,12 @@ func (config *DSHConfig) UnmarshalJSON(data []byte) error {
 	if err := decodeStrict(bytes.NewReader(data), &raw); err != nil {
 		return err
 	}
+	if raw.Token != "" {
+		return errors.New("dsh.token 已移除：Pal 现在直接连接 dsh Remote API")
+	}
 	config.URL = raw.URL
 	config.Home = raw.Home
 	config.Variant = raw.Variant
-	config.Token = raw.Token
 	return nil
 }
 
@@ -81,7 +80,7 @@ func (config RelayConfig) MarshalJSON() ([]byte, error) {
 	}{config.URL, config.Key, config.SkipVerify})
 }
 
-// validateDSHConfig 校验原生 dsh 后端配置；旧插件 token 由 LoadClient 按需校验。
+// validateDSHConfig 校验原生 dsh 后端配置。
 func validateDSHConfig(cfg DSHConfig) error {
 	if cfg.URL != "" {
 		endpoint, err := url.Parse(cfg.URL)
@@ -110,12 +109,6 @@ func LoadClient(path string) (ClientConfig, error) {
 	if loaded.DSH != nil {
 		if err := validateDSHConfig(*loaded.DSH); err != nil {
 			return ClientConfig{}, err
-		}
-		// 旧插件配置同时包含 url 与 token 时才按旧规则校验；仅 token 保持过渡兼容。
-		if loaded.DSH.Token != "" && loaded.DSH.URL != "" {
-			if err := dshlegacy.ValidateConfig(loaded.DSH.URL, loaded.DSH.Token); err != nil {
-				return ClientConfig{}, err
-			}
 		}
 	}
 	if loaded.Herdr.Disabled && loaded.DSH == nil {
