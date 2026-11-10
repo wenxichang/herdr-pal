@@ -319,27 +319,28 @@ func notificationStatus(status herdr.AgentStatus) string {
 
 // CurrentTargets 返回当前目标的独立副本。
 //
-// 宿主入口只在目录可用且没有任何可控制会话时出现；其余按标题、PaneID 升序。
+// 宿主入口只在目录可用且没有任何可控制会话时出现并排在首位；会话按标题、
+// 会话 ID 升序。
 func (e *Executor) CurrentTargets() []session.Target {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	targets := make([]session.Target, 0, len(e.sessions)+1)
+	sessions := make([]executorSession, 0, len(e.sessions))
+	for _, state := range e.sessions {
+		sessions = append(sessions, state)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].target.Title != sessions[j].target.Title {
+			return sessions[i].target.Title < sessions[j].target.Title
+		}
+		return sessions[i].summary.ID < sessions[j].summary.ID
+	})
+	targets := make([]session.Target, 0, len(sessions)+1)
 	if e.catalogOK && len(e.sessions) == 0 {
 		targets = append(targets, e.hostTarget())
 	}
-	for _, state := range e.sessions {
+	for _, state := range sessions {
 		targets = append(targets, state.target)
 	}
-	sort.Slice(targets, func(i, j int) bool {
-		left, right := targets[i], targets[j]
-		if (left.Tab == hostEntryTab) != (right.Tab == hostEntryTab) {
-			return left.Tab == hostEntryTab
-		}
-		if left.Title != right.Title {
-			return left.Title < right.Title
-		}
-		return left.PaneID < right.PaneID
-	})
 	return targets
 }
 

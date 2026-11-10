@@ -143,6 +143,39 @@ func TestExecutorListsOnlyAvailableSessionsAndHostEntry(t *testing.T) {
 	}
 }
 
+func TestExecutorSortsSessionsByTitleThenSessionID(t *testing.T) {
+	executor, api, _ := newExecutorFixture(t, testValidHost())
+	api.sessions = []SessionSummary{
+		{ID: "b", Title: "同一标题", Available: true, UpdatedAt: 30},
+		{ID: "a", Title: "同一标题", Available: true, UpdatedAt: 20},
+		{ID: "z", Title: "A 标题", Available: true, UpdatedAt: 10},
+	}
+	executor.refresh(context.Background())
+
+	targets := executor.CurrentTargets()
+	if len(targets) != 3 {
+		t.Fatalf("CurrentTargets() 数量 = %d, want 3", len(targets))
+	}
+	gotIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		state, ok := executor.sessions[target.PaneID]
+		if !ok {
+			t.Fatalf("目标 %q 不在目录中", target.PaneID)
+		}
+		gotIDs = append(gotIDs, state.summary.ID)
+	}
+	if order := strings.Join(gotIDs, ","); order != "z,a,b" {
+		t.Fatalf("会话排序 = %s, want z,a,b（标题升序，标题相同时会话 ID 升序）", order)
+	}
+
+	api.sessions = nil
+	executor.refresh(context.Background())
+	targets = executor.CurrentTargets()
+	if len(targets) != 1 || targets[0].Tab != hostEntryTab {
+		t.Fatalf("无会话时宿主入口必须排在首位：%#v", targets)
+	}
+}
+
 func TestExecutorTargetIDsIncludeHostIdentity(t *testing.T) {
 	summary := SessionSummary{ID: "shared", Title: "共享历史", Available: true}
 
