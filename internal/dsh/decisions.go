@@ -371,9 +371,10 @@ func decisionsFromProjections(sessionID string, projections json.RawMessage, ski
 		}
 		switch entry.State {
 		case "continued":
-			// continued 表示前台请求已返回 pending，可以安全地把回答作为新消息注入。
+			// continued 表示前台请求已返回 pending：可远程回答，但 Agent 已经继续，
+			// 因此不进入 blocked 状态。
 			decision.Supported = true
-			decision.Blocking = true
+			decision.Blocking = false
 		case "open":
 			decision.Reason = "该问题仍在等待 dsh 原生界面回答"
 		default:

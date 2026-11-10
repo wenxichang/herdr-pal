@@ -248,8 +248,8 @@ func TestContinuedQuestionRequiresContinuedState(t *testing.T) {
 	if decisions[0].Supported || decisions[0].Blocking || decisions[0].Reason == "" {
 		t.Errorf("state=open 应 unsupported 且非 blocking: %+v", decisions[0])
 	}
-	if !decisions[1].Supported || decisions[1].NativeID != "call:call-continued" {
-		t.Errorf("state=continued 应可答: %+v", decisions[1])
+	if !decisions[1].Supported || decisions[1].Blocking || decisions[1].NativeID != "call:call-continued" {
+		t.Errorf("state=continued 应可答且非 blocking: %+v", decisions[1])
 	}
 	if decisions[1].Kind != "form" {
 		t.Errorf("持续问题 Kind = %q，期望 form", decisions[1].Kind)
