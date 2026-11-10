@@ -340,6 +340,11 @@ type AnswerState struct {
 - `/answer` 到来时，如果没有活动状态，取当前会话第一个 blocking 决策；没有 blocking
   决策时取第一个 supported 的非 blocking 决策（包括 timed waterfall 问题和持续问题）。
   非 blocking 决策保持 `Blocking=false`，只表示不阻塞 Agent，不表示不可回答。
+- `/answer` 必须绑定用户实际看到的决策：执行器按会话记录最近一次由 `/con` 或推送
+  终端快照展示的决策 `NativeID` 与 `Revision`。没有展示记录，或当前选中的待答决策
+  与记录不一致时，拒绝提交并提示重新 `/con`；绝不把用户针对旧题目的编号套用到
+  新审批上。提交成功、会话目标切换、决策消失或取消后清除记录，下一次 `/con` 重新
+  记录。
 - 校验答案后存入；还有下一题则回复下一题，不提交。
 - 最后一题完成后构造完整答案值并提交一次。
 - 提交前复核决策 revision 和 mux 待答表；不一致则丢弃。

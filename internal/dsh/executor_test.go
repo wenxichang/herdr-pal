@@ -730,6 +730,8 @@ func TestExecutorAnswerCollectsMultipleQuestions(t *testing.T) {
 	api.sessions = []SessionSummary{{ID: "s1", Title: "任务", Available: true}}
 	api.decisions = []Decision{testTwoQuestionForm("s1", "rev-1")}
 	selectExecutorSession(t, executor, api, "s1")
+	// /answer 必须绑定用户实际看到的决策，先展示一次。
+	executor.HandleMessage(context.Background(), executorIncoming("answer-con", "/con"))
 
 	executor.HandleMessage(context.Background(), executorIncoming("answer-1", "/answer 2"))
 
@@ -785,6 +787,7 @@ func TestExecutorAnswerFallsBackToContinuedQuestion(t *testing.T) {
 	}}
 	api.submitReceipt = AnswerReceipt{Confirmed: true, Message: "已回答，dsh 已接收。"}
 	selectExecutorSession(t, executor, api, "s1")
+	executor.HandleMessage(context.Background(), executorIncoming("call-con", "/con"))
 
 	executor.HandleMessage(context.Background(), executorIncoming("answer-call", "/answer 这是答案"))
 
@@ -876,6 +879,7 @@ func TestExecutorAnswerRejectsStaleRevision(t *testing.T) {
 	api.sessions = []SessionSummary{{ID: "s1", Title: "任务", Available: true}}
 	api.decisions = []Decision{testTwoQuestionForm("s1", "rev-1")}
 	selectExecutorSession(t, executor, api, "s1")
+	executor.HandleMessage(context.Background(), executorIncoming("stale-con", "/con"))
 
 	executor.HandleMessage(context.Background(), executorIncoming("stale-1", "/answer 1"))
 	if len(executor.answerStates) != 1 {
@@ -894,6 +898,120 @@ func TestExecutorAnswerRejectsStaleRevision(t *testing.T) {
 	if reply := sink.lastReply(); !strings.Contains(reply, "重新") || !strings.Contains(reply, "/con") {
 		t.Fatalf("回复 = %q, want 提示重新 /con", reply)
 	}
+}
+
+func TestExecutorAnswerBindsToDisplayedDecision(t *testing.T) {
+	newFixture := func(t *testing.T) (*Executor, *fakeExecutorAPI, *fakeExecutorSink) {
+		t.Helper()
+		executor, api, sink := newExecutorFixture(t, testValidHost())
+		api.sessions = []SessionSummary{
+			{ID: "s1", Title: "任务", Available: true},
+			{ID: "s2", Title: "另一个任务", Available: true},
+		}
+		api.readText = "用户：开始"
+		return executor, api, sink
+	}
+
+	t.Run("未展示决策时拒绝回答", func(t *testing.T) {
+		executor, api, sink := newFixture(t)
+		api.decisions = []Decision{testApprovalDecision("s1", "event-a", "rev-a")}
+		selectExecutorSession(t, executor, api, "s1")
+
+		executor.HandleMessage(context.Background(), executorIncoming("answer-cold", "/answer 1"))
+
+		if len(api.submitCalls) != 0 {
+			t.Fatalf("未展示决策时不应提交，got %#v", api.submitCalls)
+		}
+		if reply := sink.lastReply(); !strings.Contains(reply, "/con") {
+			t.Fatalf("回复 = %q，要求先 /con", reply)
+		}
+	})
+
+	t.Run("决策被替换后拒绝回答并提示变化", func(t *testing.T) {
+		executor, api, sink := newFixture(t)
+		api.decisions = []Decision{testApprovalDecision("s1", "event-a", "rev-a")}
+		selectExecutorSession(t, executor, api, "s1")
+		executor.HandleMessage(context.Background(), executorIncoming("con-a", "/con"))
+		if reply := sink.lastReply(); !strings.Contains(reply, "审批") {
+			t.Fatalf("/con 未展示审批 A：%q", reply)
+		}
+
+		// A 被取消，B 成为当前第一个待答；/answer 1 是用户针对 A 的编号，
+		// 绝不能提交成对 B 的 allowed-once。
+		api.decisions = []Decision{testApprovalDecision("s1", "event-b", "rev-b")}
+		executor.HandleMessage(context.Background(), executorIncoming("answer-b", "/answer 1"))
+
+		if len(api.submitCalls) != 0 {
+			t.Fatalf("待答决策变化后不应提交，got %#v", api.submitCalls)
+		}
+		reply := sink.lastReply()
+		if !strings.Contains(reply, "待处理事项已变化") || !strings.Contains(reply, "/con") {
+			t.Fatalf("回复 = %q，要求提示重新 /con", reply)
+		}
+
+		// 重新展示 B 后，同样的编号才可以提交。
+		executor.HandleMessage(context.Background(), executorIncoming("con-b", "/con"))
+		executor.HandleMessage(context.Background(), executorIncoming("answer-b-2", "/answer 1"))
+		if len(api.submitCalls) != 1 || api.submitCalls[0].decision.NativeID != "event:event-b" {
+			t.Fatalf("重新展示后应提交 B，got %#v", api.submitCalls)
+		}
+	})
+
+	t.Run("待答事件取消后清除展示记录", func(t *testing.T) {
+		executor, api, _ := newFixture(t)
+		api.decisions = []Decision{testApprovalDecision("s1", "event-a", "rev-a")}
+		selectExecutorSession(t, executor, api, "s1")
+		executor.HandleMessage(context.Background(), executorIncoming("con-a", "/con"))
+		if _, ok := executor.shownDecisionFor("s1"); !ok {
+			t.Fatal("/con 后应记录展示的决策")
+		}
+
+		api.pending = PendingSnapshot{ClientID: "client", Items: []PendingItem{{
+			EventID: "event-a", AgentID: "s1", Event: "approval/request",
+		}}}
+		executor.refresh(context.Background())
+		if _, ok := executor.shownDecisionFor("s1"); !ok {
+			t.Fatal("待答事件仍存在时不应清除展示记录")
+		}
+
+		api.pending = PendingSnapshot{ClientID: "client"}
+		executor.refresh(context.Background())
+		if _, ok := executor.shownDecisionFor("s1"); ok {
+			t.Fatal("待答事件取消后应清除展示记录")
+		}
+	})
+
+	t.Run("切换选择后清除展示记录", func(t *testing.T) {
+		executor, api, sink := newFixture(t)
+		api.decisions = []Decision{testApprovalDecision("s1", "event-a", "rev-a")}
+		sessionOne := selectExecutorSession(t, executor, api, "s1")
+		executor.HandleMessage(context.Background(), executorIncoming("con-a", "/con"))
+
+		var other session.Target
+		for _, target := range executor.CurrentTargets() {
+			if target.PaneID != sessionOne.PaneID {
+				other = target
+				break
+			}
+		}
+		if other.PaneID == "" {
+			t.Fatal("目录中缺少第二个会话")
+		}
+		if err := executor.SelectTarget(other.PaneID, other.OccupantKey); err != nil {
+			t.Fatal(err)
+		}
+		// 切回 s1 但未重新 /con：展示记录已因目标变化清除，不能直接回答。
+		if err := executor.SelectTarget(sessionOne.PaneID, sessionOne.OccupantKey); err != nil {
+			t.Fatal(err)
+		}
+		executor.HandleMessage(context.Background(), executorIncoming("answer-after-switch", "/answer 1"))
+		if len(api.submitCalls) != 0 {
+			t.Fatalf("切换目标后未重新 /con 不应提交，got %#v", api.submitCalls)
+		}
+		if reply := sink.lastReply(); !strings.Contains(reply, "/con") {
+			t.Fatalf("回复 = %q，要求重新 /con", reply)
+		}
+	})
 }
 
 func TestExecutorNewSessionSelectsCreatedTarget(t *testing.T) {
@@ -1168,6 +1286,7 @@ func TestExecutorReadShowsCurrentQuestionDuringCollection(t *testing.T) {
 	api.decisions = []Decision{testTwoQuestionForm("s1", "rev-1")}
 	api.readText = "用户：开始"
 	target := selectExecutorSession(t, executor, api, "s1")
+	executor.HandleMessage(context.Background(), executorIncoming("collection-con", "/con"))
 
 	executor.HandleMessage(context.Background(), executorIncoming("answer-first", "/answer 1"))
 	if reply := sink.lastReply(); !strings.Contains(reply, "第二题") {

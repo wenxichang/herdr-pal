@@ -67,6 +67,8 @@ const (
 	executorDecisionChangedMessage = "待处理事项已变化，请重新执行 /con 查看并回答。"
 	// executorNoDecisionMessage 表示当前没有可回答的交互。
 	executorNoDecisionMessage = "当前没有可通过 /answer 回答的 dsh 审批或问题。"
+	// executorDecisionNotShownMessage 要求先查看当前待答事项，避免凭旧提示作答。
+	executorDecisionNotShownMessage = "请先执行 /con 查看当前待答事项，再使用 /answer 回答。"
 )
 
 // API 是单宿主执行器所需的 dsh 能力。
@@ -127,6 +129,15 @@ type executorNotification struct {
 	event  im.NotificationEvent
 }
 
+// shownDecision 是用户最近一次实际看到的待答决策身份。
+//
+// /answer 只允许回答该决策：用户的编号选择针对的是展示时的题目，不能在待答
+// 集合变化后被套用到另一条审批上。
+type shownDecision struct {
+	nativeID string
+	revision string
+}
+
 // AnswerState 记录一个 dsh 会话中逐题收集但尚未提交的答案。
 //
 // 每次 /answer 都会按 DecisionID 与 Revision 复核决策；待答内容变化、被取消或
@@ -153,12 +164,13 @@ type Executor struct {
 	guard  *policy.Guard
 	logger *slog.Logger
 
-	mu            sync.RWMutex
-	sessions      map[string]executorSession
-	catalogOK     bool
-	selected      session.Target
-	createdTarget session.Target
-	answerStates  map[string]AnswerState
+	mu             sync.RWMutex
+	sessions       map[string]executorSession
+	catalogOK      bool
+	selected       session.Target
+	createdTarget  session.Target
+	answerStates   map[string]AnswerState
+	shownDecisions map[string]shownDecision
 
 	inputMu sync.Mutex
 	buffer  panel.Buffer
@@ -167,13 +179,14 @@ type Executor struct {
 // NewExecutor 创建目录为空的单宿主执行器；Run 负责周期性同步。
 func NewExecutor(host Host, api API, sink Sink, guard *policy.Guard) *Executor {
 	return &Executor{
-		host:         host,
-		api:          api,
-		sink:         sink,
-		guard:        guard,
-		logger:       slog.Default(),
-		sessions:     make(map[string]executorSession),
-		answerStates: make(map[string]AnswerState),
+		host:           host,
+		api:            api,
+		sink:           sink,
+		guard:          guard,
+		logger:         slog.Default(),
+		sessions:       make(map[string]executorSession),
+		answerStates:   make(map[string]AnswerState),
+		shownDecisions: make(map[string]shownDecision),
 	}
 }
 
@@ -243,6 +256,7 @@ func (e *Executor) refresh(ctx context.Context) {
 		}
 		next[key] = state
 	}
+	e.pruneShownDecisionsLocked(next, pending, pendingErr, sessionsErr == nil)
 	notifications := collectNotifications(previous, next)
 	e.sessions = next
 	e.catalogOK = sessionsErr == nil
@@ -427,6 +441,10 @@ func (e *Executor) SelectTarget(paneID, occupant string) error {
 	}
 	if e.selected.PaneID != target.PaneID || e.selected.OccupantKey != target.OccupantKey {
 		e.buffer.Reset()
+		// 目标切换后，旧会话展示过的决策不能用于新目标的 /answer；新目标也必须
+		// 重新 /con 展示一次。
+		e.clearShownDecisionsForTargetLocked(e.selected)
+		e.clearShownDecisionsForTargetLocked(target)
 	}
 	e.selected = target
 	return nil
@@ -718,7 +736,78 @@ func (e *Executor) pendingDecisionPrompt(ctx context.Context, sessionID string) 
 	if !ok {
 		return "", false
 	}
+	// 记录真正展示给用户的决策；后续 /answer 只能回答这一条。
+	e.rememberShownDecision(sessionID, decision)
 	return formatDecision(decision, e.decisionQuestionIndex(sessionID, decision)), true
+}
+
+// rememberShownDecision 记录会话最近展示的待答决策身份。
+func (e *Executor) rememberShownDecision(sessionID string, decision Decision) {
+	e.mu.Lock()
+	if e.shownDecisions == nil {
+		e.shownDecisions = make(map[string]shownDecision)
+	}
+	e.shownDecisions[sessionID] = shownDecision{nativeID: decision.NativeID, revision: decision.Revision}
+	e.mu.Unlock()
+}
+
+// shownDecisionFor 返回会话最近展示的待答决策。
+func (e *Executor) shownDecisionFor(sessionID string) (shownDecision, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	shown, ok := e.shownDecisions[sessionID]
+	return shown, ok
+}
+
+// clearShownDecision 清除会话最近展示的待答决策。
+func (e *Executor) clearShownDecision(sessionID string) {
+	e.mu.Lock()
+	delete(e.shownDecisions, sessionID)
+	e.mu.Unlock()
+}
+
+// clearShownDecisionsForTargetLocked 清除目标会话的展示记录；调用方必须持有 e.mu。
+func (e *Executor) clearShownDecisionsForTargetLocked(target session.Target) {
+	if target.PaneID == "" {
+		return
+	}
+	if state, ok := e.sessions[target.PaneID]; ok {
+		delete(e.shownDecisions, state.summary.ID)
+	}
+}
+
+// pruneShownDecisionsLocked 清除会话已消失或待答事件已取消的展示记录。
+//
+// 目录或待答表读取失败时无法确认取消事实，保留记录；/answer 时仍会复核当前
+// 决策身份与 revision，不会把答案提交给用户没见过的决策。
+func (e *Executor) pruneShownDecisionsLocked(next map[string]executorSession, pending PendingSnapshot, pendingErr error, catalogOK bool) {
+	if !catalogOK || len(e.shownDecisions) == 0 {
+		return
+	}
+	live := make(map[string]struct{}, len(next))
+	for _, state := range next {
+		live[state.summary.ID] = struct{}{}
+	}
+	var pendingEvents map[string]struct{}
+	if pendingErr == nil {
+		pendingEvents = make(map[string]struct{}, len(pending.Items))
+		for _, item := range pending.Items {
+			pendingEvents[item.AgentID+"\x00"+item.EventID] = struct{}{}
+		}
+	}
+	for sessionID, shown := range e.shownDecisions {
+		if _, ok := live[sessionID]; !ok {
+			delete(e.shownDecisions, sessionID)
+			continue
+		}
+		if pendingEvents == nil || !strings.HasPrefix(shown.nativeID, "event:") {
+			continue
+		}
+		eventID := strings.TrimPrefix(shown.nativeID, "event:")
+		if _, ok := pendingEvents[sessionID+"\x00"+eventID]; !ok {
+			delete(e.shownDecisions, sessionID)
+		}
+	}
 }
 
 // decisionQuestionIndex 返回多题收集期间当前应展示的问题下标。
@@ -780,6 +869,7 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 		if !ok || current.Revision != state.Revision ||
 			state.QuestionIx < 0 || state.QuestionIx >= len(current.Questions) {
 			e.clearAnswerState(sessionID)
+			e.clearShownDecision(sessionID)
 			reply(executorDecisionChangedMessage)
 			return
 		}
@@ -787,7 +877,20 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 	} else {
 		current, ok := selectPendingDecision(decisions)
 		if !ok || len(current.Questions) == 0 {
+			e.clearShownDecision(sessionID)
 			reply(executorNoDecisionMessage)
+			return
+		}
+		// 编号答案只对用户实际看到的决策有效：待答集合变化后绝不能把
+		// 「/answer 1」套用到另一条审批上。
+		shown, displayed := e.shownDecisionFor(sessionID)
+		if !displayed {
+			reply(executorDecisionNotShownMessage)
+			return
+		}
+		if shown.nativeID != current.NativeID || shown.revision != current.Revision {
+			e.clearShownDecision(sessionID)
+			reply(executorDecisionChangedMessage)
 			return
 		}
 		decision = current
@@ -831,6 +934,8 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 		reply(message)
 		return
 	}
+	// 已提交成功；后续 /answer 必须看到新的 /con 展示才能再次回答。
+	e.clearShownDecision(sessionID)
 	if message := strings.TrimSpace(receipt.Message); message != "" {
 		reply(message)
 		return
@@ -901,6 +1006,9 @@ func (e *Executor) handleNewSession(ctx context.Context, reply func(string), act
 		target:       target,
 		pendingUntil: time.Now().Add(createdSessionGrace),
 	}
+	// 新建会话切换了目标，新目标必须重新 /con 展示待答事项。
+	e.clearShownDecisionsForTargetLocked(e.selected)
+	e.clearShownDecisionsForTargetLocked(target)
 	e.selected = target
 	e.createdTarget = target
 	e.mu.Unlock()
