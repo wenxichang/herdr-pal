@@ -6,13 +6,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
+	"github.com/wenxichang/herdr-pal/internal/command"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/panel"
@@ -33,6 +38,33 @@ const (
 	defaultWorkspace = "dsh"
 	// refreshInterval 是目录与待答状态的刷新间隔。
 	refreshInterval = time.Second
+	// defaultNewSessionTitle 是 /new-session 未提供标题时使用的默认标题。
+	defaultNewSessionTitle = "默认标题"
+	// createdSessionGrace 是新建会话在 session/list 追上之前的本地保留时长。
+	createdSessionGrace = 5 * time.Second
+	// terminalSnapshotUTF16Limit 限制正文与待答提示合计的 UTF-16 代码单元数。
+	terminalSnapshotUTF16Limit = 20000
+	// snapshotSeparator 分隔聊天正文与待答提示。
+	snapshotSeparator = "\n\n"
+)
+
+const (
+	// executorSelectionInvalidMessage 表示当前选择已失效。
+	executorSelectionInvalidMessage = "dsh 会话已失效，请重新 /ls 并选择。"
+	// executorHostEntryMessage 表示宿主入口只接受 /new-session。
+	executorHostEntryMessage = "这是 dsh 宿主入口，仅支持 /new-session 新建会话。"
+	// executorBlockedPromptMessage 阻止把普通文本误当审批回答。
+	executorBlockedPromptMessage = "dsh 正在等待审批或回答，请先执行 /answer 处理待处理事项。"
+	// executorPromptQueuedMessage 是排队发送成功的固定回复。
+	executorPromptQueuedMessage = "已发送给 dsh（排队）。"
+	// executorKeyUnsupportedMessage 说明 dsh 不支持终端按键。
+	executorKeyUnsupportedMessage = "dsh 不支持终端按键；审批请使用 /answer。"
+	// executorUnsupportedCommandMessage 是未在 dsh 执行器实现的命令回复。
+	executorUnsupportedCommandMessage = "请使用 /ls、/N、/con、/answer 或普通文本操作 dsh。"
+	// executorDecisionChangedMessage 表示待答内容已变化，必须重新读取。
+	executorDecisionChangedMessage = "待处理事项已变化，请重新执行 /con 查看并回答。"
+	// executorNoDecisionMessage 表示当前没有可回答的交互。
+	executorNoDecisionMessage = "当前没有可通过 /answer 回答的 dsh 审批或问题。"
 )
 
 // API 是单宿主执行器所需的 dsh 能力。
@@ -72,6 +104,8 @@ type executorSession struct {
 	target      session.Target
 	blocked     bool
 	decisionKey string
+	// pendingUntil 非零时表示本地新建会话在 session/list 追上之前的保留期限。
+	pendingUntil time.Time
 }
 
 // status 按 blocked > working > idle 推导会话状态。
@@ -91,6 +125,21 @@ type executorNotification struct {
 	event  im.NotificationEvent
 }
 
+// AnswerState 记录一个 dsh 会话中逐题收集但尚未提交的答案。
+//
+// 每次 /answer 都会按 DecisionID 与 Revision 复核决策；待答内容变化、被取消或
+// 版本不一致时丢弃全部已收集答案，避免把旧答案提交到新问题。
+type AnswerState struct {
+	// DecisionID 是 dsh 原生交互标识。
+	DecisionID string
+	// Revision 是决策原始帧的摘要。
+	Revision string
+	// QuestionIx 是下一道待回答问题的下标。
+	QuestionIx int
+	// Answers 是按问题 ID 保存的已校验答案。
+	Answers map[string]Answer
+}
+
 // Executor 把一个 dsh 宿主映射为 HPRP 稳定目标并维护状态通知。
 //
 // Executor 不启动 Mux 或网络连接；Client.Run 与 Executor.Run 由多宿主 Backend
@@ -102,10 +151,12 @@ type Executor struct {
 	guard  *policy.Guard
 	logger *slog.Logger
 
-	mu        sync.RWMutex
-	sessions  map[string]executorSession
-	catalogOK bool
-	selected  session.Target
+	mu            sync.RWMutex
+	sessions      map[string]executorSession
+	catalogOK     bool
+	selected      session.Target
+	createdTarget session.Target
+	answerStates  map[string]AnswerState
 
 	inputMu sync.Mutex
 	buffer  panel.Buffer
@@ -114,12 +165,13 @@ type Executor struct {
 // NewExecutor 创建目录为空的单宿主执行器；Run 负责周期性同步。
 func NewExecutor(host Host, api API, sink Sink, guard *policy.Guard) *Executor {
 	return &Executor{
-		host:     host,
-		api:      api,
-		sink:     sink,
-		guard:    guard,
-		logger:   slog.Default(),
-		sessions: make(map[string]executorSession),
+		host:         host,
+		api:          api,
+		sink:         sink,
+		guard:        guard,
+		logger:       slog.Default(),
+		sessions:     make(map[string]executorSession),
+		answerStates: make(map[string]AnswerState),
 	}
 }
 
@@ -172,6 +224,19 @@ func (e *Executor) refresh(ctx context.Context) {
 	}
 
 	e.mu.Lock()
+	if sessionsErr == nil {
+		// 新建会话可能尚未出现在 session/list：在 5 秒宽限期内保留本地条目。
+		now := time.Now()
+		for key, state := range e.sessions {
+			if state.pendingUntil.IsZero() || !now.Before(state.pendingUntil) {
+				continue
+			}
+			if _, exists := next[key]; exists {
+				continue
+			}
+			next[key] = state
+		}
+	}
 	notifications := collectNotifications(previous, next)
 	e.sessions = next
 	e.catalogOK = sessionsErr == nil
@@ -440,4 +505,478 @@ func (e *Executor) sessionTarget(s SessionSummary) session.Target {
 func shortHash(parts ...string) string {
 	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(digest[:])[:16]
+}
+
+// HandleMessage 处理一条已完成 IM 协议校验的 dsh 目标命令。
+//
+// 身份与消息标识在产生任何外部动作前校验；每次调用开始都会清除上一次
+// /new-session 留下的待领取目标，避免旧目标被错误关联到后续命令结果。
+func (e *Executor) HandleMessage(ctx context.Context, message im.IncomingText) {
+	if e == nil {
+		return
+	}
+	e.clearCreatedTarget()
+	if e.guard.Authorize(policy.Identity{UserID: message.UserID, ChatType: message.ChatType}) != nil {
+		if e.logger != nil {
+			e.logger.Warn("dsh 消息被策略拒绝",
+				"user_hash", shortHash(message.UserID),
+				"chat_type", message.ChatType,
+			)
+		}
+		return
+	}
+	reply := func(content string) { e.respond(ctx, message.RequestID, content) }
+	if strings.TrimSpace(message.MessageID) == "" {
+		reply("消息标识缺失，未执行任何操作。")
+		return
+	}
+
+	e.inputMu.Lock()
+	defer e.inputMu.Unlock()
+
+	action, err := command.Parse(message.Content)
+	if err != nil {
+		reply(err.Error())
+		return
+	}
+	target, state, hostEntry, err := e.selectedSessionTarget()
+	if err != nil {
+		reply(executorSelectionInvalidMessage)
+		return
+	}
+	if hostEntry && action.Kind != command.KindNewSession {
+		reply(executorHostEntryMessage)
+		return
+	}
+
+	switch action.Kind {
+	case command.KindPrompt:
+		// 待答期间拒绝普通文本，避免把消息误当成审批或问题答案。
+		if state.blocked {
+			reply(executorBlockedPromptMessage)
+			return
+		}
+		if err := e.api.Prompt(ctx, state.summary.ID, message.MessageID, action.Text); err != nil {
+			reply("发送失败，请稍后重试。")
+			return
+		}
+		reply(executorPromptQueuedMessage)
+	case command.KindContent:
+		e.handleRead(ctx, reply, target, state.summary.ID, executorReadRefresh)
+	case command.KindPageUp:
+		e.handleRead(ctx, reply, target, state.summary.ID, executorReadPageUp)
+	case command.KindPageDown:
+		e.handleRead(ctx, reply, target, state.summary.ID, executorReadPageDown)
+	case command.KindAnswer:
+		e.handleAnswer(ctx, reply, state.summary.ID, action)
+	case command.KindNewSession:
+		e.handleNewSession(ctx, reply, action)
+	case command.KindKey:
+		reply(executorKeyUnsupportedMessage)
+	default:
+		reply(executorUnsupportedCommandMessage)
+	}
+}
+
+// respond 通过 Sink 发送一条命令回复。
+func (e *Executor) respond(ctx context.Context, requestID, content string) {
+	if e.sink == nil || strings.TrimSpace(requestID) == "" {
+		return
+	}
+	_ = e.sink.RespondMarkdown(ctx, requestID, content)
+}
+
+// selectedSessionTarget 按完整身份解析当前选择。
+//
+// hostEntry 为 true 时 state 为零值；其他情况下 state 是会话的最新观测状态。
+func (e *Executor) selectedSessionTarget() (session.Target, executorSession, bool, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.selected.PaneID == "" {
+		return session.Target{}, executorSession{}, false, session.ErrNoSelection
+	}
+	target, err := e.targetLocked(e.selected.PaneID, e.selected.OccupantKey)
+	if err != nil {
+		return session.Target{}, executorSession{}, false, err
+	}
+	if target.Tab == hostEntryTab {
+		return target, executorSession{}, true, nil
+	}
+	state, ok := e.sessions[target.PaneID]
+	if !ok {
+		return session.Target{}, executorSession{}, false, session.ErrSelectionInvalid
+	}
+	return target, state, false, nil
+}
+
+// executorReadMode 区分聊天正文刷新、向上翻页和向下翻页。
+type executorReadMode uint8
+
+const (
+	executorReadRefresh executorReadMode = iota
+	executorReadPageUp
+	executorReadPageDown
+)
+
+// handleRead 读取聊天正文并复用 panel.Buffer 分页，末尾追加当前待答提示。
+func (e *Executor) handleRead(ctx context.Context, reply func(string), target session.Target, sessionID string, mode executorReadMode) {
+	key := target.OccupantKey
+	switch mode {
+	case executorReadRefresh, executorReadPageUp:
+		text, err := e.api.Read(ctx, sessionID)
+		if err != nil {
+			reply("读取 dsh 对话失败，请稍后重试。")
+			return
+		}
+		lines := strings.Split(text, "\n")
+		if mode == executorReadRefresh {
+			e.buffer.Refresh(key, lines)
+		} else if err := e.buffer.Expand(key, lines); err != nil {
+			reply(executorReadErrorMessage(err))
+			return
+		}
+	case executorReadPageDown:
+		if err := e.buffer.PageDown(); err != nil {
+			reply(executorReadErrorMessage(err))
+			return
+		}
+	}
+	output := strings.Join(e.buffer.Render(), "\n")
+	if strings.TrimSpace(output) == "" {
+		output = "dsh 暂无对话文本。"
+	}
+	if prompt, ok := e.pendingDecisionPrompt(ctx, sessionID); ok {
+		output += snapshotSeparator + prompt
+	}
+	reply(output)
+}
+
+// executorReadErrorMessage 把分页错误映射为固定提示。
+func executorReadErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, panel.ErrPanelChanged):
+		return "对话内容已变化，请重新执行 /con。"
+	case errors.Is(err, panel.ErrOldestPage):
+		return "已经是最早可读取内容。"
+	case errors.Is(err, panel.ErrNewestPage):
+		return "已经是最新内容。"
+	default:
+		return "分页不可用，请重新执行 /con。"
+	}
+}
+
+// pendingDecisionPrompt 返回当前应提示给用户的决策文本。
+func (e *Executor) pendingDecisionPrompt(ctx context.Context, sessionID string) (string, bool) {
+	decisions, err := e.api.Decisions(ctx, sessionID)
+	if err != nil {
+		if e.logger != nil {
+			e.logger.Warn("读取 dsh 待处理事项失败",
+				"session_hash", shortHash(sessionID),
+				"error", err,
+			)
+		}
+		return "", false
+	}
+	decision, ok := selectPendingDecision(decisions)
+	if !ok {
+		return "", false
+	}
+	return formatDecision(decision, 0), true
+}
+
+// selectPendingDecision 按设计文档的规则选择待答项。
+//
+// 优先第一个 blocking 决策；没有 blocking 时回退到第一个 supported 的持续问题
+// （call:<callId>），持续问题本身不进入 blocked 状态。
+func selectPendingDecision(decisions []Decision) (Decision, bool) {
+	for _, decision := range decisions {
+		if decision.Blocking {
+			return decision, true
+		}
+	}
+	for _, decision := range decisions {
+		if decision.Supported && strings.HasPrefix(decision.NativeID, "call:") {
+			return decision, true
+		}
+	}
+	return Decision{}, false
+}
+
+// decisionByID 在最新决策列表中按原生 ID 查找。
+func decisionByID(decisions []Decision, nativeID string) (Decision, bool) {
+	for _, decision := range decisions {
+		if decision.NativeID == nativeID {
+			return decision, true
+		}
+	}
+	return Decision{}, false
+}
+
+// handleAnswer 逐题收集答案，最后一题完成后一次性提交。
+//
+// 每次回答前重新读取决策；DecisionID、Revision 或待答表不一致时丢弃状态并
+// 要求重新 /con。提交失败不自动重试。
+func (e *Executor) handleAnswer(ctx context.Context, reply func(string), sessionID string, action command.Action) {
+	decisions, err := e.api.Decisions(ctx, sessionID)
+	if err != nil {
+		reply("读取 dsh 待处理事项失败，请稍后重试。")
+		return
+	}
+
+	state, active := e.answerStates[sessionID]
+	var decision Decision
+	if active {
+		current, ok := decisionByID(decisions, state.DecisionID)
+		if !ok || current.Revision != state.Revision ||
+			state.QuestionIx < 0 || state.QuestionIx >= len(current.Questions) {
+			delete(e.answerStates, sessionID)
+			reply(executorDecisionChangedMessage)
+			return
+		}
+		decision = current
+	} else {
+		current, ok := selectPendingDecision(decisions)
+		if !ok || len(current.Questions) == 0 {
+			reply(executorNoDecisionMessage)
+			return
+		}
+		decision = current
+		state = AnswerState{
+			DecisionID: decision.NativeID,
+			Revision:   decision.Revision,
+			Answers:    make(map[string]Answer, len(decision.Questions)),
+		}
+	}
+
+	question := decision.Questions[state.QuestionIx]
+	answer, err := parseAnswer(action.Indexes, action.Text, question)
+	if err != nil {
+		reply(fmt.Sprintf("%v\n\n%s", err, formatDecision(decision, state.QuestionIx)))
+		return
+	}
+	state.Answers[question.ID] = answer
+
+	if state.QuestionIx+1 < len(decision.Questions) {
+		state.QuestionIx++
+		e.answerStates[sessionID] = state
+		reply(fmt.Sprintf("已记录第 %d/%d 题答案。\n\n%s",
+			state.QuestionIx, len(decision.Questions), formatDecision(decision, state.QuestionIx)))
+		return
+	}
+
+	value, err := buildAnswerValue(decision, state.Answers)
+	if err != nil {
+		delete(e.answerStates, sessionID)
+		reply("回答无效，请重新执行 /con 查看并回答。")
+		return
+	}
+	receipt, err := e.api.SubmitAnswer(ctx, decision, value)
+	delete(e.answerStates, sessionID)
+	if err != nil {
+		message := strings.TrimSpace(receipt.Message)
+		if message == "" {
+			message = "提交 dsh 回答失败，请核对 dsh 原生界面。"
+		}
+		reply(message)
+		return
+	}
+	if message := strings.TrimSpace(receipt.Message); message != "" {
+		reply(message)
+		return
+	}
+	reply("已提交。")
+}
+
+// handleNewSession 在当前宿主上创建会话并立即切换选择。
+func (e *Executor) handleNewSession(ctx context.Context, reply func(string), action command.Action) {
+	title := sanitizeDecisionText(action.Title, decisionTextMaxBytes)
+	if title == "" {
+		title = defaultNewSessionTitle
+	}
+	directory, err := resolveSessionDirectory(action.Directory)
+	if err != nil {
+		reply("目录不存在或不是目录，请提供已存在的目录。")
+		return
+	}
+
+	created, err := e.api.Create(ctx, directory, title)
+	if err != nil || strings.TrimSpace(created.ID) == "" {
+		reply("新建 dsh 会话失败，请稍后重试。")
+		return
+	}
+	effectiveTitle := sanitizeDecisionText(created.Title, decisionTextMaxBytes)
+	if effectiveTitle == "" {
+		effectiveTitle = title
+	}
+	summary := SessionSummary{
+		ID:        created.ID,
+		Title:     effectiveTitle,
+		Cwd:       directory,
+		Available: true,
+		UpdatedAt: time.Now().UnixMilli(),
+	}
+	target := e.sessionTarget(summary)
+
+	e.mu.Lock()
+	if e.sessions == nil {
+		e.sessions = make(map[string]executorSession)
+	}
+	e.sessions[target.PaneID] = executorSession{
+		summary:      summary,
+		target:       target,
+		pendingUntil: time.Now().Add(createdSessionGrace),
+	}
+	e.selected = target
+	e.createdTarget = target
+	e.mu.Unlock()
+	// 新会话目标不同，旧会话的终端分页缓存不能继续展示。
+	e.buffer.Reset()
+
+	var content strings.Builder
+	fmt.Fprintf(&content, "已在 %s 新建 dsh 会话「%s」。", directory, effectiveTitle)
+	if created.RenameFailed {
+		content.WriteString("\n标题设置失败，当前标题可能为会话 ID。")
+	}
+	content.WriteString("\n已切换到新会话。")
+	reply(content.String())
+}
+
+// resolveSessionDirectory 展开用户主目录并校验目录存在；不会创建目录。
+func resolveSessionDirectory(raw string) (string, error) {
+	directory := strings.TrimSpace(raw)
+	if directory == "" || directory == "~" || strings.HasPrefix(directory, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case directory == "", directory == "~":
+			directory = home
+		default:
+			directory = filepath.Join(home, strings.TrimPrefix(directory, "~/"))
+		}
+	}
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", errors.New("dsh 会话目录不是目录")
+	}
+	return absolute, nil
+}
+
+// ReadTerminalSnapshot 读取一个 dsh 目标的文本快照。
+//
+// 会话目标返回聊天正文并在末尾附上当前待处理审批或问题；宿主入口返回操作说明。
+// 正文与提示合计不超过 20000 个 UTF-16 代码单元，超长时只截断正文，保留提示。
+func (e *Executor) ReadTerminalSnapshot(ctx context.Context, paneID, occupant string, _ im.OutputMode, maxLines int) (im.TerminalContent, error) {
+	if e == nil {
+		return im.TerminalContent{}, session.ErrSelectionInvalid
+	}
+	e.mu.RLock()
+	target, err := e.targetLocked(paneID, occupant)
+	var summary SessionSummary
+	if err == nil && target.Tab != hostEntryTab {
+		state, ok := e.sessions[target.PaneID]
+		if !ok {
+			err = session.ErrSelectionInvalid
+		} else {
+			summary = state.summary
+		}
+	}
+	e.mu.RUnlock()
+	if err != nil {
+		return im.TerminalContent{}, err
+	}
+
+	capturedAt := time.Now().UTC()
+	if target.Tab == hostEntryTab {
+		return im.TerminalContent{
+			Mode:       im.OutputModeText,
+			Text:       executorHostEntryMessage,
+			Page:       &im.TerminalPage{Current: 1, Total: 1},
+			CapturedAt: capturedAt,
+		}, nil
+	}
+
+	text, err := e.api.Read(ctx, summary.ID)
+	if err != nil {
+		return im.TerminalContent{}, err
+	}
+	prompt, _ := e.pendingDecisionPrompt(ctx, summary.ID)
+	return im.TerminalContent{
+		Mode:       im.OutputModeText,
+		Text:       boundedSnapshotText(transcriptTail(text, maxLines), prompt),
+		Page:       &im.TerminalPage{Current: 1, Total: 1},
+		CapturedAt: capturedAt,
+	}, nil
+}
+
+// TakeCreatedTarget 返回并清除最近一次 /new-session 创建的目标。
+func (e *Executor) TakeCreatedTarget() (session.Target, bool) {
+	if e == nil {
+		return session.Target{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	target := e.createdTarget
+	e.createdTarget = session.Target{}
+	if target.PaneID == "" {
+		return session.Target{}, false
+	}
+	return target, true
+}
+
+// clearCreatedTarget 清除待领取的新建会话目标。
+func (e *Executor) clearCreatedTarget() {
+	e.mu.Lock()
+	e.createdTarget = session.Target{}
+	e.mu.Unlock()
+}
+
+// transcriptTail 按 maxLines 截取末尾若干行。
+func transcriptTail(text string, maxLines int) string {
+	lines := strings.Split(text, "\n")
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// boundedSnapshotText 组合正文与待答提示，总长不超过 UTF-16 上限。
+//
+// 超长时先截断正文（保留最新内容），提示完整保留；提示本身异常超长时保留其
+// 末尾，因为 /answer 使用提示位于文本尾部。
+func boundedSnapshotText(transcript, prompt string) string {
+	prompt = truncateUTF16Tail(prompt, terminalSnapshotUTF16Limit)
+	if strings.TrimSpace(prompt) == "" {
+		return truncateUTF16Tail(transcript, terminalSnapshotUTF16Limit)
+	}
+	budget := terminalSnapshotUTF16Limit - utf16Units(snapshotSeparator) - utf16Units(prompt)
+	if budget < 0 {
+		budget = 0
+	}
+	transcript = strings.TrimRight(truncateUTF16Tail(transcript, budget), "\n")
+	if transcript == "" {
+		return prompt
+	}
+	return transcript + snapshotSeparator + prompt
+}
+
+// utf16Units 返回字符串按 UTF-16 代码单元计的长度。
+func utf16Units(text string) int {
+	units := 0
+	for _, current := range text {
+		width := utf16.RuneLen(current)
+		if width < 1 {
+			width = 1
+		}
+		units += width
+	}
+	return units
 }
