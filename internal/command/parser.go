@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Kind 表示解析后的动作类别。
@@ -30,14 +31,21 @@ const (
 	KindHelp
 	// KindPrompt 请求发送普通文本提示。
 	KindPrompt
+	// KindAnswer 请求回答 dsh 的审批或问题。
+	KindAnswer Kind = iota + 9
+	// KindNewSession 请求创建 dsh 会话。
+	KindNewSession
 )
 
 // Action 是输入文本对应的桥接动作。
 type Action struct {
-	Kind  Kind
-	Index int
-	Keys  []string
-	Text  string
+	Kind      Kind
+	Index     int
+	Keys      []string
+	Text      string
+	Indexes   []int
+	Title     string
+	Directory string
 }
 
 // ErrInvalidCommand 表示输入为空或命令格式不受支持。
@@ -47,7 +55,15 @@ const generalUsage = "用法: 可用命令见 /help"
 
 const keyUsage = "/key 用法: /key KEYS"
 
+const answerUsage = "/answer 用法: /answer [编号...] [文本]"
+
 const maxKeySequence = 32
+
+const maxAnswerIndexes = 32
+
+const defaultSessionTitle = "默认标题"
+
+const maxSessionTitleRunes = 256
 
 const helpText = `输入帮助：
 /ls                 列出 Agent
@@ -58,6 +74,8 @@ const helpText = `输入帮助：
 /key KEYS           发送按键；逗号或空白分隔，最多 32 个
 /enter              等同 /key enter
 /slash TEXT         将 /TEXT 作为普通消息发送给 Agent
+/answer ARGS        回答 dsh 审批或问题（仅 dsh），如 /answer 1,2 或 /answer 5 文本
+/new-session ARGS   新建 dsh 会话（仅 dsh），如 /new-session 标题 /绝对目录
 
 按键支持 up、down、esc、space、单个 ASCII 字母或数字；dn 等同 down，sp 等同 space。
 相邻按键间隔 100ms；全部发送后等待 200ms，再读取控制台。enter 只能单独发送，不能出现在多键队列中。
@@ -100,9 +118,88 @@ func Parse(input string) (Action, error) {
 		return parseKeys(strings.TrimSpace(strings.TrimPrefix(trimmed, "/key")))
 	case "/slash":
 		return parseSlash(trimmed)
+	case "/answer":
+		return parseAnswer(strings.TrimSpace(strings.TrimPrefix(trimmed, "/answer")))
+	case "/new-session":
+		return parseNewSession(strings.TrimSpace(strings.TrimPrefix(trimmed, "/new-session"))), nil
 	default:
 		return Action{}, invalidCommand(generalUsage)
 	}
+}
+
+// parseAnswer 解析 dsh 审批/问题答案：前导纯数字 token 为选项编号，其余原文为自定义文本。
+// 编号以逗号或空白分隔，必须大于 0 且去重后不超过 32 个。
+func parseAnswer(raw string) (Action, error) {
+	action := Action{Kind: KindAnswer}
+	textStart := -1
+	for index := 0; index < len(raw); {
+		r, size := utf8.DecodeRuneInString(raw[index:])
+		if r == ',' || unicode.IsSpace(r) {
+			index += size
+			continue
+		}
+		end := index
+		for end < len(raw) {
+			tokenRune, tokenSize := utf8.DecodeRuneInString(raw[end:])
+			if tokenRune == ',' || unicode.IsSpace(tokenRune) {
+				break
+			}
+			end += tokenSize
+		}
+		token := raw[index:end]
+		if !isASCIIUnsignedInteger(token) {
+			textStart = index
+			break
+		}
+		value, err := strconv.Atoi(token)
+		if err != nil || value <= 0 {
+			return Action{}, invalidCommand(answerUsage)
+		}
+		if !slices.Contains(action.Indexes, value) {
+			if len(action.Indexes) == maxAnswerIndexes {
+				return Action{}, invalidCommand(answerUsage)
+			}
+			action.Indexes = append(action.Indexes, value)
+		}
+		index = end
+	}
+	if textStart >= 0 {
+		action.Text = strings.TrimSpace(raw[textStart:])
+	}
+	if len(action.Indexes) == 0 && action.Text == "" {
+		return Action{}, invalidCommand(answerUsage)
+	}
+	return action, nil
+}
+
+// parseNewSession 解析 dsh 新建会话参数：末尾路径样式 token 视为目录，其余 token 拼接为标题。
+func parseNewSession(raw string) Action {
+	action := Action{Kind: KindNewSession, Title: defaultSessionTitle}
+	fields := strings.Fields(raw)
+	if len(fields) > 0 && isSessionDirectory(fields[len(fields)-1]) {
+		action.Directory = fields[len(fields)-1]
+		fields = fields[:len(fields)-1]
+	}
+	if title := strings.Join(fields, " "); title != "" {
+		action.Title = truncateSessionTitle(title)
+	}
+	return action
+}
+
+func isSessionDirectory(value string) bool {
+	return value == "~" ||
+		strings.HasPrefix(value, "/") ||
+		strings.HasPrefix(value, "~/") ||
+		strings.HasPrefix(value, "./") ||
+		strings.HasPrefix(value, "../")
+}
+
+func truncateSessionTitle(title string) string {
+	runes := []rune(title)
+	if len(runes) <= maxSessionTitleRunes {
+		return title
+	}
+	return strings.TrimSpace(string(runes[:maxSessionTitleRunes]))
 }
 
 func parseAlias(fields []string, command string, action Action) (Action, error) {
