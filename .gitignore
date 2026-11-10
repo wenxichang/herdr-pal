@@ -13,4 +13,5 @@ coverage.out
 .tmp/
 tmp/
 .worktrees/
+.claude/
 docs/superpowers/
