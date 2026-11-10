@@ -177,8 +177,8 @@ const (
 	readFastMaxMessages = 100
 	// readFallbackMaxMessages 是降级分页时单页的消息上限。
 	readFallbackMaxMessages = 32
-	// readFallbackMaxPages 限制降级分页最多向更早历史追读的页数。
-	readFallbackMaxPages = 4
+	// readFallbackMaxPages 限制降级分页最多向更早历史追读的页数，与参考实现一致。
+	readFallbackMaxPages = 16
 	// readTargetMessages 是最终展示窗口的消息条数，追读满该数量即可停止。
 	readTargetMessages = 100
 )
@@ -230,8 +230,9 @@ type sessionPage struct {
 // Read 读取会话已持久化的聊天正文。
 //
 // 先以 session/projections 取得顺序投影切点，再用 session/page 读取尾页；
-// 尾页响应超过 RPC 上限或分页不可信时改为 32 条一页向上追读，最多 4 页或
-// 100 条消息。仍无法完整读取时返回 errHistoryTooLarge，不返回部分正文。
+// 尾页响应超过 RPC 上限、分页不可信，或尾页仍有更早历史但可见消息不足 100 条时，
+// 改为 32 条一页向上追读，最多 16 页或 100 条消息。仍无法完整读取时返回
+// errHistoryTooLarge，不返回部分正文。
 func (c *Client) Read(ctx context.Context, sessionID string) (string, error) {
 	if err := validateSessionID(sessionID); err != nil {
 		return "", err
@@ -253,7 +254,19 @@ func (c *Client) Read(ctx context.Context, sessionID string) (string, error) {
 			if transcriptErr != nil {
 				return "", fmt.Errorf("读取 dsh 会话正文失败: %w", transcriptErr)
 			}
-			return text, nil
+			if !page.hasMore {
+				return text, nil
+			}
+			// 尾页还有更早事件时不能直接返回：工具事件密集的会话里可见消息
+			// 可能远少于 100 条，必须向上补读，否则会静默丢失更早的聊天历史。
+			count, countErr := projectedMessageCount([][]json.RawMessage{page.records})
+			if countErr != nil {
+				return "", fmt.Errorf("读取 dsh 会话正文失败: %w", countErr)
+			}
+			if count >= readTargetMessages {
+				return text, nil
+			}
+			return c.readFallback(ctx, sessionID, asOfSeq)
 		}
 		err = parseErr
 	}
@@ -305,8 +318,8 @@ func isPageFallbackError(err error) bool {
 
 // readFallback 从切点向上按 32 条一页追读，直到历史读完或已覆盖最近 100 条消息。
 //
-// 任何无法确认完整性的分页结果都返回 errHistoryTooLarge，避免把半截历史
-// 当成完整正文展示。页面按从新到旧收集，投影前再恢复为时间顺序。
+// 最多追读 16 页；任何无法确认完整性的分页结果都返回 errHistoryTooLarge，
+// 避免把半截历史当成完整正文展示。页面按从新到旧收集，投影前再恢复为时间顺序。
 func (c *Client) readFallback(ctx context.Context, sessionID string, throughSeq int64) (string, error) {
 	var newestFirst [][]json.RawMessage
 	var beforeSeq *uint64

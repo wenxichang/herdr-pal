@@ -46,12 +46,12 @@ var (
 	errMuxUnavailable = errors.New("dsh Mux 尚未就绪")
 	// errMuxProtocol 表示 dsh 发送了无法识别的 Mux 帧；必须失败关闭而不是猜测兼容。
 	errMuxProtocol = errors.New("dsh Mux 协议错误")
-	// errMuxCapacity 表示待答表超过条数上限。
-	errMuxCapacity = fmt.Errorf("%w: 待答事件超过 %d 条", errMuxProtocol, muxMaxPendingItems)
-	// errMuxItemTooLarge 表示单条待答事件超过大小上限。
-	errMuxItemTooLarge = fmt.Errorf("%w: 单条待答事件超过 %d KiB", errMuxProtocol, muxMaxItemBytes>>10)
-	// errMuxTotalTooLarge 表示待答表总量超过内存预算。
-	errMuxTotalTooLarge = fmt.Errorf("%w: 待答事件总量超过 %d KiB", errMuxProtocol, muxMaxPendingBytes>>10)
+	// errMuxCapacity 是待答事件超过条数上限的丢弃原因，仅用于日志。
+	errMuxCapacity = fmt.Errorf("待答事件超过 %d 条", muxMaxPendingItems)
+	// errMuxItemTooLarge 是单条待答事件超过大小上限的丢弃原因，仅用于日志。
+	errMuxItemTooLarge = fmt.Errorf("单条待答事件超过 %d KiB", muxMaxItemBytes>>10)
+	// errMuxTotalTooLarge 是待答表总量超过内存预算的丢弃原因，仅用于日志。
+	errMuxTotalTooLarge = fmt.Errorf("待答事件总量超过 %d KiB", muxMaxPendingBytes>>10)
 	// errMuxIdentifier 表示本地待答事件标识无效。
 	errMuxIdentifier = errors.New("dsh 待答事件标识无效")
 	// errMuxAlreadyRunning 表示同一个 Mux 被并发运行。
@@ -263,8 +263,9 @@ type muxFrame struct {
 
 // handleFrame 解析并应用一帧。
 //
-// 其他 streamId 的帧直接忽略；events 流上只接受 item 帧，未知帧类型、
-// 未知事件类型和超限事件都返回 errMuxProtocol 的包装错误并终止订阅。
+// 其他 streamId 的帧直接忽略；events 流上只接受 item 帧，未知帧类型和未知
+// 事件类型返回 errMuxProtocol 的包装错误并终止订阅。超过本地容量预算的待答
+// 事件只丢弃并记录安全日志，不能因此撤下整个宿主。
 func (m *Mux) handleFrame(data []byte) error {
 	var frame muxFrame
 	if err := json.Unmarshal(data, &frame); err != nil {
@@ -327,6 +328,10 @@ func (m *Mux) handleReady(raw json.RawMessage) error {
 }
 
 // handleWaterfall 校验并写入一条待答事件；同一 eventId 的重放按更新处理。
+//
+// 单条、条数或总量超过本地预算时丢弃该事件并继续订阅：这是容量问题而不是
+// 协议不兼容，返回 errMuxProtocol 会让 Backend 撤下宿主并在重连后反复抖动。
+// 告警日志只包含事件类型、大小与原因，不记录事件请求或正文。
 func (m *Mux) handleWaterfall(raw json.RawMessage) error {
 	var value struct {
 		EventID string          `json:"eventId"`
@@ -346,7 +351,8 @@ func (m *Mux) handleWaterfall(raw json.RawMessage) error {
 
 	size := len(raw)
 	if size > muxMaxItemBytes {
-		return errMuxItemTooLarge
+		m.logSkippedWaterfall(value.Event, size, 0, errMuxItemTooLarge)
+		return nil
 	}
 	item := PendingItem{
 		EventID: value.EventID,
@@ -357,16 +363,21 @@ func (m *Mux) handleWaterfall(raw json.RawMessage) error {
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	total := m.totalBytes
 	if existing, ok := m.items[value.EventID]; ok {
 		total -= len(existing.Raw)
 	} else if len(m.items) >= muxMaxPendingItems {
-		return errMuxCapacity
+		count := len(m.items)
+		m.mu.Unlock()
+		m.logSkippedWaterfall(value.Event, size, count, errMuxCapacity)
+		return nil
 	}
 	total += size
 	if total > muxMaxPendingBytes {
-		return errMuxTotalTooLarge
+		count := len(m.items)
+		m.mu.Unlock()
+		m.logSkippedWaterfall(value.Event, size, count, errMuxTotalTooLarge)
+		return nil
 	}
 
 	if _, ok := m.items[value.EventID]; !ok {
@@ -376,7 +387,21 @@ func (m *Mux) handleWaterfall(raw json.RawMessage) error {
 	m.totalBytes = total
 	// 同一 eventId 重新出现时，旧的 cancel 记录必须失效。
 	delete(m.canceled, value.EventID)
+	m.mu.Unlock()
 	return nil
+}
+
+// logSkippedWaterfall 记录一条因本地容量预算被丢弃的待答事件。
+func (m *Mux) logSkippedWaterfall(event string, size, pending int, reason error) {
+	if m.logger == nil {
+		return
+	}
+	m.logger.Warn("dsh Mux 待答事件超过本地预算，已跳过",
+		"event", truncateRPCMessage(event),
+		"bytes", size,
+		"pending", pending,
+		"reason", reason,
+	)
 }
 
 // handleCancel 按 eventId 删除待答项，记录取消事实并广播等待者。

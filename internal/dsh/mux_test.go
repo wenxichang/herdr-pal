@@ -397,7 +397,7 @@ func TestMuxReconnectReplacesClientIDAndPending(t *testing.T) {
 }
 
 func TestMuxBoundsPendingAndRejectsUnknownFrames(t *testing.T) {
-	t.Run("超过256条", func(t *testing.T) {
+	t.Run("超过256条只丢弃后续事件", func(t *testing.T) {
 		allSent := make(chan struct{})
 		sendExtra := make(chan struct{})
 		fake := newMuxTestHost(t, func(conn *websocket.Conn, stop <-chan struct{}) {
@@ -420,6 +420,11 @@ func TestMuxBoundsPendingAndRejectsUnknownFrames(t *testing.T) {
 			case <-sendExtra:
 				if err := writeMuxFrame(conn, muxWaterfall("event-extra", "agent-1", map[string]any{"kind": "approval"})); err != nil {
 					t.Error(err)
+					return
+				}
+				// 后续合法帧仍必须被处理，证明超限事件没有让 Mux 退出。
+				if err := writeMuxFrame(conn, muxCancel("event-000")); err != nil {
+					t.Error(err)
 				}
 			case <-stop:
 			}
@@ -433,12 +438,18 @@ func TestMuxBoundsPendingAndRejectsUnknownFrames(t *testing.T) {
 			return len(mux.Snapshot().Items) == 256
 		})
 		close(sendExtra)
-		if err := run.wait(t); !errors.Is(err, errMuxCapacity) {
-			t.Fatalf("超过 256 条应返回 errMuxCapacity，实际 %v", err)
+		waitForMux(t, "超限事件被跳过且后续 cancel 仍生效", func() bool {
+			return len(mux.Snapshot().Items) == 255
+		})
+		for _, item := range mux.Snapshot().Items {
+			if item.EventID == "event-extra" {
+				t.Fatal("超过 256 条的事件不应入表")
+			}
 		}
+		run.stillRunning(t)
 	})
 
-	t.Run("单条超过128KiB", func(t *testing.T) {
+	t.Run("单条超过128KiB只跳过该事件", func(t *testing.T) {
 		fake := newMuxTestHost(t, func(conn *websocket.Conn, stop <-chan struct{}) {
 			if err := readMuxOpen(conn); err != nil {
 				t.Error(err)
@@ -451,17 +462,23 @@ func TestMuxBoundsPendingAndRejectsUnknownFrames(t *testing.T) {
 			oversized := map[string]any{"kind": "approval", "padding": strings.Repeat("x", 129<<10)}
 			if err := writeMuxFrame(conn, muxWaterfall("event-big", "agent-1", oversized)); err != nil {
 				t.Error(err)
+				return
+			}
+			if err := writeMuxFrame(conn, muxWaterfall("event-ok", "agent-1", map[string]any{"kind": "approval"})); err != nil {
+				t.Error(err)
 			}
 			<-stop
 		})
 		mux := newTestMux(t, fake)
 		run := startTestMux(t, mux)
-		if err := run.wait(t); !errors.Is(err, errMuxItemTooLarge) {
-			t.Fatalf("单条超过 128 KiB 应返回 errMuxItemTooLarge，实际 %v", err)
-		}
+		waitForMux(t, "超限事件被跳过，后续事件仍入表", func() bool {
+			snapshot := mux.Snapshot()
+			return len(snapshot.Items) == 1 && snapshot.Items[0].EventID == "event-ok"
+		})
+		run.stillRunning(t)
 	})
 
-	t.Run("总量超过1MiB", func(t *testing.T) {
+	t.Run("总量超过1MiB只跳过后续事件", func(t *testing.T) {
 		fake := newMuxTestHost(t, func(conn *websocket.Conn, stop <-chan struct{}) {
 			if err := readMuxOpen(conn); err != nil {
 				t.Error(err)
@@ -478,13 +495,23 @@ func TestMuxBoundsPendingAndRejectsUnknownFrames(t *testing.T) {
 					return
 				}
 			}
+			if err := writeMuxFrame(conn, muxCancel("event-0")); err != nil {
+				t.Error(err)
+				return
+			}
 			<-stop
 		})
 		mux := newTestMux(t, fake)
 		run := startTestMux(t, mux)
-		if err := run.wait(t); !errors.Is(err, errMuxTotalTooLarge) {
-			t.Fatalf("总量超过 1 MiB 应返回 errMuxTotalTooLarge，实际 %v", err)
+		waitForMux(t, "总量超限事件被跳过且后续 cancel 仍生效", func() bool {
+			return len(mux.Snapshot().Items) == 7
+		})
+		for _, item := range mux.Snapshot().Items {
+			if item.EventID == "event-8" {
+				t.Fatal("总量超限的事件不应入表")
+			}
 		}
+		run.stillRunning(t)
 	})
 
 	cases := []struct {

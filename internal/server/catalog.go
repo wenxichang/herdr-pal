@@ -215,6 +215,19 @@ func (catalog *SessionCatalog) CreateNumberedSnapshot(userID string) []CatalogEn
 	return cloneEntries(entries)
 }
 
+// CatalogEntries 返回当前在线目录的只读副本，不修改用户的 /N 编号快照。
+//
+// 供只需读取目标目录的路由逻辑使用；与 CreateNumberedSnapshot 不同，调用它
+// 不会改变用户已经看到的编号顺序。
+func (catalog *SessionCatalog) CatalogEntries(userID string) []CatalogEntry {
+	if catalog == nil {
+		return nil
+	}
+	catalog.mu.RLock()
+	defer catalog.mu.RUnlock()
+	return cloneEntries(catalog.entriesLocked(userID))
+}
+
 // ResolveNumbered 按最近一次列表中的一开始编号解析并复核当前稳定目标。
 func (catalog *SessionCatalog) ResolveNumbered(userID string, index int) (CatalogEntry, error) {
 	if catalog == nil {

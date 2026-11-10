@@ -1940,8 +1940,9 @@ func TestNewSessionUsesSelectedDSHSessionHost(t *testing.T) {
 	router.Handle(context.Background(), routerMessage("request-host", "message-host", "user-a", command))
 
 	calls := relay.Calls()
-	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, entries[1].Ref) {
-		t.Fatalf("relay calls = %#v, want execute on host entry %#v", calls, entries[1].Ref)
+	// 选中的会话仍存在时必须直接使用它，不能改派同机器另一个宿主的入口。
+	if len(calls) != 1 || calls[0].kind != "execute" || !sameSessionRef(calls[0].target, entries[0].Ref) {
+		t.Fatalf("relay calls = %#v, want execute on selected session %#v", calls, entries[0].Ref)
 	}
 	if calls[0].message.Content != command {
 		t.Fatalf("executed content = %q, want %q", calls[0].message.Content, command)
@@ -2035,6 +2036,84 @@ func TestNewSessionRequiresSelectionForMultipleHosts(t *testing.T) {
 	reply := gateway.LastReply()
 	if !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/N") || !strings.Contains(reply, "dsh 宿主") {
 		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestNewSessionRequiresSelectionForSameMachineWebAndDesktopSessions(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			dshTestSession(1, "dsh:web-1", "session:web-1", "web", "web 会话"),
+			dshTestSession(2, "dsh:desktop-1", "session:desktop-1", "desktop", "Desktop 会话"),
+		},
+	})
+
+	router.Handle(context.Background(), routerMessage("request-mixed-tabs", "message-mixed-tabs", "user-a", "/new-session 新会话"))
+
+	if relay.CallCount() != 0 {
+		t.Fatalf("web/Desktop 双宿主无选择时不应猜测宿主，relay calls = %#v", relay.Calls())
+	}
+	reply := gateway.LastReply()
+	if !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/N") || !strings.Contains(reply, "dsh 宿主") {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestNewSessionRequiresSelectionForSameVariantSessions(t *testing.T) {
+	router, gateway, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			dshTestSession(1, "dsh:session-1", "session:1", "web", "第一个会话"),
+			dshTestSession(2, "dsh:session-2", "session:2", "web", "第二个会话"),
+		},
+	})
+
+	router.Handle(context.Background(), routerMessage("request-same-variant", "message-same-variant", "user-a", "/new-session 新会话"))
+
+	if relay.CallCount() != 0 {
+		t.Fatalf("同变体多个会话无法区分宿主，relay calls = %#v", relay.Calls())
+	}
+	reply := gateway.LastReply()
+	if !strings.Contains(reply, "/ls") || !strings.Contains(reply, "/N") || !strings.Contains(reply, "dsh 宿主") {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestNewSessionDoesNotRewriteNumberedSnapshot(t *testing.T) {
+	router, _, relay := newRouterHarness(t)
+	attachSnapshot(t, router.catalog, "conn-home", ClientKey{UserID: "user-a", MachineID: "home-mac"}, hprp.SessionSnapshot{
+		Sequence: 1, Sessions: []hprp.Session{
+			dshTestHostEntry(1, "dsh-host:host-2"),
+			dshTestSession(2, "dsh:session-1", "session:1", "web", "现有会话"),
+		},
+	})
+	router.Handle(context.Background(), routerMessage("request-ls", "message-ls", "user-a", "/ls"))
+	numbered := router.catalog.CreateNumberedSnapshot("user-a")
+	if len(numbered) != 2 {
+		t.Fatalf("/ls 后编号数 = %d，期望 2", len(numbered))
+	}
+
+	// 目录变化后 /new-session 只应读取目录，不能重建并改写用户看到的 /N 编号。
+	if err := router.catalog.ApplySnapshot("conn-home", hprp.SessionSnapshot{
+		Sequence: 2, Sessions: []hprp.Session{
+			dshTestHostEntry(1, "dsh-host:host-2"),
+			dshTestSession(2, "dsh:session-1", "session:1", "web", "现有会话"),
+			dshTestSession(3, "dsh:session-0", "session:0", "web", "新增会话"),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	router.Handle(context.Background(), routerMessage("request-new", "message-new", "user-a", "/new-session 新会话"))
+	if relay.CallCount() != 1 {
+		t.Fatalf("relay calls = %#v", relay.Calls())
+	}
+
+	entry, err := router.catalog.ResolveNumbered("user-a", 1)
+	if err != nil || !sameSessionRef(entry.Ref, numbered[0].Ref) {
+		t.Fatalf("ResolveNumbered(1) = %#v, %v；/N 编号被 /new-session 改写", entry, err)
+	}
+	if _, err := router.catalog.ResolveNumbered("user-a", 3); !errors.Is(err, ErrSelectionIndexOutOfRange) {
+		t.Fatalf("ResolveNumbered(3) error = %v，期望编号快照仍只有两项", err)
 	}
 }
 

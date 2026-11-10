@@ -596,8 +596,9 @@ Expected: FAIL。
 1. `session/projections` 请求 `{"request":{"sessionId":...}}`。
 2. 校验 `kind=="sequenced"` 且 `asOfSeq >= -1`。
 3. 快路径：`session/page` 请求 `throughSeq=asOfSeq, maxMessages=100`。
-4. 若响应超过 RPC 上限或分页失败，降级为 `maxMessages=32`、向上 `beforeSeq` 分页，最多
-   4 页或 100 条消息；仍超限则返回“历史过大，无法读取”，不返回半截正文。
+4. 若响应超过 RPC 上限、分页失败，或尾页仍有更早历史但可见消息不足 100 条，降级为
+   `maxMessages=32`、向上 `beforeSeq` 分页，最多 16 页或 100 条消息；仍超限则返回
+   “历史过大，无法读取”，不返回半截正文。
 5. 调 `conversationText(page.records)`；跨页时保留 `surfaceOp.replace` 范围。
 
 - [ ] **Step 4: 运行测试确认通过**

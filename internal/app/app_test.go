@@ -2134,6 +2134,40 @@ func TestAppRejectsLegacyDSHToken(t *testing.T) {
 	}
 }
 
+func TestRunRelayMixedModeAcquiresDSHLock(t *testing.T) {
+	setTestCacheHome(t)
+	relay := newFakeRelayServer(t)
+	dshConfig := config.DSHConfig{URL: "http://127.0.0.1:17842", Home: t.TempDir(), Variant: "web"}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockDir := filepath.Join(cacheDir, "herdr-pal")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟另一个实例（dsh-only 或其他混合实例）已持有同一 dsh 宿主锁。
+	held, err := processlock.Acquire(filepath.Join(lockDir, dshLockName(dshConfig)+".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Release() }()
+
+	configPath := writeRelayTestConfig(t, map[string]any{
+		"relay": map[string]any{"url": relay.URL(), "key": testRelayKey(t), "skip_verify": true},
+		"herdr": map[string]any{"socket_path": "/tmp/herdr-pal-mixed-lock-test.sock"},
+		"dsh":   map[string]any{"url": dshConfig.URL, "home": dshConfig.Home, "variant": "web"},
+	})
+
+	err = RunRelay(context.Background(), Options{ConfigPath: configPath, Stderr: io.Discard, Stdout: io.Discard})
+	if !errors.Is(err, processlock.ErrAlreadyRunning) || !strings.Contains(err.Error(), "dsh 进程锁") {
+		t.Fatalf("RunRelay() error = %v，期望明确的 dsh 进程锁冲突", err)
+	}
+	if got := relay.connections.Load(); got != 0 {
+		t.Fatalf("dsh 锁冲突前已建立 %d 个 Relay 连接", got)
+	}
+}
+
 func TestDSHLockNameSeparatesAutoDiscoveryAndExplicitURL(t *testing.T) {
 	if got, want := dshLockName(config.DSHConfig{}), shortHash("dsh:auto"); got != want {
 		t.Fatalf("自动发现锁名 = %q, want %q", got, want)

@@ -316,6 +316,10 @@ func (client *Client) sendContent(content hprp.Content) error {
 }
 
 // SendNotification 发送携带稳定本机目标的主动通知；断线时直接失败且不缓存。
+//
+// 发送状态通知前必须上报并等待 Server 确认当前快照：Server 只接受已出现在
+// 确认快照中的目标，否则会按协议错误关闭整条 HPRP 连接。目标失效通知描述的是
+// 目标离开快照，不需要也不应等待新的确认快照。
 func (client *Client) SendNotification(ctx context.Context, target im.NotificationTarget, event im.NotificationEvent) error {
 	current := client.currentSession()
 	if current == nil {
@@ -323,6 +327,9 @@ func (client *Client) SendNotification(ctx context.Context, target im.Notificati
 	}
 	if event.Kind != im.NotificationKindTargetInvalidated {
 		if _, err := client.resolveLocalTarget(current.machineID, target.PaneID, target.OccupantHash); err != nil {
+			return err
+		}
+		if err := client.reportCurrentSnapshot(ctx); err != nil {
 			return err
 		}
 	}

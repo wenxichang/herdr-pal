@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/wenxichang/herdr-pal/internal/credential"
@@ -84,9 +85,14 @@ func (config RelayConfig) MarshalJSON() ([]byte, error) {
 func validateDSHConfig(cfg DSHConfig) error {
 	if cfg.URL != "" {
 		endpoint, err := url.Parse(cfg.URL)
-		if err != nil || endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" || endpoint.Port() == "" ||
-			endpoint.User != nil || endpoint.Path != "" || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		if err != nil || endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" ||
+			endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" ||
+			(endpoint.Path != "" && endpoint.Path != "/") {
 			return errors.New("dsh.url 必须是 http://127.0.0.1:端口，不能包含路径或凭据")
+		}
+		port, err := strconv.Atoi(endpoint.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return errors.New("dsh.url 端口必须在 1..65535")
 		}
 	}
 	if cfg.Home != "" && !filepath.IsAbs(cfg.Home) {

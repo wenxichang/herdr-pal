@@ -1230,3 +1230,129 @@ func TestExecutorRefreshPendingFailureConcurrentNewSession(t *testing.T) {
 	stop.Store(true)
 	refreshers.Wait()
 }
+
+func TestExecutorReadAndAnswerBoundRepliesForHPRP(t *testing.T) {
+	executor, api, sink := newExecutorFixture(t, testValidHost())
+	api.sessions = []SessionSummary{{ID: "s1", Title: "任务", Available: true}}
+	hugeText := strings.Repeat("长", 30000) // 30000 个 UTF-16 单元，超过 HPRP 内容上限。
+	options := make([]Option, 0, decisionMaxOptions)
+	for index := 0; index < decisionMaxOptions; index++ {
+		options = append(options, Option{
+			Value:       fmt.Sprintf("option-%d", index),
+			Label:       strings.Repeat("选", 6000),
+			Description: strings.Repeat("述", 6000),
+		})
+	}
+	api.decisions = []Decision{{
+		NativeID:  "event:huge",
+		SessionID: "s1",
+		Kind:      decisionKindForm,
+		Title:     "dsh 提问",
+		Questions: []Question{{
+			ID:          "q1",
+			Title:       "超长问题",
+			Description: hugeText,
+			Kind:        questionKindMultiple,
+			Options:     options,
+			Required:    true,
+		}},
+		Revision:  "rev-huge",
+		Blocking:  true,
+		Supported: true,
+	}}
+	api.readText = hugeText
+	selectExecutorSession(t, executor, api, "s1")
+
+	assertBoundedReply := func(what, reply string) {
+		t.Helper()
+		if length := utf16Length(reply); length > terminalSnapshotUTF16Limit {
+			t.Fatalf("%s 回复 UTF-16 长度 = %d，超过 %d", what, length, terminalSnapshotUTF16Limit)
+		}
+		content := hprp.Content{Type: hprp.ContentTypeText, Text: reply}
+		if err := hprp.ValidateContent(content); err != nil {
+			t.Fatalf("%s 回复无法通过 HPRP 校验：%v（长度 %d）", what, err, len(reply))
+		}
+	}
+
+	executor.HandleMessage(context.Background(), executorIncoming("msg-con", "/con"))
+	reply := sink.lastReply()
+	assertBoundedReply("/con", reply)
+	if !strings.Contains(reply, "/answer") {
+		t.Fatalf("/con 截断后必须保留 /answer 提示：%q", reply)
+	}
+
+	// /answer 参数错误时回复会附带完整决策提示，同样必须受限。
+	executor.HandleMessage(context.Background(), executorIncoming("msg-answer", "/answer 99"))
+	reply = sink.lastReply()
+	assertBoundedReply("/answer", reply)
+	if !strings.Contains(reply, "/answer") {
+		t.Fatalf("/answer 截断后必须保留 /answer 提示：%q", reply)
+	}
+}
+
+func TestExecutorRefreshKeepsCreatedSessionWhenSessionListFails(t *testing.T) {
+	executor, api, _ := newExecutorFixture(t, testValidHost())
+	selectExecutorHostEntry(t, executor)
+	api.createResult = CreatedSession{ID: "new-1", Title: "新任务"}
+
+	executor.HandleMessage(context.Background(), executorIncoming("new-session", "/new-session 新任务 /tmp"))
+	selected, err := executor.SelectedTarget()
+	if err != nil {
+		t.Fatalf("SelectedTarget() 返回错误：%v", err)
+	}
+
+	// session/list 失败时，宽限期内的本地新建会话必须继续保留。
+	api.sessions = nil
+	api.sessionsErr = errors.New("session/list 暂时不可用")
+	executor.refresh(context.Background())
+	targets := executor.CurrentTargets()
+	if len(targets) != 1 || targets[0].PaneID != selected.PaneID || targets[0].OccupantKey != selected.OccupantKey {
+		t.Fatalf("目录失败时宽限期内新会话不应消失，got %#v", targets)
+	}
+	if _, err := executor.SelectedTarget(); err != nil {
+		t.Fatalf("目录失败时宽限期内选择不应失效：%v", err)
+	}
+
+	// 宽限期结束后仍未出现在 session/list 中则移除。
+	executor.mu.Lock()
+	state := executor.sessions[selected.PaneID]
+	state.pendingUntil = time.Now().Add(-time.Second)
+	executor.sessions[selected.PaneID] = state
+	executor.mu.Unlock()
+	executor.refresh(context.Background())
+	if targets := executor.CurrentTargets(); len(targets) != 0 {
+		t.Fatalf("宽限期结束后应移除本地新建会话，got %#v", targets)
+	}
+}
+
+func TestExecutorStripsControlCharsFromTitlesAndWorkspaces(t *testing.T) {
+	executor, api, _ := newExecutorFixture(t, testValidHost())
+	api.sessions = []SessionSummary{{
+		ID:        "s1",
+		Title:     "\x1b[31m红色\x1b[0m\n伪造行\u009b尾",
+		Cwd:       "/work/\x1b[32m项目\u009b",
+		Available: true,
+	}}
+
+	executor.refresh(context.Background())
+	targets := executor.CurrentTargets()
+	if len(targets) != 1 {
+		t.Fatalf("CurrentTargets() = %#v，期望一个会话", targets)
+	}
+	target := targets[0]
+	if target.Title != "红色 伪造行尾" {
+		t.Fatalf("Title = %q，期望清除 ANSI/C0/C1 并折叠换行", target.Title)
+	}
+	if target.Workspace != "项目" {
+		t.Fatalf("Workspace = %q，期望清除 ANSI/C1", target.Workspace)
+	}
+	for _, forbidden := range []string{"\x1b", "\u009b", "\n", "\t"} {
+		if strings.Contains(target.Title, forbidden) || strings.Contains(target.Workspace, forbidden) {
+			t.Fatalf("目标标签仍含控制字符 %q：%#v", forbidden, target)
+		}
+	}
+	snapshot := relayclient.BuildSnapshot(1, targets)
+	if err := hprp.ValidateSessionSnapshot(snapshot); err != nil {
+		t.Fatalf("清理后的快照未通过 HPRP 校验：%v", err)
+	}
+}

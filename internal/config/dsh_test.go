@@ -71,6 +71,9 @@ func TestDSHConfigValidatesURLHomeAndVariant(t *testing.T) {
 		{"URL 带查询", `{"dsh":{"url":"http://127.0.0.1:1?x=1"}}`, "dsh.url"},
 		{"URL 带凭据", `{"dsh":{"url":"http://user@127.0.0.1:1"}}`, "dsh.url"},
 		{"URL 缺少端口", `{"dsh":{"url":"http://127.0.0.1"}}`, "dsh.url"},
+		{"端口为 0", `{"dsh":{"url":"http://127.0.0.1:0"}}`, "dsh.url"},
+		{"端口超范围", `{"dsh":{"url":"http://127.0.0.1:65536"}}`, "dsh.url"},
+		{"端口为空", `{"dsh":{"url":"http://127.0.0.1:"}}`, "dsh.url"},
 		{"相对 home", `{"dsh":{"home":"relative/home"}}`, "dsh.home"},
 		{"未知 variant", `{"dsh":{"variant":"other"}}`, "dsh.variant"},
 	} {
@@ -83,6 +86,9 @@ func TestDSHConfigValidatesURLHomeAndVariant(t *testing.T) {
 
 	for _, value := range []string{
 		`{"dsh":{"url":"http://127.0.0.1:17842"}}`,
+		`{"dsh":{"url":"http://127.0.0.1:1"}}`,
+		`{"dsh":{"url":"http://127.0.0.1:65535"}}`,
+		`{"dsh":{"url":"http://127.0.0.1:17842/"}}`,
 		`{"dsh":{"home":"/tmp/dsh-home"}}`,
 		`{"dsh":{"variant":""}}`,
 		`{"dsh":{"variant":"auto"}}`,

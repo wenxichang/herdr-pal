@@ -91,6 +91,15 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	}
 	var timedOutComponentsDone <-chan struct{}
 	defer func() { finishProcessLock(lock, &runErr, timedOutComponentsDone) }()
+	// 混合模式同样运行 dsh 后端，必须持有与 dsh-only 相同的进程锁，避免两个
+	// 实例同时控制同一 dsh 宿主。锁持有到整个 Relay 进程退出。
+	if loaded.DSH != nil {
+		dshLock, err := processlock.Acquire(filepath.Join(lockDir, dshLockName(*loaded.DSH)+".lock"))
+		if err != nil {
+			return fmt.Errorf("获取 dsh 进程锁（同一 dsh 宿主可能已被其他实例控制）: %w", err)
+		}
+		defer func() { finishProcessLock(dshLock, &runErr, timedOutComponentsDone) }()
+	}
 	stableDialPath, err := prepareStableDialPath(canonicalEndpoint)
 	if err != nil {
 		return fmt.Errorf("准备 Herdr Socket 连接路径: %w", err)

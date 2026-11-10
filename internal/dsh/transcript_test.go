@@ -545,6 +545,51 @@ func TestReadAppliesReplacementAcrossPages(t *testing.T) {
 	nextReadCall(t, calls, "session/page")
 }
 
+func TestReadBackfillsOlderVisibleHistoryWhenFastPageHasMore(t *testing.T) {
+	pageRecords := func(from, to int) []json.RawMessage {
+		records := make([]json.RawMessage, 0, to-from+1)
+		for seq := from; seq <= to; seq++ {
+			records = append(records, userEvent(t, seq, "user", textBlock(fmt.Sprintf("m%d", seq))))
+		}
+		return records
+	}
+
+	client, _ := newReadTestClient(t, func(endpoint string, args json.RawMessage) any {
+		switch endpoint {
+		case "session/projections":
+			return map[string]any{"kind": "sequenced", "asOfSeq": 500, "values": map[string]any{}}
+		case "session/page":
+			request := decodePageRequest(t, args)
+			if string(request["maxMessages"]) == "100" {
+				// 快页面只有 1 条可见消息，但仍标记有更早历史。
+				return map[string]any{"records": pageRecords(100, 100), "hasMore": true}
+			}
+			if rawBefore, ok := request["beforeSeq"]; ok {
+				if string(rawBefore) != "69" {
+					t.Errorf("降级第二页 beforeSeq = %s，期望 69", rawBefore)
+				}
+				return map[string]any{"records": pageRecords(40, 68), "hasMore": false}
+			}
+			return map[string]any{"records": pageRecords(69, 100), "hasMore": true}
+		default:
+			t.Errorf("意外的 endpoint %q", endpoint)
+			return map[string]any{}
+		}
+	})
+
+	got, err := client.Read(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("读取聊天正文: %v", err)
+	}
+	parts := strings.Split(got, "\n\n")
+	if len(parts) != 61 {
+		t.Fatalf("消息数 = %d，期望 61（补读更早可见历史）", len(parts))
+	}
+	if parts[0] != "用户：m40" || parts[len(parts)-1] != "用户：m100" {
+		t.Errorf("正文首尾 = %q / %q，期望 用户：m40 / 用户：m100", parts[0], parts[len(parts)-1])
+	}
+}
+
 func TestReadRejectsOversizedFallbackHistory(t *testing.T) {
 	pageRequests := 0
 	client, _ := newReadTestClient(t, func(endpoint string, args json.RawMessage) any {
@@ -563,11 +608,11 @@ func TestReadRejectsOversizedFallbackHistory(t *testing.T) {
 				if _, err := fmt.Sscanf(string(rawBefore), "%d", &before); err != nil {
 					t.Errorf("解析 beforeSeq %s: %v", rawBefore, err)
 				}
-				if want := 500 - (pageRequests-1)*100; before != want {
+				if want := 500 - (pageRequests-1)*10; before != want {
 					t.Errorf("第 %d 页 beforeSeq = %d，期望 %d", pageRequests, before, want)
 				}
 			}
-			seq := 500 - pageRequests*100
+			seq := 500 - pageRequests*10
 			return map[string]any{
 				"records": []json.RawMessage{userEvent(t, seq, "user", textBlock(fmt.Sprintf("m%d", seq)))},
 				"hasMore": true,
@@ -580,13 +625,13 @@ func TestReadRejectsOversizedFallbackHistory(t *testing.T) {
 
 	_, err := client.Read(context.Background(), "session-1")
 	if !errors.Is(err, errHistoryTooLarge) {
-		t.Fatalf("超过 4 页仍有更早历史应返回 errHistoryTooLarge，实际 %v", err)
+		t.Fatalf("超过 16 页仍有更早历史应返回 errHistoryTooLarge，实际 %v", err)
 	}
 	if !strings.Contains(err.Error(), "历史过大") {
 		t.Errorf("错误信息应说明历史过大: %v", err)
 	}
-	if pageRequests != 4 {
-		t.Fatalf("降级页请求数 = %d，期望 4", pageRequests)
+	if pageRequests != 16 {
+		t.Fatalf("降级页请求数 = %d，期望 16", pageRequests)
 	}
 }
 

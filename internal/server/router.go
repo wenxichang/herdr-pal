@@ -752,23 +752,27 @@ func (router *ConversationRouter) handleExecute(ctx context.Context, message im.
 
 // resolveDSHAnchor 选择 /new-session 的锚点目标。
 //
-// 选中 dsh 目标时优先使用同机器的宿主入口；没有宿主入口时使用选中的 dsh 会话本身，
-// 只有选中目标已从目录消失时才退回同机器第一个 dsh 会话。这样新建会话始终落在
-// 用户当前所选会话的宿主上。
-// 没有可用选中时，只接受唯一宿主入口或唯一机器上的 dsh 会话，避免在多个宿主间猜测。
+// 已选中的 dsh 目标仍存在时直接作为锚点（无论它是宿主入口还是会话）：只有该
+// 目标的宿主执行器才知道新建请求应落在这个宿主上，不能替换成同机器其他宿主的
+// 入口。选中目标消失后才退回同机器第一个可用宿主入口或会话。
+// 没有选中时，只接受唯一 dsh 宿主入口或唯一一个 dsh 会话，避免在多个宿主间猜测：
+// 同一机器上的 web/Desktop 会话属于不同宿主；同变体的多个会话也无法从目标字段
+// 区分是同一宿主还是多个宿主，因此保守要求用户先 /ls 和 /N 选择。
 func (router *ConversationRouter) resolveDSHAnchor(userID string, selected CatalogEntry, hasSelection bool) (CatalogEntry, error) {
-	entries := router.catalog.CreateNumberedSnapshot(userID)
+	// 只读目录：/new-session 的锚点解析不能改写用户已看到的 /N 编号快照。
+	entries := router.catalog.CatalogEntries(userID)
 	if hasSelection && isDSHCatalogEntry(selected) {
+		for _, entry := range entries {
+			if sameSessionRef(entry.Ref, selected.Ref) {
+				return selected, nil
+			}
+		}
 		var firstHost *CatalogEntry
 		var firstSession *CatalogEntry
-		selectedPresent := false
 		for index := range entries {
 			entry := entries[index]
 			if entry.Ref.MachineID != selected.Ref.MachineID || !isDSHCatalogEntry(entry) {
 				continue
-			}
-			if sameSessionRef(entry.Ref, selected.Ref) {
-				selectedPresent = true
 			}
 			if isDSHHostCatalogEntry(entry) {
 				if firstHost == nil {
@@ -780,15 +784,8 @@ func (router *ConversationRouter) resolveDSHAnchor(userID string, selected Catal
 				firstSession = &entries[index]
 			}
 		}
-		// 选中的宿主入口仍在目录中时必须复用它，否则多宿主入口会落到第一个宿主。
-		if selectedPresent && isDSHHostCatalogEntry(selected) {
-			return selected, nil
-		}
 		if firstHost != nil {
 			return *firstHost, nil
-		}
-		if selectedPresent {
-			return selected, nil
 		}
 		if firstSession != nil {
 			return *firstSession, nil
@@ -798,7 +795,6 @@ func (router *ConversationRouter) resolveDSHAnchor(userID string, selected Catal
 
 	hostEntries := make([]CatalogEntry, 0, 1)
 	sessions := make([]CatalogEntry, 0, 1)
-	machines := make(map[string]struct{})
 	for _, entry := range entries {
 		if !isDSHCatalogEntry(entry) {
 			continue
@@ -808,16 +804,15 @@ func (router *ConversationRouter) resolveDSHAnchor(userID string, selected Catal
 			continue
 		}
 		sessions = append(sessions, entry)
-		machines[entry.Ref.MachineID] = struct{}{}
 	}
 	if len(hostEntries) == 1 {
 		return hostEntries[0], nil
 	}
 	if len(hostEntries) == 0 {
-		switch {
-		case len(sessions) == 0:
+		switch len(sessions) {
+		case 0:
 			return CatalogEntry{}, ErrNoDSHHost
-		case len(machines) == 1:
+		case 1:
 			return sessions[0], nil
 		}
 	}

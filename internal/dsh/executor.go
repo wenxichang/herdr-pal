@@ -193,8 +193,8 @@ func (e *Executor) Run(ctx context.Context) error {
 
 // refresh 同步会话目录、待答 blocking 状态和通知。
 //
-// 目录失败时撤下全部目标（含宿主入口）；Pending 单独失败时保留上次 blocking
-// 判断，避免 Mux 短暂断线造成误报 done。
+// 目录失败时撤下普通目标与宿主入口，但保留仍在宽限期内的本地新建会话；
+// Pending 单独失败时保留上次 blocking 判断，避免 Mux 短暂断线造成误报 done。
 func (e *Executor) refresh(ctx context.Context) {
 	list, sessionsErr := e.api.Sessions(ctx)
 	pending, pendingErr := e.api.Pending(ctx)
@@ -230,18 +230,18 @@ func (e *Executor) refresh(ctx context.Context) {
 	}
 
 	e.mu.Lock()
-	if sessionsErr == nil {
-		// 新建会话可能尚未出现在 session/list：在 5 秒宽限期内保留本地条目。
-		now := time.Now()
-		for key, state := range e.sessions {
-			if state.pendingUntil.IsZero() || !now.Before(state.pendingUntil) {
-				continue
-			}
-			if _, exists := next[key]; exists {
-				continue
-			}
-			next[key] = state
+	// 新建会话可能尚未出现在 session/list：无论本次目录读取是否成功，都在
+	// 5 秒宽限期内保留本地条目，避免一次列表失败立即丢失刚创建的会话；到期后
+	// 仍未出现在目录中才移除。
+	now := time.Now()
+	for key, state := range e.sessions {
+		if state.pendingUntil.IsZero() || !now.Before(state.pendingUntil) {
+			continue
 		}
+		if _, exists := next[key]; exists {
+			continue
+		}
+		next[key] = state
 	}
 	notifications := collectNotifications(previous, next)
 	e.sessions = next
@@ -480,16 +480,17 @@ func (e *Executor) hostTarget() session.Target {
 //
 // PaneID 含宿主引用，避免 web/Desktop 共享历史时同会话 ID 冲突；OccupantKey
 // 只取决于宿主 Generation 和会话 ID，宿主内会话消失再出现时保持稳定。
+// Title/Workspace 来自 dsh 宿主，进入 HPRP 展示标签前必须清除 ANSI/C0/C1。
 func (e *Executor) sessionTarget(s SessionSummary) session.Target {
-	title := s.Title
-	if strings.TrimSpace(title) == "" {
+	title := sanitizeDisplayLabel(s.Title)
+	if title == "" {
 		title = s.ID
 	}
-	workspace := strings.TrimSpace(s.Cwd)
-	if workspace == "" {
-		workspace = defaultWorkspace
-	} else {
-		workspace = filepath.Base(workspace)
+	workspace := defaultWorkspace
+	if cwd := strings.TrimSpace(s.Cwd); cwd != "" {
+		if base := sanitizeDisplayLabel(filepath.Base(cwd)); base != "" {
+			workspace = base
+		}
 	}
 	status := herdr.AgentStatusIdle
 	if s.Running {
@@ -505,6 +506,21 @@ func (e *Executor) sessionTarget(s SessionSummary) session.Target {
 		Workspace:    truncateLabel(workspace, hprp.MaxLabelBytes),
 		Tab:          e.host.Variant,
 	}
+}
+
+// sanitizeDisplayLabel 清除 ANSI/C0/C1 控制字符，并把换行/制表折叠为空格。
+//
+// dsh 标题与工作目录的字符集不受 HPRP 约束；控制字符进入 Server 展示标签
+// 会污染 /ls 与通知文本，必须在生成目标时清理。
+func sanitizeDisplayLabel(value string) string {
+	cleaned := stripTranscriptControl(value)
+	cleaned = strings.Map(func(current rune) rune {
+		if current == '\n' || current == '\t' {
+			return ' '
+		}
+		return current
+	}, cleaned)
+	return strings.TrimSpace(cleaned)
 }
 
 // truncateLabel 按 UTF-8 边界把展示标签截断到字节上限。
@@ -662,14 +678,14 @@ func (e *Executor) handleRead(ctx context.Context, reply func(string), target se
 			return
 		}
 	}
-	output := strings.Join(e.buffer.Render(), "\n")
-	if strings.TrimSpace(output) == "" {
-		output = "dsh 暂无对话文本。"
+	transcript := strings.Join(e.buffer.Render(), "\n")
+	if strings.TrimSpace(transcript) == "" {
+		transcript = "dsh 暂无对话文本。"
 	}
-	if prompt, ok := e.pendingDecisionPrompt(ctx, sessionID); ok {
-		output += snapshotSeparator + prompt
-	}
-	reply(output)
+	prompt, _ := e.pendingDecisionPrompt(ctx, sessionID)
+	// 正文与决策提示都可能超过 HPRP 的 MaxContentBytes；超限会让 Server 关闭
+	// 整条连接，因此 reply 前统一按终端快照预算截断并保留提示尾部。
+	reply(boundedSnapshotText(transcript, prompt))
 }
 
 // executorReadErrorMessage 把分页错误映射为固定提示。
@@ -785,7 +801,7 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 	question := decision.Questions[state.QuestionIx]
 	answer, err := parseAnswer(action.Indexes, action.Text, question)
 	if err != nil {
-		reply(fmt.Sprintf("%v\n\n%s", err, formatDecision(decision, state.QuestionIx)))
+		reply(boundedDecisionReply(fmt.Sprintf("%v", err), decision, state.QuestionIx))
 		return
 	}
 	state.Answers[question.ID] = answer
@@ -793,8 +809,9 @@ func (e *Executor) handleAnswer(ctx context.Context, reply func(string), session
 	if state.QuestionIx+1 < len(decision.Questions) {
 		state.QuestionIx++
 		e.storeAnswerState(sessionID, state)
-		reply(fmt.Sprintf("已记录第 %d/%d 题答案。\n\n%s",
-			state.QuestionIx, len(decision.Questions), formatDecision(decision, state.QuestionIx)))
+		reply(boundedDecisionReply(
+			fmt.Sprintf("已记录第 %d/%d 题答案。", state.QuestionIx, len(decision.Questions)),
+			decision, state.QuestionIx))
 		return
 	}
 
@@ -1004,6 +1021,14 @@ func transcriptTail(text string, maxLines int) string {
 		lines = lines[len(lines)-maxLines:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// boundedDecisionReply 组合前缀与决策提示，并限制到 HPRP 安全的 UTF-16 预算。
+//
+// 选项 label/description 与问题正文来自 dsh 宿主，长度不受 HPRP 约束；直接
+// 拼接可能超过 MaxContentBytes 并导致 Server 关闭连接。
+func boundedDecisionReply(prefix string, decision Decision, questionIndex int) string {
+	return boundedSnapshotText(prefix, formatDecision(decision, questionIndex))
 }
 
 // boundedSnapshotText 组合正文与待答提示，总长不超过 UTF-16 上限。

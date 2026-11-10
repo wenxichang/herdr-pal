@@ -78,8 +78,10 @@ dsh 自带的 Remote API。Pal 不再要求用户安装、升级或重启 dsh �
 - 目录必须存在且是目录，不自动创建；支持 `~` 展开。
 - 创建后调用 `session/rename` 设置标题；重命名失败时保留已创建会话并明确提示。
 - 创建成功后自动切换到新会话。
-- 宿主选择：优先使用当前选中的 dsh 会话所属宿主；没有选中时，如果只有一个 dsh 宿主
-  可用则使用它；多个宿主且无法判断时提示先 `/ls`、`/N` 选择。
+- 宿主选择：当前选中的 dsh 目标仍存在时直接使用它（会话或宿主入口）；没有选中时，
+  只有唯一 dsh 宿主入口或唯一一个 dsh 会话才自动判定。同一机器上的 web/Desktop 会话
+  属于不同宿主；同变体的多个会话也无法从目标字段区分宿主，因此一律提示先 `/ls`、
+  `/N` 选择，避免把新会话建到错误宿主。
 
 ## 3. 非目标
 
@@ -273,8 +275,9 @@ sessionOccupant = "session:" + hex(sha256(host.Generation + "\x00" + sessionID))
 读取：
 
 1. `session/projections` 得 `asOfSeq`；非 `sequenced` 或 `asOfSeq < -1` 时返回“历史暂不可读”。
-2. 快路径 `session/page` 取 `maxMessages=100` 的尾页；响应超过 RPC 上限时降级为
-   `maxMessages=32` 向上分页，最多 4 页或 100 条消息。
+2. 快路径 `session/page` 取 `maxMessages=100` 的尾页；响应超过 RPC 上限、分页不可信或
+   尾页仍有更早历史但可见消息不足 100 条时，降级为 `maxMessages=32` 向上分页，最多
+   16 页或 100 条消息。
 3. 按事件顺序投影 user/assistant 文本，处理 `surfaceOp=replace`；跨页保留替换范围。
 4. 过滤空文本、ANSI/控制字符，截取末尾 100 条消息和 16000 UTF-16 代码单元。仍超限时
    返回“历史过大，无法读取”，不返回半截正文。
