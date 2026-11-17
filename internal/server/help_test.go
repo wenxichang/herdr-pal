@@ -113,3 +113,11 @@ func TestDefaultHelpIncludesDSHCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultHelpIncludesNotificationCommands(t *testing.T) {
+	for _, want := range []string{"/notify", "/notify off 1,2 3", "/notify on all", "/notify off all", "共享", "离线", "默认开启"} {
+		if !strings.Contains(DefaultHelpText(), want) {
+			t.Errorf("help missing %q", want)
+		}
+	}
+}

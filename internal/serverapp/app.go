@@ -26,6 +26,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/lokiquery"
 	"github.com/wenxichang/herdr-pal/internal/machinereg"
+	"github.com/wenxichang/herdr-pal/internal/notificationprefs"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/processlock"
 	"github.com/wenxichang/herdr-pal/internal/server"
@@ -152,6 +153,11 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("加载 HPRP 凭据存储: %w", err)
 	}
+	notificationPreferencesPath := filepath.Join(loaded.Server.StateDir, "notification_preferences.json")
+	notificationStore, err := notificationprefs.LoadStore(notificationPreferencesPath)
+	if err != nil {
+		return fmt.Errorf("加载通知偏好存储 %q: %w", notificationPreferencesPath, err)
+	}
 	registrationStore, err := machinereg.LoadStore(filepath.Join(loaded.Server.StateDir, "registrations.json"), machinereg.StoreOptions{})
 	if err != nil {
 		return fmt.Errorf("加载机器注册申请存储: %w", err)
@@ -192,9 +198,10 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	}
 	router, err := server.NewConversationRouterWithConfig(
 		server.ConversationRouterConfig{
-			HelpProvider: helpProvider,
-			RateLimiter:  server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
-			Auditor:      businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
+			HelpProvider:            helpProvider,
+			NotificationPreferences: notificationStore,
+			RateLimiter:             server.NewUserRateLimiter(loaded.RateLimit.PerSecond, loaded.RateLimit.PerMinute, time.Now),
+			Auditor:                 businessAuditor, AuditRedactor: auditRedactor, BotIDHash: shortHash(loaded.WeCom.BotID),
 			RegistrationRequester: registrationService,
 			RegistrationApproval:  registrationApproval,
 		},

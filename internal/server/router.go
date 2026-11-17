@@ -16,6 +16,7 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/hprp"
 	"github.com/wenxichang/herdr-pal/internal/im"
 	"github.com/wenxichang/herdr-pal/internal/machinereg"
+	"github.com/wenxichang/herdr-pal/internal/notificationprefs"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
 	"github.com/wenxichang/herdr-pal/internal/session"
@@ -120,16 +121,30 @@ func (router *ConversationRouter) sendNotification(ctx context.Context, userID, 
 	if notification.Target.MachineID != machineID {
 		return ErrTargetChanged
 	}
-	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
-	if notification.Kind == hprp.NotificationKindTargetInvalidated {
-		return router.gateway.SendMarkdownTo(ctx, userID, invalidatedNotificationText(notification.Target))
+	if err := hprp.ValidateNotificationEvent(notification); err != nil {
+		return err
 	}
-	if notification.Kind != hprp.NotificationKindAgentStatusChanged || notification.Data == nil {
-		return hprp.ErrInvalidMessage
+	invalidated := notification.Kind == hprp.NotificationKindTargetInvalidated
+	source, err := router.catalog.ResolveNotificationSource(userID, notification.Target, invalidated)
+	if err != nil {
+		if invalidated {
+			router.logger.Debug("失效通知来源已过期，忽略事件", "user_hash", routerHash(userID), "session_hash", routerHash(notification.Target.SessionID))
+			return nil
+		}
+		return err
 	}
-	entry, err := router.catalog.ResolveTarget(userID, notification.Target)
+	entry := source.Entry
+	key, err := notificationIdentity(userID, entry)
 	if err != nil {
 		return err
+	}
+	enabled := router.notificationPreferences.Enabled(key)
+	if !enabled {
+		return nil
+	}
+	recentlyActive := router.activity.RecentlyActiveAndTouch(userID, router.now(), backgroundNotificationActivityWindow)
+	if invalidated {
+		return router.gateway.SendMarkdownTo(ctx, userID, invalidatedNotificationText(notification.Target))
 	}
 	statusText := statusNotificationText(entry, notification.Data.Status)
 	if !statusNeedsTerminal(notification.Data.PreviousStatus, notification.Data.Status) {
@@ -171,26 +186,29 @@ func (router *ConversationRouter) sendNotification(ctx context.Context, userID, 
 
 // ConversationRouter 处理企业微信全局命令并把其他输入转发给选中机器。
 type ConversationRouter struct {
-	catalog        *SessionCatalog
-	executor       *UserExecutor
-	gateway        WeComGateway
-	relay          RelayRequester
-	deduper        *policy.Deduper
-	logger         *slog.Logger
-	helpProvider   HelpProvider
-	requestTimeout time.Duration
-	activity       *userActivityTracker
-	now            func() time.Time
-	rateLimiter    *UserRateLimiter
-	auditor        audit.Auditor
-	auditRedactor  *audit.Redactor
-	botIDHash      string
-	registrations  RegistrationRequester
-	regApproval    RegistrationApprovalHandler
+	catalog                 *SessionCatalog
+	executor                *UserExecutor
+	gateway                 WeComGateway
+	relay                   RelayRequester
+	deduper                 *policy.Deduper
+	logger                  *slog.Logger
+	helpProvider            HelpProvider
+	requestTimeout          time.Duration
+	activity                *userActivityTracker
+	now                     func() time.Time
+	rateLimiter             *UserRateLimiter
+	auditor                 audit.Auditor
+	auditRedactor           *audit.Redactor
+	botIDHash               string
+	registrations           RegistrationRequester
+	regApproval             RegistrationApprovalHandler
+	notificationPreferences NotificationPreferences
 }
 
 // ConversationRouterConfig 是服务端会话路由器的展示配置。
 type ConversationRouterConfig struct {
+	// NotificationPreferences 保存业务组合开关；nil 为独立内存存储，生产应注入持久化存储。
+	NotificationPreferences NotificationPreferences
 	// HelpProvider 每次 /help 请求都读取最新内容；nil 仅用于测试和内嵌默认值。
 	HelpProvider HelpProvider
 	// RateLimiter 在消息去重后限制单个用户的唯一输入频率；nil 表示禁用。
@@ -235,12 +253,16 @@ func NewConversationRouterWithConfig(config ConversationRouterConfig, catalog *S
 	if config.RegistrationApproval == nil {
 		config.RegistrationApproval = unavailableRegistrationApprovalHandler{}
 	}
+	if config.NotificationPreferences == nil {
+		config.NotificationPreferences = notificationprefs.NewMemoryStore()
+	}
 	return &ConversationRouter{
 		catalog: catalog, executor: executor, gateway: gateway, relay: relay,
 		deduper: deduper, logger: logger, helpProvider: config.HelpProvider, requestTimeout: defaultRelayRequestTimeout,
 		activity: newUserActivityTracker(), now: time.Now, rateLimiter: config.RateLimiter,
 		auditor: config.Auditor, auditRedactor: config.AuditRedactor, botIDHash: config.BotIDHash,
 		registrations: config.RegistrationRequester, regApproval: config.RegistrationApproval,
+		notificationPreferences: config.NotificationPreferences,
 	}, nil
 }
 
@@ -443,7 +465,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 			router.reply(ctx, message, err.Error()+"\n\n"+registrationApprovalSnapshotReminder)
 			return
 		}
-		if isRegistrationCommand(message.Content) || isRegistrationApprovalCommand(message.Content) {
+		if isRegistrationCommand(message.Content) || isRegistrationApprovalCommand(message.Content) || isNotificationCommand(message.Content) {
 			router.reply(ctx, message, err.Error())
 			return
 		}
@@ -456,7 +478,7 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 	}
 	router.logger.Debug("企业微信交互已接收", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "target_index", action.index, "switch_after", action.switchAfter, "content_bytes", len([]byte(message.Content)))
 	router.activity.Touch(message.UserID, router.now())
-	if action.kind != serverActionHelp && action.kind != serverActionRegister && action.kind != serverActionNewSession &&
+	if action.kind != serverActionList && action.kind != serverActionNotify && action.kind != serverActionHelp && action.kind != serverActionRegister && action.kind != serverActionNewSession &&
 		!isRegistrationApprovalAction(action.kind) && !router.catalog.HasSessions(message.UserID) {
 		router.logger.Info("企业微信交互未路由", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", serverActionName(action.kind), "error_type", "no_sessions", "reason", "当前用户没有在线且可用的 Relay 会话")
 		router.reply(ctx, message, noAvailableSessionsMessage)
@@ -479,6 +501,8 @@ func (router *ConversationRouter) handleAuthorized(ctx context.Context, message 
 		router.handleRegistration(ctx, message, action)
 	case serverActionListRegistrations, serverActionApproveRegistrations, serverActionRejectRegistrations:
 		router.handleRegistrationApproval(ctx, message, action)
+	case serverActionNotify:
+		router.handleNotify(ctx, message, *action.notification)
 	case serverActionMode:
 		router.handleMode(ctx, message, action.mode)
 	case serverActionDirected:
@@ -633,10 +657,32 @@ func (router *ConversationRouter) logRegistrationApprovalCommandFailure(message 
 }
 
 func (router *ConversationRouter) handleList(ctx context.Context, message im.IncomingText) {
-	entries := router.catalog.CreateNumberedSnapshot(message.UserID)
+	router.catalog.InvalidateNotificationList(message.UserID)
+	inventory := router.catalog.NotificationInventory(message.UserID)
+	groups, err := notificationGroups(message.UserID, inventory.Entries)
+	if err != nil {
+		router.reply(ctx, message, "通知目标解析失败，请重试。")
+		return
+	}
+	preferences, err := router.notificationPreferences.Reconcile(message.UserID, inventory.MachineIDs, groups.Identities)
+	if err != nil {
+		router.logger.Warn("通知偏好核对失败", "user_hash", routerHash(message.UserID), "error_type", "notification_preferences_reconcile")
+		router.reply(ctx, message, "通知设置核对失败，请重试。")
+		return
+	}
+	router.catalog.ForgetRetiredNotificationGroups(message.UserID, preferences.RemovedIdentities)
+	entries := router.catalog.createNumberedSnapshotFromEntries(message.UserID, inventory.Entries)
+	groupCounts := make(map[notificationprefs.Identity]int)
+	for _, entry := range entries {
+		key, _ := notificationIdentity(message.UserID, entry)
+		groupCounts[key]++
+	}
+
 	if len(entries) == 0 {
 		router.logger.Info("企业微信会话列表为空", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "error_type", "no_sessions", "reason", "当前用户没有在线且可选择的 Agent")
-		router.reply(ctx, message, "当前没有在线且可选择的 Agent。")
+		if router.reply(ctx, message, noAvailableSessionsMessage) == nil {
+			_ = router.catalog.CommitNotificationList(message.UserID, entries)
+		}
 		return
 	}
 	selected, selectedErr := router.catalog.Selected(message.UserID)
@@ -656,11 +702,18 @@ func (router *ConversationRouter) handleList(ctx context.Context, message im.Inc
 			fmt.Fprintf(&content, " — %s", safeRouterLabel(entry.Session.Display.Title))
 		}
 		content.WriteString(marker)
+		key, _ := notificationIdentity(message.UserID, entry)
+		fmt.Fprintf(&content, "\n   通知：%s", notificationStateLabel(preferences.States[key]))
+		if groupCounts[key] > 1 {
+			content.WriteString("（相同组合共享开关）")
+		}
 		fmt.Fprintf(&content, "\n   工作区：%s\n   状态：%s", safeRouterLabel(panel.WorkspaceLabel(entry.Session.Display.Workspace, entry.Session.Display.Tab)), safeRouterLabel(panel.AgentStatusLabelValue(hprp.NormalizeStatus(entry.Session.Status))))
 	}
 	content.WriteString("\n使用 /N 选择目标。")
 	router.logger.Debug("企业微信会话列表已生成", "user_hash", routerHash(message.UserID), "message_hash", routerHash(message.MessageID), "action", "list", "session_count", len(entries), "has_selection", selectedErr == nil)
-	router.reply(ctx, message, content.String())
+	if router.reply(ctx, message, content.String()) == nil {
+		_ = router.catalog.CommitNotificationList(message.UserID, entries)
+	}
 }
 
 func (router *ConversationRouter) handleSelect(ctx context.Context, message im.IncomingText, index int) {
@@ -1359,17 +1412,19 @@ const (
 	serverActionRejectRegistrations
 	serverActionAnswer
 	serverActionNewSession
+	serverActionNotify
 )
 
 type serverAction struct {
-	kind        serverActionKind
-	index       int
-	content     string
-	mode        hprp.OutputMode
-	machineID   string
-	sources     []string
-	indexes     []int
-	switchAfter bool
+	kind         serverActionKind
+	index        int
+	content      string
+	mode         hprp.OutputMode
+	machineID    string
+	sources      []string
+	indexes      []int
+	switchAfter  bool
+	notification *notificationAction
 }
 
 func parseServerAction(content string) (serverAction, error) {
@@ -1382,6 +1437,12 @@ func parseServerAction(content string) (serverAction, error) {
 		return action, err
 	}
 	switch fields[0] {
+	case "/notify":
+		action, err := parseNotificationAction(fields)
+		if err != nil {
+			return serverAction{}, err
+		}
+		return serverAction{kind: serverActionNotify, notification: &action}, nil
 	case "/ls":
 		if len(fields) != 1 {
 			return serverAction{}, errors.New("/ls 用法: /ls")
@@ -1466,7 +1527,7 @@ func parseDirectedAction(trimmed, prefix string) (serverAction, bool, error) {
 	}
 	nested, err := parseServerAction(remainder)
 	if err != nil || (nested.kind != serverActionForward && nested.kind != serverActionMode) {
-		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help、/reg、注册审批命令或另一个 /N。")
+		return serverAction{}, true, errors.New("定向输入不能执行 /ls、/help、/reg、/notify、注册审批命令或另一个 /N。")
 	}
 	return serverAction{
 		kind:        serverActionDirected,

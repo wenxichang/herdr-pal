@@ -1,5 +1,17 @@
 # Herdr Pal 交接上下文
 
+## 2026-11-12 会话主动通知开关
+
+- Server 新增 `/notify`、当前组合 on/off、逗号/空格混用的批量编号及 on/off all；无效编号逐项跳过。
+- 开关按用户、机器、标题、工作区、Tab 和 CLI 类型组成的业务身份共享，不依赖临时 Target ID；`/ls` 与 `/notify` 状态显示为 `✔️ 开启` / `✖️ 关闭`。
+- `<state_dir>/notification_preferences.json` 保存显式开/关记录，默认开启；启动时严格校验，损坏不静默重置。
+- `/ls` 使用同次目录视图核对并显示状态，新增默认开、保留已有，仅清理在线、已同步且当前列表非空的机器中消失的组合。
+  离线、未同步及空列表机器保留设置；同组合仍有会话时不删除，改名后新组合无记录则默认开启。
+- notify 编号仅映射到最近完整送达列表中的组合，后台输出自动编号不覆盖它；Target 替换但组合相同仍可设置。
+- `sendNotification` 在更新活跃状态、发送提示或读取快照之前检查开关。命令结果、主动查询及后续分段正常发送。
+- 退出来源只保存有界内存元数据；组合对账删除后同步移除它的退出来源，避免迟到失效消息恢复默认开启。
+- 仅 Server 实现；Pal、Herdr、dsh 和 HPRP 协议无变化。已有自定义 help.md 需要管理员自行补充新命令。
+
 ## 2026-11-10 dsh 原生 API 接入
 
 - 删除 `plugins/dsh-herdr-pal/` 与过渡包 `internal/dshlegacy/`；Pal 直接使用 dsh 自带
@@ -39,6 +51,7 @@ Herdr Pal 是 Herdr 与企业微信之间的独立 bridge：
 - 企业微信帮助：`~/.config/herdr-pal-server/help.md`
 - Pal：`~/.config/herdr-pal/config.json`
 - 凭据存储：默认 `<state_dir>/credentials.json`
+- 通知开关：固定 `<state_dir>/notification_preferences.json`，仅保存业务组合及 enabled 状态
 - 待审批机器注册：固定 `<state_dir>/registrations.json`，只保存尚未处理的申请
 - Admin Socket：默认 `<state_dir>/admin.sock`
 
@@ -71,7 +84,7 @@ Darwin/Linux AMD64、ARM64 `hp-cli` 和 Windows AMD64 客户端 Beta。当前平
 - Pal 与 Server 使用公开 HPRP/1；不兼容的主版本通过 WebSocket 子协议隔离。
 - 网络只允许 WSS。`skip_verify` 默认开启仅用于受信任内网的自签名证书部署。
 - Herdr protocol 门禁接受 17 到 22，只使用公共 Local Socket API、CLI 和公开 Schema。
-- 不持久化选择、在线目录、分页、通知或在途命令，不提供离线任务和通知回放。
+- 不持久化选择、在线目录、分页、通知事件或在途命令，不提供离线任务和通知回放；仅业务组合的通知开关持久化。
 - 终端显示模式按用户和完整稳定目标保存在 Server 内存中；OpenCode 默认图片，其他 Agent
   默认文本，Server 重启后恢复默认。
 - 终端内容只描述为近期快照，不承诺完整对话或结构化 LLM transcript。
@@ -227,6 +240,7 @@ Enter；随后再检查 3 次，每次间隔 500ms，仍无变化才报错。任
 - `internal/adminproto`、`internal/adminclient`、`internal/adminserver`：HPAP/1、本地客户端、
   Unix Socket 安全边界、管理方法和审计。
 - `internal/server`：在线目录、HPRP Hub、用户执行器和企业微信路由。
+- `internal/notificationprefs`：通知业务身份、范围对账与原子持久化。
 - `internal/relayclient`：Pal 的 HPRP 连接、快照、命令幂等和输出上报。
 - `internal/herdr`：公共 NDJSON 请求、订阅和平台传输。
 - `internal/dsh`：dsh 原生宿主发现、Cookie 认证、RPC、`$events` Mux、目录、正文和交互。

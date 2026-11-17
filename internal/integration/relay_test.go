@@ -279,6 +279,7 @@ type integrationRelayExecutor struct {
 	mu               sync.Mutex
 	target           session.Target
 	selected         bool
+	hidden           bool
 	prompt           string
 	sink             im.ReplySink
 	terminal         *im.TerminalContent
@@ -292,6 +293,9 @@ type integrationRelayExecutor struct {
 func (executor *integrationRelayExecutor) CurrentTargets() []session.Target {
 	executor.mu.Lock()
 	defer executor.mu.Unlock()
+	if executor.hidden {
+		return nil
+	}
 	return []session.Target{executor.target}
 }
 

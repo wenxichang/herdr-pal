@@ -8,8 +8,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/hprp"
+	"github.com/wenxichang/herdr-pal/internal/notificationprefs"
 )
 
 var (
@@ -59,22 +61,28 @@ type routingState struct {
 //
 // 目录只驻留内存；连接关闭会立即删除对应机器并使该用户编号快照失效。
 type SessionCatalog struct {
-	mu          sync.RWMutex
-	connections map[string]ClientKey
-	byKey       map[ClientKey]string
-	machines    map[ClientKey]machineState
-	routing     map[string]routingState
-	updates     chan struct{}
+	mu                   sync.RWMutex
+	connections          map[string]ClientKey
+	byKey                map[ClientKey]string
+	machines             map[ClientKey]machineState
+	routing              map[string]routingState
+	updates              chan struct{}
+	notificationLists    map[string][]notificationprefs.Identity
+	retiredNotifications map[notificationSourceKey]retiredNotificationSource
+	notificationNow      func() time.Time
 }
 
 // NewSessionCatalog 创建空的在线会话目录。
 func NewSessionCatalog() *SessionCatalog {
 	return &SessionCatalog{
-		connections: make(map[string]ClientKey),
-		byKey:       make(map[ClientKey]string),
-		machines:    make(map[ClientKey]machineState),
-		routing:     make(map[string]routingState),
-		updates:     make(chan struct{}),
+		connections:          make(map[string]ClientKey),
+		byKey:                make(map[ClientKey]string),
+		machines:             make(map[ClientKey]machineState),
+		routing:              make(map[string]routingState),
+		updates:              make(chan struct{}),
+		notificationLists:    make(map[string][]notificationprefs.Identity),
+		retiredNotifications: make(map[notificationSourceKey]retiredNotificationSource),
+		notificationNow:      time.Now,
 	}
 }
 
@@ -125,6 +133,7 @@ func (catalog *SessionCatalog) ApplySnapshot(connectionID string, snapshot hprp.
 	if snapshot.Sequence < current.sequence {
 		return ErrSnapshotStale
 	}
+	catalog.recordRetiredNotificationSourcesLocked(key, current.sessions, snapshot.Sessions)
 	catalog.migrateOutputModesLocked(key, current.sessions, snapshot.Sessions)
 	current.sequence = snapshot.Sequence
 	current.sessions = append([]hprp.Session(nil), snapshot.Sessions...)
@@ -144,6 +153,11 @@ func (catalog *SessionCatalog) Detach(connectionID string) bool {
 	key, exists := catalog.connections[connectionID]
 	if !exists {
 		return false
+	}
+	for sourceKey := range catalog.retiredNotifications {
+		if sourceKey.userID == key.UserID && sourceKey.target.MachineID == key.MachineID {
+			delete(catalog.retiredNotifications, sourceKey)
+		}
 	}
 	delete(catalog.connections, connectionID)
 	if catalog.byKey[key] == connectionID {
@@ -205,13 +219,7 @@ func (catalog *SessionCatalog) CreateNumberedSnapshot(userID string) []CatalogEn
 	catalog.mu.Lock()
 	defer catalog.mu.Unlock()
 	entries := catalog.entriesLocked(userID)
-	routing := catalog.routing[userID]
-	routing.numbered = make([]hprp.Target, len(entries))
-	for index := range entries {
-		routing.numbered[index] = entries[index].Ref
-	}
-	routing.numberedValid = true
-	catalog.routing[userID] = routing
+	catalog.setNumberedEntriesLocked(userID, entries)
 	return cloneEntries(entries)
 }
 

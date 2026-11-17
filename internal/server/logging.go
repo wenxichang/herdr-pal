@@ -123,6 +123,8 @@ func safeLogValue(value string) string {
 
 func serverActionName(kind serverActionKind) string {
 	switch kind {
+	case serverActionNotify:
+		return "notification_preferences"
 	case serverActionList:
 		return "list"
 	case serverActionSelect:

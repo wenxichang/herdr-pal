@@ -264,6 +264,8 @@ func TestDSHNativeApprovalAndNewSession(t *testing.T) {
 		testkit.DSHQuestion{ID: "second", Question: "补充说明"},
 	))
 	waitDSHStatus(t, harness, "blocked")
+	// 目录状态先于通知正文到达；编号答案必须等用户实际看到本轮问题。
+	waitWeComPush(t, harness, "选择第一项")
 	firstReply := waitWeComReply(t, harness, "dsh-answer-form-1", "/answer 1")
 	if !strings.Contains(firstReply, "已记录第 1/2 题答案") || !strings.Contains(firstReply, "补充说明") {
 		t.Fatalf("多题第一题回复 = %q", firstReply)

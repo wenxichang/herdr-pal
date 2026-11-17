@@ -600,3 +600,32 @@ func bootstrapOutputSecrets(output string) []string {
 	}
 	return secrets
 }
+
+func TestRunRejectsInvalidNotificationPreferencesWithoutLeakingContent(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+		mode       os.FileMode
+	}{
+		{"corrupt", "sensitive-notification-content", 0o600},
+		{"version", `{"version":99,"records":[]}`, 0o600},
+		{"permissions", `{"version":1,"records":[]}`, 0o644},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := secureServerAppTempDir(t)
+			path := filepath.Join(stateDir, "notification_preferences.json")
+			if err := os.WriteFile(path, []byte(test.body), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			configPath := writeServerAppConfig(t, stateDir, reserveServerAppAddress(t), "127.0.0.1:0", "bot-notification-invalid")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := Run(ctx, Options{ConfigPath: configPath, Getenv: func(string) string { return "" }, Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, AuthFile: filepath.Join(t.TempDir(), "auth.json")})
+			if err == nil || !strings.Contains(err.Error(), path) || strings.Contains(err.Error(), "sensitive-notification-content") {
+				t.Fatalf("Run()=%v", err)
+			}
+		})
+	}
+}
