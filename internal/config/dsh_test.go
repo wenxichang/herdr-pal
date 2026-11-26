@@ -101,6 +101,28 @@ func TestDSHConfigValidatesURLHomeAndVariant(t *testing.T) {
 	}
 }
 
+// TestDSHConfigIncludeUnavailableDefaultsToFalse 验证目录过滤开关默认关闭。
+func TestDSHConfigIncludeUnavailableDefaultsToFalse(t *testing.T) {
+	for _, test := range []struct {
+		name, value string
+		want        bool
+	}{
+		{"未配置", `{"dsh":{}}`, false},
+		{"显式 false", `{"dsh":{"include_unavailable":false}}`, false},
+		{"显式 true", `{"dsh":{"include_unavailable":true}}`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loaded, err := loadDSHClientConfig(t, test.value)
+			if err != nil {
+				t.Fatalf("LoadClient() error = %v", err)
+			}
+			if loaded.DSH == nil || loaded.DSH.IncludeUnavailable != test.want {
+				t.Fatalf("IncludeUnavailable = %+v, want %v", loaded.DSH, test.want)
+			}
+		})
+	}
+}
+
 func loadDSHClientConfig(t *testing.T, value string) (ClientConfig, error) {
 	t.Helper()
 	key := testRelayKey(t)

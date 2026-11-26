@@ -82,7 +82,7 @@ func NewBackend(cfg DiscoveryConfig, sink Sink, guard *policy.Guard, logger *slo
 		return discoverHosts(ctx, cfg, systemProber{}, runtime.GOOS)
 	}
 	factory := func(host Host) (*hostWorker, error) {
-		client := NewClient(host, logger)
+		client := NewClientWithDirectoryOptions(host, logger, cfg.IncludeUnavailable)
 		executor := NewExecutor(host, client, sink, guard)
 		executor.logger = logger
 		return &hostWorker{host: host, client: client, executor: executor}, nil
@@ -102,6 +102,30 @@ func newBackend(cfg DiscoveryConfig, discover discoverFunc, factory hostFactory,
 		discoveryInterval: hostDiscoveryInterval,
 		hosts:             make(map[string]*hostWorker),
 	}
+}
+
+// discoveryConfig 返回当前发现配置的副本；调用方可在锁外使用。
+func (b *Backend) discoveryConfig() DiscoveryConfig {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg
+}
+
+// UpdateDiscoveryConfig 热替换发现配置，使下一轮发现按新的 dsh 目标进行。
+//
+// 只接受通过变体校验的配置；不取消现有宿主，由下一轮 syncHosts 按 hostRef
+// 差异撤下不再需要的宿主并建立新宿主。返回本次是否真的发生了变更。
+func (b *Backend) UpdateDiscoveryConfig(cfg DiscoveryConfig) (bool, error) {
+	if err := validateDiscoveryVariant(cfg.Variant); err != nil {
+		return false, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cfg == cfg {
+		return false, nil
+	}
+	b.cfg = cfg
+	return true, nil
 }
 
 // backendLogger 为 nil 时回退到默认 logger。
@@ -146,7 +170,7 @@ func (b *Backend) Run(ctx context.Context) error {
 // discoverFunc 返回错误时不做任何变更；无效宿主与重复引用被跳过。撤下宿主
 // 先移出目录再取消，使 CurrentTargets 立即不再暴露失效目标。
 func (b *Backend) syncHosts(ctx context.Context) {
-	hosts, err := b.discover(ctx, b.cfg)
+	hosts, err := b.discover(ctx, b.discoveryConfig())
 	if err != nil {
 		b.logger.Warn("dsh 宿主发现失败，保留现有连接", "error", err)
 		return

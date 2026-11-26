@@ -1,5 +1,20 @@
 # Herdr Pal 交接上下文
 
+## 2026-11-26 dsh 目录可见性与配置热更新
+
+- 新增 Pal 配置 `dsh.include_unavailable`，默认 `false`：保持按 `agentAvailable` 过滤目录。
+  设为 `true` 时不再按该字段过滤，保留下来的会话一律视为 `Available=true`；子代理
+  （`origin=subagent`）与迁移中（`formatStatus=migration-required`）会话始终过滤。
+- `Client` 通过 `NewClientWithDirectoryOptions` 接收该开关；`DiscoveryConfig` 透传到每个
+  宿主的客户端。执行器不再二次按 `Available` 过滤目录。
+- 新增 `internal/app/configwatch.go`：非关键组件每 5 秒按文件内容 MD5 检查配置，
+  `dsh` 段变化后调用 `Backend.UpdateDiscoveryConfig` 热更新，下一轮 `syncHosts` 按
+  `hostRef`（含端口）撤旧建新。内容无效（编辑器截断写入）不推进摘要、不退出，稍后重试。
+  只热更新 `dsh` 段；`relay`、`herdr`、`log` 仍需重启。
+- `runRelayComponents` 支持非关键组件：附属组件结束不结束整体运行；结果收集移入
+  独立 goroutine，主流程在超时后先返回，不再同步等待卡住的组件。
+- 混合模式（`herdr.disabled=false` 且配置 `dsh`）与纯 dsh 模式都会启动配置监听。
+
 ## 2026-11-12 会话主动通知开关
 
 - Server 新增 `/notify`、当前组合 on/off、逗号/空格混用的批量编号及 on/off all；无效编号逐项跳过。

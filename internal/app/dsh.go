@@ -15,7 +15,25 @@ import (
 	"github.com/wenxichang/herdr-pal/internal/version"
 )
 
-func runDSHRelay(ctx context.Context, loaded config.ClientConfig, logger *slog.Logger) (runErr error) {
+// newDSHConfigWatch 返回监听配置文件的组件函数。
+//
+// 监听是可选的增强能力：异常退出只记录日志，不拖垮 relay 与 backend，因此
+// 组件始终返回 nil。
+func newDSHConfigWatch(configPath string, updater dshConfigUpdater, logger *slog.Logger) func(context.Context) error {
+	return func(componentContext context.Context) error {
+		if err := watchDSHConfig(componentContext, configPath, updater, logger); err != nil &&
+			componentContext.Err() == nil {
+			logger.Warn("dsh 配置监听已停止，后续配置变更需要重启生效", "error", err)
+		}
+		return nil
+	}
+}
+
+// runDSHRelay 运行仅 dsh 后端的 Relay 客户端。
+//
+// configPath 用于监听配置文件变更：dsh 端口等发现配置变化后热更新后端，
+// 不重启进程；relay 等其他配置仍需重启生效。
+func runDSHRelay(ctx context.Context, configPath string, loaded config.ClientConfig, logger *slog.Logger) (runErr error) {
 	if loaded.DSH == nil {
 		return newConfigError("缺少 dsh 配置")
 	}
@@ -52,8 +70,11 @@ func runDSHRelay(ctx context.Context, loaded config.ClientConfig, logger *slog.L
 		"credential_id", loaded.Relay.CredentialID,
 		"dsh_variant", dshVariant(loaded.DSH.Variant),
 		"discovery", dshDiscoveryMode(loaded.DSH.URL),
+		"include_unavailable", loaded.DSH.IncludeUnavailable,
 	)
-	runErr, timedOut = runRelayComponents(ctx, relay.Run, backend.Run, defaultShutdownTimeout)
+	// dsh 端口变化时由配置监听热更新发现配置，无需重启进程。
+	runErr, timedOut = runRelayComponents(ctx, relay.Run, backend.Run, defaultShutdownTimeout,
+		newDSHConfigWatch(configPath, backend, logger))
 	return runErr
 }
 
@@ -70,7 +91,12 @@ func dshLockName(cfg config.DSHConfig) string {
 }
 
 func newDSHBackend(cfg config.DSHConfig, sink dsh.Sink, guard *policy.Guard, logger *slog.Logger) (*dsh.Backend, error) {
-	return dsh.NewBackend(dsh.DiscoveryConfig{URL: cfg.URL, Home: cfg.Home, Variant: cfg.Variant}, sink, guard, logger)
+	return dsh.NewBackend(dsh.DiscoveryConfig{
+		URL:                cfg.URL,
+		Home:               cfg.Home,
+		Variant:            cfg.Variant,
+		IncludeUnavailable: cfg.IncludeUnavailable,
+	}, sink, guard, logger)
 }
 
 func dshVariant(value string) string {

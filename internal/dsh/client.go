@@ -51,6 +51,8 @@ type Client struct {
 	rpc    *rpcClient
 	mux    *Mux
 	logger *slog.Logger
+	// includeUnavailable 为 true 时不按 agentAvailable 过滤会话目录。
+	includeUnavailable bool
 }
 
 // SessionSummary 是会话目录中的一个可控制会话。
@@ -73,13 +75,23 @@ type SessionSummary struct {
 
 // NewClient 为已发现的宿主创建高层客户端。
 //
-// logger 可为 nil；客户端只在需要诊断时记录不含认证材料与会话正文的信息。
+// 默认按 agentAvailable 过滤目录；需要列出全部会话时用
+// NewClientWithDirectoryOptions 显式开启。logger 可为 nil；客户端只在需要
+// 诊断时记录不含认证材料与会话正文的信息。
 func NewClient(host Host, logger *slog.Logger) *Client {
+	return NewClientWithDirectoryOptions(host, logger, false)
+}
+
+// NewClientWithDirectoryOptions 创建高层客户端。
+//
+// includeUnavailable 为 true 时不按 agentAvailable 过滤会话目录。
+func NewClientWithDirectoryOptions(host Host, logger *slog.Logger, includeUnavailable bool) *Client {
 	return &Client{
-		host:   host,
-		rpc:    newRPCClient(host),
-		mux:    newMux(host, logger),
-		logger: logger,
+		host:               host,
+		rpc:                newRPCClient(host),
+		mux:                newMux(host, logger),
+		logger:             logger,
+		includeUnavailable: includeUnavailable,
 	}
 }
 
@@ -104,8 +116,12 @@ type sessionListRow struct {
 	} `json:"projections"`
 }
 
-// Sessions 返回当前宿主真正持有 Agent 控制权的会话。
+// Sessions 返回当前宿主的会话目录。
 //
+// 默认只返回持有 Agent 控制权的会话；Client 开启 includeUnavailable 后不再按
+// agentAvailable 过滤，保留下来的会话一律视为可控制。子代理和迁移中的会话始终
+// 过滤；结果按 UpdatedAt 降序、ID 升序稳定排序。ID 无效、重复或数量超限时整体
+// 失败，不返回部分目录。
 // 冷历史、子代理会话和迁移中的会话会被过滤；结果按 UpdatedAt 降序、
 // ID 升序稳定排序。ID 无效、重复或数量超限时整体失败，不返回部分目录。
 func (c *Client) Sessions(ctx context.Context) ([]SessionSummary, error) {
@@ -137,8 +153,8 @@ func (c *Client) Sessions(ctx context.Context) ([]SessionSummary, error) {
 		}
 		seen[row.SessionID] = struct{}{}
 
-		// 只有宿主确认持有 Agent 的会话才可控制；缺失该字段时按不可控制处理。
-		if row.AgentAvailable == nil || !*row.AgentAvailable {
+		// 缺失控制权字段按不可控制处理；includeUnavailable 打开时不再据此过滤。
+		if !c.includeUnavailable && (row.AgentAvailable == nil || !*row.AgentAvailable) {
 			continue
 		}
 		if row.Origin == "subagent" || row.FormatStatus == "migration-required" {

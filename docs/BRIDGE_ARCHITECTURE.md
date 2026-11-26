@@ -11,8 +11,9 @@
   `dsh.url` 与 `dsh.home`。显式 URL 也用于集成测试和自定义部署。
 - 认证：从 `<DSH_HOME>/.credentials.yaml` 的浏览器会话记录生成绑定
   `127.0.0.1:<port>` 的短期 HMAC Cookie；认证材料不落盘、不写日志。每次请求重新生成。
-- 目录：只列出 `agentAvailable=true` 的会话，过滤子代理和迁移中会话；web 与 Desktop
-  各自维护控制权，条目不会重叠。没有可控制会话时提供“新建会话”宿主入口。
+- 目录：默认只列出 `agentAvailable=true` 的会话，过滤子代理和迁移中会话；`dsh.include_unavailable=true`
+  时不再按该字段过滤，保留下来的会话一律视为可控制。web 与 Desktop 各自维护控制权，
+  条目不会重叠。没有可控制会话时提供“新建会话”宿主入口。
 - 读取：`session/projections` 取切点，`session/page` 读取尾页；只投影真实用户输入
   （`source.kind=user`）和助手 text 块，排除工具、推理、内部注入和压缩替换。
 - 输入：普通文本使用 `session/prompt` 的 `mode="queue"`；IM 消息 ID 作为 `requestId`
@@ -24,6 +25,9 @@
   通过 HPRP `created_target` 让 Server 确认快照后切换选择。
 - 生命周期：每个宿主目标身份包含 `hostRef` 与 Generation；宿主消失、重启或目录读取
   失败时只撤下该宿主目标，不影响其他宿主和 Herdr，Pal 进程继续运行。
+- 配置热更新：`app.watchDSHConfig` 每 5 秒按内容 MD5 检查配置文件，`dsh` 段变化后调用
+  `Backend.UpdateDiscoveryConfig`，下一轮发现按新端口撤旧建新；`relay`、`log` 等仍需
+  重启。监听是非关键组件，异常退出不拖垮 relay 与 supervisor。
 
 旧 `dsh.token` 配置会被拒绝并提示删除。Herdr 关闭时可配置 `herdr.disabled=true` 独立
 运行 dsh 后端。下文 Herdr 专属的 Socket、pane 生命周期和终端快照规则继续仅适用于

@@ -11,7 +11,8 @@
   "dsh": {
     "url": "",
     "home": "",
-    "variant": "auto"
+    "variant": "auto",
+    "include_unavailable": false
   },
   "log": {
     "level": "info"
