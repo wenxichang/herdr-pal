@@ -457,3 +457,44 @@ func TestRunRelayComponentsPropagatesPrimaryFailure(t *testing.T) {
 		t.Fatalf("错误信息缺少原始原因：%v", err)
 	}
 }
+
+// TestRunRelayComponentsStaysUpWhilePrimaryRunning 验证关键组件正常运行期间
+// 不会因为 shutdownTimeout 到期而提前结束整体运行。
+//
+// 回归用例：曾有实现把超时分支误当作“等待关键组件”的兜底，导致空载运行
+// shutdownTimeout 后以 ErrShutdownTimeout 退出；附属组件（配置监听）同样
+// 永不返回时也不能触发该路径。
+func TestRunRelayComponentsStaysUpWhilePrimaryRunning(t *testing.T) {
+	// 附属组件模拟配置监听：阻塞到 ctx 取消。
+	blockUntilDone := func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	// 超时设置得比观察窗口短，用来暴露“空转超时”问题。
+	shutdownTimeout := 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		err, _ := runRelayComponents(ctx, blockUntilDone, blockUntilDone, shutdownTimeout, blockUntilDone)
+		done <- err
+	}()
+
+	// 观察 5 个超时周期：关键组件都在运行，整体必须保持运行。
+	select {
+	case err := <-done:
+		t.Fatalf("关键组件运行时不应结束：%v", err)
+	case <-time.After(shutdownTimeout * 5):
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("退出错误 = %v，期望 context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("取消后未及时退出")
+	}
+}

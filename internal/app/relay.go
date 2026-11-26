@@ -255,15 +255,18 @@ func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(contex
 	timer := time.NewTimer(shutdownTimeout)
 	defer timer.Stop()
 
-	// 先等第一个关键组件结束；到期仍未出现结果说明关键组件都卡住了。
+	// 等待第一个结束的关键组件；正常运行时它会一直阻塞在这里，直到进程收到退出信号。
 	var first componentResult
 	select {
 	case first = <-primaryResult:
-	case <-timer.C:
-		if ctx.Err() != nil {
+	case <-ctx.Done():
+		// 父 context 结束：等待其余组件收尾，超时则上报。
+		select {
+		case <-done:
+			return ctx.Err(), nil
+		case <-timer.C:
 			return ctx.Err(), done
 		}
-		return ErrShutdownTimeout, done
 	}
 
 	// 关键组件已结束，继续等待其余组件在宽限期内退出。
