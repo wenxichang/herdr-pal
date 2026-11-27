@@ -156,6 +156,32 @@ func TestSessionsFiltersUncontrolledAndSubagent(t *testing.T) {
 	}
 }
 
+// TestSessionsIncludeUnavailableKeepsUnavailableRows 验证开启后不再按
+// agentAvailable 过滤，且保留下来的会话一律视为可控制。
+func TestSessionsIncludeUnavailableKeepsUnavailableRows(t *testing.T) {
+	items := []map[string]any{
+		{"sessionId": "owned", "agentAvailable": true, "updatedAt": 3},
+		{"sessionId": "cold", "agentAvailable": false, "updatedAt": 2},
+		{"sessionId": "unknown-ownership", "updatedAt": 1},
+		{"sessionId": "subagent-child", "agentAvailable": true, "origin": "subagent", "updatedAt": 0},
+	}
+
+	client, _ := newSessionsTestClient(t, items)
+	client.includeUnavailable = true
+	sessions, err := client.Sessions(context.Background())
+	if err != nil {
+		t.Fatalf("读取会话目录: %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("会话数 = %d，期望 3（仅过滤子代理）: %+v", len(sessions), sessions)
+	}
+	for _, session := range sessions {
+		if !session.Available {
+			t.Errorf("保留下来的会话应视为可控制: %+v", session)
+		}
+	}
+}
+
 func TestSessionsCopiesTitleAndWorkspace(t *testing.T) {
 	items := []map[string]any{
 		{

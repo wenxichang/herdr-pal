@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wenxichang/herdr-pal/internal/bridge"
 	"github.com/wenxichang/herdr-pal/internal/config"
+	"github.com/wenxichang/herdr-pal/internal/dsh"
 	"github.com/wenxichang/herdr-pal/internal/herdr"
 	"github.com/wenxichang/herdr-pal/internal/panel"
 	"github.com/wenxichang/herdr-pal/internal/policy"
@@ -52,7 +54,7 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		return newConfigError(err.Error())
 	}
 	if loaded.Herdr.Disabled {
-		return runDSHRelay(ctx, loaded, logger)
+		return runDSHRelay(ctx, options.ConfigPath, loaded, logger)
 	}
 	runner := options.Runner
 	if runner == nil {
@@ -147,11 +149,13 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 	}
 	var executor relayclient.Executor = service
 	runSupervisor := supervisor.Run
+	var dshBackend *dsh.Backend
 	if loaded.DSH != nil {
 		backend, err := newDSHBackend(*loaded.DSH, relay, guard, logger.With("component", "dsh_backend", "credential_id", loaded.Relay.CredentialID))
 		if err != nil {
 			return fmt.Errorf("创建 dsh 后端: %w", err)
 		}
+		dshBackend = backend
 		executor = relayclient.NewExecutorMux(service, backend)
 		runSupervisor = func(ctx context.Context) error { return runBackendPair(ctx, supervisor.Run, backend.Run) }
 	}
@@ -172,7 +176,12 @@ func RunRelay(ctx context.Context, options Options) (runErr error) {
 		"socket_hash", socketHash,
 		"dsh_variant", dshVariantForConfig(loaded.DSH),
 	)
-	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, runSupervisor, defaultShutdownTimeout)
+	// 混合与纯 dsh 模式都要监听配置：dsh 端口变化后热更新发现配置，无需重启。
+	var extras []func(context.Context) error
+	if dshBackend != nil {
+		extras = append(extras, newDSHConfigWatch(options.ConfigPath, dshBackend, logger))
+	}
+	runErr, timedOutComponentsDone = runRelayComponents(ctx, relay.Run, runSupervisor, defaultShutdownTimeout, extras...)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		logger.Error("Herdr Pal Relay 客户端停止",
 			"component", relayComponentName(runErr),
@@ -187,16 +196,57 @@ func newRelayTerminalRenderer() (bridge.TerminalRenderer, error) {
 	return terminalimage.New()
 }
 
-func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(context.Context) error, shutdownTimeout time.Duration) (error, <-chan struct{}) {
+// runRelayComponents 并行运行 relay 与 supervisor，并可选运行其他附属组件。
+//
+// 前两个组件是关键的：任一结束都会取消其余组件并决定整体生命周期。extra 中
+// 的组件是非关键的，它以任何方式结束都只记录日志，不取消关键组件；等待关键
+// 组件结果时，它已结束的事实会被忽略。返回的 done 只表示全部组件都已退出。
+func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(context.Context) error, shutdownTimeout time.Duration, extra ...func(context.Context) error) (error, <-chan struct{}) {
 	componentContext, cancel := context.WithCancel(ctx)
-	results := make(chan componentResult, 2)
+	// 关键组件结束时下面会主动 cancel；defer 只兜住提前返回的路径，避免 context 泄漏。
+	defer cancel()
+	total := 2 + len(extra)
+	// 缓冲区等于组件数，runComponent 的发送永不阻塞。
+	results := make(chan componentResult, total)
 	done := make(chan struct{})
-	go runComponent(componentContext, "relay_connection", true, runRelay, results)
-	go runComponent(componentContext, "herdr_supervisor", true, runSupervisor, results)
-	first := <-results
-	cancel()
+
+	var started sync.WaitGroup
+	started.Add(total)
+	start := func(name string, primary bool, run func(context.Context) error) {
+		go func() {
+			defer started.Done()
+			runComponent(componentContext, name, primary, run, results)
+		}()
+	}
+	start("relay_connection", true, runRelay)
+	start("herdr_supervisor", true, runSupervisor)
+	for index, run := range extra {
+		start(fmt.Sprintf("auxiliary_%d", index), false, run)
+	}
+
+	// 结果收集必须在独立 goroutine 中进行：关键组件结束后，其余组件可能卡住，
+	// 主流程要能在 shutdownTimeout 到期时先返回，而不是同步等待全部结果。
+	//
+	// primaryResult 由第一个结束的关键组件写入并关闭，附属组件的结果被忽略。
+	primaryResult := make(chan componentResult, 1)
 	go func() {
-		<-results
+		// 缓冲区等于组件数，runComponent 的发送永不阻塞，因此这里总能收齐。
+		remaining := total
+		reported := false
+		for remaining > 0 {
+			result := <-results
+			remaining--
+			if !result.primary || reported {
+				continue
+			}
+			reported = true
+			primaryResult <- result
+			close(primaryResult)
+			cancel()
+		}
+	}()
+	go func() {
+		started.Wait()
 		close(done)
 	}()
 	if shutdownTimeout <= 0 {
@@ -204,6 +254,23 @@ func runRelayComponents(ctx context.Context, runRelay, runSupervisor func(contex
 	}
 	timer := time.NewTimer(shutdownTimeout)
 	defer timer.Stop()
+
+	// 等待第一个结束的关键组件；正常运行时它会一直阻塞在这里，直到进程收到退出信号。
+	var first componentResult
+	select {
+	case first = <-primaryResult:
+	case <-ctx.Done():
+		// 父 context 结束：等待其余组件收尾，超时则上报。
+		select {
+		case <-done:
+			return ctx.Err(), nil
+		case <-timer.C:
+			return ctx.Err(), done
+		}
+	}
+
+	// 关键组件已结束，继续等待其余组件在宽限期内退出。
+	timer.Reset(shutdownTimeout)
 	select {
 	case <-done:
 		if ctx.Err() != nil {

@@ -34,10 +34,13 @@ const (
 //
 // URL 非空时直接构造显式宿主，不扫描本机进程；Home 非空时覆盖发现到的
 // DSH_HOME；Variant 为 auto/空时不过滤，否则只保留对应变体。
+// IncludeUnavailable 只影响会话目录，不参与宿主发现。
 type DiscoveryConfig struct {
 	URL     string
 	Home    string
 	Variant string
+	// IncludeUnavailable 为 true 时不按 agentAvailable 过滤会话目录。
+	IncludeUnavailable bool
 }
 
 // Prober 抽象发现 dsh 宿主所需的系统探测能力。

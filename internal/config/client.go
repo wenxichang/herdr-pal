@@ -26,15 +26,18 @@ type DSHConfig struct {
 	URL     string `json:"url,omitempty"`
 	Home    string `json:"home,omitempty"`
 	Variant string `json:"variant,omitempty"`
+	// IncludeUnavailable 为 true 时不按 agentAvailable 过滤会话目录。
+	IncludeUnavailable bool `json:"include_unavailable,omitempty"`
 }
 
 // UnmarshalJSON 严格读取 dsh 原生字段，并对已移除的旧插件 token 返回迁移提示。
 func (config *DSHConfig) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		URL     string `json:"url"`
-		Home    string `json:"home"`
-		Variant string `json:"variant"`
-		Token   string `json:"token"`
+		URL                string `json:"url"`
+		Home               string `json:"home"`
+		Variant            string `json:"variant"`
+		IncludeUnavailable *bool  `json:"include_unavailable"`
+		Token              string `json:"token"`
 	}
 	if err := decodeStrict(bytes.NewReader(data), &raw); err != nil {
 		return err
@@ -45,6 +48,7 @@ func (config *DSHConfig) UnmarshalJSON(data []byte) error {
 	config.URL = raw.URL
 	config.Home = raw.Home
 	config.Variant = raw.Variant
+	config.IncludeUnavailable = raw.IncludeUnavailable != nil && *raw.IncludeUnavailable
 	return nil
 }
 

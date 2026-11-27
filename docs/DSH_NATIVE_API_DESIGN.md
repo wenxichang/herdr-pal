@@ -267,7 +267,9 @@ sessionOccupant = "session:" + hex(sha256(host.Generation + "\x00" + sessionID))
 
 `session/list` 的 `items`：
 
-- 过滤 `origin=subagent`、`formatStatus=migration-required`、`agentAvailable=false`。
+- 过滤 `origin=subagent`、`formatStatus=migration-required`；`agentAvailable=false`
+  默认过滤，`dsh.include_unavailable=true` 时保留并视为可控制（缺失该字段同样按
+  false 处理）。
 - 最多 256 个会话（每个宿主）。
 - 标题取 `projections.values.title`，缺省为 session ID。
 - Workspace 取 `basename(cwd)`，缺省为宿主变体。
@@ -404,6 +406,23 @@ type CommandResult struct {
 - `HandleMessage` / `ReadTerminalSnapshot` 路由到目标所属执行器。
 - 某个宿主 API 失败时只撤下该宿主，不影响其他宿主和 Herdr。
 
+### 5.8 配置热更新
+
+dsh 换端口时不应要求重启 Pal。`app.watchDSHConfig` 作为非关键组件与 relay、
+supervisor 并行运行：
+
+- 每 5 秒计算一次配置文件内容的 MD5；摘要不变则跳过，因此只改 mtime 或重写相同内容
+  都不会触发更新。
+- 摘要变化后重新 `config.LoadClient`，失败（编辑器截断写入导致的半截 JSON）不推进
+  摘要、不退出监听，内容稳定后自然重试成功。
+- 成功解码后调用 `Backend.UpdateDiscoveryConfig` 替换 `DiscoveryConfig`，下一轮
+  `syncHosts` 按 `hostRef`（含端口）差异撤下旧宿主、建立新宿主。
+- 只热更新 `dsh` 段；`relay`、`herdr`、`log` 等仍需重启生效。
+- 监听组件异常退出只记录日志，不取消 relay 与 supervisor。
+
+`runRelayComponents` 为此支持非关键组件：附属组件以任何方式结束都不会结束整体运行；
+第一个结束的关键组件决定生命周期，主流程在超时后先返回而不等待卡住的组件。
+
 ## 6. 配置
 
 ```json
@@ -413,7 +432,8 @@ type CommandResult struct {
   "dsh": {
     "url": "",
     "home": "",
-    "variant": "auto"
+    "variant": "auto",
+    "include_unavailable": false
   }
 }
 ```
@@ -422,6 +442,8 @@ type CommandResult struct {
 - `url`：可选，显式 `http://127.0.0.1:端口`；为空时自动发现。
 - `home`：可选，显式 `DSH_HOME`；为空时使用发现值或 `~/.dsh`。
 - `variant`：`auto`（默认）、`web`、`desktop`；用于发现过滤。
+- `include_unavailable`：默认 `false`，按 `agentAvailable` 过滤目录；设为 `true` 时
+  不再过滤，保留下来的会话一律视为可控制。
 - `dsh.token` 不再支持；出现时返回迁移提示，不再读取 Node 插件。
 
 ## 7. 平台与版本

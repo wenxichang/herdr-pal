@@ -497,8 +497,11 @@ Pal 直接连接 dsh 自带的本机 Remote API，不需要安装 dsh 插件、N
 
 - 自动发现本机正在运行的 dsh web 与 Desktop 宿主；也可以在 Pal 配置中显式填写
   `dsh.url`、`dsh.home` 和 `dsh.variant`。
-- `/ls` 只列出当前宿主持有 Agent 控制权的会话，不列出无控制权的冷历史；历史会话被
-  dsh 恢复为 live 后才会出现。宿主的 web 与 Desktop 条目不会交叉。
+- `/ls` 默认只列出当前宿主持有 Agent 控制权的会话，不列出无控制权的冷历史；历史会话被
+  dsh 恢复为 live 后才会出现。需要列出全部会话时把 `dsh.include_unavailable` 设为 `true`。
+  宿主的 web 与 Desktop 条目不会交叉。
+- Pal 每 5 秒检查一次配置文件，内容（MD5）变化时自动重新加载 `dsh` 段并热更新后端。
+  dsh 换端口后无需重启 Pal；`relay`、`log` 等其他配置仍需重启生效。
 - `/con` 只显示真实用户输入和助手文本，不显示工具调用、推理或内部注入。
 - `/answer` 回答审批或问题；审批只提交“允许本次”或“拒绝”，不会自动批准。
 - `/new-session` 新建 dsh 会话并自动切换；目录必须已经存在，Pal 不会自动创建。
@@ -512,12 +515,16 @@ Pal 直接连接 dsh 自带的本机 Remote API，不需要安装 dsh 插件、N
 {
   "relay": { "url": "wss://服务端地址:9443", "key": "hpk_...", "skip_verify": true },
   "herdr": { "disabled": true },
-  "dsh": { "url": "", "home": "", "variant": "auto" }
+  "dsh": { "url": "", "home": "", "variant": "auto", "include_unavailable": false }
 }
 ```
 
 `dsh.url` 为空时自动发现；`dsh.home` 为空时使用 dsh 进程环境中的 `DSH_HOME` 或
 `~/.dsh`。Windows 不自动发现，需要同时显式填写 `url` 和 `home`。
+
+`dsh.include_unavailable` 默认 `false`，只列出宿主确认持有 Agent 控制权的会话。设为
+`true` 后不再按 `agentAvailable` 过滤，无控制权的冷历史也会出现在 `/ls` 中；子代理会话
+和迁移中会话始终过滤。修改 `dsh` 段的任意字段都会在 5 秒内热更新，无需重启。
 
 ## 企业微信命令
 
