@@ -225,6 +225,22 @@ Cookie: dsh-auth-...=v1....
 Mux 断线后指数退避重连；重连后以新的 `ready` 重建待答表。审批提交必须使用当前
 `clientId` + `eventId`。
 
+同一条 Mux 连接上同时打开 `workspace/follow`，用于获取归档会话集合：
+
+```json
+{"type":"open","streamId":"workspace","endpoint":"workspace/follow","payload":{"args":{}}}
+```
+
+`workspace` 流的帧按 `streamId` 与 `$events` 区分，`value.type`：
+
+- `baseline`：连接建立后的完整快照，`value.archivedSessionIds` 是归档集合。
+- `archived`：归档集合变化，`archivedSessionIds` 位于帧的顶层，且是**完整集合**
+  而非差量，可直接替换；`[]` 表示全部取消归档。
+
+两种帧的归档字段层级不同，解析时都要兼容。归档集合超过 4096 条时忽略该次更新。
+该订阅失败不致命：目录仍可用，只是无法过滤归档会话。工作区流尚未收到 `baseline`
+时集合视为“不可用”，此时不按归档过滤，避免连接刚建立就误删目录。
+
 ## 5. 模块设计
 
 ### 5.1 `internal/dsh`
@@ -270,6 +286,9 @@ sessionOccupant = "session:" + hex(sha256(host.Generation + "\x00" + sessionID))
 - 过滤 `origin=subagent`、`formatStatus=migration-required`；`agentAvailable=false`
   默认过滤，`dsh.include_unavailable=true` 时保留并视为可控制（缺失该字段同样按
   false 处理）。
+- 过滤宿主已归档的会话。`session/list` 不含任何归档字段，归档语义是“阻止执行”
+  而非“从目录移除”，因此归档会话仍以 `agentAvailable=true` 出现；归档集合只能
+  从 Mux 的 `workspace/follow` 流取得（见 4.5）。
 - 最多 256 个会话（每个宿主）。
 - 标题取 `projections.values.title`，缺省为 session ID。
 - Workspace 取 `basename(cwd)`，缺省为宿主变体。

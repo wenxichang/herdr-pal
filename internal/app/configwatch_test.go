@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wenxichang/herdr-pal/internal/credential"
 	"github.com/wenxichang/herdr-pal/internal/dsh"
 )
 
@@ -68,16 +70,30 @@ func (u *fakeConfigUpdater) callCount() int {
 func writeWatchConfig(t *testing.T, dir, dshURL string, includeUnavailable bool) string {
 	t.Helper()
 	path := filepath.Join(dir, "config.json")
+	// key 必须固定：testRelayKey 每次调用都生成新 key，会让“重写相同内容”
+	// 的测试实际上写入了不同内容，从而误判为配置发生变化。
 	raw := fmt.Sprintf(
 		`{"relay":{"url":"wss://relay.internal:9443","key":%q,"skip_verify":true},`+
 			`"herdr":{"disabled":true},`+
 			`"dsh":{"url":%q,"home":"/tmp/dsh-home","variant":"web","include_unavailable":%t}}`,
-		testRelayKey(t), dshURL, includeUnavailable,
+		watchTestRelayKey(), dshURL, includeUnavailable,
 	)
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatalf("写入测试配置失败：%v", err)
 	}
 	return path
+}
+
+// watchTestRelayKey 返回固定的合法机器 Key，保证同一用例写入的内容可复现。
+func watchTestRelayKey() string {
+	key, _, err := credential.Issue(
+		1, "user", "machine", []credential.SourceRule{"127.0.0.1"}, nil, time.Unix(1, 0),
+		bytes.NewReader(bytes.Repeat([]byte{0x31}, 48)),
+	)
+	if err != nil {
+		panic("生成测试机器 Key 失败: " + err.Error())
+	}
+	return key
 }
 
 // withFastWatchInterval 把轮询周期缩短到 10ms，并在测试结束时恢复。
@@ -90,8 +106,8 @@ func withFastWatchInterval(t *testing.T) {
 
 // startConfigWatch 在后台运行监听，返回可取消的上下文与结束信号。
 //
-// 启动后短暂等待，确保监听已经读取并记录基线摘要；否则紧接着的写文件可能
-// 被当成基线，导致“无变化”的误判。
+// 启动后跨越多个轮询周期再返回，确保监听已记录基线摘要；否则紧接着的写文件
+// 可能被当成基线，导致“无变化”的误判。
 func startConfigWatch(t *testing.T, path string, updater dshConfigUpdater) (context.CancelFunc, <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -100,8 +116,7 @@ func startConfigWatch(t *testing.T, path string, updater dshConfigUpdater) (cont
 		done <- watchDSHConfig(ctx, path, updater, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}()
 	t.Cleanup(cancel)
-	// 至少跨越两个轮询周期，保证基线读取完成。
-	time.Sleep(configWatchInterval * 3)
+	time.Sleep(configWatchInterval * 5)
 	return cancel, done
 }
 
