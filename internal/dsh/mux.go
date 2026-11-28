@@ -21,6 +21,16 @@ const (
 	muxStreamID = "events"
 	// muxOpenMessage 是订阅 $events 的固定打开帧。
 	muxOpenMessage = `{"type":"open","streamId":"events","endpoint":"$events","payload":{"args":{}}}`
+	// muxWorkspaceStreamID 是工作区归档集合使用的流 ID。
+	muxWorkspaceStreamID = "workspace"
+	// muxWorkspaceOpenMessage 是订阅 workspace/follow 的固定打开帧。
+	//
+	// 该流是获取归档集合的唯一可用途径：session/list 不包含任何归档字段，
+	// 而 dsh 的归档语义是“阻止执行”而非“从目录移除”，因此归档会话仍会以
+	// agentAvailable=true 出现在 list 中，必须结合本集合才能过滤。
+	muxWorkspaceOpenMessage = `{"type":"open","streamId":"workspace","endpoint":"workspace/follow","payload":{"args":{}}}`
+	// muxMaxArchivedIDs 限制归档集合条数，防止异常宿主耗尽内存。
+	muxMaxArchivedIDs = 4096
 	// muxMaxReadBytes 限制单条 WebSocket 消息大小，与 RPC 响应上限一致。
 	muxMaxReadBytes = 4 << 20
 	// muxMaxPendingItems 限制待答表条数，防止异常宿主耗尽内存。
@@ -111,15 +121,17 @@ type Mux struct {
 	runMu   sync.Mutex
 	running bool
 
-	mu           sync.Mutex
-	clientID     string
-	items        map[string]PendingItem
-	order        []string
-	totalBytes   int
-	canceled     map[string]uint64
-	canceledRing []muxCancelRecord
-	cancelSeq    uint64
-	cancelSignal chan struct{}
+	mu            sync.Mutex
+	clientID      string
+	items         map[string]PendingItem
+	order         []string
+	totalBytes    int
+	canceled      map[string]uint64
+	canceledRing  []muxCancelRecord
+	cancelSeq     uint64
+	cancelSignal  chan struct{}
+	archivedIDs   map[string]struct{}
+	workspaceSeen bool
 }
 
 // newMux 为宿主构造 Mux；此时不会建立连接，连接由 Run 维护。
@@ -142,6 +154,7 @@ func newMux(host Host, logger *slog.Logger) *Mux {
 		items:        make(map[string]PendingItem),
 		canceled:     make(map[string]uint64),
 		cancelSignal: make(chan struct{}),
+		archivedIDs:  make(map[string]struct{}),
 	}
 }
 
@@ -236,6 +249,13 @@ func (m *Mux) runSession(ctx context.Context) (ready bool, err error) {
 	if err := connection.Write(ctx, websocket.MessageText, []byte(muxOpenMessage)); err != nil {
 		return false, fmt.Errorf("订阅 dsh $events 失败: %w", err)
 	}
+	// 归档集合与 $events 共用同一条 Mux 连接：两条流的帧靠 streamId 区分。
+	// 该订阅失败不致命——目录仍可用，只是无法过滤归档会话，因此只记录日志。
+	if err := connection.Write(ctx, websocket.MessageText, []byte(muxWorkspaceOpenMessage)); err != nil {
+		if m.logger != nil {
+			m.logger.Warn("订阅 dsh workspace/follow 失败，归档会话将无法过滤", "error", err)
+		}
+	}
 
 	for {
 		messageType, data, err := connection.Read(ctx)
@@ -263,13 +283,17 @@ type muxFrame struct {
 
 // handleFrame 解析并应用一帧。
 //
-// 其他 streamId 的帧直接忽略；events 流上只接受 item 帧，未知帧类型和未知
-// 事件类型返回 errMuxProtocol 的包装错误并终止订阅。超过本地容量预算的待答
-// 事件只丢弃并记录安全日志，不能因此撤下整个宿主。
+// events 流上只接受 item 帧，未知帧类型和未知事件类型返回 errMuxProtocol 的
+// 包装错误并终止订阅；workspace 流只更新归档集合，未知帧被忽略；其他
+// streamId 的帧直接丢弃。超过本地容量预算的待答事件只丢弃并记录安全日志，
+// 不能因此撤下整个宿主。
 func (m *Mux) handleFrame(data []byte) error {
 	var frame muxFrame
 	if err := json.Unmarshal(data, &frame); err != nil {
 		return fmt.Errorf("%w: 帧不是合法 JSON", errMuxProtocol)
+	}
+	if frame.StreamID == muxWorkspaceStreamID {
+		return m.handleWorkspaceFrame(frame)
 	}
 	if frame.StreamID != muxStreamID {
 		return nil
@@ -300,6 +324,88 @@ func (m *Mux) handleFrame(data []byte) error {
 	default:
 		return fmt.Errorf("%w: 未知事件类型 %q", errMuxProtocol, truncateRPCMessage(header.Type))
 	}
+}
+
+// handleWorkspaceFrame 应用 workspace/follow 的一帧，维护归档会话集合。
+//
+// baseline 是连接建立后的完整快照，archived 是后续增量；两者携带的
+// archivedSessionIds 都是完整集合而不是差量，因此可以直接替换。无法识别的
+// 帧类型只忽略，不影响 $events 订阅。
+func (m *Mux) handleWorkspaceFrame(frame muxFrame) error {
+	if frame.Type != "item" || len(frame.Value) == 0 {
+		return nil
+	}
+	var value struct {
+		Type string `json:"type"`
+		// 归档集合可能在顶层，也可能在 value 内层；两种布局都接受。
+		Archived []string `json:"archivedSessionIds"`
+		Value    struct {
+			ArchivedSessionIDs []string `json:"archivedSessionIds"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(frame.Value, &value); err != nil {
+		return nil
+	}
+	if value.Type != "baseline" && value.Type != "archived" {
+		return nil
+	}
+	ids := value.Archived
+	if ids == nil {
+		ids = value.Value.ArchivedSessionIDs
+	}
+	if len(ids) > muxMaxArchivedIDs {
+		if m.logger != nil {
+			m.logger.Warn("dsh 归档集合超过本地预算，忽略本次更新", "count", len(ids))
+		}
+		return nil
+	}
+
+	archived := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		archived[id] = struct{}{}
+	}
+	m.mu.Lock()
+	m.archivedIDs = archived
+	m.workspaceSeen = true
+	m.mu.Unlock()
+	return nil
+}
+
+// archivedSnapshot 返回归档集合并报告工作区流是否已收到过 baseline。
+//
+// 未收到 baseline 时 returned 为 false，调用方应把“未知”与“无归档”区分开，
+// 避免连接刚建立时误判为没有归档会话。
+func (m *Mux) archivedSnapshot() (map[string]struct{}, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.workspaceSeen {
+		return nil, false
+	}
+	copied := make(map[string]struct{}, len(m.archivedIDs))
+	for id := range m.archivedIDs {
+		copied[id] = struct{}{}
+	}
+	return copied, true
+}
+
+// ArchivedSessions 返回宿主当前归档的会话 ID 集合。
+//
+// 第二个返回值表示集合是否可用：工作区流尚未收到 baseline、或连接已断开时
+// 为 false。归档会话仍持有 Agent 控制权，只有结合本集合才能从目录中排除它们。
+func (c *Client) ArchivedSessions(ctx context.Context) (map[string]struct{}, bool) {
+	if c == nil || c.mux == nil {
+		return nil, false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil, false
+	}
+	return c.mux.archivedSnapshot()
 }
 
 // handleReady 记录新的 clientId 并清空待答表和取消历史。

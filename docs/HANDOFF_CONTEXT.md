@@ -1,5 +1,20 @@
 # Herdr Pal 交接上下文
 
+## 2026-11-28 dsh 归档会话过滤
+
+- `/ls` 现在排除宿主已归档的会话。`session/list` 不含任何归档字段——dsh 的归档
+  语义是“阻止执行”（`agent/pre-step` 返回 reject），归档会话仍以 `agentAvailable=true`
+  出现在列表中，因此必须结合归档集合。
+- 归档集合的唯一可用来源是 Mux 的 `workspace/follow` 流：在既有 `$events` 连接上
+  追加一条流，按 `streamId` 区分帧。`internal/dsh/mux.go` 新增
+  `handleWorkspaceFrame` / `archivedSnapshot`，`Client.ArchivedSessions` 对外暴露。
+- 两种帧的字段层级不同：`baseline` 的归档集合在 `value.archivedSessionIds`，
+  增量 `archived` 帧的在顶层；集合是完整替换而非差量，`[]` 表示全部取消归档。
+- 工作区流未就绪时不按归档过滤（视为“无法判定”），避免连接刚建立就误删目录。
+- 归档集合超过 4096 条时忽略该次更新；`workspace/follow` 订阅失败只记日志，
+  不影响目录、读取和发送。
+- 真机验证：归档 `run` 会话后 `/ls` 计数 10→9，取消归档后自动恢复 10，无需重启。
+
 ## 2026-11-26 dsh 目录可见性与配置热更新
 
 - 新增 Pal 配置 `dsh.include_unavailable`，默认 `false`：保持按 `agentAvailable` 过滤目录。
