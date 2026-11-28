@@ -500,6 +500,8 @@ Pal 直接连接 dsh 自带的本机 Remote API，不需要安装 dsh 插件、N
 - `/ls` 默认只列出当前宿主持有 Agent 控制权的会话，不列出无控制权的冷历史；历史会话被
   dsh 恢复为 live 后才会出现。需要列出全部会话时把 `dsh.include_unavailable` 设为 `true`。
   宿主的 web 与 Desktop 条目不会交叉。
+- `/ls` 会排除宿主已归档的会话：归档在 dsh 里表示“阻止执行”而非“移出列表”，Pal 通过
+  Mux 的 `workspace/follow` 流取得归档集合并据此过滤。
 - Pal 每 5 秒检查一次配置文件，内容（MD5）变化时自动重新加载 `dsh` 段并热更新后端。
   dsh 换端口后无需重启 Pal；`relay`、`log` 等其他配置仍需重启生效。
 - `/con` 只显示真实用户输入和助手文本，不显示工具调用、推理或内部注入。

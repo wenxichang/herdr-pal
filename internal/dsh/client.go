@@ -129,6 +129,8 @@ func (c *Client) Sessions(ctx context.Context) ([]SessionSummary, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取 dsh 会话目录失败: %w", err)
 	}
+	// 归档集合来自 workspace/follow 流；未就绪时为 nil，表示“无法判定”。
+	archived, _ := c.ArchivedSessions(ctx)
 
 	var value sessionListValue
 	if err := json.Unmarshal(raw, &value); err != nil || value.Items == nil {
@@ -156,6 +158,14 @@ func (c *Client) Sessions(ctx context.Context) ([]SessionSummary, error) {
 		// 缺失控制权字段按不可控制处理；includeUnavailable 打开时不再据此过滤。
 		if !c.includeUnavailable && (row.AgentAvailable == nil || !*row.AgentAvailable) {
 			continue
+		}
+		// 归档会话仍持有控制权并出现在 session/list 中，必须结合工作区归档
+		// 集合排除。集合不可用（工作区流未就绪）时无法判定，按未归档处理，
+		// 避免连接刚建立就误删目录。
+		if archived != nil {
+			if _, hidden := archived[row.SessionID]; hidden {
+				continue
+			}
 		}
 		if row.Origin == "subagent" || row.FormatStatus == "migration-required" {
 			continue
